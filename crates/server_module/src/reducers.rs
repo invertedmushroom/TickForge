@@ -657,3 +657,240 @@ pub fn clear_events(ctx: &ReducerContext, before_tick: u64) -> Result<(), String
 
     Ok(())
 }
+
+// ── Economy Reducers ────────────────────────────────────────────────
+// These operate outside the tick pipeline. Clients call them directly
+// for instant-feel inventory management. The simulation worker never
+// calls these — it only observes player_equipment changes via
+// subscription callbacks to trigger stat recalculation.
+//
+// All economy reducers validate caller ownership via client_sequence
+// before mutating any rows.
+
+/// Equip an item from inventory into an equipment slot.
+///
+/// If the equipment slot is already occupied, the existing item is
+/// moved back to the inventory slot the new item came from (swap).
+#[reducer]
+pub fn equip_item(
+    ctx: &ReducerContext,
+    entity_id: u64,
+    inventory_slot: u32,
+    target_slot: EquipmentSlot,
+) -> Result<(), String> {
+    let caller = ctx.sender();
+
+    // Verify ownership
+    let seq = ctx.db.client_sequence().client_identity().find(&caller)
+        .ok_or("Client not registered")?;
+    if seq.entity_id != entity_id {
+        return Err("Client does not own this entity".into());
+    }
+
+    // Find the inventory item
+    let inv_item = ctx.db.player_inventory().iter()
+        .find(|r| r.owner_entity == entity_id && r.slot_index == inventory_slot)
+        .ok_or("No item in that inventory slot")?;
+
+    let equipping_item_id = inv_item.item_id;
+    let inv_row_id = inv_item.row_id;
+
+    // Check if equipment slot is already occupied
+    let existing_equip = ctx.db.player_equipment().iter()
+        .find(|r| r.owner_entity == entity_id && r.slot == target_slot);
+
+    if let Some(old_equip) = existing_equip {
+        // Swap: move old equipment into the inventory slot being vacated
+        let old_row_id = old_equip.row_id;
+        let old_item_id = old_equip.item_id;
+
+        // Update inventory slot with the old equipment item
+        ctx.db.player_inventory().row_id().update(PlayerInventory {
+            row_id: inv_row_id,
+            owner_entity: entity_id,
+            slot_index: inventory_slot,
+            item_id: old_item_id,
+            quantity: 1,
+        });
+
+        // Update equipment slot with the new item
+        ctx.db.player_equipment().row_id().update(PlayerEquipment {
+            row_id: old_row_id,
+            owner_entity: entity_id,
+            slot: target_slot,
+            item_id: equipping_item_id,
+        });
+    } else {
+        // No existing equipment — remove from inventory, insert into equipment
+        ctx.db.player_inventory().row_id().delete(&inv_row_id);
+        ctx.db.player_equipment().insert(PlayerEquipment {
+            row_id: 0, // auto_inc
+            owner_entity: entity_id,
+            slot: target_slot,
+            item_id: equipping_item_id,
+        });
+    }
+
+    log::info!(
+        "equip_item: entity={} item={} slot={:?}",
+        entity_id, equipping_item_id, target_slot
+    );
+    Ok(())
+}
+
+/// Unequip an item from an equipment slot into a specific inventory slot.
+#[reducer]
+pub fn unequip_item(
+    ctx: &ReducerContext,
+    entity_id: u64,
+    equipment_slot: EquipmentSlot,
+    target_inventory_slot: u32,
+) -> Result<(), String> {
+    let caller = ctx.sender();
+
+    let seq = ctx.db.client_sequence().client_identity().find(&caller)
+        .ok_or("Client not registered")?;
+    if seq.entity_id != entity_id {
+        return Err("Client does not own this entity".into());
+    }
+
+    // Find the equipped item
+    let equip = ctx.db.player_equipment().iter()
+        .find(|r| r.owner_entity == entity_id && r.slot == equipment_slot)
+        .ok_or("Nothing equipped in that slot")?;
+
+    let item_id = equip.item_id;
+    let equip_row_id = equip.row_id;
+
+    // Verify target inventory slot is empty
+    let slot_occupied = ctx.db.player_inventory().iter()
+        .any(|r| r.owner_entity == entity_id && r.slot_index == target_inventory_slot);
+    if slot_occupied {
+        return Err("Target inventory slot is occupied".into());
+    }
+
+    // Remove equipment, insert into inventory
+    ctx.db.player_equipment().row_id().delete(&equip_row_id);
+    ctx.db.player_inventory().insert(PlayerInventory {
+        row_id: 0,
+        owner_entity: entity_id,
+        slot_index: target_inventory_slot,
+        item_id,
+        quantity: 1,
+    });
+
+    log::info!(
+        "unequip_item: entity={} item={} slot={:?} -> inv_slot={}",
+        entity_id, item_id, equipment_slot, target_inventory_slot
+    );
+    Ok(())
+}
+
+/// Swap items between two inventory slots (or move if one is empty).
+#[reducer]
+pub fn swap_item(
+    ctx: &ReducerContext,
+    entity_id: u64,
+    slot_a: u32,
+    slot_b: u32,
+) -> Result<(), String> {
+    let caller = ctx.sender();
+
+    let seq = ctx.db.client_sequence().client_identity().find(&caller)
+        .ok_or("Client not registered")?;
+    if seq.entity_id != entity_id {
+        return Err("Client does not own this entity".into());
+    }
+
+    if slot_a == slot_b {
+        return Ok(()); // No-op
+    }
+
+    let item_a = ctx.db.player_inventory().iter()
+        .find(|r| r.owner_entity == entity_id && r.slot_index == slot_a);
+    let item_b = ctx.db.player_inventory().iter()
+        .find(|r| r.owner_entity == entity_id && r.slot_index == slot_b);
+
+    match (item_a, item_b) {
+        (Some(a), Some(b)) => {
+            // Swap both entries
+            let (a_id, a_row, a_item, a_qty) = (a.row_id, a.slot_index, a.item_id, a.quantity);
+            let (b_id, b_row, b_item, b_qty) = (b.row_id, b.slot_index, b.item_id, b.quantity);
+            ctx.db.player_inventory().row_id().update(PlayerInventory {
+                row_id: a_id, owner_entity: entity_id,
+                slot_index: a_row, item_id: b_item, quantity: b_qty,
+            });
+            ctx.db.player_inventory().row_id().update(PlayerInventory {
+                row_id: b_id, owner_entity: entity_id,
+                slot_index: b_row, item_id: a_item, quantity: a_qty,
+            });
+        }
+        (Some(a), None) => {
+            // Move A to slot B
+            ctx.db.player_inventory().row_id().update(PlayerInventory {
+                row_id: a.row_id, owner_entity: entity_id,
+                slot_index: slot_b, item_id: a.item_id, quantity: a.quantity,
+            });
+        }
+        (None, Some(b)) => {
+            // Move B to slot A
+            ctx.db.player_inventory().row_id().update(PlayerInventory {
+                row_id: b.row_id, owner_entity: entity_id,
+                slot_index: slot_a, item_id: b.item_id, quantity: b.quantity,
+            });
+        }
+        (None, None) => {
+            // Both empty — no-op
+        }
+    }
+
+    Ok(())
+}
+
+/// Grant an item to a player's inventory. Trusted-worker only.
+///
+/// Called by the simulation worker when a player loots a pickup or
+/// receives a quest reward. The simulation determines *what* drops;
+/// this reducer persists the result.
+#[reducer]
+pub fn loot_item(
+    ctx: &ReducerContext,
+    entity_id: u64,
+    target_slot: u32,
+    item_id: u32,
+    quantity: u32,
+) -> Result<(), String> {
+    if !is_trusted_caller(ctx) {
+        return Err("loot_item may only be invoked by a trusted worker".into());
+    }
+
+    // Verify entity exists
+    if ctx.db.entity().entity_id().find(&entity_id).is_none() {
+        return Err("Entity does not exist".into());
+    }
+
+    // Verify slot is empty
+    let slot_occupied = ctx.db.player_inventory().iter()
+        .any(|r| r.owner_entity == entity_id && r.slot_index == target_slot);
+    if slot_occupied {
+        return Err("Target inventory slot is occupied".into());
+    }
+
+    ctx.db.player_inventory().insert(PlayerInventory {
+        row_id: 0,
+        owner_entity: entity_id,
+        slot_index: target_slot,
+        item_id,
+        quantity,
+    });
+
+    log::info!("loot_item: entity={} item={} qty={} slot={}", entity_id, item_id, quantity, target_slot);
+    Ok(())
+}
+
+/// Accept a pending trade. Stub — full trade system not yet implemented.
+#[reducer]
+pub fn trade_accept(ctx: &ReducerContext, _trade_id: u64) -> Result<(), String> {
+    let _caller = ctx.sender();
+    Err("Trading system not yet implemented".into())
+}

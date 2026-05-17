@@ -10,6 +10,7 @@ use game_core::combat::skill::{
     AbilityExecutionContext, AbilityExecutionId, ResolvedTargeting,
     ScheduledAction, ScheduledActionType, SkillShape,
 };
+use game_core::director::{DirectorSpawn, DirectorState};
 use game_core::entity::entity_index::EntityIndex;
 use game_core::sim_state::SimState;
 use game_protocol::types::{Quatf, Vec3f};
@@ -142,6 +143,9 @@ pub struct TickResult {
     /// Region assignment changes for entities that crossed a grid cell boundary
     /// this tick. Only entities whose cell changed (with hysteresis) are included.
     pub region_updates: Vec<(EntityId, RegionCell)>,
+    /// Entities spawned by the world director this tick.
+    /// Coordinator marshals these into DB insert calls so the entities are persisted.
+    pub director_spawns: Vec<DirectorSpawn>,
 }
 
 /// The canonical 10-phase simulation tick pipeline per spec.
@@ -203,6 +207,11 @@ pub struct TickPipeline {
     /// Populated at the end of each tick (Phase 10) with entity positions.
     /// Phase 6 reads historical positions for compensated hit detection.
     transform_history: TransformHistory,
+    /// World director — evaluates dynamic event triggers and spawns NPCs.
+    director: DirectorState,
+    /// Entity ID counter for director-spawned entities.
+    /// Starts at a high value to avoid collisions with DB-assigned IDs.
+    next_director_entity_id: u64,
 }
 
 impl TickPipeline {
@@ -302,6 +311,8 @@ impl TickPipeline {
             summary: TickSummary::default(),
             entity_regions: HashMap::new(),
             transform_history: TransformHistory::new(),
+            director: DirectorState::new(),
+            next_director_entity_id: 1_000_000_000,
 }
     }
 
@@ -587,6 +598,9 @@ impl TickPipeline {
         // Phase 7: AI decisions
         self.phase_ai_decisions();
 
+        // Phase 7.5: World orchestration — director evaluates triggers and spawns
+        let director_spawns = self.phase_world_orchestration();
+
         // Snapshot health for entities that took damage this tick — must happen BEFORE
         // phase_state_finalization removes dead entity slots from the EntityStore.
         let health_updates = self.collect_health_updates();
@@ -644,6 +658,7 @@ impl TickPipeline {
             threat_updates,
             npc_state_updates,
             region_updates,
+            director_spawns,
         };
 
         self.current_tick = self.current_tick.next();
@@ -1506,6 +1521,60 @@ impl TickPipeline {
             y: from.y,
             z: from.z + dz * inv * speed * dt,
         });
+    }
+
+    // ── Phase 7.5: World orchestration ──────────────────────────
+
+    /// Evaluate dynamic event triggers and spawn NPCs/bosses into the simulation.
+    ///
+    /// Sweeps `entity_regions` to count active players per region cell,
+    /// evaluates all registered `DirectorState` events against those counts,
+    /// and calls `spawn_entity_from_snapshot` for each spawn directive.
+    ///
+    /// Returns the list of spawns so Phase 10 can include them in the TickResult
+    /// for the coordinator to persist as DB rows.
+    fn phase_world_orchestration(&mut self) -> Vec<DirectorSpawn> {
+        // Build region player counts from current entity_regions.
+        let mut region_player_counts: HashMap<(i32, i32, u32), u32> = HashMap::new();
+        for (eid, cell) in &self.entity_regions {
+            if let Some(idx) = self.state.entities.lookup(*eid) {
+                let i = idx.as_usize();
+                if self.state.entities.kinds[i] == game_core::entity::lifecycle::EntityKind::Player
+                    && self.state.entities.states[i] == game_core::entity::lifecycle::EntityState::Active
+                {
+                    *region_player_counts
+                        .entry((cell.region_x, cell.region_z, cell.layer))
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+
+        let spawns = self.director.evaluate(&region_player_counts, self.current_tick);
+
+        // Materialize spawns into the simulation immediately.
+        for spawn in &spawns {
+            let id = EntityId(self.next_director_entity_id);
+            self.next_director_entity_id += 1;
+            self.spawn_entity_from_snapshot(
+                id,
+                spawn.kind,
+                self.current_tick,
+                spawn.max_hp,
+                spawn.position,
+            );
+        }
+
+        spawns
+    }
+
+    /// Get mutable access to the director state for event registration.
+    pub fn director_mut(&mut self) -> &mut DirectorState {
+        &mut self.director
+    }
+
+    /// Get read access to the director state.
+    pub fn director(&self) -> &DirectorState {
+        &self.director
     }
 
     // ── Health delta collection ─────────────────────────────────

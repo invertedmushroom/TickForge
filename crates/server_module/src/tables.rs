@@ -5,6 +5,7 @@ use spacetimedb::{table, ScheduleAt, SpacetimeType};
 pub use game_schema::{
     Vec3f, EntityKind, EntityState, NpcAiState, DamageType,
     IntentAction, AbilityTarget, MoveDir, UseAbilityData,
+    EquipmentSlot,
 };
 // ── Module Config ───────────────────────────────────────────────────
 // Stores the admin identity (the CLI identity that published the module).
@@ -253,4 +254,55 @@ pub struct EntityRegion {
 pub struct TrustedWorker {
     #[primary_key]
     pub worker_identity: spacetimedb::Identity,
+}
+
+// ── Inventory & Equipment ───────────────────────────────────────────
+// Economy tables live outside the tick pipeline. Clients call reducers
+// directly (swap_item, equip_item, etc.). The simulation worker never
+// writes these tables — it only observes player_equipment changes via
+// subscription callbacks to trigger stat recalculation.
+//
+// Single writer: client-facing reducers (validated per-player).
+
+#[table(accessor = player_inventory, public)]
+pub struct PlayerInventory {
+    #[primary_key]
+    #[auto_inc]
+    pub row_id: u64,
+    /// Entity that owns this inventory slot.
+    pub owner_entity: u64,
+    /// Bag slot index (0-based). Unique per owner.
+    pub slot_index: u32,
+    /// Item definition id.
+    pub item_id: u32,
+    /// Stack count (1 for non-stackable items).
+    pub quantity: u32,
+}
+
+#[table(accessor = player_equipment, public)]
+pub struct PlayerEquipment {
+    #[primary_key]
+    #[auto_inc]
+    pub row_id: u64,
+    /// Entity that owns this equipment slot.
+    pub owner_entity: u64,
+    /// Which equipment slot this item occupies.
+    pub slot: EquipmentSlot,
+    /// Item definition id.
+    pub item_id: u32,
+}
+
+#[table(accessor = bank, public)]
+pub struct Bank {
+    #[primary_key]
+    #[auto_inc]
+    pub row_id: u64,
+    /// Entity that owns this bank slot.
+    pub owner_entity: u64,
+    /// Bank slot index (0-based). Unique per owner.
+    pub slot_index: u32,
+    /// Item definition id.
+    pub item_id: u32,
+    /// Stack count.
+    pub quantity: u32,
 }

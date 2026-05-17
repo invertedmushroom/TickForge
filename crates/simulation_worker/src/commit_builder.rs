@@ -150,6 +150,16 @@ pub struct CommitNpcState {
     pub target_entity: Option<u64>,
 }
 
+/// Director spawn request — entity to be created in the DB by the coordinator.
+#[derive(Clone, Debug)]
+pub struct CommitDirectorSpawn {
+    pub kind: game_schema::EntityKind,
+    pub max_hp: f32,
+    pub pos_x: f32,
+    pub pos_y: f32,
+    pub pos_z: f32,
+}
+
 // ── CommitPackage ───────────────────────────────────────────────
 
 /// Complete marshalled payload for one tick commit.
@@ -179,6 +189,8 @@ pub struct CommitPackage {
     pub threat_cleared_entity_ids: Vec<u64>,
     /// NPC AI state snapshot — upsert by entity PK in the reducer.
     pub npc_state_updates: Vec<CommitNpcState>,
+    /// Entities spawned by the world director that need DB rows created.
+    pub director_spawns: Vec<CommitDirectorSpawn>,
 }
 
 // ── Builder ─────────────────────────────────────────────────────
@@ -290,6 +302,18 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
         })
         .collect();
 
+    let director_spawns = result
+        .director_spawns
+        .iter()
+        .map(|s| CommitDirectorSpawn {
+            kind: s.kind,
+            max_hp: s.max_hp,
+            pos_x: s.position.x,
+            pos_y: s.position.y,
+            pos_z: s.position.z,
+        })
+        .collect();
+
     CommitPackage {
         tick_id,
         transforms,
@@ -304,6 +328,7 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
         threat_updates,
         threat_cleared_entity_ids,
         npc_state_updates,
+        director_spawns,
     }
 }
 
@@ -467,6 +492,7 @@ mod tests {
             threat_updates: Vec::new(),
             npc_state_updates: Vec::new(),
             region_updates: Vec::new(),
+            director_spawns: Vec::new(),
         }
     }
 
@@ -771,6 +797,7 @@ mod tests {
             threat_updates: Vec::new(),
             npc_state_updates: Vec::new(),
             region_updates: Vec::new(),
+            director_spawns: Vec::new(),
         };
         let pkg = build(result, Vec::new());
 

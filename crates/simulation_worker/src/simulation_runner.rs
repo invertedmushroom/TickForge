@@ -10,6 +10,8 @@
 //! This struct is not feature-gated and has no SpacetimeDB dependency,
 //! so all simulation lifecycle logic is testable offline.
 
+use std::collections::HashSet;
+
 use game_core::combat::skill::AbilityRegistry;
 use game_core::physics_backend::PhysicsBackend;
 use game_protocol::entity_id::EntityId;
@@ -30,6 +32,11 @@ pub struct SimulationRunner {
     pipeline: TickPipeline,
     commit: CommitAuthority,
     tick_driver: TickDriver,
+    /// Entities whose equipment changed between ticks. Drained before
+    /// each `run_tick` call. The coordinator pushes entity IDs here
+    /// when it observes `player_equipment` DB changes. Step 4 (Stats
+    /// Pipeline) will use this set to recalculate cached stat blocks.
+    pending_stat_recalcs: HashSet<EntityId>,
 }
 
 impl SimulationRunner {
@@ -44,6 +51,7 @@ impl SimulationRunner {
             pipeline: TickPipeline::new(start_tick, physics, dt, abilities),
             commit: CommitAuthority::new(),
             tick_driver: TickDriver::new(),
+            pending_stat_recalcs: HashSet::new(),
         }
     }
 
@@ -51,14 +59,23 @@ impl SimulationRunner {
 
     /// Attempt to process one simulation tick.
     ///
-    /// Delegates eligibility, desync correction, pipeline execution,
-    /// and in-flight marking to `TickDriver`.  Returns the raw
-    /// `TickResult` for the coordinator to marshal into wire types.
+    /// Drains any pending stat recalculation requests (from equipment
+    /// changes observed between ticks), then delegates to `TickDriver`.
     pub fn run_tick(
         &mut self,
         canonical_tick: u64,
         intents: &[game_protocol::intent::PlayerIntent],
     ) -> Result<TickResult, TickSkipped> {
+        // Drain pending equipment-driven stat recalculations.
+        // Step 4 (Stats Pipeline) will act on these; for now just clear.
+        if !self.pending_stat_recalcs.is_empty() {
+            log::info!(
+                "stat_recalc: draining {} pending equipment changes",
+                self.pending_stat_recalcs.len()
+            );
+            self.pending_stat_recalcs.clear();
+        }
+
         self.tick_driver.process_tick(
             canonical_tick,
             intents,
@@ -82,6 +99,17 @@ impl SimulationRunner {
     /// Record a failed commit (does not advance cursor).
     pub fn acknowledge_failure(&mut self, tick: u64, reason: &str) {
         self.commit.acknowledge_failure(tick, reason);
+    }
+
+    // ── Equipment bridge ────────────────────────────────────────
+
+    /// Queue a stat recalculation for `entity_id`.
+    ///
+    /// Called by the coordinator when it observes a `player_equipment`
+    /// row change (insert, update, or delete). The recalculation is
+    /// applied at the start of the next `run_tick` call, before Phase 1.
+    pub fn queue_stat_recalc(&mut self, entity_id: EntityId) {
+        self.pending_stat_recalcs.insert(entity_id);
     }
 
     // ── Entity lifecycle ────────────────────────────────────────

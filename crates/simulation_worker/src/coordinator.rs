@@ -381,6 +381,48 @@ pub fn run(config: CoordinatorConfig) {
         EntitySync::sync_delete(&mut guard.sim, eid);
     });
 
+    // ── Equipment bridge ────────────────────────────────────────────
+    // Observe player_equipment changes to trigger stat recalculation.
+    // These callbacks fire when a client calls equip_item / unequip_item
+    // reducers. The coordinator queues a stat recalc on SimulationRunner,
+    // which applies it before the next tick's Phase 1.
+
+    let state_for_equip_insert = Arc::clone(&state);
+    conn.db.player_equipment().on_insert(move |ctx, row| {
+        if matches!(ctx.event, spacetimedb_sdk::Event::SubscribeApplied) {
+            return; // Initial snapshot — stats will be seeded from full state
+        }
+        let eid = EntityId(row.owner_entity);
+        info!("player_equipment.on_insert: entity={} item={} slot={:?}", row.owner_entity, row.item_id, row.slot);
+        let mut guard = match state_for_equip_insert.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.sim.queue_stat_recalc(eid);
+    });
+
+    let state_for_equip_update = Arc::clone(&state);
+    conn.db.player_equipment().on_update(move |_ctx, _old, new_row| {
+        let eid = EntityId(new_row.owner_entity);
+        info!("player_equipment.on_update: entity={} item={} slot={:?}", new_row.owner_entity, new_row.item_id, new_row.slot);
+        let mut guard = match state_for_equip_update.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.sim.queue_stat_recalc(eid);
+    });
+
+    let state_for_equip_delete = Arc::clone(&state);
+    conn.db.player_equipment().on_delete(move |_ctx, old_row| {
+        let eid = EntityId(old_row.owner_entity);
+        info!("player_equipment.on_delete: entity={} item={} slot={:?}", old_row.owner_entity, old_row.item_id, old_row.slot);
+        let mut guard = match state_for_equip_delete.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.sim.queue_stat_recalc(eid);
+    });
+
     // Block on the connection thread — the callbacks above drive the simulation.
     conn.run_threaded().join().expect("Connection thread panicked");
 }
@@ -436,6 +478,7 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
             "SELECT * FROM active_buff",
             "SELECT * FROM threat_entry",
             "SELECT * FROM npc_state",
+            "SELECT * FROM player_equipment",
         ]);
 }
 

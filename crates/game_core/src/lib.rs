@@ -1,5 +1,6 @@
 pub mod collision_layers;
 pub mod combat;
+pub mod director;
 pub mod encounter;
 pub mod entity;
 pub mod physics_backend;
