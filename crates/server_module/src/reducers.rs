@@ -346,6 +346,11 @@ pub fn commit_tick_results(
     consumed_intent_ids: Vec<u64>,
     entity_state_updates: Vec<EntityStateUpdate>,
     region_updates: Vec<RegionUpdate>,
+    buff_updates: Vec<BuffUpdate>,
+    buff_cleared_entity_ids: Vec<u64>,
+    threat_updates: Vec<ThreatUpdate>,
+    threat_cleared_entity_ids: Vec<u64>,
+    npc_state_updates: Vec<NpcStateUpdate>,
 ) -> Result<(), String> {
     // Per spec (security_and_authority): trusted-only reducers must verify caller identity.
     // Accept the module itself (scheduler) or any registered simulation worker.
@@ -441,6 +446,77 @@ pub fn commit_tick_results(
         });
     }
 
+    // Persist buffs: delete all rows for entities present in buff_cleared_entity_ids, then
+    // re-insert. buff_cleared_entity_ids always includes every non-Removed entity (with an
+    // empty vec for entities that currently have no buffs), so stale rows are
+    // reliably cleared when all buffs on an entity expire in the same tick.
+    {
+        // buff_cleared_entity_ids drives deletes; buff_updates drives inserts.
+        // Separating them ensures entities with zero buffs still clear stale DB rows.
+        for entity_id in &buff_cleared_entity_ids {
+            let to_delete: Vec<u64> = ctx.db.active_buff()
+                .iter()
+                .filter(|b| b.entity_id == *entity_id)
+                .map(|b| b.buff_instance_id)
+                .collect();
+            for id in to_delete {
+                ctx.db.active_buff().buff_instance_id().delete(&id);
+            }
+        }
+        for b in buff_updates {
+            ctx.db.active_buff().insert(ActiveBuff {
+                buff_instance_id: 0, // auto_inc
+                entity_id: b.entity_id,
+                buff_id: b.buff_id,
+                source_entity: b.source_entity,
+                stacks: b.stacks,
+                expires_at_tick: b.expires_at_tick,
+            });
+        }
+    }
+
+    // Persist threat: delete all rows for NPCs present in threat_cleared_entity_ids, then re-insert.
+    // threat_cleared_entity_ids always includes every non-Removed NPC/Boss entity so stale rows
+    // are reliably cleared when all threat decays to zero in a single tick.
+    {
+        // threat_cleared_entity_ids drives deletes; threat_updates drives inserts.
+        for npc_entity in &threat_cleared_entity_ids {
+            let to_delete: Vec<u64> = ctx.db.threat_entry()
+                .iter()
+                .filter(|t| t.npc_entity == *npc_entity)
+                .map(|t| t.threat_id)
+                .collect();
+            for id in to_delete {
+                ctx.db.threat_entry().threat_id().delete(&id);
+            }
+        }
+        for t in threat_updates {
+            ctx.db.threat_entry().insert(ThreatEntry {
+                threat_id: 0, // auto_inc
+                npc_entity: t.npc_entity,
+                source_entity: t.source_entity,
+                threat: t.threat,
+            });
+        }
+    }
+
+    // Persist NPC state: upsert by entity PK (1:1 per NPC entity).
+    for n in npc_state_updates {
+        if ctx.db.npc_state().entity_id().find(&n.entity_id).is_some() {
+            ctx.db.npc_state().entity_id().update(NpcState {
+                entity_id: n.entity_id,
+                ai_state: n.ai_state,
+                target_entity: n.target_entity,
+            });
+        } else {
+            ctx.db.npc_state().insert(NpcState {
+                entity_id: n.entity_id,
+                ai_state: n.ai_state,
+                target_entity: n.target_entity,
+            });
+        }
+    }
+
     // Advance the last_committed_tick cursor used by tick_trigger's backpressure guard.
     // Only update if this commit is actually moving the cursor forward (guards against
     // out-of-order or replayed commits, though the trusted-worker check above makes
@@ -502,6 +578,29 @@ pub struct RegionUpdate {
     pub entity_id: u64,
     pub region_x: i32,
     pub region_z: i32,
+}
+
+#[derive(spacetimedb::SpacetimeType, Clone, Debug)]
+pub struct BuffUpdate {
+    pub entity_id: u64,
+    pub buff_id: u32,
+    pub source_entity: u64,
+    pub stacks: u32,
+    pub expires_at_tick: Option<u64>,
+}
+
+#[derive(spacetimedb::SpacetimeType, Clone, Debug)]
+pub struct ThreatUpdate {
+    pub npc_entity: u64,
+    pub source_entity: u64,
+    pub threat: f32,
+}
+
+#[derive(spacetimedb::SpacetimeType, Clone, Debug)]
+pub struct NpcStateUpdate {
+    pub entity_id: u64,
+    pub ai_state: NpcAiState,
+    pub target_entity: Option<u64>,
 }
 
 // ── Worker Registration ─────────────────────────────────────────────

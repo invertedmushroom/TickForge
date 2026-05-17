@@ -120,6 +120,32 @@ pub struct CommitWorldEvent {
     pub event_kind: CommitWorldEventKind,
 }
 
+/// One buff instance for persistence. Mirrors the `active_buff` DB table.
+#[derive(Clone, Debug)]
+pub struct CommitBuff {
+    pub entity_id: u64,
+    pub buff_id: u32,
+    pub source_entity: u64,
+    pub stacks: u32,
+    pub expires_at_tick: Option<u64>,
+}
+
+/// One threat entry for persistence. Mirrors the `threat_entry` DB table.
+#[derive(Clone, Debug)]
+pub struct CommitThreat {
+    pub npc_entity: u64,
+    pub source_entity: u64,
+    pub threat: f32,
+}
+
+/// NPC AI state for persistence. Mirrors the `npc_state` DB table.
+#[derive(Clone, Debug)]
+pub struct CommitNpcState {
+    pub entity_id: u64,
+    pub ai_state: game_schema::NpcAiState,
+    pub target_entity: Option<u64>,
+}
+
 // ── CommitPackage ───────────────────────────────────────────────
 
 /// Complete marshalled payload for one tick commit.
@@ -137,6 +163,18 @@ pub struct CommitPackage {
     pub consumed_intent_ids: Vec<u64>,
     pub entity_state_updates: Vec<CommitEntityState>,
     pub region_updates: Vec<CommitRegion>,
+    /// Full buff snapshot — delete-all-then-insert per entity in the reducer.
+    pub buff_updates: Vec<CommitBuff>,
+    /// Entity IDs whose buff rows should be fully replaced this tick.
+    /// Includes entities with zero buffs so stale rows are cleared when all buffs expire.
+    pub buff_cleared_entity_ids: Vec<u64>,
+    /// Full threat snapshot — delete-all-then-insert per NPC in the reducer.
+    pub threat_updates: Vec<CommitThreat>,
+    /// NPC/Boss entity IDs whose threat rows should be fully replaced this tick.
+    /// Includes entities with zero threat so stale rows are cleared when threat decays out.
+    pub threat_cleared_entity_ids: Vec<u64>,
+    /// NPC AI state snapshot — upsert by entity PK in the reducer.
+    pub npc_state_updates: Vec<CommitNpcState>,
 }
 
 // ── Builder ─────────────────────────────────────────────────────
@@ -189,6 +227,45 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
 
     let (combat_events, world_events) = classify_events(&result.events);
 
+    let buff_updates = result
+        .buff_updates
+        .iter()
+        .flat_map(|(eid, buffs)| {
+            buffs.iter().map(move |b| CommitBuff {
+                entity_id: eid.0,
+                buff_id: b.buff_id,
+                source_entity: b.source.0,
+                stacks: b.stacks,
+                expires_at_tick: b.expires_at.map(|t| t.0),
+            })
+        })
+        .collect();
+
+    let threat_updates = result
+        .threat_updates
+        .iter()
+        .flat_map(|(eid, entries)| {
+            entries.iter().map(move |e| CommitThreat {
+                npc_entity: eid.0,
+                source_entity: e.source.0,
+                threat: e.threat,
+            })
+        })
+        .collect();
+
+    let npc_state_updates = result
+        .npc_state_updates
+        .iter()
+        .map(|(eid, ai_state, target)| CommitNpcState {
+            entity_id: eid.0,
+            ai_state: *ai_state,
+            target_entity: target.map(|t| t.0),
+        })
+        .collect();
+
+    let buff_cleared_entity_ids = result.buff_updates.iter().map(|(eid, _)| eid.0).collect();
+    let threat_cleared_entity_ids = result.threat_updates.iter().map(|(eid, _)| eid.0).collect();
+
     CommitPackage {
         tick_id,
         transforms,
@@ -198,6 +275,11 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
         consumed_intent_ids,
         entity_state_updates,
         region_updates: Vec::new(),
+        buff_updates,
+        buff_cleared_entity_ids,
+        threat_updates,
+        threat_cleared_entity_ids,
+        npc_state_updates,
     }
 }
 
@@ -350,6 +432,9 @@ mod tests {
                 (EntityId(200), game_schema::EntityState::DespawnPending),
             ],
             health_updates: vec![(EntityId(100), 75.0, 100.0)],
+            buff_updates: Vec::new(),
+            threat_updates: Vec::new(),
+            npc_state_updates: Vec::new(),
         }
     }
 
@@ -650,6 +735,9 @@ mod tests {
             summary: Default::default(),
             entity_state_updates: Vec::new(),
             health_updates: Vec::new(),
+            buff_updates: Vec::new(),
+            threat_updates: Vec::new(),
+            npc_state_updates: Vec::new(),
         };
         let pkg = build(result, Vec::new());
 

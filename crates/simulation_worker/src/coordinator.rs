@@ -39,7 +39,7 @@ use std::path::Path;
 use log::{error, info, warn};
 use spacetimedb_sdk::{DbContext, Identity, Table, TableWithPrimaryKey};
 
-use crate::commit_builder::{self, CommitPackage, CommitCombatEvent, CommitCombatEventKind, CommitWorldEventKind, CommitEntityStateKind};
+use crate::commit_builder::{self, CommitPackage, CommitCombatEvent, CommitCombatEventKind, CommitWorldEventKind, CommitEntityStateKind, CommitBuff, CommitThreat, CommitNpcState};
 use crate::entity_sync::EntitySync;
 use crate::module_bindings::*;
 use crate::physics::rapier_world::PhysicsWorld;
@@ -192,6 +192,11 @@ pub fn run(config: CoordinatorConfig) {
         let combat_events = wire_combat_events(&pkg);
         let world_events = wire_world_events(&pkg);
         let entity_state_updates = wire_entity_state_updates(&pkg);
+        let buff_updates = wire_buff_updates(&pkg);
+        let buff_cleared_entity_ids = pkg.buff_cleared_entity_ids.clone();
+        let threat_updates = wire_threat_updates(&pkg);
+        let threat_cleared_entity_ids = pkg.threat_cleared_entity_ids.clone();
+        let npc_state_updates = wire_npc_state_updates(&pkg);
 
         // Commit results to SpacetimeDB via the acknowledgement-aware path.
         // `commit_tick_results_then` is fire-and-forget for the *send*; the
@@ -208,6 +213,11 @@ pub fn run(config: CoordinatorConfig) {
             pkg.consumed_intent_ids.clone(),
             entity_state_updates,
             wire_region_updates(&pkg),
+            buff_updates,
+            buff_cleared_entity_ids,
+            threat_updates,
+            threat_cleared_entity_ids,
+            npc_state_updates,
             move |_rctx, outcome| {
                 let mut guard = match state_for_ack.lock() {
                     Ok(g) => g,
@@ -290,6 +300,40 @@ pub fn run(config: CoordinatorConfig) {
             .map(|t| game_protocol::types::Vec3f { x: t.pos_x, y: t.pos_y, z: t.pos_z })
             .unwrap_or(game_protocol::types::Vec3f { x: 0.0, y: 1.0, z: 0.0 });
 
+        // Read runtime state from the SDK cache for restart continuity.
+        let buffs: Vec<game_core::combat::status::ActiveBuff> = ctx.db
+            .active_buff()
+            .iter()
+            .filter(|b| b.entity_id == new_entity.entity_id)
+            .map(|b| game_core::combat::status::ActiveBuff {
+                buff_id: b.buff_id,
+                source: EntityId(b.source_entity),
+                target: EntityId(b.entity_id),
+                stacks: b.stacks,
+                // max_stacks is static registry data not stored in the DB.
+                // Use u32::MAX as an explicit "uncapped" sentinel — the correct
+                // value is restored next time this buff is applied from combat.
+                max_stacks: u32::MAX,
+                expires_at: b.expires_at_tick.map(game_protocol::tick::TickId),
+            })
+            .collect();
+
+        let threats: Vec<game_core::combat::status::ThreatEntry> = ctx.db
+            .threat_entry()
+            .iter()
+            .filter(|t| t.npc_entity == new_entity.entity_id)
+            .map(|t| game_core::combat::status::ThreatEntry {
+                source: EntityId(t.source_entity),
+                threat: t.threat,
+            })
+            .collect();
+
+        let npc_state: Option<(game_schema::NpcAiState, Option<EntityId>)> = ctx.db
+            .npc_state()
+            .entity_id()
+            .find(&new_entity.entity_id)
+            .map(|n| (convert_npc_ai_state(n.ai_state), n.target_entity.map(EntityId)));
+
         let mut guard = match state_for_entity.lock() {
             Ok(g) => g,
             Err(poisoned) => {
@@ -297,7 +341,7 @@ pub fn run(config: CoordinatorConfig) {
                 poisoned.into_inner()
             }
         };
-        EntitySync::sync_insert(&mut guard.sim, eid, kind, state, tick, max_hp, pos);
+        EntitySync::sync_insert(&mut guard.sim, eid, kind, state, tick, max_hp, pos, buffs, threats, npc_state);
     });
 
     // entity.on_update — thin adapter over EntitySync::sync_update.
@@ -382,6 +426,9 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
             "SELECT * FROM entity",
             "SELECT * FROM entity_health",
             "SELECT * FROM entity_transform",
+            "SELECT * FROM active_buff",
+            "SELECT * FROM threat_entry",
+            "SELECT * FROM npc_state",
         ]);
 }
 
@@ -536,6 +583,16 @@ fn convert_entity_state(state: crate::module_bindings::EntityState) -> game_sche
     }
 }
 
+fn convert_npc_ai_state(state: crate::module_bindings::NpcAiState) -> game_schema::NpcAiState {
+    match state {
+        crate::module_bindings::NpcAiState::Idle => game_schema::NpcAiState::Idle,
+        crate::module_bindings::NpcAiState::Patrol => game_schema::NpcAiState::Patrol,
+        crate::module_bindings::NpcAiState::Combat => game_schema::NpcAiState::Combat,
+        crate::module_bindings::NpcAiState::Flee => game_schema::NpcAiState::Flee,
+        crate::module_bindings::NpcAiState::Scripted => game_schema::NpcAiState::Scripted,
+    }
+}
+
 // ── CommitPackage → SDK wire type conversions ───────────────────
 //
 // Each function does a 1:1 structural mapping from the SDK-free
@@ -628,6 +685,51 @@ fn wire_region_updates(pkg: &CommitPackage) -> Vec<RegionUpdate> {
             region_z: r.region_z,
         })
         .collect()
+}
+
+fn wire_buff_updates(pkg: &CommitPackage) -> Vec<BuffUpdate> {
+    pkg.buff_updates
+        .iter()
+        .map(|b| BuffUpdate {
+            entity_id: b.entity_id,
+            buff_id: b.buff_id,
+            source_entity: b.source_entity,
+            stacks: b.stacks,
+            expires_at_tick: b.expires_at_tick,
+        })
+        .collect()
+}
+
+fn wire_threat_updates(pkg: &CommitPackage) -> Vec<ThreatUpdate> {
+    pkg.threat_updates
+        .iter()
+        .map(|t| ThreatUpdate {
+            npc_entity: t.npc_entity,
+            source_entity: t.source_entity,
+            threat: t.threat,
+        })
+        .collect()
+}
+
+fn wire_npc_state_updates(pkg: &CommitPackage) -> Vec<NpcStateUpdate> {
+    pkg.npc_state_updates
+        .iter()
+        .map(|n| NpcStateUpdate {
+            entity_id: n.entity_id,
+            ai_state: wire_npc_ai_state(n.ai_state),
+            target_entity: n.target_entity,
+        })
+        .collect()
+}
+
+fn wire_npc_ai_state(state: game_schema::NpcAiState) -> NpcAiState {
+    match state {
+        game_schema::NpcAiState::Idle => NpcAiState::Idle,
+        game_schema::NpcAiState::Patrol => NpcAiState::Patrol,
+        game_schema::NpcAiState::Combat => NpcAiState::Combat,
+        game_schema::NpcAiState::Flee => NpcAiState::Flee,
+        game_schema::NpcAiState::Scripted => NpcAiState::Scripted,
+    }
 }
 
 fn wire_damage_type(dt: game_schema::DamageType) -> DamageType {

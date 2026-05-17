@@ -98,6 +98,19 @@ impl SimulationRunner {
         self.pipeline.spawn_entity_from_snapshot(id, kind, tick, max_hp, position);
     }
 
+    /// Restore buff, threat, and NPC AI state from DB rows after a worker restart.
+    ///
+    /// Call this once per entity *after* `spawn_entity_from_snapshot` for that entity.
+    /// Rows for unknown entity IDs are silently ignored.
+    pub fn seed_runtime_state(
+        &mut self,
+        buffs: &[(EntityId, Vec<game_core::combat::status::ActiveBuff>)],
+        threats: &[(EntityId, Vec<game_core::combat::status::ThreatEntry>)],
+        npc_states: &[(EntityId, game_schema::NpcAiState, Option<EntityId>)],
+    ) {
+        self.pipeline.seed_runtime_state(buffs, threats, npc_states);
+    }
+
     /// Hard teardown for an entity from all runtime stores.
     /// Returns `true` if the entity was present and removed.
     pub fn force_remove_entity(&mut self, id: EntityId) -> bool {

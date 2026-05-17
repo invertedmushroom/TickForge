@@ -8,10 +8,11 @@
 //!
 //! This module has no SpacetimeDB dependency and is testable offline.
 
+use game_core::combat::status::{ActiveBuff, ThreatEntry};
 use game_protocol::entity_id::EntityId;
 use game_protocol::tick::TickId;
 use game_protocol::types::Vec3f;
-use game_schema::{EntityKind, EntityState};
+use game_schema::{EntityKind, EntityState, NpcAiState};
 use log::{debug, info, warn};
 
 use crate::simulation_runner::SimulationRunner;
@@ -73,6 +74,9 @@ impl EntitySync {
         tick: TickId,
         max_hp: f32,
         position: Vec3f,
+        buffs: Vec<ActiveBuff>,
+        threats: Vec<ThreatEntry>,
+        npc_state: Option<(NpcAiState, Option<EntityId>)>,
     ) -> SyncInsertResult {
         // Guard: never spawn entities that have already passed their useful lifecycle.
         match state {
@@ -95,6 +99,17 @@ impl EntitySync {
         }
 
         sim.spawn_entity_from_snapshot(id, kind, tick, max_hp, position);
+
+        // Restore runtime state from DB rows (noops if slices are empty).
+        let buff_pairs = if buffs.is_empty() { vec![] } else { vec![(id, buffs)] };
+        let threat_pairs = if threats.is_empty() { vec![] } else { vec![(id, threats)] };
+        let npc_pairs: Vec<(EntityId, NpcAiState, Option<EntityId>)> = npc_state
+            .map(|(ai, tgt)| vec![(id, ai, tgt)])
+            .unwrap_or_default();
+        if !buff_pairs.is_empty() || !threat_pairs.is_empty() || !npc_pairs.is_empty() {
+            sim.seed_runtime_state(&buff_pairs, &threat_pairs, &npc_pairs);
+        }
+
         info!(
             "Entity {} ({kind:?}) spawned into simulation at tick {:?} pos=({},{},{})",
             id.0, tick, position.x, position.y, position.z
@@ -244,6 +259,7 @@ mod tests {
         let result = EntitySync::sync_insert(
             &mut sim, id, EntityKind::Player, EntityState::Spawning,
             TickId(1), 100.0, Vec3f { x: 1.0, y: 2.0, z: 3.0 },
+            vec![], vec![], None,
         );
         assert_eq!(result, SyncInsertResult::Spawned);
         assert!(sim.contains(id));
@@ -256,6 +272,7 @@ mod tests {
         let result = EntitySync::sync_insert(
             &mut sim, id, EntityKind::Npc, EntityState::Removed,
             TickId(1), 50.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            vec![], vec![], None,
         );
         assert_eq!(result, SyncInsertResult::SkippedTerminal);
         assert!(!sim.contains(id));
@@ -268,6 +285,7 @@ mod tests {
         let result = EntitySync::sync_insert(
             &mut sim, id, EntityKind::Npc, EntityState::DespawnPending,
             TickId(1), 50.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            vec![], vec![], None,
         );
         assert_eq!(result, SyncInsertResult::SkippedTerminal);
         assert!(!sim.contains(id));
@@ -280,12 +298,14 @@ mod tests {
         let first = EntitySync::sync_insert(
             &mut sim, id, EntityKind::Player, EntityState::Spawning,
             TickId(1), 100.0, Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+            vec![], vec![], None,
         );
         assert_eq!(first, SyncInsertResult::Spawned);
 
         let second = EntitySync::sync_insert(
             &mut sim, id, EntityKind::Player, EntityState::Active,
             TickId(2), 100.0, Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+            vec![], vec![], None,
         );
         assert_eq!(second, SyncInsertResult::SkippedDuplicate);
     }
@@ -299,6 +319,7 @@ mod tests {
         EntitySync::sync_insert(
             &mut sim, id, EntityKind::Npc, EntityState::Spawning,
             TickId(1), 80.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            vec![], vec![], None,
         );
         // Activate the entity so is_active() returns true.
         sim.mark_despawn(id); // Spawning doesn't become Active without a tick,
@@ -317,6 +338,7 @@ mod tests {
         EntitySync::sync_insert(
             &mut sim, id, EntityKind::Npc, EntityState::Spawning,
             TickId(1), 60.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            vec![], vec![], None,
         );
         assert!(sim.contains(id));
 
@@ -344,6 +366,7 @@ mod tests {
         EntitySync::sync_insert(
             &mut sim, id, EntityKind::Player, EntityState::Spawning,
             TickId(1), 100.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            vec![], vec![], None,
         );
         let result = EntitySync::sync_update(
             &mut sim, id, EntityState::Spawning, EntityState::Active,
@@ -360,6 +383,7 @@ mod tests {
         EntitySync::sync_insert(
             &mut sim, id, EntityKind::Player, EntityState::Spawning,
             TickId(1), 100.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            vec![], vec![], None,
         );
         let result = EntitySync::sync_delete(&mut sim, id);
         assert_eq!(result, SyncDeleteResult::Removed);

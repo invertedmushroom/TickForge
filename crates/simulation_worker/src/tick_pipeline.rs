@@ -60,6 +60,16 @@ pub struct TickResult {
     /// `HealthUpdate` wire types. Collected after all combat phases, before entity removal,
     /// so killed entities (hp=0) are included in the same commit as their death event.
     pub health_updates: Vec<(EntityId, f32, f32)>,
+    /// Full buff snapshot for all active entities. Each entry is
+    /// (entity_id, Vec<ActiveBuff>). Written as delete-all-then-insert
+    /// per entity in the reducer.
+    pub buff_updates: Vec<(EntityId, Vec<game_core::combat::status::ActiveBuff>)>,
+    /// Full threat table snapshot for NPCs/bosses with non-empty threat.
+    /// Each entry is (npc_entity_id, Vec<ThreatEntry>).
+    pub threat_updates: Vec<(EntityId, Vec<game_core::combat::status::ThreatEntry>)>,
+    /// NPC AI state snapshot for all active NPCs/bosses.
+    /// Each entry is (entity_id, NpcAiState, top_threat target).
+    pub npc_state_updates: Vec<(EntityId, game_schema::NpcAiState, Option<EntityId>)>,
 }
 
 /// The canonical 10-phase simulation tick pipeline per spec.
@@ -238,6 +248,38 @@ impl TickPipeline {
         }
     }
 
+    /// Seed runtime state from DB rows recovered on worker restart.
+    ///
+    /// Must be called after `spawn_entity_from_snapshot` so the entity already
+    /// has an `EntityIndex` mapping.  Silently ignores rows whose entity is not
+    /// present (e.g. entities that became Removed between the commit and the restart).
+    pub fn seed_runtime_state(
+        &mut self,
+        buffs: &[(EntityId, Vec<game_core::combat::status::ActiveBuff>)],
+        threats: &[(EntityId, Vec<game_core::combat::status::ThreatEntry>)],
+        npc_states: &[(EntityId, game_schema::NpcAiState, Option<EntityId>)],
+    ) {
+        for (eid, entity_buffs) in buffs {
+            if let Some(idx) = self.state.entities.lookup(*eid) {
+                self.state.status.buffs[idx.as_usize()] = entity_buffs.clone();
+            }
+        }
+        for (eid, entries) in threats {
+            if let Some(idx) = self.state.entities.lookup(*eid) {
+                if let Some(ref mut table) = self.state.combat.threat_tables[idx.as_usize()] {
+                    table.entries = entries.clone();
+                }
+            }
+        }
+        for (eid, ai_state, _target) in npc_states {
+            if let Some(idx) = self.state.entities.lookup(*eid) {
+                self.state.ai.npc_ai[idx.as_usize()] = Some(*ai_state);
+                // target_entity is re-derived each tick from the threat table in the
+                // AI decisions phase — no need to persist it in NpcAiState.
+            }
+        }
+    }
+
     /// Downcast the physics backend to a concrete type.
     /// Returns `None` if the backend is not of type `T`.
     pub fn physics_as<T: 'static>(&mut self) -> Option<&mut T> {
@@ -403,6 +445,11 @@ impl TickPipeline {
             ))
             .count();
         self.summary.active_hitboxes = self.state.combat.hitboxes.len();
+        // Collect runtime domain snapshots for persistence.
+        let buff_updates = self.collect_buff_updates();
+        let threat_updates = self.collect_threat_updates();
+        let npc_state_updates = self.collect_npc_state_updates();
+
         let result = TickResult {
             tick_id: self.current_tick,
             transforms: self.physics.get_all_transforms(),
@@ -410,6 +457,9 @@ impl TickPipeline {
             summary: self.summary,
             entity_state_updates,
             health_updates,
+            buff_updates,
+            threat_updates,
+            npc_state_updates,
         };
 
         self.current_tick = self.current_tick.next();
@@ -910,6 +960,63 @@ impl TickPipeline {
             let i = idx.as_usize();
             Some((eid, self.state.combat.health.hp[i], self.state.combat.health.max_hp[i]))
         }).collect()
+    }
+
+    // ── Runtime domain snapshots (full snapshot every tick) ──────
+
+    /// Snapshot all active buffs for persistence.
+    ///
+    /// Emits ALL non-Removed entities (including those with empty buff arrays) so
+    /// the reducer's delete-all-then-insert reliably clears stale rows when every
+    /// buff on an entity expires in the same tick.
+    fn collect_buff_updates(&self) -> Vec<(EntityId, Vec<game_core::combat::status::ActiveBuff>)> {
+        let mut out = Vec::new();
+        for i in 0..self.state.entities.len() {
+            if self.state.entities.states[i] == game_core::entity::lifecycle::EntityState::Removed {
+                continue;
+            }
+            let eid = self.state.entities.id_of(EntityIndex(i as u32));
+            out.push((eid, self.state.status.buffs[i].clone()));
+        }
+        out
+    }
+
+    /// Snapshot all threat tables for persistence.
+    ///
+    /// Emits ALL non-Removed NPC/Boss entities (including those with an empty threat
+    /// table) so the reducer reliably clears stale rows when all threat decays to zero.
+    fn collect_threat_updates(&self) -> Vec<(EntityId, Vec<game_core::combat::status::ThreatEntry>)> {
+        let mut out = Vec::new();
+        for i in 0..self.state.entities.len() {
+            if self.state.entities.states[i] == game_core::entity::lifecycle::EntityState::Removed {
+                continue;
+            }
+            if let Some(ref table) = self.state.combat.threat_tables[i] {
+                // Emit even when entries are empty — the reducer uses the entity ID
+                // to delete stale rows, so zero entries must still clear the DB.
+                let eid = self.state.entities.id_of(EntityIndex(i as u32));
+                out.push((eid, table.entries.clone()));
+            }
+        }
+        out
+    }
+
+    /// Snapshot NPC AI state for all active NPCs/bosses.
+    fn collect_npc_state_updates(&self) -> Vec<(EntityId, game_schema::NpcAiState, Option<EntityId>)> {
+        let mut out = Vec::new();
+        for i in 0..self.state.entities.len() {
+            if self.state.entities.states[i] == game_core::entity::lifecycle::EntityState::Removed {
+                continue;
+            }
+            if let Some(ai_state) = self.state.ai.npc_ai[i] {
+                let eid = self.state.entities.id_of(EntityIndex(i as u32));
+                let target = self.state.combat.threat_tables[i]
+                    .as_ref()
+                    .and_then(|t| t.top_threat());
+                out.push((eid, ai_state, target));
+            }
+        }
+        out
     }
 
     // ── Phase 8: State finalization ─────────────────────────────
