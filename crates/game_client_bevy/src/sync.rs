@@ -4,6 +4,7 @@ use bevy::prelude::*;
 use bevy::utils::HashMap;
 use game_client::module_bindings::Entity as RemoteEntity;
 use game_client::module_bindings::*;
+use game_core::physics_backend::BodyShape;
 use spacetimedb_sdk::{DbContext, Table};
 
 use crate::camera::GameCamera;
@@ -234,6 +235,10 @@ struct EntityMeshes {
     projectile_mesh: Handle<Mesh>,
     hazard_mesh: Handle<Mesh>,
     prop_mesh: Handle<Mesh>,
+    /// Per-`BodyShape` mesh handles. When an entity has an authored
+    /// `body_shape` (via `NpcConfig` / `InteractableConfig`), look up the
+    /// mesh here; otherwise fall back to the kind default above.
+    body_shape_meshes: std::collections::HashMap<BodyShape, Handle<Mesh>>,
     player_mat: Handle<StandardMaterial>,
     npc_mat: Handle<StandardMaterial>,
     boss_mat: Handle<StandardMaterial>,
@@ -255,6 +260,24 @@ impl FromWorld for EntityMeshes {
         let projectile_mesh = meshes.add(Sphere::new(0.15));
         let hazard_mesh = meshes.add(Cylinder::new(0.4, 0.1));
         let prop_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
+
+        // Build a mesh per `BodyShape` variant so spawn sites can pick the
+        // correctly-sized visual. Capsule `half_length` follows the
+        // existing player-mesh convention (`2.0 * physics_half_height`)
+        // so the visual scale stays consistent across body shapes.
+        let mut body_shape_meshes: std::collections::HashMap<BodyShape, Handle<Mesh>> =
+            std::collections::HashMap::new();
+        for shape in BodyShape::ALL {
+            let handle = if let Some((hh, r)) = shape.capsule_dims() {
+                meshes.add(Capsule3d::new(r, hh * 2.0))
+            } else {
+                let half = shape
+                    .cuboid_half_extents()
+                    .expect("BodyShape is either capsule or cuboid");
+                meshes.add(Cuboid::new(half.x * 2.0, half.y * 2.0, half.z * 2.0))
+            };
+            body_shape_meshes.insert(shape, handle);
+        }
 
         let mut materials = world.resource_mut::<Assets<StandardMaterial>>();
         let player_mat = materials.add(StandardMaterial {
@@ -309,6 +332,7 @@ impl FromWorld for EntityMeshes {
             projectile_mesh,
             hazard_mesh,
             prop_mesh,
+            body_shape_meshes,
             player_mat,
             npc_mat,
             boss_mat,
@@ -482,19 +506,56 @@ fn sync_entities(
             }
         } else {
             let is_local = local_player.entity_id == Some(row.entity_id);
+            // Look up an authored `body_shape` for this entity (if any).
+            // Capsule entities (Player/Npc/Boss) read from `npc_config`;
+            // Prop entities read from `interactable_config`. Missing rows
+            // fall back to the kind default mesh below.
+            let authored_shape: Option<BodyShape> = match kind {
+                EntityKind::Player | EntityKind::Npc | EntityKind::Boss => stdb
+                    .conn
+                    .db
+                    .npc_config()
+                    .iter()
+                    .find(|c| c.entity_id == row.entity_id)
+                    .and_then(|c| c.body_shape)
+                    .and_then(BodyShape::from_u8),
+                EntityKind::Prop => stdb
+                    .conn
+                    .db
+                    .interactable_config()
+                    .iter()
+                    .find(|c| c.entity_id == row.entity_id)
+                    .and_then(|c| BodyShape::from_u8(c.body_shape)),
+                EntityKind::Projectile | EntityKind::Hazard => None,
+            };
+            let shape_mesh = authored_shape
+                .and_then(|s| meshes.body_shape_meshes.get(&s).cloned());
             let (mesh, mat) = match kind {
-                EntityKind::Player if is_local => {
-                    (meshes.player_mesh.clone(), meshes.local_player_mat.clone())
-                }
-                EntityKind::Player => (meshes.player_mesh.clone(), meshes.player_mat.clone()),
-                EntityKind::Npc => (meshes.npc_mesh.clone(), meshes.npc_mat.clone()),
-                EntityKind::Boss => (meshes.boss_mesh.clone(), meshes.boss_mat.clone()),
+                EntityKind::Player if is_local => (
+                    shape_mesh.unwrap_or_else(|| meshes.player_mesh.clone()),
+                    meshes.local_player_mat.clone(),
+                ),
+                EntityKind::Player => (
+                    shape_mesh.unwrap_or_else(|| meshes.player_mesh.clone()),
+                    meshes.player_mat.clone(),
+                ),
+                EntityKind::Npc => (
+                    shape_mesh.unwrap_or_else(|| meshes.npc_mesh.clone()),
+                    meshes.npc_mat.clone(),
+                ),
+                EntityKind::Boss => (
+                    shape_mesh.unwrap_or_else(|| meshes.boss_mesh.clone()),
+                    meshes.boss_mat.clone(),
+                ),
                 EntityKind::Projectile => (
                     meshes.projectile_mesh.clone(),
                     meshes.projectile_mat.clone(),
                 ),
                 EntityKind::Hazard => (meshes.hazard_mesh.clone(), meshes.hazard_mat.clone()),
-                EntityKind::Prop => (meshes.prop_mesh.clone(), meshes.prop_mat.clone()),
+                EntityKind::Prop => (
+                    shape_mesh.unwrap_or_else(|| meshes.prop_mesh.clone()),
+                    meshes.prop_mat.clone(),
+                ),
             };
 
             let mut entity_cmd = commands.spawn((

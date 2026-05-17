@@ -231,6 +231,14 @@ pub struct MechanicZoneParam {
     pub buff_id: Option<u32>,
     #[serde(default)]
     pub lifetime_ticks: Option<u32>,
+    /// Optional override for the volume's entity-kind filter. When `None`,
+    /// built-in mechanics that spawn this zone default to filtering for
+    /// players only — preserving historical behavior. Authors can opt
+    /// into NPC/all coverage by setting this explicitly (e.g.
+    /// `EntityKindFilter::Any` for a zone that should also affect
+    /// scripted adds).
+    #[serde(default)]
+    pub entity_filter: Option<EntityKindFilter>,
 }
 
 impl MechanicZoneParam {
@@ -835,7 +843,14 @@ impl Mechanic for TimedVolumePulseMechanic {
                 shape: zone.shape,
                 anchor: zone.anchor.clone(),
                 lifetime_ticks: zone.lifetime_ticks,
-                entity_filter: EntityKindFilter::Kinds(vec![game_schema::EntityKind::Player]),
+                entity_filter: zone.entity_filter.clone().unwrap_or_else(|| {
+                    // Default to player-only filtering — historical
+                    // behavior of `timed_volume_pulse` and the only
+                    // useful setting for typical "stand in / stand out"
+                    // boss zones. Authors set `entity_filter` on the
+                    // zone param to override (e.g. include adds).
+                    EntityKindFilter::Kinds(vec![game_schema::EntityKind::Player])
+                }),
             });
         }
     }
@@ -2150,6 +2165,7 @@ mod tests {
             priority: 0,
             buff_id: None,
             lifetime_ticks: None,
+            entity_filter: None,
         });
 
         let mut ctx = FakeMechanicCtx::new(TickId(10), EntityId(99));

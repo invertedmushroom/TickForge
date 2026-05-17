@@ -242,6 +242,15 @@ impl TickPipeline {
         entity_filter: EntityKindFilter,
         follow_owner: bool,
     ) -> VolumeId {
+        // Capture the owning boss's layer at spawn time. This is
+        // intentionally static for the volume's lifetime: a volume
+        // belongs to the encounter instance that requested it, and
+        // bosses are never moved across layers in the current scope
+        // (encounter teardown / `force_remove_entities` removes the
+        // boss + drops its volumes before any cross-layer scenario
+        // could occur). If a future change ever introduces live
+        // boss layer migration, this capture would need to be
+        // re-evaluated per-tick alongside the boss transform.
         let layer = self.layer_of(boss_id);
         let store = self.volumes.entry(boss_id).or_default();
         let id = store.allocate_id();

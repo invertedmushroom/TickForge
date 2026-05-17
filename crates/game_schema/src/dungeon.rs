@@ -182,6 +182,43 @@ pub enum ShapeDef {
     },
 }
 
+/// Authoring-friendly catalog of physics body shapes.
+///
+/// Mirrors `game_core::physics_backend::BodyShape` 1:1 — `to_u8()`
+/// returns the same discriminants used by `NpcConfig.body_shape` /
+/// `InteractableConfig.body_shape`. Kept in `game_schema` so dungeon
+/// RON files can name shapes without depending on `game_core`.
+///
+/// Stable ordering: values must not be reordered.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub enum BodyShapeDef {
+    PlayerCapsule,
+    NpcCapsule,
+    BossCapsule,
+    LargeBossCapsule,
+    GateCuboid,
+    SwitchCuboid,
+    ChestCuboid,
+    CrateCuboid,
+}
+
+impl BodyShapeDef {
+    /// Encode as the same `u8` discriminant used by
+    /// `game_core::physics_backend::BodyShape::to_u8`.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            BodyShapeDef::PlayerCapsule => 0,
+            BodyShapeDef::NpcCapsule => 1,
+            BodyShapeDef::BossCapsule => 2,
+            BodyShapeDef::LargeBossCapsule => 3,
+            BodyShapeDef::GateCuboid => 4,
+            BodyShapeDef::SwitchCuboid => 5,
+            BodyShapeDef::ChestCuboid => 6,
+            BodyShapeDef::CrateCuboid => 7,
+        }
+    }
+}
+
 /// An interactable object placed inside a dungeon instance.
 ///
 /// `local_id` is a template-scoped identifier so that switches can reference
@@ -205,6 +242,12 @@ pub struct InteractableDef {
     pub puzzle_required_count: Option<u32>,
     #[serde(default)]
     pub puzzle_window_ticks: Option<u32>,
+    /// Optional explicit body shape. When `None`, the dungeon loader
+    /// picks a default from `kind` (Gate → GateCuboid, Switch →
+    /// SwitchCuboid, Chest → ChestCuboid, BossSpawn → BossCapsule,
+    /// NpcSpawn → NpcCapsule).
+    #[serde(default)]
+    pub body_shape: Option<BodyShapeDef>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

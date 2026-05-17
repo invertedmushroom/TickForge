@@ -270,6 +270,11 @@ pub struct NpcConfig {
     pub leash_radius: f32,
     /// Proximity aggro radius. Idle/patrol NPCs attack players within this. 0 = disabled.
     pub aggro_radius: f32,
+    /// Authoritative physics body shape for this NPC, encoded as a
+    /// `BodyShape` discriminant (see `game_core::physics_backend::BodyShape::to_u8`).
+    /// `None` means "use the kind's default capsule" (NpcCapsule for Npc,
+    /// BossCapsule for Boss).
+    pub body_shape: Option<u8>,
 }
 
 // ── Event Tables ────────────────────────────────────────────────────
@@ -869,6 +874,11 @@ pub struct InteractableConfig {
     /// Window in ticks for timed puzzle activation. 0 = no timed puzzle.
     pub puzzle_window_ticks: u32,
     pub state: InteractState,
+    /// Authoritative physics body shape for this interactable, encoded as a
+    /// `BodyShape` discriminant. Always populated by `create_instance` from
+    /// the dungeon `InteractableDef.body_shape` (or a default per
+    /// `InteractKind`).
+    pub body_shape: u8,
 }
 
 // ── Simulation Diagnostics ──────────────────────────────────────────

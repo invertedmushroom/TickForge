@@ -505,6 +505,25 @@ pub fn run(config: CoordinatorConfig) {
             .and_then(|c| c.encounter_name.clone())
             .filter(|key| !key.is_empty());
 
+        // Resolve the authoritative physics body shape.
+        // Character kinds read NpcConfig.body_shape (Players have no row →
+        // PlayerCapsule default). Props read InteractableConfig.body_shape.
+        let body_shape: Option<game_core::physics_backend::BodyShape> = match kind {
+            game_schema::EntityKind::Player
+            | game_schema::EntityKind::Npc
+            | game_schema::EntityKind::Boss => npc_config_row
+                .as_ref()
+                .and_then(|c| c.body_shape)
+                .and_then(game_core::physics_backend::BodyShape::from_u8),
+            game_schema::EntityKind::Prop => ctx
+                .db
+                .interactable_config()
+                .entity_id()
+                .find(&new_entity.entity_id)
+                .and_then(|c| game_core::physics_backend::BodyShape::from_u8(c.body_shape)),
+            _ => None,
+        };
+
         let npc_config: Option<crate::entity_sync::NpcSpawnConfig> = npc_config_row.map(|c| {
             let mut ability_ids: Vec<u32> = Vec::new();
             if let Some(id) = c.ability_id_1 {
@@ -595,6 +614,7 @@ pub fn run(config: CoordinatorConfig) {
                 buffs,
                 npc_state,
                 npc_config,
+                body_shape,
                 ..Default::default()
             },
         );

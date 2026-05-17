@@ -310,6 +310,11 @@ pub struct TickPipeline {
     /// Mirrors the `entity_team` DB table for O(1) access in combat checks.
     /// Updated in `set_entity_team`; 0 = unassigned/no team.
     pub(super) entity_team_cache: Vec<u32>,
+    /// Per-entity body shape, indexed by `EntityId`. Populated in
+    /// `spawn_entity_from_snapshot_with_shape`, cleared in `force_remove_entity`.
+    /// Drives the lag-comp hurtbox shape per target so larger boss capsules and
+    /// prop bounding capsules are honoured during rewind tests.
+    pub(super) entity_body_shapes: HashMap<EntityId, game_core::physics_backend::BodyShape>,
     /// Last transform snapshot sent to the commit reducer per entity.
     ///
     /// Used to emit transform deltas instead of a full-world snapshot every tick.
@@ -413,6 +418,24 @@ pub struct TickPipeline {
     /// when `apply_spawn_adds` resolves the spawn and forwarded into the
     /// owning encounter's bus on death. Cleared on force_remove_entities.
     pub(crate) add_to_boss: HashMap<EntityId, EntityId>,
+    /// Tier-2 encounter outputs (ChangeBossPhase / IncrementZoneCounter)
+    /// produced by `cleanup_encounter_for_boss_removal` after the normal
+    /// Phase 7.5b dispatch has already executed this tick. Cleanup runs
+    /// during Phase 8b finalization on dying bosses, so its outputs must
+    /// be carried forward and merged into the current tick's
+    /// `boss_phase_updates` / `zone_counter_deltas` before TickResult is
+    /// assembled.
+    pub(super) pending_cleanup_commit_outputs:
+        Vec<game_core::encounter::EncounterOutput>,
+    /// Director spawn requests emitted by mechanic stop-emissions during
+    /// `cleanup_encounter_for_boss_removal`. Merged into the current
+    /// tick's `director_spawns` after Phase 8b.
+    pub(super) pending_cleanup_spawns: Vec<game_core::director::DirectorSpawn>,
+    /// Pending add memberships emitted by mechanic stop-emissions during
+    /// `cleanup_encounter_for_boss_removal`. `spawn_index` values are
+    /// local to `pending_cleanup_spawns` and must be shifted at drain time.
+    pub(super) pending_cleanup_memberships:
+        Vec<game_core::director::PendingAddMembership>,
 }
 
 impl TickPipeline {
@@ -553,6 +576,7 @@ impl TickPipeline {
             self.weapon_swap_cooldowns.remove(id);
             self.entity_tags.remove(id);
             self.add_to_boss.remove(id);
+            self.entity_body_shapes.remove(id);
         }
 
         // 6a) Drop any encounter-owned volumes for removed bosses.
@@ -642,6 +666,7 @@ impl TickPipeline {
             entity_regions: HashMap::new(),
             entity_layer_cache: Vec::new(),
             entity_team_cache: Vec::new(),
+            entity_body_shapes: HashMap::new(),
             last_committed_transforms: HashMap::new(),
             transform_history: TransformHistory::new(),
             director: DirectorState::new(),
@@ -668,6 +693,9 @@ impl TickPipeline {
             pending_death_state_inserts: Vec::new(),
             entity_tags: HashMap::new(),
             add_to_boss: HashMap::new(),
+            pending_cleanup_commit_outputs: Vec::new(),
+            pending_cleanup_spawns: Vec::new(),
+            pending_cleanup_memberships: Vec::new(),
         }
     }
 
@@ -892,6 +920,22 @@ impl TickPipeline {
         }
     }
 
+    /// Hurtbox sensor shape for an entity, used by lag-comp rewind tests.
+    ///
+    /// Returns the entity's authored `BodyShape::hurtbox_sensor_shape()` when
+    /// known, otherwise falls back to the standard Player/NPC capsule so
+    /// tests and untracked entities still get a sensible hurtbox.
+    pub(super) fn hurtbox_shape_for(
+        &self,
+        id: EntityId,
+    ) -> game_core::physics_backend::SensorShape {
+        if let Some(shape) = self.entity_body_shapes.get(&id) {
+            shape.hurtbox_sensor_shape()
+        } else {
+            lag_compensation::hurtbox_sensor_shape()
+        }
+    }
+
     /// Ingest an entity from a DB snapshot row into the simulation.
     ///
     /// Registers the entity in SimState and creates the appropriate physics body
@@ -905,6 +949,23 @@ impl TickPipeline {
         max_hp: f32,
         position: Vec3f,
         layer: u32,
+    ) {
+        self.spawn_entity_from_snapshot_with_shape(id, kind, tick, max_hp, position, layer, None);
+    }
+
+    /// Same as `spawn_entity_from_snapshot`, but with an authoritative
+    /// `BodyShape` override sourced from `NpcConfig.body_shape` /
+    /// `InteractableConfig.body_shape`. When `body_shape` is `None`
+    /// the per-kind default capsule (or `0.5m` cube for props) is used.
+    pub fn spawn_entity_from_snapshot_with_shape(
+        &mut self,
+        id: EntityId,
+        kind: EntityKind,
+        tick: TickId,
+        max_hp: f32,
+        position: Vec3f,
+        layer: u32,
+        body_shape: Option<game_core::physics_backend::BodyShape>,
     ) {
         // Idempotency guard — the coordinator's on_insert callback already checks
         // contains() before calling here, but this defence-in-depth prevents a double-
@@ -932,20 +993,35 @@ impl TickPipeline {
 
         match kind {
             EntityKind::Player | EntityKind::Npc | EntityKind::Boss => {
-                self.physics.reuse_or_spawn_character(id, position, kind);
+                let shape = body_shape
+                    .unwrap_or_else(|| {
+                        game_core::physics_backend::BodyShape::default_capsule_for_kind(kind)
+                    });
+                self.entity_body_shapes.insert(id, shape);
+                self.physics
+                    .reuse_or_spawn_character_shaped(id, position, shape);
             }
             EntityKind::Prop => {
-                // Props get a dynamic box body; default half-extents 0.5m cube.
-                self.physics.spawn_prop_body(
-                    id,
-                    position,
-                    game_protocol::types::Vec3f {
-                        x: 0.5,
-                        y: 0.5,
-                        z: 0.5,
-                    },
-                    true,
-                );
+                // Props get a cuboid body whose dimensions come from the
+                // authoritative `BodyShape`. Fall back to the legacy 0.5m
+                // pushable cube when no shape override was supplied.
+                if let Some(shape) = body_shape {
+                    self.entity_body_shapes.insert(id, shape);
+                    self.physics.spawn_prop_body_shaped(id, position, shape);
+                } else {
+                    self.entity_body_shapes
+                        .insert(id, game_core::physics_backend::BodyShape::CrateCuboid);
+                    self.physics.spawn_prop_body(
+                        id,
+                        position,
+                        game_protocol::types::Vec3f {
+                            x: 0.5,
+                            y: 0.5,
+                            z: 0.5,
+                        },
+                        true,
+                    );
+                }
             }
             // Projectile and Hazard bodies are spawned by the ability/encounter system;
             // the DB row alone is not enough to reconstruct the full physics state.
@@ -1832,6 +1908,55 @@ impl TickPipeline {
         // death-driven deltas are both associative increments, so merge order is
         // irrelevant.
         zone_counter_deltas.extend(self.pending_zone_counter_deltas.drain(..));
+
+        // Merge cleanup-cascade outputs from `cleanup_encounter_for_boss_removal`
+        // (invoked during Phase 8b on dying bosses). These mechanic-stop
+        // emissions ran through the full encounter dispatch but their
+        // commit/spawn/membership buffers had no enclosing tick-loop scope
+        // to drain into. Splice them in now so terminal `IncrementZoneCounter`
+        // and `SpawnAdds` outputs from stop callbacks reach the commit
+        // pipeline. `ChangeBossPhase` from a dying boss is meaningless but
+        // we forward it for completeness — downstream applies on a missing
+        // entity are no-ops.
+        if !self.pending_cleanup_commit_outputs.is_empty() {
+            for output in self.pending_cleanup_commit_outputs.drain(..) {
+                match output {
+                    game_core::encounter::EncounterOutput::ChangeBossPhase {
+                        boss_entity_id,
+                        new_phase,
+                        entered_at_tick,
+                    } => {
+                        boss_phase_updates.push((boss_entity_id.0, new_phase, entered_at_tick));
+                    }
+                    game_core::encounter::EncounterOutput::IncrementZoneCounter {
+                        layer,
+                        region_x,
+                        region_z,
+                        counter_name,
+                        delta,
+                    } => {
+                        zone_counter_deltas.push((layer, region_x, region_z, counter_name, delta));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !self.pending_cleanup_spawns.is_empty() {
+            let cleanup_offset = director_spawns.len() as u32;
+            let mut cleanup_memberships =
+                std::mem::take(&mut self.pending_cleanup_memberships);
+            if cleanup_offset > 0 {
+                for m in &mut cleanup_memberships {
+                    m.spawn_index = m.spawn_index.saturating_add(cleanup_offset);
+                }
+            }
+            director_spawns.extend(self.pending_cleanup_spawns.drain(..));
+            encounter_memberships.extend(cleanup_memberships);
+        } else {
+            // Cleanup memberships without spawns are nonsensical; drop to
+            // avoid dangling indices.
+            self.pending_cleanup_memberships.clear();
+        }
 
         // Aggregate by (layer, region_x, region_z, counter_name) so multiple
         // kills in the same region cell collapse into a single secondary

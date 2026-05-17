@@ -1646,6 +1646,7 @@ impl TickPipeline {
                     hitbox_shape,
                     prev_pos,
                     curr_pos,
+                    self.hurtbox_shape_for(target_id),
                     candidate_pos,
                 ) {
                     continue;
@@ -1814,7 +1815,12 @@ impl TickPipeline {
                 };
 
                 // Run the standalone shape intersection test.
-                if !lag_compensation::shapes_intersect(hitbox_shape, hitbox_pos, historical_pos) {
+                if !lag_compensation::shapes_intersect(
+                    hitbox_shape,
+                    hitbox_pos,
+                    self.hurtbox_shape_for(target_id),
+                    historical_pos,
+                ) {
                     continue;
                 }
 

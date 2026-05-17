@@ -1387,6 +1387,7 @@ pub fn commit_tick_results(
                     puzzle_required_count: existing.puzzle_required_count,
                     puzzle_window_ticks: existing.puzzle_window_ticks,
                     state: u.state,
+                    body_shape: existing.body_shape,
                 });
         }
     }
@@ -3014,6 +3015,12 @@ pub fn create_instance(
                 ability_id_4: None,
                 leash_radius: 30.0,
                 aggro_radius: 15.0,
+                // Resolve per-spawn override or default to BossCapsule.
+                body_shape: Some(
+                    def.body_shape
+                        .map(|s| s.to_u8())
+                        .unwrap_or(/* BodyShape::BossCapsule */ 2),
+                ),
             });
             log::info!(
                 "Boss entity {} ({npc_name}) spawned in instance layer={layer} encounter={encounter_key}",
@@ -3050,6 +3057,17 @@ pub fn create_instance(
             puzzle_required_count: def.puzzle_required_count.unwrap_or(0),
             puzzle_window_ticks: def.puzzle_window_ticks.unwrap_or(0),
             state: InteractState::Idle,
+            // Per-spawn override or default per kind.
+            body_shape: def
+                .body_shape
+                .map(|s| s.to_u8())
+                .unwrap_or_else(|| match interact_kind {
+                    // Discriminants must match `BodyShape::to_u8`.
+                    InteractKind::Gate => 4,    // GateCuboid
+                    InteractKind::Switch => 5,  // SwitchCuboid
+                    InteractKind::Chest => 6,   // ChestCuboid
+                    InteractKind::Grab => 7,    // CrateCuboid
+                }),
         });
     }
 
@@ -3959,7 +3977,7 @@ mod debug_reducers {
                         ability_id_3: None,
                         ability_id_4: None,
                         leash_radius: 0.0,
-                        aggro_radius: 0.0,
+                        aggro_radius: 0.0,                        body_shape: None,
                     }),
                 );
                 log::info!("combat scenario: training dummy entity_id={e1}");
@@ -3982,7 +4000,7 @@ mod debug_reducers {
                         ability_id_3: None,
                         ability_id_4: None,
                         leash_radius: 0.0,
-                        aggro_radius: 0.0,
+                        aggro_radius: 0.0,                        body_shape: None,
                     }),
                 );
                 log::info!("combat scenario: melee NPC entity_id={e2}");
@@ -4005,7 +4023,7 @@ mod debug_reducers {
                         ability_id_3: None,
                         ability_id_4: None,
                         leash_radius: 0.0,
-                        aggro_radius: 0.0,
+                        aggro_radius: 0.0,                        body_shape: None,
                     }),
                 );
                 log::info!("combat scenario: ranged NPC entity_id={e3}");
@@ -4028,7 +4046,7 @@ mod debug_reducers {
                         ability_id_3: None,
                         ability_id_4: None,
                         leash_radius: 0.0,
-                        aggro_radius: 0.0,
+                        aggro_radius: 0.0,                        body_shape: None,
                     }),
                 );
                 log::info!("combat scenario: full-combat NPC entity_id={e4}");
@@ -4068,7 +4086,7 @@ mod debug_reducers {
                                 ability_id_3: None,
                                 ability_id_4: None,
                                 leash_radius: 0.0,
-                                aggro_radius: 0.0,
+                                aggro_radius: 0.0,                                body_shape: None,
                             }),
                         );
                         count += 1;
@@ -4121,7 +4139,7 @@ mod debug_reducers {
                         ability_id_3: None,
                         ability_id_4: None,
                         leash_radius: 0.0,
-                        aggro_radius: 0.0,
+                        aggro_radius: 0.0,                        body_shape: None,
                     }),
                 );
                 spawned += 1;
@@ -4186,7 +4204,7 @@ mod debug_reducers {
                         ability_id_3: None,
                         ability_id_4: None,
                         leash_radius: 0.0,
-                        aggro_radius: 0.0,
+                        aggro_radius: 0.0,                        body_shape: None,
                     }),
                 );
                 let id_b = spawn_npc_internal(
@@ -4206,7 +4224,7 @@ mod debug_reducers {
                         ability_id_3: None,
                         ability_id_4: None,
                         leash_radius: 0.0,
-                        aggro_radius: 0.0,
+                        aggro_radius: 0.0,                        body_shape: None,
                     }),
                 );
 

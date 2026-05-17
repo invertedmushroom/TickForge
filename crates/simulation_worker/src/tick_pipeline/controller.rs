@@ -912,6 +912,18 @@ impl TickPipeline {
         for group in expired {
             if let Some(runtime) = self.lever_puzzles.remove(&group) {
                 for lever in runtime.activated {
+                    // Intentional: use the non-propagating
+                    // `set_interactable_own_state_runtime`. When a
+                    // timed-lever puzzle expires without completing,
+                    // `activate_timed_lever` will have toggled each
+                    // lever to `Active` via the own-state path only —
+                    // the linked gate is never propagated until the
+                    // puzzle COMPLETES (see the `if complete { … }`
+                    // branch below). Reverting each lever to `Idle`
+                    // therefore must NOT propagate, or we would
+                    // spuriously force any linked gate that happened to
+                    // be `Active` (e.g. opened by an unrelated trigger)
+                    // back to `Idle`.
                     self.set_interactable_own_state_runtime(lever, SimInteractState::Idle);
                 }
             }

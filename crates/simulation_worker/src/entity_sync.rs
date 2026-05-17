@@ -65,6 +65,10 @@ pub struct RuntimeSnapshot {
     pub npc_state: Option<(NpcAiState, Option<EntityId>)>,
     /// NPC spawn config: (passive, no_chase, ability_ids).
     pub npc_config: Option<NpcSpawnConfig>,
+    /// Authoritative physics body shape from `NpcConfig.body_shape` or
+    /// `InteractableConfig.body_shape`. `None` falls back to the kind's
+    /// default capsule (or 0.5 m pushable cube for props).
+    pub body_shape: Option<game_core::physics_backend::BodyShape>,
 }
 
 /// Lightweight NPC configuration read from the DB at spawn time.
@@ -121,12 +125,21 @@ impl EntitySync {
             return SyncInsertResult::SkippedDuplicate;
         }
 
-        sim.spawn_entity_from_snapshot(id, kind, tick, max_hp, position, layer);
+        sim.spawn_entity_from_snapshot_with_shape(
+            id,
+            kind,
+            tick,
+            max_hp,
+            position,
+            layer,
+            snapshot.body_shape,
+        );
 
         let RuntimeSnapshot {
             buffs,
             npc_state,
             npc_config,
+            body_shape: _,
         } = snapshot;
 
         // Restore runtime state from DB rows (noops if slices are empty).

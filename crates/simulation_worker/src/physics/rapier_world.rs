@@ -1,6 +1,6 @@
 use super::collision_groups;
 use game_core::physics_backend::{
-    ColliderKind, CollisionEvent as GameCollisionEvent, EnvironmentShape, MoveResult,
+    BodyShape, ColliderKind, CollisionEvent as GameCollisionEvent, EnvironmentShape, MoveResult,
     PhysicsBackend, RayHit,
 };
 use game_protocol::entity_id::EntityId;
@@ -235,9 +235,15 @@ pub struct PhysicsWorld {
     env_colliders_by_layer: HashMap<u32, Vec<u64>>,
 
     // Disabled character body pool — bodies with colliders intact but disabled.
-    // Keyed by EntityKind so NPC bodies are reused for NPCs, etc.
-    // All character kinds currently share identical capsule geometry (0.5, 0.3).
-    disabled_pool: Vec<(RigidBodyHandle, EntityKind)>,
+    // Keyed by `BodyShape` so different capsule sizes (player vs boss vs large
+    // boss) never share pooled bodies — their colliders have different
+    // dimensions and recycling across shapes would silently change the
+    // entity's collision/hurtbox volume.
+    disabled_pool: Vec<(RigidBodyHandle, BodyShape)>,
+
+    // Per-entity body shape — populated on spawn, consulted on disable to
+    // pool by shape. Stays in lockstep with `entity_to_body`.
+    entity_shapes: HashMap<EntityId, BodyShape>,
 
     // Per-entity visibility layer — cached from authoritative entity_regions.
     // Used by scene-query predicates to filter cross-layer interactions.
@@ -295,6 +301,7 @@ impl PhysicsWorld {
             env_collider_handles: HashMap::new(),
             env_colliders_by_layer: HashMap::new(),
             disabled_pool: Vec::new(),
+            entity_shapes: HashMap::new(),
             entity_layers: HashMap::new(),
             layer_policies: HashMap::new(),
         };
@@ -649,6 +656,7 @@ impl PhysicsWorld {
     pub fn remove_entity(&mut self, entity_id: EntityId) -> bool {
         if let Some(body_handle) = self.entity_to_body.remove(&entity_id) {
             self.entity_layers.remove(&entity_id);
+            self.entity_shapes.remove(&entity_id);
             // Clean up collider metadata for all colliders attached to this body.
             // Use body.colliders() for O(attached) instead of scanning all colliders.
             let attached: Vec<ColliderHandle> = self
@@ -697,6 +705,13 @@ impl PhysicsWorld {
     pub fn disable_entity(&mut self, entity_id: EntityId, kind: EntityKind) -> bool {
         if let Some(body_handle) = self.entity_to_body.remove(&entity_id) {
             self.entity_layers.remove(&entity_id);
+            // Resolve the shape used at spawn — needed so the pool keys by
+            // shape rather than kind. Fall back to the kind's default capsule
+            // for entities spawned before per-shape tracking was added.
+            let shape = self
+                .entity_shapes
+                .remove(&entity_id)
+                .unwrap_or_else(|| BodyShape::default_capsule_for_kind(kind));
 
             // Clean up sensor and collider-kind metadata exactly as remove_entity does,
             // but keep the body+colliders alive in Rapier.
@@ -725,7 +740,7 @@ impl PhysicsWorld {
                 }
             }
 
-            self.disabled_pool.push((body_handle, kind));
+            self.disabled_pool.push((body_handle, shape));
             true
         } else {
             false
@@ -746,12 +761,26 @@ impl PhysicsWorld {
         position: Vector,
         kind: EntityKind,
     ) -> bool {
+        let shape = BodyShape::default_capsule_for_kind(kind);
+        self.reuse_or_spawn_character_with_shape(entity_id, position, shape)
+    }
+
+    /// Try to reuse a pooled character body matching `shape`, or allocate
+    /// a fresh capsule sized to `shape.capsule_dims()`. Records the shape
+    /// in `entity_shapes` so a later disable can pool by the same shape.
+    pub fn reuse_or_spawn_character_with_shape(
+        &mut self,
+        entity_id: EntityId,
+        position: Vector,
+        shape: BodyShape,
+    ) -> bool {
         if self.entity_to_body.contains_key(&entity_id) {
             return false;
         }
 
-        // Find a pooled body matching this kind (pop from back for O(1)).
-        let pool_idx = self.disabled_pool.iter().rposition(|(_, k)| *k == kind);
+        let kind = shape.entity_kind();
+        // Find a pooled body matching this shape (pop from back for O(1)).
+        let pool_idx = self.disabled_pool.iter().rposition(|(_, s)| *s == shape);
         if let Some(idx) = pool_idx {
             let (body_handle, _) = self.disabled_pool.swap_remove(idx);
 
@@ -798,15 +827,20 @@ impl PhysicsWorld {
             }
 
             self.entity_to_body.insert(entity_id, body_handle);
+            self.entity_shapes.insert(entity_id, shape);
             true
         } else {
-            // Pool empty for this kind — create fresh.
+            // Pool empty for this shape — create fresh.
             let groups = match kind {
                 EntityKind::Player => collision_groups::player_body_groups(),
                 EntityKind::Npc | EntityKind::Boss => collision_groups::npc_body_groups(),
                 _ => collision_groups::player_body_groups(),
             };
-            self.add_kinematic_capsule(entity_id, position, 0.5, 0.3, groups);
+            let (half_height, radius) = shape
+                .capsule_dims()
+                .unwrap_or((0.5, 0.3));
+            self.add_kinematic_capsule(entity_id, position, half_height, radius, groups);
+            self.entity_shapes.insert(entity_id, shape);
             true
         }
     }
@@ -1168,6 +1202,8 @@ impl PhysicsBackend for PhysicsWorld {
             }
         };
         self.add_kinematic_capsule(entity_id, pos, 0.5, 0.3, groups);
+        self.entity_shapes
+            .insert(entity_id, BodyShape::default_capsule_for_kind(kind));
         true
     }
 
@@ -1738,6 +1774,60 @@ impl PhysicsBackend for PhysicsWorld {
     ) -> bool {
         let pos = Vector::new(position.x, position.y, position.z);
         PhysicsWorld::reuse_or_spawn_character(self, entity_id, pos, kind)
+    }
+
+    fn reuse_or_spawn_character_shaped(
+        &mut self,
+        entity_id: EntityId,
+        position: game_protocol::types::Vec3f,
+        shape: BodyShape,
+    ) -> bool {
+        let pos = Vector::new(position.x, position.y, position.z);
+        PhysicsWorld::reuse_or_spawn_character_with_shape(self, entity_id, pos, shape)
+    }
+
+    fn spawn_character_body_shaped(
+        &mut self,
+        entity_id: EntityId,
+        position: game_protocol::types::Vec3f,
+        shape: BodyShape,
+    ) -> bool {
+        if self.entity_to_body.contains_key(&entity_id) {
+            return false;
+        }
+        let kind = shape.entity_kind();
+        let groups = match kind {
+            EntityKind::Player => collision_groups::player_body_groups(),
+            EntityKind::Npc | EntityKind::Boss => collision_groups::npc_body_groups(),
+            _ => collision_groups::player_body_groups(),
+        };
+        let (half_height, radius) = shape.capsule_dims().unwrap_or((0.5, 0.3));
+        let pos = Vector::new(position.x, position.y, position.z);
+        self.add_kinematic_capsule(entity_id, pos, half_height, radius, groups);
+        self.entity_shapes.insert(entity_id, shape);
+        true
+    }
+
+    fn spawn_prop_body_shaped(
+        &mut self,
+        entity_id: EntityId,
+        position: game_protocol::types::Vec3f,
+        shape: BodyShape,
+    ) -> bool {
+        let Some(half_extents) = shape.cuboid_half_extents() else {
+            return false;
+        };
+        let ok = <Self as PhysicsBackend>::spawn_prop_body(
+            self,
+            entity_id,
+            position,
+            half_extents,
+            shape.is_pushable_prop(),
+        );
+        if ok {
+            self.entity_shapes.insert(entity_id, shape);
+        }
+        ok
     }
 
     fn drain_pool(&mut self, max_idle: usize) {

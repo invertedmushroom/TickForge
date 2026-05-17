@@ -128,6 +128,7 @@ fn connect(mut commands: Commands) {
                     "SELECT * FROM player_equipment",
                     "SELECT * FROM module_config",
                     "SELECT * FROM interactable_config",
+                    "SELECT * FROM npc_config",
                     "SELECT * FROM boss_phase",
                     "SELECT * FROM world_phase",
                     "SELECT * FROM zone_counter",

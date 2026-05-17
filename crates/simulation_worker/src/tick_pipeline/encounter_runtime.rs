@@ -31,6 +31,15 @@ impl TickPipeline {
         for boss_id in boss_ids {
             let Some(boss_idx) = self.state.entities.lookup(boss_id) else {
                 // Boss entity no longer exists — clean up encounter.
+                //
+                // Normal teardown goes through `force_remove_entities`,
+                // which calls `cleanup_encounter_for_boss_removal`
+                // before tearing down the entity slot (draining active
+                // mechanics, dispatching their stop emissions, and
+                // removing the encounter row). Tests and any direct
+                // `state.remove_entity` callers, however, can free the
+                // boss slot without that pre-cleanup, so this branch
+                // remains a required safety net rather than dead code.
                 self.encounters.remove(&boss_id);
                 self.drop_volumes_for_boss(boss_id);
                 continue;
@@ -280,7 +289,7 @@ impl TickPipeline {
             }
         }
 
-        // 4) ReplaceAbilityList.
+        // 5) ReplaceAbilityList.
         for output in &outputs {
             if let EO::ReplaceAbilityList {
                 boss_entity_id,
@@ -291,7 +300,7 @@ impl TickPipeline {
             }
         }
 
-        // 5) SpawnAdds.
+        // 6) SpawnAdds.
         for output in &outputs {
             if let EO::SpawnAdds {
                 boss_entity_id,
@@ -311,7 +320,7 @@ impl TickPipeline {
             }
         }
 
-        // 6) Telegraph.
+        // 7) Telegraph.
         for output in &outputs {
             if let EO::Telegraph {
                 boss_entity_id,
@@ -324,7 +333,7 @@ impl TickPipeline {
             }
         }
 
-        // 6a) Client-facing encounter cues.
+        // 8) Client-facing encounter cues.
         for output in &outputs {
             if let EO::EncounterCue {
                 boss_entity_id,
@@ -348,12 +357,7 @@ impl TickPipeline {
             }
         }
 
-        // 6b) Buff effects — already applied in section 3 above. Left as a
-        // no-op marker so the section numbering stays stable for the
-        // remaining dispatch steps; new ApplyBuff/RemoveBuffs outputs
-        // emitted nested by later steps would not reach here anyway.
-
-        // 6c) Interactable effects.
+        // 9) Interactable effects.
         for output in &outputs {
             match output {
                 EO::SetInteractableState {
@@ -373,7 +377,7 @@ impl TickPipeline {
             }
         }
 
-        // 6d) SpawnVolume / DespawnVolume.
+        // 10) SpawnVolume / DespawnVolume.
         for output in &outputs {
             match output {
                 EO::SpawnVolume {
@@ -408,7 +412,7 @@ impl TickPipeline {
             }
         }
 
-        // 7) CastSkill.
+        // 11) CastSkill.
         for output in outputs {
             if let EO::CastSkill {
                 boss_entity_id,
@@ -553,6 +557,26 @@ impl TickPipeline {
                 &mut pending_memberships,
                 0,
             );
+            // Carry the cleanup-cascade outputs into the current tick's
+            // commit pipeline so that Tier-2 effects (e.g. zone counter
+            // increments) and any terminal add spawns emitted by mechanic
+            // stop callbacks are not silently dropped. The owning tick
+            // loop drains these into `boss_phase_updates` /
+            // `zone_counter_deltas` / `director_spawns` /
+            // `encounter_memberships` after Phase 8b finalization.
+            if !commit_outputs.is_empty() {
+                self.pending_cleanup_commit_outputs.extend(commit_outputs);
+            }
+            if !encounter_spawns.is_empty() || !pending_memberships.is_empty() {
+                let spawn_offset = self.pending_cleanup_spawns.len() as u32;
+                self.pending_cleanup_spawns.extend(encounter_spawns);
+                if spawn_offset > 0 {
+                    for m in &mut pending_memberships {
+                        m.spawn_index = m.spawn_index.saturating_add(spawn_offset);
+                    }
+                }
+                self.pending_cleanup_memberships.extend(pending_memberships);
+            }
         }
 
         self.encounters.remove(&boss_id);

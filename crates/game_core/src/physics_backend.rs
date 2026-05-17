@@ -32,6 +32,190 @@ pub enum SensorShape {
     Capsule { half_height: f32, radius: f32 },
 }
 
+/// Catalog of authoritative body shapes used by spawned entities.
+///
+/// Each variant pins the exact half-extents / radius used by the physics
+/// backend, the lag-comp hurtbox, and the client mesh so they cannot drift.
+///
+/// Capsule variants are oriented along the Y axis. `half_height` is the
+/// half-distance between the two hemisphere centers; total capsule height
+/// is `2 * (half_height + radius)`.
+///
+/// Cuboid half-extents are stored as `(half_x, half_y, half_z)`. The
+/// `pushable` flag controls whether the prop body is dynamic+CCD or fixed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BodyShape {
+    /// Standard player capsule — half_height 0.5, radius 0.3.
+    PlayerCapsule,
+    /// Standard NPC capsule — same dimensions as `PlayerCapsule`.
+    NpcCapsule,
+    /// Standard boss capsule — half_height 0.9, radius 0.45.
+    BossCapsule,
+    /// Large boss capsule — half_height 1.5, radius 0.9.
+    LargeBossCapsule,
+    /// Tall blocking gate cuboid — half-extents (2.0, 2.5, 0.25). Fixed.
+    GateCuboid,
+    /// Small interactable switch cuboid — half-extents (0.25, 0.25, 0.25). Fixed.
+    SwitchCuboid,
+    /// Chest cuboid — half-extents (0.5, 0.35, 0.4). Fixed.
+    ChestCuboid,
+    /// Pushable crate cuboid — half-extents (0.5, 0.5, 0.5). Dynamic + CCD.
+    CrateCuboid,
+}
+
+impl BodyShape {
+    /// All `BodyShape` variants in declaration order. Useful for building
+    /// per-shape lookup tables (e.g. client mesh handles).
+    pub const ALL: [BodyShape; 8] = [
+        BodyShape::PlayerCapsule,
+        BodyShape::NpcCapsule,
+        BodyShape::BossCapsule,
+        BodyShape::LargeBossCapsule,
+        BodyShape::GateCuboid,
+        BodyShape::SwitchCuboid,
+        BodyShape::ChestCuboid,
+        BodyShape::CrateCuboid,
+    ];
+
+    /// Capsule dimensions `(half_height, radius)`. Returns `None` for cuboid variants.
+    pub fn capsule_dims(self) -> Option<(f32, f32)> {
+        match self {
+            BodyShape::PlayerCapsule => Some((0.5, 0.3)),
+            BodyShape::NpcCapsule => Some((0.5, 0.3)),
+            BodyShape::BossCapsule => Some((0.9, 0.45)),
+            BodyShape::LargeBossCapsule => Some((1.5, 0.9)),
+            BodyShape::GateCuboid
+            | BodyShape::SwitchCuboid
+            | BodyShape::ChestCuboid
+            | BodyShape::CrateCuboid => None,
+        }
+    }
+
+    /// Cuboid half-extents. Returns `None` for capsule variants.
+    pub fn cuboid_half_extents(self) -> Option<Vec3f> {
+        match self {
+            BodyShape::GateCuboid => Some(Vec3f::new(2.0, 2.5, 0.25)),
+            BodyShape::SwitchCuboid => Some(Vec3f::new(0.25, 0.25, 0.25)),
+            BodyShape::ChestCuboid => Some(Vec3f::new(0.5, 0.35, 0.4)),
+            BodyShape::CrateCuboid => Some(Vec3f::new(0.5, 0.5, 0.5)),
+            BodyShape::PlayerCapsule
+            | BodyShape::NpcCapsule
+            | BodyShape::BossCapsule
+            | BodyShape::LargeBossCapsule => None,
+        }
+    }
+
+    /// Whether this prop shape produces a dynamic (pushable) rigid body.
+    /// `false` (fixed) for capsule variants and for non-`CrateCuboid` props.
+    pub fn is_pushable_prop(self) -> bool {
+        matches!(self, BodyShape::CrateCuboid)
+    }
+
+    /// True if this shape is a character capsule.
+    pub fn is_capsule(self) -> bool {
+        self.capsule_dims().is_some()
+    }
+
+    /// True if this shape is a cuboid prop.
+    pub fn is_cuboid(self) -> bool {
+        self.cuboid_half_extents().is_some()
+    }
+
+    /// Best-effort `EntityKind` for collision-group dispatch.
+    ///
+    /// Capsule variants map to `Player`/`Npc`/`Boss`. Cuboid variants
+    /// always map to `Prop`. Used by the Rapier backend when only a shape
+    /// is available but a kind is needed for `InteractionGroups`.
+    pub fn entity_kind(self) -> EntityKind {
+        match self {
+            BodyShape::PlayerCapsule => EntityKind::Player,
+            BodyShape::NpcCapsule => EntityKind::Npc,
+            BodyShape::BossCapsule | BodyShape::LargeBossCapsule => EntityKind::Boss,
+            BodyShape::GateCuboid
+            | BodyShape::SwitchCuboid
+            | BodyShape::ChestCuboid
+            | BodyShape::CrateCuboid => EntityKind::Prop,
+        }
+    }
+
+    /// Default capsule shape for an `EntityKind` when no per-entity
+    /// override is configured. `Prop`/`Projectile`/`Hazard` have no
+    /// natural capsule and fall back to `NpcCapsule`.
+    pub fn default_capsule_for_kind(kind: EntityKind) -> BodyShape {
+        match kind {
+            EntityKind::Player => BodyShape::PlayerCapsule,
+            EntityKind::Npc => BodyShape::NpcCapsule,
+            EntityKind::Boss => BodyShape::BossCapsule,
+            EntityKind::Prop | EntityKind::Projectile | EntityKind::Hazard => {
+                BodyShape::NpcCapsule
+            }
+        }
+    }
+
+    /// Encode as a `u8` discriminant for DB storage. Stable across versions:
+    /// values must not be reordered.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            BodyShape::PlayerCapsule => 0,
+            BodyShape::NpcCapsule => 1,
+            BodyShape::BossCapsule => 2,
+            BodyShape::LargeBossCapsule => 3,
+            BodyShape::GateCuboid => 4,
+            BodyShape::SwitchCuboid => 5,
+            BodyShape::ChestCuboid => 6,
+            BodyShape::CrateCuboid => 7,
+        }
+    }
+
+    /// Decode from a `u8` discriminant. Returns `None` for unknown values.
+    pub fn from_u8(v: u8) -> Option<BodyShape> {
+        Some(match v {
+            0 => BodyShape::PlayerCapsule,
+            1 => BodyShape::NpcCapsule,
+            2 => BodyShape::BossCapsule,
+            3 => BodyShape::LargeBossCapsule,
+            4 => BodyShape::GateCuboid,
+            5 => BodyShape::SwitchCuboid,
+            6 => BodyShape::ChestCuboid,
+            7 => BodyShape::CrateCuboid,
+            _ => return None,
+        })
+    }
+
+    /// Hurtbox shape used for lag-compensation rewind intersection tests.
+    ///
+    /// Capsule body shapes return their exact capsule. Cuboid props return a
+    /// bounding capsule (radius = max horizontal half-extent, half-height = vertical
+    /// half-extent) — props don't move, so this is mostly used by AoE shape tests
+    /// that include props in their candidate set.
+    pub fn hurtbox_sensor_shape(self) -> SensorShape {
+        if let Some((half_height, radius)) = self.capsule_dims() {
+            SensorShape::Capsule {
+                half_height,
+                radius,
+            }
+        } else if let Some(half) = self.cuboid_half_extents() {
+            SensorShape::Capsule {
+                half_height: half.y,
+                radius: half.x.max(half.z),
+            }
+        } else {
+            SensorShape::Capsule {
+                half_height: 0.5,
+                radius: 0.3,
+            }
+        }
+    }
+
+    /// Maximum hurtbox radius across all body-shape variants. Used by lag-comp
+    /// broadphase to compute a conservative candidate radius without knowing
+    /// the specific target shape up-front.
+    pub const fn max_hurtbox_radius() -> f32 {
+        // Equals LargeBossCapsule radius.
+        0.9
+    }
+}
+
 /// Engine-agnostic collision event — produced by `drain_collision_events`.
 ///
 /// The physics backend maps its internal collision representation
@@ -150,6 +334,23 @@ pub trait PhysicsBackend: Send {
         kind: EntityKind,
     ) -> bool;
 
+    /// Spawn a character body using an explicit `BodyShape`.
+    ///
+    /// Single source of truth for character capsule dimensions used by
+    /// physics, lag-comp hurtbox, and client meshes. The default
+    /// implementation discards the shape and falls back to
+    /// `spawn_character_body` (mock backends without geometry). Real
+    /// backends must override to use `shape.capsule_dims()` and remember
+    /// the per-entity shape for pooling.
+    fn spawn_character_body_shaped(
+        &mut self,
+        entity_id: EntityId,
+        position: Vec3f,
+        shape: BodyShape,
+    ) -> bool {
+        self.spawn_character_body(entity_id, position, shape.entity_kind())
+    }
+
     /// Spawn a dynamic box body for a prop entity.
     ///
     /// Creates a cuboid rigid body with the given half-extents that responds to
@@ -163,6 +364,23 @@ pub trait PhysicsBackend: Send {
         half_extents: Vec3f,
         pushable: bool,
     ) -> bool;
+
+    /// Spawn a prop body using an explicit `BodyShape`.
+    ///
+    /// Default implementation pulls `cuboid_half_extents()` and
+    /// `is_pushable_prop()` off the shape and delegates to
+    /// `spawn_prop_body`. Returns `false` if `shape` is not a cuboid.
+    fn spawn_prop_body_shaped(
+        &mut self,
+        entity_id: EntityId,
+        position: Vec3f,
+        shape: BodyShape,
+    ) -> bool {
+        let Some(half_extents) = shape.cuboid_half_extents() else {
+            return false;
+        };
+        self.spawn_prop_body(entity_id, position, half_extents, shape.is_pushable_prop())
+    }
 
     /// Move a kinematic character body by `desired_translation`, sliding along obstacles.
     ///
@@ -312,6 +530,22 @@ pub trait PhysicsBackend: Send {
         kind: EntityKind,
     ) -> bool {
         self.spawn_character_body(entity_id, position, kind)
+    }
+
+    /// Try to reuse a pooled character body for `entity_id`, or create a fresh
+    /// one with the requested `BodyShape`.
+    ///
+    /// Default: delegates to `reuse_or_spawn_character` using
+    /// `shape.entity_kind()` and ignores per-shape capsule geometry. Real
+    /// backends must override to pool by shape so different capsule sizes
+    /// (e.g. boss vs player) never share pooled bodies.
+    fn reuse_or_spawn_character_shaped(
+        &mut self,
+        entity_id: EntityId,
+        position: Vec3f,
+        shape: BodyShape,
+    ) -> bool {
+        self.reuse_or_spawn_character(entity_id, position, shape.entity_kind())
     }
 
     /// Remove excess pooled bodies above `max_idle` to bound memory.

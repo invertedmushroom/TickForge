@@ -51,8 +51,12 @@ pub const MAX_REWIND_TICKS: u32 = 4;
 /// after the intent was consumed.
 pub const MAX_HISTORY_TICKS: usize = 8;
 
-/// Standard character hurtbox: capsule with half_height=0.5, radius=0.3.
-/// Must match the shape used in `PhysicsWorld::spawn_character_body`.
+/// Legacy default character hurtbox dimensions (Player/NPC capsule).
+///
+/// Retained for tests and call sites that explicitly want the standard
+/// capsule. Per-entity hurtbox dimensions are now driven by
+/// `BodyShape::hurtbox_sensor_shape()`; callers that need the exact target
+/// shape should pass it through `shapes_intersect`/`swept_shapes_intersect`.
 pub const HURTBOX_HALF_HEIGHT: f32 = 0.5;
 pub const HURTBOX_RADIUS: f32 = 0.3;
 
@@ -195,7 +199,12 @@ pub fn compute_rewind_ticks(
 
 // ── Shape intersection ──────────────────────────────────────────
 
-/// Standard character hurtbox shape for intersection tests.
+/// Legacy standard character hurtbox shape (Player/NPC capsule).
+///
+/// Tests and a few legacy call sites that don't yet thread per-entity
+/// hurtbox shapes still use this. Prefer
+/// `BodyShape::hurtbox_sensor_shape()` for new code so larger boss capsules
+/// (and prop bounding capsules) are honoured.
 pub fn hurtbox_sensor_shape() -> SensorShape {
     SensorShape::Capsule {
         half_height: HURTBOX_HALF_HEIGHT,
@@ -228,11 +237,13 @@ pub fn hitbox_sensor_shape(shape: SkillShape) -> SensorShape {
 /// Conservative horizontal candidate radius for lag-comp broadphase filtering.
 ///
 /// This must be at least as large as the shape's horizontal extent plus the
-/// hurtbox radius so the spatial prefilter cannot exclude true hits.
+/// maximum hurtbox radius across all body-shape variants so the spatial
+/// prefilter cannot exclude true hits — including very large bosses.
 pub fn hitbox_candidate_radius(shape: SensorShape) -> f32 {
+    let max_r = game_core::physics_backend::BodyShape::max_hurtbox_radius();
     match shape {
-        SensorShape::Sphere { radius } => radius + HURTBOX_RADIUS,
-        SensorShape::Capsule { radius, .. } => radius + HURTBOX_RADIUS,
+        SensorShape::Sphere { radius } => radius + max_r,
+        SensorShape::Capsule { radius, .. } => radius + max_r,
     }
 }
 
@@ -241,11 +252,14 @@ pub fn hitbox_candidate_radius(shape: SensorShape) -> f32 {
 ///
 /// Uses Parry's `intersection_test` — no Rapier BVH, no physics state mutation.
 /// The hitbox position includes the attacker's facing-rotated offset.
+/// `hurtbox_shape` must be the target's hurtbox shape — typically
+/// `BodyShape::hurtbox_sensor_shape()` for that entity.
 ///
 /// Returns `true` if the two shapes overlap.
 pub fn shapes_intersect(
     hitbox_shape: SensorShape,
     hitbox_world_pos: Vec3f,
+    hurtbox_shape: SensorShape,
     hurtbox_world_pos: Vec3f,
 ) -> bool {
     use rapier3d::parry::math::Pose3;
@@ -259,19 +273,47 @@ pub fn shapes_intersect(
         hurtbox_world_pos.z,
     );
 
-    let hurtbox = Capsule::new_y(HURTBOX_HALF_HEIGHT, HURTBOX_RADIUS);
-
-    match hitbox_shape {
-        SensorShape::Sphere { radius } => {
-            let shape = Ball::new(radius);
-            parry_intersect(&iso_hitbox, &shape, &iso_hurtbox, &hurtbox).unwrap_or(false)
+    match (hitbox_shape, hurtbox_shape) {
+        (SensorShape::Sphere { radius: hb_r }, SensorShape::Sphere { radius: hu_r }) => {
+            let a = Ball::new(hb_r);
+            let b = Ball::new(hu_r);
+            parry_intersect(&iso_hitbox, &a, &iso_hurtbox, &b).unwrap_or(false)
         }
-        SensorShape::Capsule {
-            half_height,
-            radius,
-        } => {
-            let shape = Capsule::new_y(half_height, radius);
-            parry_intersect(&iso_hitbox, &shape, &iso_hurtbox, &hurtbox).unwrap_or(false)
+        (
+            SensorShape::Sphere { radius: hb_r },
+            SensorShape::Capsule {
+                half_height: hu_hh,
+                radius: hu_r,
+            },
+        ) => {
+            let a = Ball::new(hb_r);
+            let b = Capsule::new_y(hu_hh, hu_r);
+            parry_intersect(&iso_hitbox, &a, &iso_hurtbox, &b).unwrap_or(false)
+        }
+        (
+            SensorShape::Capsule {
+                half_height: hb_hh,
+                radius: hb_r,
+            },
+            SensorShape::Sphere { radius: hu_r },
+        ) => {
+            let a = Capsule::new_y(hb_hh, hb_r);
+            let b = Ball::new(hu_r);
+            parry_intersect(&iso_hitbox, &a, &iso_hurtbox, &b).unwrap_or(false)
+        }
+        (
+            SensorShape::Capsule {
+                half_height: hb_hh,
+                radius: hb_r,
+            },
+            SensorShape::Capsule {
+                half_height: hu_hh,
+                radius: hu_r,
+            },
+        ) => {
+            let a = Capsule::new_y(hb_hh, hb_r);
+            let b = Capsule::new_y(hu_hh, hu_r);
+            parry_intersect(&iso_hitbox, &a, &iso_hurtbox, &b).unwrap_or(false)
         }
     }
 }
@@ -288,6 +330,7 @@ pub fn swept_shapes_intersect(
     hitbox_shape: SensorShape,
     prev_pos: Vec3f,
     curr_pos: Vec3f,
+    hurtbox_shape: SensorShape,
     hurtbox_world_pos: Vec3f,
 ) -> bool {
     use rapier3d::parry::math::{Pose3, Vector};
@@ -310,7 +353,14 @@ pub fn swept_shapes_intersect(
     let zero_vel = Vector::ZERO;
     let options = ShapeCastOptions::with_max_time_of_impact(1.0);
 
-    let hurtbox = Capsule::new_y(HURTBOX_HALF_HEIGHT, HURTBOX_RADIUS);
+    // Build the target hurtbox shape from the per-target `BodyShape`.
+    let hurtbox: rapier3d::parry::shape::SharedShape = match hurtbox_shape {
+        SensorShape::Sphere { radius } => rapier3d::parry::shape::SharedShape::ball(radius),
+        SensorShape::Capsule {
+            half_height,
+            radius,
+        } => rapier3d::parry::shape::SharedShape::capsule_y(half_height, radius),
+    };
 
     let toi_result = match hitbox_shape {
         SensorShape::Sphere { radius } => {
@@ -321,7 +371,7 @@ pub fn swept_shapes_intersect(
                 &shape,
                 &iso_hurtbox,
                 zero_vel,
-                &hurtbox,
+                hurtbox.as_ref(),
                 options,
             )
         }
@@ -336,7 +386,7 @@ pub fn swept_shapes_intersect(
                 &shape,
                 &iso_hurtbox,
                 zero_vel,
-                &hurtbox,
+                hurtbox.as_ref(),
                 options,
             )
         }
@@ -469,6 +519,7 @@ mod tests {
         assert!(shapes_intersect(
             SensorShape::Sphere { radius: 2.0 },
             Vec3f::new(0.0, 0.0, 0.0),
+            hurtbox_sensor_shape(),
             Vec3f::new(0.0, 0.0, 0.0),
         ));
     }
@@ -479,6 +530,7 @@ mod tests {
         assert!(!shapes_intersect(
             SensorShape::Sphere { radius: 1.0 },
             Vec3f::new(0.0, 0.0, 0.0),
+            hurtbox_sensor_shape(),
             Vec3f::new(100.0, 0.0, 0.0),
         ));
     }
@@ -490,6 +542,7 @@ mod tests {
         assert!(shapes_intersect(
             SensorShape::Sphere { radius: 2.0 },
             Vec3f::new(0.0, 0.0, 0.0),
+            hurtbox_sensor_shape(),
             Vec3f::new(2.2, 0.0, 0.0),
         ));
     }
@@ -548,6 +601,7 @@ mod tests {
             shape,
             Vec3f::new(0.0, 0.0, 0.0),
             Vec3f::new(1.0, 0.0, 0.0),
+            hurtbox_sensor_shape(),
             Vec3f::new(1.0, 0.0, 0.0),
         ));
     }
@@ -562,6 +616,7 @@ mod tests {
             shape,
             Vec3f::new(0.0, 0.0, 0.0),
             Vec3f::new(10.0, 0.0, 0.0),
+            hurtbox_sensor_shape(),
             Vec3f::new(5.0, 0.0, 0.0),
         ));
     }
@@ -575,6 +630,7 @@ mod tests {
             shape,
             Vec3f::new(0.0, 0.0, 0.0),
             Vec3f::new(1.0, 0.0, 0.0),
+            hurtbox_sensor_shape(),
             Vec3f::new(0.0, 0.0, 10.0),
         ));
     }
@@ -587,6 +643,7 @@ mod tests {
             shape,
             Vec3f::new(5.0, 0.0, 0.0),
             Vec3f::new(6.0, 0.0, 0.0),
+            hurtbox_sensor_shape(),
             Vec3f::new(5.0, 0.0, 0.0),
         ));
     }
@@ -603,11 +660,13 @@ mod tests {
         assert!(!shapes_intersect(
             shape,
             Vec3f::new(0.0, 0.0, 0.0),
+            hurtbox_sensor_shape(),
             Vec3f::new(3.0, 0.0, 0.0)
         ));
         assert!(!shapes_intersect(
             shape,
             Vec3f::new(5.0, 0.0, 0.0),
+            hurtbox_sensor_shape(),
             Vec3f::new(3.0, 0.0, 0.0)
         ));
         // Swept catches it:
@@ -615,6 +674,7 @@ mod tests {
             shape,
             Vec3f::new(0.0, 0.0, 0.0),
             Vec3f::new(5.0, 0.0, 0.0),
+            hurtbox_sensor_shape(),
             Vec3f::new(3.0, 0.0, 0.0),
         ));
     }

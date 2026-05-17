@@ -1043,6 +1043,14 @@ impl TickPipeline {
                 continue;
             };
             if let game_core::encounter::BuffApplyMode::ReplaceAny(buff_ids) = &mode {
+                // ReplaceAny from the encounter runtime is the
+                // legitimate owner of mechanic-locked buffs (e.g.
+                // Manaya's Core mark swaps), so no MechanicLocked
+                // exemption is applied here. Player-cast cleanse-style
+                // skills that need to respect MechanicLocked must use
+                // `apply_encounter_remove_buffs` / `RemoveBuffs`
+                // semantics or filter via a different code path —
+                // this entry point is encounter-owned by construction.
                 let removed = self
                     .state
                     .status
@@ -1528,22 +1536,6 @@ impl TickPipeline {
         boss_idx: EntityIndex,
     ) -> bool {
         let boss_layer = self.layer_of_idx(boss_idx);
-        if self
-            .state
-            .combat
-            .threat_tables
-            .get(boss_idx)
-            .is_some_and(|table| {
-                table.entries.iter().any(|entry| {
-                    self.state
-                        .entities
-                        .lookup(entry.source)
-                        .is_some_and(|idx| self.layer_of_idx(idx) == boss_layer)
-                })
-            })
-        {
-            return true;
-        }
         let radius = self
             .state
             .ai
@@ -1556,6 +1548,32 @@ impl TickPipeline {
             return false;
         };
         let radius_sq = radius * radius;
+        // Threat-table reactivation: an existing same-layer threat
+        // source wakes the encounter. We deliberately do NOT apply
+        // the aggro-radius distance gate here — once a boss has been
+        // pulled and its threat table contains entries, ranged threat
+        // beyond the aggro radius (e.g. a ranged DPS kiting at long
+        // range) must still keep the encounter active. The same-layer
+        // check is enough to prevent stale cross-layer threat entries
+        // from forcing reactivation. The fallback player-scan branch
+        // applies the distance gate for the cold-start case where no
+        // threat table exists yet.
+        if self
+            .state
+            .combat
+            .threat_tables
+            .get(boss_idx)
+            .is_some_and(|table| {
+                table.entries.iter().any(|entry| {
+                    let Some(idx) = self.state.entities.lookup(entry.source) else {
+                        return false;
+                    };
+                    self.layer_of_idx(idx) == boss_layer
+                })
+            })
+        {
+            return true;
+        }
         self.state
             .active_indices_of_kind(EntityKind::Player)
             .into_iter()

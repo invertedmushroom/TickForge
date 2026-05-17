@@ -153,6 +153,26 @@ impl SimulationRunner {
         }
     }
 
+    /// Same as `spawn_entity_from_snapshot` but forwards an authoritative
+    /// `BodyShape` override sourced from `NpcConfig` / `InteractableConfig`.
+    pub fn spawn_entity_from_snapshot_with_shape(
+        &mut self,
+        id: EntityId,
+        kind: EntityKind,
+        tick: TickId,
+        max_hp: f32,
+        position: Vec3f,
+        layer: u32,
+        body_shape: Option<game_core::physics_backend::BodyShape>,
+    ) {
+        self.pipeline.spawn_entity_from_snapshot_with_shape(
+            id, kind, tick, max_hp, position, layer, body_shape,
+        );
+        if let Some(team_id) = self.pending_teams.remove(&id) {
+            self.set_entity_team(id, team_id);
+        }
+    }
+
     /// Restore buff, threat, and NPC AI state from DB rows after a worker restart.
     ///
     /// Call this once per entity *after* `spawn_entity_from_snapshot` for that entity.
@@ -282,7 +302,19 @@ impl SimulationRunner {
         advisory: Vec3f,
         new_layer: u32,
     ) -> bool {
-        let resolved = self.resolve_spawn_position(advisory, new_layer);
+        // Use the entity's per-shape capsule dims if known so larger
+        // bodies (BossCapsule, LargeBossCapsule) don't embed into terrain
+        // after a layer change.
+        let (hh, r) = self
+            .pipeline
+            .entity_body_shapes
+            .get(&id)
+            .and_then(|s| s.capsule_dims())
+            .unwrap_or((
+                game_core::physics_constants::CAPSULE_HALF_HEIGHT,
+                game_core::physics_constants::CAPSULE_RADIUS,
+            ));
+        let resolved = self.resolve_spawn_position_with_capsule(advisory, new_layer, hh, r);
         self.pipeline.physics.teleport_entity(id, resolved)
     }
 
