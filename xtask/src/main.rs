@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use regex::Regex;
+use serde::{Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
@@ -15,6 +18,95 @@ const SERVER_HOST: &str = "127.0.0.1:3000";
 const MODULE_PATH: &str = "crates/server_module";
 const WORKER_BINDINGS_OUT: &str = "crates/simulation_worker/src/module_bindings";
 const CLIENT_BINDINGS_OUT: &str = "crates/game_client/src/module_bindings";
+const WEB_CONTRACT_OUT: &str = "target/web-contract";
+const WEB_CONTRACT_BINDINGS_DIR: &str = "bindings";
+const WEB_CONTRACT_PACKAGE_NAME: &str = "@dive/client-contract";
+const WEB_CONTRACT_STDB_NPM_VERSION: &str = "2.1.0";
+const WEB_BROWSER_POLICY_FILE: &str = "browser-policy.json";
+const WEB_CONTENT_METADATA_FILE: &str = "content-metadata.json";
+const WEB_CONTENT_LOOKUP_FILE: &str = "content-lookup.json";
+const WEB_MAP_BUNDLES_DIR: &str = "map-bundles";
+const WEB_MAP_BUNDLE_COLLIDER_FORMAT_VERSION: u32 = 1;
+const WEB_CONTENT_SOURCES: &[&str] = &[
+    "data/abilities.ron",
+    "data/buffs.ron",
+    "data/dungeons.ron",
+    "data/items.ron",
+    "data/layers.ron",
+    "data/spawn_rules.ron",
+];
+const WEB_ALWAYS_ON_SUBSCRIPTIONS: &[&str] = &[
+    "SELECT * FROM my_region",
+    "SELECT * FROM nearby_transforms",
+    "SELECT * FROM nearby_entities",
+    "SELECT * FROM nearby_health",
+    "SELECT * FROM client_sequence",
+    "SELECT * FROM sim_tick",
+    "SELECT * FROM module_config",
+    "SELECT * FROM combat_event",
+    "SELECT * FROM world_event",
+    "SELECT * FROM active_buff",
+    "SELECT * FROM npc_state",
+    "SELECT * FROM entity_layer",
+    "SELECT * FROM entity_team",
+    "SELECT * FROM instance",
+    "SELECT * FROM instance_membership",
+    "SELECT * FROM death_state",
+];
+const WEB_FEATURE_SUBSCRIPTIONS: &[&str] = &[
+    "SELECT * FROM player_inventory",
+    "SELECT * FROM player_equipment",
+    "SELECT * FROM bank",
+    "SELECT * FROM party",
+    "SELECT * FROM party_member",
+    "SELECT * FROM party_invite",
+    "SELECT * FROM boss_phase",
+    "SELECT * FROM world_phase",
+    "SELECT * FROM respawn_point",
+    "SELECT * FROM interactable_config",
+];
+const WEB_FORBIDDEN_TABLES: &[&str] = &[
+    "entity",
+    "entity_transform",
+    "entity_health",
+    "entity_region",
+    "stealthed_entity",
+    "trusted_worker",
+];
+const WEB_ALLOWED_REDUCERS: &[&str] = &[
+    "spawnPlayer",
+    "submitIntent",
+    "submitIntentsBatch",
+    "respawnPlayer",
+    "joinInstance",
+    "leaveInstance",
+    "equipItem",
+    "unequipItem",
+    "swapItem",
+    "lootItem",
+    "createParty",
+    "inviteToParty",
+    "acceptPartyInvite",
+    "declinePartyInvite",
+    "leaveParty",
+    "kickFromParty",
+    "disbandParty",
+];
+const WEB_FORBIDDEN_REDUCERS: &[&str] = &[
+    "registerWorker",
+    "commitTickResults",
+    "tickTrigger",
+    "worldClock",
+    "createInstance",
+    "terrainSetUpsert",
+    "terrainChunkUpsert",
+    "terrainManifestUpsert",
+    "spawnNpc",
+    "addRespawnPoint",
+    "removeRespawnPoint",
+    "expireInstances",
+    "incrementZoneCounter",
+];
 
 #[derive(Parser)]
 #[command(name = "cargo xtask")]
@@ -45,6 +137,8 @@ enum DevCmd {
     /// Publish schema and regenerate bindings.
     /// The WASM module is always built with Cargo's release profile.
     Schema,
+    /// Generate the browser-facing contract artifact package.
+    WebContract(WebContractArgs),
     Reset(ResetArgs),
     WorkerRegister(WorkerRegisterArgs),
     Worker(RunWorkerArgs),
@@ -242,6 +336,21 @@ struct ImportTerrainArgs {
     skip_set: bool,
 }
 
+#[derive(Args)]
+struct WebContractArgs {
+    /// Output directory for generated web-contract artifacts.
+    #[arg(long, default_value = WEB_CONTRACT_OUT)]
+    out: PathBuf,
+
+    /// Skip schema publish/regeneration before TypeScript codegen.
+    #[arg(long, default_value_t = false)]
+    skip_schema: bool,
+
+    /// Validate that output is up to date without writing files.
+    #[arg(long, default_value_t = false)]
+    check: bool,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -255,6 +364,7 @@ fn run_dev(cmd: DevCmd) -> Result<()> {
     match cmd {
         DevCmd::Server => dev_server(),
         DevCmd::Schema => dev_schema(),
+        DevCmd::WebContract(args) => dev_web_contract(args),
         DevCmd::Reset(args) => dev_reset(args),
         DevCmd::WorkerRegister(args) => dev_worker_register(args),
         DevCmd::Worker(args) => dev_worker(args),
@@ -383,6 +493,890 @@ fn dev_schema() -> Result<()> {
             MODULE_PATH,
         ],
     ))
+}
+
+#[derive(Serialize)]
+struct WebContractManifest {
+    package_name: String,
+    contract_version: String,
+    schema_hash: String,
+    content_hash: String,
+    metadata_hash: String,
+    bindings_dir: String,
+    browser_policy_file: String,
+    content_metadata_file: String,
+    content_lookup_file: String,
+    map_bundles_dir: String,
+    layer_count: usize,
+    dungeon_template_count: usize,
+    source_files: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct WebContractPackageJson {
+    name: String,
+    version: String,
+    private: bool,
+    #[serde(rename = "type")]
+    package_type: String,
+    description: String,
+    main: String,
+    files: Vec<String>,
+    exports: BTreeMap<String, String>,
+    dependencies: BTreeMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct WebContentMetadata {
+    schema_version: u32,
+    layers: Vec<LayerMetadata>,
+    dungeon_templates: Vec<DungeonTemplateMetadata>,
+}
+
+#[derive(Serialize)]
+struct WebContentLookup {
+    layer_ids: Vec<u32>,
+    layer_name_to_ids: BTreeMap<String, Vec<u32>>,
+    dungeon_template_ids: Vec<String>,
+    terrain_sets: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct BrowserPolicy {
+    schema_version: u32,
+    always_on_subscriptions: Vec<String>,
+    feature_subscriptions: Vec<String>,
+    forbidden_tables: Vec<String>,
+    allowed_reducers: Vec<String>,
+    forbidden_reducers: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct LayerMetadata {
+    layer_id: u32,
+    name: String,
+    terrain_set: Option<String>,
+    client_visual: Option<String>,
+    collision_policy: LayerCollisionPolicyMetadata,
+    spawn_points: Vec<[f32; 3]>,
+    geometry: Vec<GeometryMetadata>,
+}
+
+#[derive(Serialize, Clone)]
+struct DungeonTemplateMetadata {
+    template_id: String,
+    name: String,
+    max_players: u32,
+    terrain_set: Option<String>,
+    collision_policy: LayerCollisionPolicyMetadata,
+    spawn_points: Vec<[f32; 3]>,
+    exit_points: Vec<[f32; 3]>,
+    geometry: Vec<GeometryMetadata>,
+    interactables: Vec<InteractableMetadata>,
+}
+
+#[derive(Serialize, Clone)]
+struct LayerCollisionPolicyMetadata {
+    player_collides_player: bool,
+}
+
+#[derive(Serialize, Clone)]
+struct GeometryMetadata {
+    position: [f32; 3],
+    shape: ShapeMetadata,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ShapeMetadata {
+    Cuboid {
+        half_x: f32,
+        half_y: f32,
+        half_z: f32,
+    },
+    Cylinder {
+        half_height: f32,
+        radius: f32,
+    },
+    Heightfield {
+        nrows: usize,
+        ncols: usize,
+        scale_x: f32,
+        scale_y: f32,
+        scale_z: f32,
+        heights: Vec<f32>,
+    },
+    TriMesh {
+        vertices: Vec<f32>,
+        indices: Vec<u32>,
+    },
+}
+
+#[derive(Serialize, Clone)]
+struct InteractableMetadata {
+    local_id: u32,
+    script_id: Option<String>,
+    tags: Vec<String>,
+    kind: InteractableKindMetadata,
+    position: [f32; 3],
+    linked_to: Option<u32>,
+    required_buff: Option<u32>,
+    required_item: Option<u32>,
+    interact_range: Option<f32>,
+    puzzle_group: Option<String>,
+    puzzle_required_count: Option<u32>,
+    puzzle_window_ticks: Option<u32>,
+    body_shape: Option<BodyShapeMetadata>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum InteractableKindMetadata {
+    Gate,
+    Switch,
+    Chest,
+    BossSpawn {
+        npc_name: String,
+        encounter_name: Option<String>,
+    },
+    NpcSpawn {
+        npc_name: String,
+    },
+}
+
+#[derive(Serialize, Clone)]
+struct BodyShapeMetadata {
+    id: u8,
+    name: String,
+}
+
+#[derive(Serialize)]
+struct MapBundleIndex {
+    schema_version: u32,
+    bundles: Vec<MapBundleIndexEntry>,
+}
+
+#[derive(Serialize)]
+struct MapBundleIndexEntry {
+    bundle_id: String,
+    source_kind: String,
+    name: String,
+    layer_id: Option<u32>,
+    dungeon_template_id: Option<String>,
+    terrain_set: Option<String>,
+    manifest_path: String,
+    collider_count: usize,
+    content_hash: String,
+}
+
+#[derive(Serialize)]
+struct MapBundleModule {
+    schema_version: u32,
+    bundles: Vec<MapBundleModuleEntry>,
+}
+
+#[derive(Serialize)]
+struct MapBundleModuleEntry {
+    bundle_id: String,
+    manifest: MapBundleManifest,
+    colliders: ColliderBundle,
+}
+
+#[derive(Serialize)]
+struct MapBundleManifest {
+    schema_version: u32,
+    bundle_version: String,
+    content_hash: String,
+    bundle_id: String,
+    source: MapBundleSource,
+    render_meshes: Vec<AssetRef>,
+    collider_json: Vec<AssetRef>,
+    debug_markers: Vec<DebugMarker>,
+}
+
+#[derive(Serialize, Clone)]
+struct MapBundleSource {
+    kind: String,
+    name: String,
+    layer_id: Option<u32>,
+    dungeon_template_id: Option<String>,
+    terrain_set: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct AssetRef {
+    url: String,
+    sha256: String,
+    bytes: usize,
+}
+
+#[derive(Serialize, Clone)]
+struct DebugMarker {
+    kind: String,
+    label: String,
+    position: [f32; 3],
+}
+
+#[derive(Serialize, Clone)]
+struct ColliderBundle {
+    format_version: u32,
+    content_hash: String,
+    coordinate_system: String,
+    source: MapBundleSource,
+    colliders: Vec<BundleCollider>,
+}
+
+#[derive(Serialize, Clone)]
+struct BundleCollider {
+    collider_id: String,
+    position: [f32; 3],
+    rotation: [f32; 4],
+    shape: ShapeMetadata,
+}
+
+fn build_content_metadata(
+    world_layers: &game_schema::dungeon::WorldLayersFile,
+    dungeons: &game_schema::dungeon::DungeonFile,
+) -> WebContentMetadata {
+    let layers = world_layers
+        .layers
+        .iter()
+        .map(export_layer_metadata)
+        .collect::<Vec<_>>();
+    let dungeon_templates = dungeons
+        .templates
+        .iter()
+        .map(export_dungeon_template_metadata)
+        .collect::<Vec<_>>();
+
+    WebContentMetadata {
+        schema_version: 1,
+        layers,
+        dungeon_templates,
+    }
+}
+
+fn build_content_lookup(metadata: &WebContentMetadata) -> WebContentLookup {
+    let layer_ids = metadata
+        .layers
+        .iter()
+        .map(|layer| layer.layer_id)
+        .collect::<Vec<_>>();
+
+    let mut layer_name_to_ids = BTreeMap::<String, Vec<u32>>::new();
+    for layer in &metadata.layers {
+        layer_name_to_ids
+            .entry(layer.name.clone())
+            .or_default()
+            .push(layer.layer_id);
+    }
+
+    let dungeon_template_ids = metadata
+        .dungeon_templates
+        .iter()
+        .map(|template| template.template_id.clone())
+        .collect::<Vec<_>>();
+
+    let mut terrain_sets = BTreeSet::new();
+    for layer in &metadata.layers {
+        if let Some(set) = &layer.terrain_set {
+            terrain_sets.insert(set.clone());
+        }
+    }
+    for template in &metadata.dungeon_templates {
+        if let Some(set) = &template.terrain_set {
+            terrain_sets.insert(set.clone());
+        }
+    }
+
+    WebContentLookup {
+        layer_ids,
+        layer_name_to_ids,
+        dungeon_template_ids,
+        terrain_sets: terrain_sets.into_iter().collect(),
+    }
+}
+
+fn build_browser_policy() -> BrowserPolicy {
+    BrowserPolicy {
+        schema_version: 1,
+        always_on_subscriptions: WEB_ALWAYS_ON_SUBSCRIPTIONS
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        feature_subscriptions: WEB_FEATURE_SUBSCRIPTIONS
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        forbidden_tables: WEB_FORBIDDEN_TABLES
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        allowed_reducers: WEB_ALLOWED_REDUCERS
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+        forbidden_reducers: WEB_FORBIDDEN_REDUCERS
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
+    }
+}
+
+fn build_map_bundle_outputs(
+    metadata: &WebContentMetadata,
+    content_hash: &str,
+) -> Result<(MapBundleIndex, MapBundleModule, Vec<(String, String)>)> {
+    let mut index_entries = Vec::new();
+    let mut module_entries = Vec::new();
+    let mut files = Vec::new();
+
+    for layer in &metadata.layers {
+        let slug = sanitize_bundle_part(&format!("layer-{}-{}", layer.layer_id, layer.name));
+        let bundle_id = slug.clone();
+        let source = MapBundleSource {
+            kind: "layer".to_string(),
+            name: layer.name.clone(),
+            layer_id: Some(layer.layer_id),
+            dungeon_template_id: None,
+            terrain_set: layer.terrain_set.clone(),
+        };
+        let colliders = collider_bundle_for_geometries(
+            content_hash,
+            source.clone(),
+            &layer.geometry,
+            &format!("layer-{}", layer.layer_id),
+        );
+        let (manifest, collider_json) =
+            build_single_map_bundle(&bundle_id, content_hash, source, &colliders)?;
+        let manifest_path = format!("{bundle_id}/manifest.json");
+        let collider_path = format!("{bundle_id}/colliders/static-colliders.json");
+        index_entries.push(MapBundleIndexEntry {
+            bundle_id: bundle_id.clone(),
+            source_kind: "layer".to_string(),
+            name: layer.name.clone(),
+            layer_id: Some(layer.layer_id),
+            dungeon_template_id: None,
+            terrain_set: layer.terrain_set.clone(),
+            manifest_path: manifest_path.clone(),
+            collider_count: colliders.colliders.len(),
+            content_hash: content_hash.to_string(),
+        });
+        module_entries.push(MapBundleModuleEntry {
+            bundle_id,
+            manifest,
+            colliders,
+        });
+        files.push((
+            manifest_path,
+            serde_json::to_string_pretty(&module_entries.last().unwrap().manifest)?,
+        ));
+        files.push((collider_path, collider_json));
+    }
+
+    for template in &metadata.dungeon_templates {
+        let slug = sanitize_bundle_part(&format!("dungeon-{}", template.template_id));
+        let bundle_id = slug.clone();
+        let source = MapBundleSource {
+            kind: "dungeon".to_string(),
+            name: template.name.clone(),
+            layer_id: None,
+            dungeon_template_id: Some(template.template_id.clone()),
+            terrain_set: template.terrain_set.clone(),
+        };
+        let colliders = collider_bundle_for_geometries(
+            content_hash,
+            source.clone(),
+            &template.geometry,
+            &format!("dungeon-{}", template.template_id),
+        );
+        let (manifest, collider_json) =
+            build_single_map_bundle(&bundle_id, content_hash, source, &colliders)?;
+        let manifest_path = format!("{bundle_id}/manifest.json");
+        let collider_path = format!("{bundle_id}/colliders/static-colliders.json");
+        index_entries.push(MapBundleIndexEntry {
+            bundle_id: bundle_id.clone(),
+            source_kind: "dungeon".to_string(),
+            name: template.name.clone(),
+            layer_id: None,
+            dungeon_template_id: Some(template.template_id.clone()),
+            terrain_set: template.terrain_set.clone(),
+            manifest_path: manifest_path.clone(),
+            collider_count: colliders.colliders.len(),
+            content_hash: content_hash.to_string(),
+        });
+        module_entries.push(MapBundleModuleEntry {
+            bundle_id,
+            manifest,
+            colliders,
+        });
+        files.push((
+            manifest_path,
+            serde_json::to_string_pretty(&module_entries.last().unwrap().manifest)?,
+        ));
+        files.push((collider_path, collider_json));
+    }
+
+    Ok((
+        MapBundleIndex {
+            schema_version: 1,
+            bundles: index_entries,
+        },
+        MapBundleModule {
+            schema_version: 1,
+            bundles: module_entries,
+        },
+        files,
+    ))
+}
+
+fn build_single_map_bundle(
+    bundle_id: &str,
+    content_hash: &str,
+    source: MapBundleSource,
+    colliders: &ColliderBundle,
+) -> Result<(MapBundleManifest, String)> {
+    let collider_json =
+        serde_json::to_string_pretty(&colliders).context("serialize collider bundle")?;
+    let collider_asset = AssetRef {
+        url: "colliders/static-colliders.json".to_string(),
+        sha256: hash_bytes(collider_json.as_bytes()),
+        bytes: collider_json.len(),
+    };
+    let debug_markers = colliders
+        .colliders
+        .first()
+        .map(|collider| DebugMarker {
+            kind: "origin".to_string(),
+            label: format!("{} origin", source.name),
+            position: collider.position,
+        })
+        .into_iter()
+        .collect();
+
+    Ok((
+        MapBundleManifest {
+            schema_version: 1,
+            bundle_version: "local-v1".to_string(),
+            content_hash: content_hash.to_string(),
+            bundle_id: bundle_id.to_string(),
+            source,
+            render_meshes: Vec::new(),
+            collider_json: vec![collider_asset],
+            debug_markers,
+        },
+        collider_json,
+    ))
+}
+
+fn collider_bundle_for_geometries(
+    content_hash: &str,
+    source: MapBundleSource,
+    geometries: &[GeometryMetadata],
+    id_prefix: &str,
+) -> ColliderBundle {
+    let colliders = geometries
+        .iter()
+        .enumerate()
+        .map(|(idx, geometry)| BundleCollider {
+            collider_id: format!("{id_prefix}-collider-{idx}"),
+            position: geometry.position,
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            shape: geometry.shape.clone(),
+        })
+        .collect();
+
+    ColliderBundle {
+        format_version: WEB_MAP_BUNDLE_COLLIDER_FORMAT_VERSION,
+        content_hash: content_hash.to_string(),
+        coordinate_system: "right_handed_y_up".to_string(),
+        source,
+        colliders,
+    }
+}
+
+fn sanitize_bundle_part(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut last_was_dash = false;
+    for ch in value.chars() {
+        let next = if ch.is_ascii_alphanumeric() {
+            last_was_dash = false;
+            Some(ch.to_ascii_lowercase())
+        } else if ch == '_' || ch == '-' {
+            if last_was_dash {
+                None
+            } else {
+                last_was_dash = true;
+                Some('-')
+            }
+        } else if last_was_dash {
+            None
+        } else {
+            last_was_dash = true;
+            Some('-')
+        };
+        if let Some(ch) = next {
+            out.push(ch);
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn export_layer_metadata(layer: &game_schema::dungeon::WorldLayerDef) -> LayerMetadata {
+    LayerMetadata {
+        layer_id: layer.layer_id,
+        name: layer.name.clone(),
+        terrain_set: layer.terrain_set.clone(),
+        client_visual: layer.client_visual.clone(),
+        collision_policy: LayerCollisionPolicyMetadata {
+            player_collides_player: layer.collision_policy.player_collides_player,
+        },
+        spawn_points: layer.spawn_points.clone(),
+        geometry: layer
+            .geometry
+            .iter()
+            .map(export_geometry_metadata)
+            .collect(),
+    }
+}
+
+fn export_dungeon_template_metadata(
+    template: &game_schema::dungeon::DungeonTemplate,
+) -> DungeonTemplateMetadata {
+    DungeonTemplateMetadata {
+        template_id: template.template_id.clone(),
+        name: template.name.clone(),
+        max_players: template.max_players,
+        terrain_set: template.terrain_set.clone(),
+        collision_policy: LayerCollisionPolicyMetadata {
+            player_collides_player: template.collision_policy.player_collides_player,
+        },
+        spawn_points: template.spawn_points.clone(),
+        exit_points: template.exit_points.clone(),
+        geometry: template
+            .geometry
+            .iter()
+            .map(export_geometry_metadata)
+            .collect(),
+        interactables: template
+            .interactables
+            .iter()
+            .map(export_interactable_metadata)
+            .collect(),
+    }
+}
+
+fn export_geometry_metadata(geometry: &game_schema::dungeon::GeometryDef) -> GeometryMetadata {
+    GeometryMetadata {
+        position: geometry.position,
+        shape: export_shape_metadata(&geometry.shape),
+    }
+}
+
+fn export_shape_metadata(shape: &game_schema::dungeon::ShapeDef) -> ShapeMetadata {
+    match shape {
+        game_schema::dungeon::ShapeDef::Cuboid {
+            half_x,
+            half_y,
+            half_z,
+        } => ShapeMetadata::Cuboid {
+            half_x: *half_x,
+            half_y: *half_y,
+            half_z: *half_z,
+        },
+        game_schema::dungeon::ShapeDef::Cylinder {
+            half_height,
+            radius,
+        } => ShapeMetadata::Cylinder {
+            half_height: *half_height,
+            radius: *radius,
+        },
+        game_schema::dungeon::ShapeDef::Heightfield {
+            nrows,
+            ncols,
+            scale_x,
+            scale_y,
+            scale_z,
+            heights,
+        } => ShapeMetadata::Heightfield {
+            nrows: *nrows,
+            ncols: *ncols,
+            scale_x: *scale_x,
+            scale_y: *scale_y,
+            scale_z: *scale_z,
+            heights: heights.clone(),
+        },
+        game_schema::dungeon::ShapeDef::TriMesh { vertices, indices } => ShapeMetadata::TriMesh {
+            vertices: vertices.clone(),
+            indices: indices.clone(),
+        },
+    }
+}
+
+fn export_interactable_metadata(
+    interactable: &game_schema::dungeon::InteractableDef,
+) -> InteractableMetadata {
+    InteractableMetadata {
+        local_id: interactable.local_id,
+        script_id: interactable.script_id.clone(),
+        tags: interactable.tags.clone(),
+        kind: export_interactable_kind_metadata(&interactable.kind),
+        position: interactable.position,
+        linked_to: interactable.linked_to,
+        required_buff: interactable.required_buff,
+        required_item: interactable.required_item,
+        interact_range: interactable.interact_range,
+        puzzle_group: interactable.puzzle_group.clone(),
+        puzzle_required_count: interactable.puzzle_required_count,
+        puzzle_window_ticks: interactable.puzzle_window_ticks,
+        body_shape: interactable.body_shape.map(export_body_shape_metadata),
+    }
+}
+
+fn export_interactable_kind_metadata(
+    kind: &game_schema::dungeon::InteractKindDef,
+) -> InteractableKindMetadata {
+    match kind {
+        game_schema::dungeon::InteractKindDef::Gate => InteractableKindMetadata::Gate,
+        game_schema::dungeon::InteractKindDef::Switch => InteractableKindMetadata::Switch,
+        game_schema::dungeon::InteractKindDef::Chest => InteractableKindMetadata::Chest,
+        game_schema::dungeon::InteractKindDef::BossSpawn {
+            npc_name,
+            encounter_name,
+        } => InteractableKindMetadata::BossSpawn {
+            npc_name: npc_name.clone(),
+            encounter_name: encounter_name.clone(),
+        },
+        game_schema::dungeon::InteractKindDef::NpcSpawn { npc_name } => {
+            InteractableKindMetadata::NpcSpawn {
+                npc_name: npc_name.clone(),
+            }
+        }
+    }
+}
+
+fn export_body_shape_metadata(shape: game_schema::dungeon::BodyShapeDef) -> BodyShapeMetadata {
+    BodyShapeMetadata {
+        id: shape.to_u8(),
+        name: body_shape_name(shape).to_string(),
+    }
+}
+
+fn body_shape_name(shape: game_schema::dungeon::BodyShapeDef) -> &'static str {
+    match shape {
+        game_schema::dungeon::BodyShapeDef::PlayerCapsule => "PlayerCapsule",
+        game_schema::dungeon::BodyShapeDef::NpcCapsule => "NpcCapsule",
+        game_schema::dungeon::BodyShapeDef::BossCapsule => "BossCapsule",
+        game_schema::dungeon::BodyShapeDef::LargeBossCapsule => "LargeBossCapsule",
+        game_schema::dungeon::BodyShapeDef::GateCuboid => "GateCuboid",
+        game_schema::dungeon::BodyShapeDef::SwitchCuboid => "SwitchCuboid",
+        game_schema::dungeon::BodyShapeDef::ChestCuboid => "ChestCuboid",
+        game_schema::dungeon::BodyShapeDef::CrateCuboid => "CrateCuboid",
+    }
+}
+
+fn dev_web_contract(args: WebContractArgs) -> Result<()> {
+    if !args.skip_schema {
+        println!("Refreshing schema before web-contract generation...");
+        dev_schema()?;
+    }
+
+    let out_dir = args.out;
+    let staging_dir = staging_dir_for(&out_dir);
+
+    if staging_dir.exists() {
+        fs::remove_dir_all(&staging_dir)
+            .with_context(|| format!("failed removing staging dir {}", staging_dir.display()))?;
+    }
+    fs::create_dir_all(&staging_dir)
+        .with_context(|| format!("failed creating staging dir {}", staging_dir.display()))?;
+
+    let bindings_dir = staging_dir.join(WEB_CONTRACT_BINDINGS_DIR);
+    fs::create_dir_all(&bindings_dir)
+        .with_context(|| format!("failed creating bindings dir {}", bindings_dir.display()))?;
+    run_spacetime_generate_typescript(&bindings_dir)?;
+
+    let schema_hash = hash_directory(&bindings_dir)?;
+    let content_hash = hash_content_files(WEB_CONTENT_SOURCES)?;
+
+    let world_layers: game_schema::dungeon::WorldLayersFile =
+        load_ron_file(Path::new("data/layers.ron"))?;
+    let dungeons: game_schema::dungeon::DungeonFile =
+        load_ron_file(Path::new("data/dungeons.ron"))?;
+    let content_metadata = build_content_metadata(&world_layers, &dungeons);
+    let content_lookup = build_content_lookup(&content_metadata);
+    let browser_policy = build_browser_policy();
+    let (map_bundle_index, map_bundle_module, map_bundle_files) =
+        build_map_bundle_outputs(&content_metadata, &content_hash)?;
+    let content_metadata_json =
+        serde_json::to_string_pretty(&content_metadata).context("serialize content metadata")?;
+    let content_lookup_json =
+        serde_json::to_string_pretty(&content_lookup).context("serialize content lookup")?;
+    let browser_policy_json =
+        serde_json::to_string_pretty(&browser_policy).context("serialize browser policy")?;
+    let map_bundle_index_json =
+        serde_json::to_string_pretty(&map_bundle_index).context("serialize map bundle index")?;
+    let map_bundle_module_json =
+        serde_json::to_string_pretty(&map_bundle_module).context("serialize map bundle module")?;
+    let map_bundle_module_ts = format!(
+        "export const mapBundles = {map_bundle_module_json} as const;\nexport default mapBundles;\n"
+    );
+    let metadata_hash = hash_bytes(content_metadata_json.as_bytes());
+
+    let source_files = WEB_CONTENT_SOURCES
+        .iter()
+        .map(|path| path.to_string())
+        .collect::<Vec<_>>();
+
+    let manifest = WebContractManifest {
+        package_name: WEB_CONTRACT_PACKAGE_NAME.to_string(),
+        contract_version: env!("CARGO_PKG_VERSION").to_string(),
+        schema_hash,
+        content_hash: content_hash.clone(),
+        metadata_hash,
+        bindings_dir: WEB_CONTRACT_BINDINGS_DIR.to_string(),
+        browser_policy_file: WEB_BROWSER_POLICY_FILE.to_string(),
+        content_metadata_file: WEB_CONTENT_METADATA_FILE.to_string(),
+        content_lookup_file: WEB_CONTENT_LOOKUP_FILE.to_string(),
+        map_bundles_dir: WEB_MAP_BUNDLES_DIR.to_string(),
+        layer_count: world_layers.layers.len(),
+        dungeon_template_count: dungeons.templates.len(),
+        source_files,
+    };
+
+    let mut exports = BTreeMap::new();
+    exports.insert("./bindings".to_string(), "./bindings/index.ts".to_string());
+    exports.insert(
+        "./bindings/types".to_string(),
+        "./bindings/types.ts".to_string(),
+    );
+    exports.insert(
+        "./bindings/types/*".to_string(),
+        "./bindings/types/*".to_string(),
+    );
+    exports.insert(
+        "./browser-policy.json".to_string(),
+        "./browser-policy.json".to_string(),
+    );
+    exports.insert("./contract.json".to_string(), "./contract.json".to_string());
+    exports.insert(
+        "./content-metadata.json".to_string(),
+        "./content-metadata.json".to_string(),
+    );
+    exports.insert(
+        "./content-lookup.json".to_string(),
+        "./content-lookup.json".to_string(),
+    );
+    exports.insert(
+        "./map-bundles".to_string(),
+        "./map-bundles/index.ts".to_string(),
+    );
+    exports.insert(
+        "./map-bundles/index.json".to_string(),
+        "./map-bundles/index.json".to_string(),
+    );
+    exports.insert("./map-bundles/*".to_string(), "./map-bundles/*".to_string());
+
+    let mut dependencies = BTreeMap::new();
+    dependencies.insert(
+        "spacetimedb".to_string(),
+        WEB_CONTRACT_STDB_NPM_VERSION.to_string(),
+    );
+
+    let package_json = WebContractPackageJson {
+        name: WEB_CONTRACT_PACKAGE_NAME.to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        private: true,
+        package_type: "module".to_string(),
+        description: "Generated Dive browser contract artifacts".to_string(),
+        main: format!("{WEB_CONTRACT_BINDINGS_DIR}/index.ts"),
+        files: vec![
+            WEB_CONTRACT_BINDINGS_DIR.to_string(),
+            WEB_MAP_BUNDLES_DIR.to_string(),
+            WEB_BROWSER_POLICY_FILE.to_string(),
+            "contract.json".to_string(),
+            WEB_CONTENT_METADATA_FILE.to_string(),
+            WEB_CONTENT_LOOKUP_FILE.to_string(),
+            "README.md".to_string(),
+        ],
+        exports,
+        dependencies,
+    };
+
+    write_text_file(
+        &staging_dir.join(WEB_CONTENT_METADATA_FILE),
+        &content_metadata_json,
+    )?;
+    write_text_file(
+        &staging_dir.join(WEB_CONTENT_LOOKUP_FILE),
+        &content_lookup_json,
+    )?;
+    write_text_file(
+        &staging_dir.join(WEB_BROWSER_POLICY_FILE),
+        &browser_policy_json,
+    )?;
+    let map_bundles_dir = staging_dir.join(WEB_MAP_BUNDLES_DIR);
+    write_text_file(&map_bundles_dir.join("index.json"), &map_bundle_index_json)?;
+    write_text_file(&map_bundles_dir.join("index.ts"), &map_bundle_module_ts)?;
+    for (relative_path, content) in map_bundle_files {
+        write_text_file(&map_bundles_dir.join(relative_path), &content)?;
+    }
+
+    write_text_file(
+        &staging_dir.join("contract.json"),
+        &serde_json::to_string_pretty(&manifest).context("serialize contract manifest")?,
+    )?;
+    write_text_file(
+        &staging_dir.join("package.json"),
+        &serde_json::to_string_pretty(&package_json).context("serialize package.json")?,
+    )?;
+    write_text_file(
+        &staging_dir.join("README.md"),
+        "Generated by `cargo xtask dev web-contract`.\nContains TypeScript bindings, browser policy, deterministic contract metadata, exported layer/dungeon content artifacts, and local map-bundle fixtures.\n",
+    )?;
+
+    if args.check {
+        if !out_dir.exists() {
+            fs::remove_dir_all(&staging_dir).ok();
+            bail!(
+                "web-contract output not found at {}. Run `cargo xtask dev web-contract` first.",
+                out_dir.display()
+            );
+        }
+
+        let expected_hash = hash_directory(&staging_dir)?;
+        let current_hash = hash_directory(&out_dir)?;
+        fs::remove_dir_all(&staging_dir).ok();
+
+        if expected_hash != current_hash {
+            bail!(
+                "web-contract output at {} is stale. Run `cargo xtask dev web-contract`.",
+                out_dir.display()
+            );
+        }
+
+        println!("Web contract output is up to date: {}", out_dir.display());
+        return Ok(());
+    }
+
+    if out_dir.exists() {
+        fs::remove_dir_all(&out_dir)
+            .with_context(|| format!("failed removing output dir {}", out_dir.display()))?;
+    }
+    if let Some(parent) = out_dir.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed creating output parent {}", parent.display()))?;
+    }
+    fs::rename(&staging_dir, &out_dir).with_context(|| {
+        format!(
+            "failed moving staging output {} -> {}",
+            staging_dir.display(),
+            out_dir.display()
+        )
+    })?;
+
+    println!("Generated web contract at {}", out_dir.display());
+    Ok(())
 }
 
 fn dev_reset(args: ResetArgs) -> Result<()> {
@@ -1110,6 +2104,118 @@ fn query_terrain_set_id(set_name: &str) -> Result<u32> {
          Check that the server is running and the set was created.",
         set_name
     )
+}
+
+fn staging_dir_for(out_dir: &Path) -> PathBuf {
+    let parent = out_dir.parent().unwrap_or_else(|| Path::new("."));
+    let stem = out_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("web-contract");
+    parent.join(format!("{stem}.staging"))
+}
+
+fn run_spacetime_generate_typescript(out_dir: &Path) -> Result<()> {
+    let mut generate = Command::new("spacetime");
+    generate.args(["generate", "--lang", "typescript", "--out-dir"]);
+    generate.arg(out_dir);
+    generate.args(["--module-path", MODULE_PATH]);
+    run_command(generate)
+}
+
+fn hash_content_files(paths: &[&str]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    for path in paths {
+        hasher.update(path.as_bytes());
+        hasher.update([0u8]);
+        let bytes = fs::read(path).with_context(|| format!("reading {path}"))?;
+        hasher.update(&bytes);
+        hasher.update([0u8]);
+    }
+    Ok(hex_digest(&hasher.finalize()))
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex_digest(&hasher.finalize())
+}
+
+fn hash_directory(root: &Path) -> Result<String> {
+    if !root.exists() {
+        bail!("directory does not exist: {}", root.display());
+    }
+
+    let mut hasher = Sha256::new();
+    for rel in collect_files_relative(root)? {
+        let full = root.join(&rel);
+        let rel_norm = rel.to_string_lossy().replace('\\', "/");
+        hasher.update(rel_norm.as_bytes());
+        hasher.update([0u8]);
+        let bytes = fs::read(&full).with_context(|| format!("reading {}", full.display()))?;
+        hasher.update(&bytes);
+        hasher.update([0u8]);
+    }
+    Ok(hex_digest(&hasher.finalize()))
+}
+
+fn collect_files_relative(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_files_recursive(root, root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_files_recursive(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let mut entries = fs::read_dir(dir)
+        .with_context(|| format!("reading directory {}", dir.display()))?
+        .collect::<std::result::Result<Vec<_>, std::io::Error>>()
+        .with_context(|| format!("collecting entries from {}", dir.display()))?;
+
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_recursive(root, &path, out)?;
+            continue;
+        }
+        if path.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .with_context(|| {
+                    format!(
+                        "failed computing relative path: {} from {}",
+                        path.display(),
+                        root.display()
+                    )
+                })?
+                .to_path_buf();
+            out.push(rel);
+        }
+    }
+    Ok(())
+}
+
+fn load_ron_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    let raw = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    ron::from_str(&raw).with_context(|| format!("parsing RON {}", path.display()))
+}
+
+fn write_text_file(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed creating parent {}", parent.display()))?;
+    }
+    fs::write(path, content).with_context(|| format!("writing {}", path.display()))
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 fn dev_capture_fixture(args: CaptureFixtureArgs) -> Result<()> {
