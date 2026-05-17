@@ -242,6 +242,7 @@ pub fn spawn_player(ctx: &ReducerContext) -> Result<(), String> {
         entity_id: eid,
         region_x: 0,
         region_z: 0,
+        layer: 0,
     });
 
     // Register sequence tracking
@@ -303,6 +304,7 @@ pub fn spawn_npc(
         entity_id: eid,
         region_x: 0,
         region_z: 0,
+        layer: 0,
     });
 
     log::info!("NPC spawned: entity_id={} pos=({},{},{}) max_hp={}", eid, pos_x, pos_y, pos_z, max_hp);
@@ -443,6 +445,7 @@ pub fn commit_tick_results(
             entity_id: r.entity_id,
             region_x: r.region_x,
             region_z: r.region_z,
+            layer: r.layer,
         });
     }
 
@@ -578,6 +581,7 @@ pub struct RegionUpdate {
     pub entity_id: u64,
     pub region_x: i32,
     pub region_z: i32,
+    pub layer: u32,
 }
 
 #[derive(spacetimedb::SpacetimeType, Clone, Debug)]

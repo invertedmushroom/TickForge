@@ -685,6 +685,7 @@ fn wire_region_updates(pkg: &CommitPackage) -> Vec<RegionUpdate> {
             entity_id: r.entity_id,
             region_x: r.region_x,
             region_z: r.region_z,
+            layer: r.layer,
         })
         .collect()
 }

@@ -222,12 +222,17 @@ pub enum WorldEventKind {
 // ── AOI / Spatial ───────────────────────────────────────────────────
 // Per spec: world divided into grid cells, clients subscribe by region.
 
-#[table(accessor = entity_region, public, index(accessor = by_region, btree(columns = [region_x, region_z])))]
+#[table(accessor = entity_region, public, index(accessor = by_region, btree(columns = [region_x, region_z, layer])))]
 pub struct EntityRegion {
     #[primary_key]
     pub entity_id: u64,
     pub region_x: i32,
     pub region_z: i32,
+    /// Visibility layer for instancing, phasing, and stealth.
+    /// Layer 0 is the default open-world layer. Non-zero layers isolate
+    /// entities from each other on the same grid cell (boss instances,
+    /// quest phases, stealth states).
+    pub layer: u32,
 }
 
 // ── Trusted Workers ─────────────────────────────────────────────────

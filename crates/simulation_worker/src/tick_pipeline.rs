@@ -15,6 +15,74 @@ use game_core::sim_state::SimState;
 use game_protocol::types::{Quatf, Vec3f};
 use game_schema::EntityKind;
 
+// ── Region / AOI constants ──────────────────────────────────────────
+
+/// Width of a spatial grid cell in world units.
+pub const CELL_SIZE: f32 = 50.0;
+
+/// Hysteresis band in world units. An entity must move at least this far
+/// past a cell boundary before a region transition is emitted. Prevents
+/// thrashing when entities oscillate on cell edges.
+pub const HYSTERESIS_BAND: f32 = 5.0;
+
+/// A spatial grid cell assignment with a visibility layer.
+///
+/// `region_x` and `region_z` identify the cell in an infinite 2D grid.
+/// `layer` isolates entities within the same cell (instancing, phasing, stealth).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RegionCell {
+    pub region_x: i32,
+    pub region_z: i32,
+    pub layer: u32,
+}
+
+impl RegionCell {
+    /// Compute the grid cell for a world position on the default layer.
+    pub fn from_position(pos: &Vec3f) -> Self {
+        Self {
+            region_x: (pos.x / CELL_SIZE).floor() as i32,
+            region_z: (pos.z / CELL_SIZE).floor() as i32,
+            layer: 0,
+        }
+    }
+
+    /// Compute the grid cell with hysteresis: only transition if the entity
+    /// has moved past the boundary by at least `HYSTERESIS_BAND` units.
+    /// Returns `current` unchanged if the move is within the dead zone.
+    pub fn from_position_with_hysteresis(pos: &Vec3f, current: &RegionCell) -> Self {
+        let raw_x = (pos.x / CELL_SIZE).floor() as i32;
+        let raw_z = (pos.z / CELL_SIZE).floor() as i32;
+
+        let mut result = *current;
+
+        if raw_x != current.region_x {
+            let boundary = if raw_x > current.region_x {
+                // Moved right: check distance past the right edge of the current cell
+                (current.region_x + 1) as f32 * CELL_SIZE
+            } else {
+                // Moved left: check distance past the left edge of the current cell
+                current.region_x as f32 * CELL_SIZE
+            };
+            if (pos.x - boundary).abs() >= HYSTERESIS_BAND {
+                result.region_x = raw_x;
+            }
+        }
+
+        if raw_z != current.region_z {
+            let boundary = if raw_z > current.region_z {
+                (current.region_z + 1) as f32 * CELL_SIZE
+            } else {
+                current.region_z as f32 * CELL_SIZE
+            };
+            if (pos.z - boundary).abs() >= HYSTERESIS_BAND {
+                result.region_z = raw_z;
+            }
+        }
+
+        result
+    }
+}
+
 /// Record a mutation in the audit log (no-op in release builds).
 macro_rules! audit {
     ($state:expr, $domain:ident, $subsystem:ident, $phase:expr, $entity:expr, $detail:expr) => {
@@ -70,6 +138,9 @@ pub struct TickResult {
     /// NPC AI state snapshot for all active NPCs/bosses.
     /// Each entry is (entity_id, NpcAiState, top_threat target).
     pub npc_state_updates: Vec<(EntityId, game_schema::NpcAiState, Option<EntityId>)>,
+    /// Region assignment changes for entities that crossed a grid cell boundary
+    /// this tick. Only entities whose cell changed (with hysteresis) are included.
+    pub region_updates: Vec<(EntityId, RegionCell)>,
 }
 
 /// The canonical 10-phase simulation tick pipeline per spec.
@@ -122,6 +193,11 @@ pub struct TickPipeline {
     pending_impulses: Vec<(EntityId, Vec3f)>,
     /// Running stats for the current tick — incremented inline, returned in TickResult.
     summary: TickSummary,
+    /// Last committed region cell per entity. Used to detect cell crossings with
+    /// hysteresis so only actual transitions produce `RegionUpdate` entries.
+    /// Seeded at spawn (from initial position → cell), updated each tick when
+    /// a transition is emitted. Entries are removed in `force_remove_entity`.
+    entity_regions: HashMap<EntityId, RegionCell>,
 }
 
 impl TickPipeline {
@@ -184,7 +260,10 @@ impl TickPipeline {
             self.state.combat.executions.remove(exec_id);
         }
 
-        // 5) Finally, remove entity from SimState and physics world
+        // 6) Drop region tracking for this entity.
+        self.entity_regions.remove(&id);
+
+        // 7) Finally, remove entity from SimState and physics world
         let removed = self.state.remove_entity(id);
         // Always attempt to remove physics body; remove_entity is idempotent there.
         self.physics.remove_entity(id);
@@ -209,6 +288,7 @@ impl TickPipeline {
             next_scheduled_id: 0,
             pending_impulses: Vec::new(),
             summary: TickSummary::default(),
+            entity_regions: HashMap::new(),
 }
     }
 
@@ -268,6 +348,9 @@ impl TickPipeline {
                 self.state.ai.home_positions[idx.as_usize()] = position;
             }
         }
+
+        // Seed the initial region cell from the spawn position.
+        self.entity_regions.insert(id, RegionCell::from_position(&position));
     }
 
     /// Seed runtime state from DB rows recovered on worker restart.
@@ -472,9 +555,12 @@ impl TickPipeline {
         let threat_updates = self.collect_threat_updates();
         let npc_state_updates = self.collect_npc_state_updates();
 
+        let transforms = self.physics.get_all_transforms();
+        let region_updates = self.collect_region_updates(&transforms);
+
         let result = TickResult {
             tick_id: self.current_tick,
-            transforms: self.physics.get_all_transforms(),
+            transforms,
             events: std::mem::take(&mut self.pending_events),
             summary: self.summary,
             entity_state_updates,
@@ -482,6 +568,7 @@ impl TickPipeline {
             buff_updates,
             threat_updates,
             npc_state_updates,
+            region_updates,
         };
 
         self.current_tick = self.current_tick.next();
@@ -1264,6 +1351,33 @@ impl TickPipeline {
                     .as_ref()
                     .and_then(|t| t.top_threat());
                 out.push((eid, ai_state, target));
+            }
+        }
+        out
+    }
+
+    /// Detect grid-cell transitions using the already-collected transforms.
+    ///
+    /// Compares each entity's current position against its stored `RegionCell`,
+    /// applying hysteresis so oscillation at cell boundaries does not produce
+    /// spurious updates. Only changed cells are emitted; the stored cell is
+    /// updated in place so the next tick's comparison is correct.
+    fn collect_region_updates(
+        &mut self,
+        transforms: &[(EntityId, Transform)],
+    ) -> Vec<(EntityId, RegionCell)> {
+        let mut out = Vec::new();
+        for &(eid, ref tf) in transforms {
+            let pos = &tf.position;
+            let new_cell = match self.entity_regions.get(&eid) {
+                Some(current) => RegionCell::from_position_with_hysteresis(pos, current),
+                // Entity not tracked yet (shouldn't happen — spawn seeds it).
+                None => RegionCell::from_position(pos),
+            };
+            let changed = self.entity_regions.get(&eid) != Some(&new_cell);
+            if changed {
+                self.entity_regions.insert(eid, new_cell);
+                out.push((eid, new_cell));
             }
         }
         out

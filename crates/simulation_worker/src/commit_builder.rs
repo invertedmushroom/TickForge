@@ -70,6 +70,7 @@ pub struct CommitRegion {
     pub entity_id: u64,
     pub region_x: i32,
     pub region_z: i32,
+    pub layer: u32,
 }
 
 /// Damage data embedded in a combat event.
@@ -269,6 +270,17 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
     let buff_cleared_entity_ids = result.buff_updates.iter().map(|(eid, _)| eid.0).collect();
     let threat_cleared_entity_ids = result.threat_updates.iter().map(|(eid, _)| eid.0).collect();
 
+    let region_updates = result
+        .region_updates
+        .iter()
+        .map(|(eid, cell)| CommitRegion {
+            entity_id: eid.0,
+            region_x: cell.region_x,
+            region_z: cell.region_z,
+            layer: cell.layer,
+        })
+        .collect();
+
     CommitPackage {
         tick_id,
         transforms,
@@ -277,7 +289,7 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
         world_events,
         consumed_intent_ids,
         entity_state_updates,
-        region_updates: Vec::new(),
+        region_updates,
         buff_updates,
         buff_cleared_entity_ids,
         threat_updates,
@@ -445,6 +457,7 @@ mod tests {
             buff_updates: Vec::new(),
             threat_updates: Vec::new(),
             npc_state_updates: Vec::new(),
+            region_updates: Vec::new(),
         }
     }
 
@@ -748,6 +761,7 @@ mod tests {
             buff_updates: Vec::new(),
             threat_updates: Vec::new(),
             npc_state_updates: Vec::new(),
+            region_updates: Vec::new(),
         };
         let pkg = build(result, Vec::new());
 
