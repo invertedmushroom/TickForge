@@ -6,7 +6,19 @@ pub use game_schema::{
     Vec3f, EntityKind, EntityState, NpcAiState, DamageType,
     IntentAction, AbilityTarget, MoveDir, UseAbilityData,
 };
+// ── Module Config ───────────────────────────────────────────────────
+// Stores the admin identity (the CLI identity that published the module).
+// Populated during init; used for owner-only reducer auth checks.
 
+#[table(accessor = module_config, public)]
+pub struct ModuleConfig {
+    #[primary_key]
+    pub key: u32,
+    pub admin: spacetimedb::Identity,
+    /// Last sim tick successfully committed by the simulation worker.
+    /// Read by tick_trigger to gate backpressure (skip insert when backlog is too large).
+    pub last_committed_tick: u64,
+}
 // ── Simulation Clock ────────────────────────────────────────────────
 // Per spec: tick number must be committed through the database.
 // The DB commit timeline defines the canonical tick.

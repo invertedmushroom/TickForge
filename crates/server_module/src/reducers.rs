@@ -7,6 +7,13 @@ use crate::tables::*;
 pub fn init(ctx: &ReducerContext) {
     log::info!("Module initializing — seeding tick 0");
 
+    // Store the publishing identity as admin for owner-only reducers.
+    ctx.db.module_config().insert(ModuleConfig {
+        key: 0,
+        admin: ctx.sender(),
+        last_committed_tick: 0,
+    });
+
     // Seed tick 0
     ctx.db.sim_tick().insert(SimTick {
         tick_id: 0,
@@ -44,6 +51,14 @@ pub fn client_disconnected(ctx: &ReducerContext) {
 // Per spec: scheduled reducer should verify caller identity to
 // prevent client invocation.
 
+/// Maximum number of unacknowledged sim_tick rows before tick_trigger pauses.
+/// At 20 Hz a backlog of 5 means the worker is >250 ms behind — pause and let it catch up.
+const BACKLOG_LIMIT: u64 = 5;
+
+/// Number of sim_tick rows to retain for coordinator restart seeding (6 seconds at 20 Hz).
+/// Older rows are pruned each tick to prevent unbounded table growth.
+const SIM_TICK_RETAIN: u64 = 120;
+
 #[reducer]
 pub fn tick_trigger(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String> {
     if ctx.sender() != ctx.identity() {
@@ -55,12 +70,53 @@ pub fn tick_trigger(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(),
         .max_by_key(|t| t.tick_id)
         .ok_or("No tick found")?;
 
-    let next_tick_id = current.tick_id + 1;
+    let current_max = current.tick_id;
+
+    // Backpressure guard: skip inserting a new tick if the simulation worker
+    // has not committed recent ticks. This prevents sim_tick from accumulating
+    // faster than the worker can consume when it is slow or disconnected.
+    //
+    // Guard is only active once a worker has committed at least one tick
+    // (last_committed_tick > 0).  Before that — clean deploy, hot-reload after a
+    // schema migration that zero-initialises the field, or a fresh server with no
+    // worker yet — we let ticks flow freely.  The sim_tick table is already bounded
+    // by the SIM_TICK_RETAIN pruning below, so unbounded growth is not a concern.
+    let last_committed = ctx.db.module_config().key().find(0)
+        .map(|c| c.last_committed_tick)
+        .unwrap_or(0);
+
+    if last_committed > 0 {
+        let backlog = current_max.saturating_sub(last_committed);
+        if backlog > BACKLOG_LIMIT {
+            log::warn!(
+                "tick backpressure: backlog={} (limit={}) last_committed={} — skipping tick {}",
+                backlog, BACKLOG_LIMIT, last_committed, current_max + 1
+            );
+            return Ok(());
+        }
+    }
+
+    let next_tick_id = current_max + 1;
 
     ctx.db.sim_tick().insert(SimTick {
         tick_id: next_tick_id,
         timestamp_us: ctx.timestamp.to_micros_since_unix_epoch(),
     });
+
+    // Prune old sim_tick rows to cap table size.
+    // Keeps the last SIM_TICK_RETAIN rows so a restarting coordinator can still
+    // seed last_processed_tick = MAX(sim_tick) without loading the full history.
+    if next_tick_id > SIM_TICK_RETAIN {
+        let cutoff = next_tick_id - SIM_TICK_RETAIN;
+        let to_delete: Vec<u64> = ctx.db.sim_tick()
+            .iter()
+            .filter(|t| t.tick_id < cutoff)
+            .map(|t| t.tick_id)
+            .collect();
+        for id in to_delete {
+            ctx.db.sim_tick().tick_id().delete(&id);
+        }
+    }
 
     Ok(())
 }
@@ -186,7 +242,60 @@ pub fn spawn_player(ctx: &ReducerContext) -> Result<(), String> {
     log::info!("Player spawned: entity_id={}, identity={:?}", eid, caller);
     Ok(())
 }
+// ── NPC Spawning ────────────────────────────────────────────────
+// Spawn a test NPC at an explicit position. Admin or trusted-worker only.
+// Used for smoke-testing the combat path (player Slash → NPC damage → death).
 
+#[reducer]
+pub fn spawn_npc(
+    ctx: &ReducerContext,
+    pos_x: f32,
+    pos_y: f32,
+    pos_z: f32,
+    max_hp: f32,
+) -> Result<(), String> {
+    if !is_trusted_caller(ctx) && !is_module_admin(ctx) {
+        return Err("spawn_npc may only be called by admin or a trusted worker".into());
+    }
+
+    let current_tick = ctx.db.sim_tick().iter()
+        .max_by_key(|t| t.tick_id)
+        .map(|t| t.tick_id)
+        .unwrap_or(0);
+
+    let entity = ctx.db.entity().insert(Entity {
+        entity_id: 0,
+        kind: EntityKind::Npc,
+        state: EntityState::Spawning,
+        spawned_at_tick: current_tick,
+        owner_identity: None,
+    });
+    let eid = entity.entity_id;
+
+    ctx.db.entity_transform().insert(EntityTransform {
+        entity_id: eid,
+        pos_x, pos_y, pos_z,
+        rot_x: 0.0, rot_y: 0.0, rot_z: 0.0, rot_w: 1.0,
+        vel_x: 0.0, vel_y: 0.0, vel_z: 0.0,
+        angvel_x: 0.0, angvel_y: 0.0, angvel_z: 0.0,
+        last_tick: current_tick,
+    });
+
+    ctx.db.entity_health().insert(EntityHealth {
+        entity_id: eid,
+        hp: max_hp,
+        max_hp,
+    });
+
+    ctx.db.entity_region().insert(EntityRegion {
+        entity_id: eid,
+        region_x: 0,
+        region_z: 0,
+    });
+
+    log::info!("NPC spawned: entity_id={} pos=({},{},{}) max_hp={}", eid, pos_x, pos_y, pos_z, max_hp);
+    Ok(())
+}
 // ── Commit Tick Results ─────────────────────────────────────────────
 // Called by the simulation worker (external process) to commit
 // authoritative results back to SpacetimeDB.
@@ -196,6 +305,15 @@ pub fn spawn_player(ctx: &ReducerContext) -> Result<(), String> {
 // pass through reducers.
 //
 // Per spec: verify caller identity for trusted-only reducers.
+
+/// Check if the caller is the module admin (the identity that published the module).
+fn is_module_admin(ctx: &ReducerContext) -> bool {
+    if ctx.sender() == ctx.identity() {
+        return true;
+    }
+    ctx.db.module_config().key().find(0)
+        .is_some_and(|cfg| ctx.sender() == cfg.admin)
+}
 
 /// Check if the caller is the module itself or a registered simulation worker.
 fn is_trusted_caller(ctx: &ReducerContext) -> bool {
@@ -298,6 +416,17 @@ pub fn commit_tick_results(
         });
     }
 
+    // Advance the last_committed_tick cursor used by tick_trigger's backpressure guard.
+    // Only update if this commit is actually moving the cursor forward (guards against
+    // out-of-order or replayed commits, though the trusted-worker check above makes
+    // those unlikely).
+    if let Some(mut cfg) = ctx.db.module_config().key().find(0) {
+        if tick_id > cfg.last_committed_tick {
+            cfg.last_committed_tick = tick_id;
+            ctx.db.module_config().key().update(cfg);
+        }
+    }
+
     Ok(())
 }
 
@@ -355,8 +484,8 @@ pub struct RegionUpdate {
 
 #[reducer]
 pub fn register_worker(ctx: &ReducerContext, worker_identity: spacetimedb::Identity) -> Result<(), String> {
-    if ctx.sender() != ctx.identity() {
-        return Err("register_worker may only be invoked by the module owner".into());
+    if !is_module_admin(ctx) {
+        return Err("register_worker may only be invoked by the module admin".into());
     }
     if ctx.db.trusted_worker().worker_identity().find(&worker_identity).is_some() {
         return Err("Worker already registered".into());

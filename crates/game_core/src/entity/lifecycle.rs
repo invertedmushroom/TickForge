@@ -2,8 +2,8 @@ use game_protocol::entity_id::EntityId;
 use game_protocol::tick::TickId;
 use serde::{Deserialize, Serialize};
 
-// EntityKind and EntityState are canonical shared types from game_schema.
-pub use game_schema::{EntityKind, EntityState};
+// EntityKind, EntityState, and NpcAiState are canonical shared types from game_schema.
+pub use game_schema::{EntityKind, EntityState, NpcAiState};
 
 /// Minimal entity metadata tracked by the simulation.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

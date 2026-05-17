@@ -3,7 +3,12 @@ use rapier3d::math::{Pose, Vector};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use game_protocol::entity_id::EntityId;
-use game_core::physics_backend::PhysicsBackend;
+use game_schema::EntityKind;
+use game_core::physics_backend::{
+    ColliderKind,
+    CollisionEvent as GameCollisionEvent,
+    PhysicsBackend,
+};
 use super::collision_groups;
 
 /// Wraps the full Rapier physics simulation state.
@@ -42,15 +47,12 @@ pub struct PhysicsWorld {
     // Entity ↔ Rapier handle mapping
     entity_to_body: HashMap<EntityId, RigidBodyHandle>,
     body_to_entity: HashMap<RigidBodyHandle, EntityId>,
-}
 
-/// A collision event resolved to entity IDs.
-#[derive(Clone, Debug)]
-pub struct EntityCollisionEvent {
-    pub entity1: EntityId,
-    pub entity2: EntityId,
-    pub started: bool,
-    pub is_sensor: bool,
+    // Collider metadata — tracks the role of every collider
+    collider_kinds: HashMap<ColliderHandle, ColliderKind>,
+    // Game-level opaque sensor handles: u64 → ColliderHandle.
+    sensor_handle_counter: u64,
+    sensor_handles: HashMap<u64, ColliderHandle>,
 }
 
 /// Result of a raycast query.
@@ -91,6 +93,9 @@ impl PhysicsWorld {
             contact_force_recv,
             entity_to_body: HashMap::new(),
             body_to_entity: HashMap::new(),
+            collider_kinds: HashMap::new(),
+            sensor_handle_counter: 0,
+            sensor_handles: HashMap::new(),
         }
     }
 
@@ -118,15 +123,19 @@ impl PhysicsWorld {
     }
 
     /// Drain all collision events from the last step, resolved to entity IDs.
-    pub fn drain_collision_events(&self) -> Vec<EntityCollisionEvent> {
+    pub fn drain_collision_events(&self) -> Vec<GameCollisionEvent> {
         let mut events = Vec::new();
         while let Ok(event) = self.collision_recv.try_recv() {
-            let entity1 = self.entity_for_collider(event.collider1());
-            let entity2 = self.entity_for_collider(event.collider2());
+            let c1 = event.collider1();
+            let c2 = event.collider2();
+            let entity1 = self.entity_for_collider(c1);
+            let entity2 = self.entity_for_collider(c2);
             if let (Some(e1), Some(e2)) = (entity1, entity2) {
-                events.push(EntityCollisionEvent {
+                events.push(GameCollisionEvent {
                     entity1: e1,
                     entity2: e2,
+                    kind1: self.kind_for_collider(c1),
+                    kind2: self.kind_for_collider(c2),
                     started: event.started(),
                     is_sensor: event.sensor(),
                 });
@@ -149,6 +158,16 @@ impl PhysicsWorld {
         let collider = self.colliders.get(collider_handle)?;
         let body_handle = collider.parent()?;
         self.body_to_entity.get(&body_handle).copied()
+    }
+
+    /// Resolve a collider handle to its `ColliderKind`.
+    /// Defaults to `Body` for colliders that were never registered
+    /// (e.g. environment / legacy bodies).
+    fn kind_for_collider(&self, handle: ColliderHandle) -> ColliderKind {
+        self.collider_kinds
+            .get(&handle)
+            .copied()
+            .unwrap_or(ColliderKind::Body)
     }
 
     /// Get a QueryPipeline for scene queries, borrowing from the broad phase.
@@ -174,8 +193,9 @@ impl PhysicsWorld {
         let collider = ColliderBuilder::cuboid(100.0, 0.1, 100.0)
             .collision_groups(collision_groups::environment_groups())
             .build();
-        self.colliders
+        let ch = self.colliders
             .insert_with_parent(collider, body_handle, &mut self.bodies);
+        self.collider_kinds.insert(ch, ColliderKind::Body);
 
         self.entity_to_body.insert(entity_id, body_handle);
         self.body_to_entity.insert(body_handle, entity_id);
@@ -184,6 +204,7 @@ impl PhysicsWorld {
     }
 
     /// Add a dynamic sphere body at the given position.
+    /// Also attaches a hurtbox sensor of the same radius.
     pub fn add_dynamic_sphere(
         &mut self,
         entity_id: EntityId,
@@ -205,8 +226,19 @@ impl PhysicsWorld {
             .collision_groups(groups)
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .build();
-        self.colliders
+        let ch = self.colliders
             .insert_with_parent(collider, body_handle, &mut self.bodies);
+        self.collider_kinds.insert(ch, ColliderKind::Body);
+
+        // Hurtbox sensor — same shape, sensor-only, hurtbox collision group.
+        let hurtbox = ColliderBuilder::ball(radius)
+            .sensor(true)
+            .collision_groups(collision_groups::skill_hurtbox_groups())
+            .active_events(ActiveEvents::COLLISION_EVENTS)
+            .build();
+        let hch = self.colliders
+            .insert_with_parent(hurtbox, body_handle, &mut self.bodies);
+        self.collider_kinds.insert(hch, ColliderKind::Hurtbox);
 
         self.entity_to_body.insert(entity_id, body_handle);
         self.body_to_entity.insert(body_handle, entity_id);
@@ -215,6 +247,7 @@ impl PhysicsWorld {
     }
 
     /// Add a dynamic capsule body (useful for player/NPC characters).
+    /// Also attaches a hurtbox sensor of the same capsule shape.
     pub fn add_dynamic_capsule(
         &mut self,
         entity_id: EntityId,
@@ -236,8 +269,19 @@ impl PhysicsWorld {
             .collision_groups(groups)
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .build();
-        self.colliders
+        let ch = self.colliders
             .insert_with_parent(collider, body_handle, &mut self.bodies);
+        self.collider_kinds.insert(ch, ColliderKind::Body);
+
+        // Hurtbox sensor — same capsule shape, sensor-only.
+        let hurtbox = ColliderBuilder::capsule_y(half_height, radius)
+            .sensor(true)
+            .collision_groups(collision_groups::skill_hurtbox_groups())
+            .active_events(ActiveEvents::COLLISION_EVENTS)
+            .build();
+        let hch = self.colliders
+            .insert_with_parent(hurtbox, body_handle, &mut self.bodies);
+        self.collider_kinds.insert(hch, ColliderKind::Hurtbox);
 
         self.entity_to_body.insert(entity_id, body_handle);
         self.body_to_entity.insert(body_handle, entity_id);
@@ -247,6 +291,7 @@ impl PhysicsWorld {
 
     /// Add a kinematic body (server-controlled movement, not physics-driven).
     /// Used for: flight, scripted movement, elevators.
+    /// Also attaches a hurtbox sensor of the same capsule shape.
     pub fn add_kinematic_capsule(
         &mut self,
         entity_id: EntityId,
@@ -261,12 +306,31 @@ impl PhysicsWorld {
             .build();
         let body_handle = self.bodies.insert(body);
 
+        // Include KINEMATIC_KINEMATIC so sensor hitboxes (attached to a kinematic player body)
+        // can register contacts against this kinematic body collider.
+        // Rapier defaults exclude kinematic-kinematic pairs — without this, skill hitboxes
+        // fired by kinematic player bodies never detect kinematic NPC bodies.
+        let active_types = ActiveCollisionTypes::default() | ActiveCollisionTypes::KINEMATIC_KINEMATIC;
         let collider = ColliderBuilder::capsule_y(half_height, radius)
             .collision_groups(groups)
             .active_events(ActiveEvents::COLLISION_EVENTS)
+            .active_collision_types(active_types)
             .build();
-        self.colliders
+        let ch = self.colliders
             .insert_with_parent(collider, body_handle, &mut self.bodies);
+        self.collider_kinds.insert(ch, ColliderKind::Body);
+
+        // Hurtbox sensor — same capsule shape, sensor-only.
+        // Also needs KINEMATIC_KINEMATIC for the same reason as the body collider above.
+        let hurtbox = ColliderBuilder::capsule_y(half_height, radius)
+            .sensor(true)
+            .collision_groups(collision_groups::skill_hurtbox_groups())
+            .active_events(ActiveEvents::COLLISION_EVENTS)
+            .active_collision_types(active_types)
+            .build();
+        let hch = self.colliders
+            .insert_with_parent(hurtbox, body_handle, &mut self.bodies);
+        self.collider_kinds.insert(hch, ColliderKind::Hurtbox);
 
         self.entity_to_body.insert(entity_id, body_handle);
         self.body_to_entity.insert(body_handle, entity_id);
@@ -283,22 +347,29 @@ impl PhysicsWorld {
         shape: SharedShape,
         offset: Pose,
         groups: InteractionGroups,
+        kind: ColliderKind,
     ) -> Option<ColliderHandle> {
         let body_handle = *self.entity_to_body.get(&entity_id)?;
 
+        // Skill hitboxes must detect kinematic NPC bodies — include KINEMATIC_KINEMATIC
+        // so contacts fire even when both the caster and target are kinematic bodies.
+        let active_types = ActiveCollisionTypes::default() | ActiveCollisionTypes::KINEMATIC_KINEMATIC;
         let collider = ColliderBuilder::new(shape)
             .position(offset)
             .sensor(true)
             .collision_groups(groups)
             .active_events(ActiveEvents::COLLISION_EVENTS)
+            .active_collision_types(active_types)
             .build();
         let handle = self.colliders
             .insert_with_parent(collider, body_handle, &mut self.bodies);
+        self.collider_kinds.insert(handle, kind);
         Some(handle)
     }
 
     /// Remove a specific collider (e.g. a skill hitbox sensor).
     pub fn remove_collider(&mut self, handle: ColliderHandle) {
+        self.collider_kinds.remove(&handle);
         self.colliders.remove(handle, &mut self.islands, &mut self.bodies, true);
     }
 
@@ -308,6 +379,20 @@ impl PhysicsWorld {
     pub fn remove_entity(&mut self, entity_id: EntityId) -> bool {
         if let Some(body_handle) = self.entity_to_body.remove(&entity_id) {
             self.body_to_entity.remove(&body_handle);
+            // Clean up collider metadata for all colliders attached to this body.
+            // Rapier's body removal cascades to colliders, so we mirror that.
+            let attached: Vec<ColliderHandle> = self.collider_kinds
+                .keys()
+                .filter(|ch| {
+                    self.colliders.get(**ch)
+                        .and_then(|c| c.parent())
+                        .map_or(false, |p| p == body_handle)
+                })
+                .copied()
+                .collect();
+            for ch in attached {
+                self.collider_kinds.remove(&ch);
+            }
             self.bodies.remove(
                 body_handle,
                 &mut self.islands,
@@ -432,6 +517,9 @@ impl PhysicsWorld {
 }
 
 impl PhysicsBackend for PhysicsWorld {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+
     fn step(&mut self, _dt: f32) {
         // dt is already baked into IntegrationParameters; call Rapier step.
         self.step();
@@ -449,6 +537,92 @@ impl PhysicsBackend for PhysicsWorld {
                 Some((*eid, super::conversions::body_to_transform(body)))
             })
             .collect()
+    }
+
+    fn drain_collision_events(&mut self) -> Vec<GameCollisionEvent> {
+        // Delegate to the inherent method (same return type now).
+        PhysicsWorld::drain_collision_events(self)
+    }
+
+    fn remove_entity(&mut self, entity_id: EntityId) -> bool {
+        // Delegate to the inherent method via UFCS.
+        PhysicsWorld::remove_entity(self, entity_id)
+    }
+
+    fn set_kinematic_position(
+        &mut self,
+        entity_id: EntityId,
+        position: game_protocol::types::Vec3f,
+    ) -> bool {
+        let v = Vector::new(position.x, position.y, position.z);
+        PhysicsWorld::set_kinematic_position(self, entity_id, v)
+    }
+
+    fn set_linear_velocity(
+        &mut self,
+        entity_id: EntityId,
+        velocity: game_protocol::types::Vec3f,
+    ) -> bool {
+        if let Some(handle) = self.entity_to_body.get(&entity_id) {
+            if let Some(body) = self.bodies.get_mut(*handle) {
+                body.set_linvel(Vector::new(velocity.x, velocity.y, velocity.z), true);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn spawn_sensor(
+        &mut self,
+        entity_id: EntityId,
+        shape: game_core::physics_backend::SensorShape,
+        offset: game_protocol::types::Vec3f,
+        kind: ColliderKind,
+    ) -> Option<u64> {
+        use game_core::physics_backend::SensorShape;
+        let rapier_shape: SharedShape = match shape {
+            SensorShape::Sphere { radius } => SharedShape::ball(radius),
+            SensorShape::Capsule { half_height, radius } => SharedShape::capsule_y(half_height, radius),
+        };
+        let groups = match kind {
+            ColliderKind::Hitbox(_) => collision_groups::skill_hitbox_groups(),
+            ColliderKind::Hurtbox  => collision_groups::skill_hurtbox_groups(),
+            _                      => collision_groups::skill_hitbox_groups(),
+        };
+        let pose = Pose::translation(offset.x, offset.y, offset.z);
+        let handle = self.add_sensor_to_entity(entity_id, rapier_shape, pose, groups, kind)?;
+        let opaque = self.sensor_handle_counter;
+        self.sensor_handle_counter += 1;
+        self.sensor_handles.insert(opaque, handle);
+        Some(opaque)
+    }
+
+    fn remove_sensor(&mut self, handle: u64) {
+        if let Some(col_handle) = self.sensor_handles.remove(&handle) {
+            self.remove_collider(col_handle);
+        }
+    }
+
+    fn spawn_character_body(
+        &mut self,
+        entity_id: EntityId,
+        position: game_protocol::types::Vec3f,
+        kind: EntityKind,
+    ) -> bool {
+        if self.entity_to_body.contains_key(&entity_id) {
+            return false;
+        }
+        let pos = Vector::new(position.x, position.y, position.z);
+        // Standard character capsule: half_height=0.5, radius=0.3.
+        // Select the correct collision layer based on entity kind (bug #14 fix).
+        let groups = match kind {
+            EntityKind::Player => collision_groups::player_body_groups(),
+            EntityKind::Npc | EntityKind::Boss => collision_groups::npc_body_groups(),
+            // Projectile/Hazard bodies are not created via this path.
+            EntityKind::Projectile | EntityKind::Hazard => collision_groups::player_body_groups(),
+        };
+        self.add_kinematic_capsule(entity_id, pos, 0.5, 0.3, groups);
+        true
     }
 }
 
