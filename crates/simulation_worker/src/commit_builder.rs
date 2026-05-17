@@ -95,9 +95,6 @@ pub enum CommitCombatEventKind {
     BlockStart,
     BlockEnd,
     Damage(CommitDamageData),
-    Healed {
-        amount: f32,
-    },
     SkillHit(u32),
     BuffApplied(CommitBuffAppliedData),
     BuffExpired(u32),
@@ -113,19 +110,9 @@ pub enum CommitCombatEventKind {
         ability_id: u32,
         damage_taken: f32,
     },
-    TelegraphWarning {
+    LockOnWarning {
         target: u64,
         impact_tick: u64,
-    },
-    LockOnAcquired,
-    LockOnSessionStarted {
-        ability_id: u32,
-    },
-    LockOnCanceled {
-        target: u64,
-    },
-    LockOnFired {
-        targets: Vec<u64>,
     },
     ProjectileLaunched {
         execution_id: u64,
@@ -149,14 +136,6 @@ pub enum CommitCombatEventKind {
     },
     SkillObjectRemoved {
         execution_id: u64,
-    },
-    Teleported {
-        from_x: f32,
-        from_y: f32,
-        from_z: f32,
-        to_x: f32,
-        to_y: f32,
-        to_z: f32,
     },
     Knockback {
         force: f32,
@@ -226,8 +205,7 @@ pub struct CommitWorldEvent {
     pub event_kind: CommitWorldEventKind,
 }
 
-/// Per-instance buff state for persistence. Only runtime-varying fields;
-/// static template data is reconstructed from `BuffRegistry` at rehydration.
+/// One buff instance for persistence. Mirrors the `active_buff` DB table.
 #[derive(Clone, Debug)]
 pub struct CommitBuff {
     pub entity_id: u64,
@@ -235,10 +213,23 @@ pub struct CommitBuff {
     pub source_entity: u64,
     pub stacks: u32,
     pub expires_at_tick: Option<u64>,
+    // Modifier fields (flat)
+    pub mod_damage_out_pct: Option<f32>,
+    pub mod_damage_in_pct: Option<f32>,
+    pub mod_cooldown_reduce_pct: Option<f32>,
+    pub mod_speed_pct: Option<f32>,
     pub mod_ai_override_kind: Option<u8>,
     pub mod_ai_override_target: Option<u64>,
+    pub mod_root: Option<bool>,
     pub mod_stealth: Option<bool>,
-    pub last_dot_tick: Option<u64>,
+}
+
+/// One threat entry for persistence. Mirrors the `threat_entry` DB table.
+#[derive(Clone, Debug)]
+pub struct CommitThreat {
+    pub npc_entity: u64,
+    pub source_entity: u64,
+    pub threat: f32,
 }
 
 /// NPC AI state for persistence. Mirrors the `npc_state` DB table.
@@ -257,14 +248,6 @@ pub struct CommitDirectorSpawn {
     pub pos_x: f32,
     pub pos_y: f32,
     pub pos_z: f32,
-    pub layer: u32,
-}
-
-/// Interactable state change for commit.
-#[derive(Clone, Debug)]
-pub struct CommitInteractableUpdate {
-    pub entity_id: u64,
-    pub new_state: game_core::sim_state::SimInteractState,
 }
 
 /// Complete marshalled payload for one tick commit.
@@ -287,18 +270,15 @@ pub struct CommitPackage {
     /// Entity IDs whose buff rows should be fully replaced this tick.
     /// Includes entities with zero buffs so stale rows are cleared when all buffs expire.
     pub buff_cleared_entity_ids: Vec<u64>,
+    /// Aggro-holder snapshot — delete-all-then-insert per changed NPC in the reducer.
+    pub threat_updates: Vec<CommitThreat>,
+    /// NPC/Boss entity IDs whose threat rows should be fully replaced this tick.
+    /// Includes entities with zero threat so stale rows are cleared when aggro drops.
+    pub threat_cleared_entity_ids: Vec<u64>,
     /// NPC AI state snapshot — upsert by entity PK in the reducer.
     pub npc_state_updates: Vec<CommitNpcState>,
     /// Entities spawned by the world director that need DB rows created.
     pub director_spawns: Vec<CommitDirectorSpawn>,
-    /// Interactable state changes committed inline via `commit_tick_results`.
-    pub interactable_updates: Vec<CommitInteractableUpdate>,
-    /// Boss phase transitions from encounter executor.
-    /// Each entry is (boss_entity_id, phase_number, entered_at_tick).
-    pub boss_phase_updates: Vec<(u64, u32, u64)>,
-    /// Zone counter increments from encounter executor / combat system.
-    /// Each entry is (layer, region_x, region_z, counter_name, delta).
-    pub zone_counter_deltas: Vec<(u32, i32, i32, String, f64)>,
 }
 
 /// Build a `CommitPackage` from a `TickResult` and consumed intent IDs.
@@ -367,11 +347,27 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
                     source_entity: b.source.0,
                     stacks: b.stacks,
                     expires_at_tick: b.expires_at.map(|t| t.0),
+                    mod_damage_out_pct: b.modifiers.damage_out_pct,
+                    mod_damage_in_pct: b.modifiers.damage_in_pct,
+                    mod_cooldown_reduce_pct: b.modifiers.cooldown_reduce_pct,
+                    mod_speed_pct: b.modifiers.speed_pct,
                     mod_ai_override_kind: ai_kind,
                     mod_ai_override_target: ai_target,
+                    mod_root: b.modifiers.root,
                     mod_stealth: b.modifiers.stealth,
-                    last_dot_tick: b.last_dot_tick.map(|t| t.0),
                 }
+            })
+        })
+        .collect();
+
+    let threat_updates = result
+        .threat_updates
+        .iter()
+        .flat_map(|(eid, entries)| {
+            entries.iter().map(move |e| CommitThreat {
+                npc_entity: eid.0,
+                source_entity: e.source.0,
+                threat: e.threat,
             })
         })
         .collect();
@@ -388,12 +384,15 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
 
     let mut buff_cleared_entity_ids: Vec<u64> =
         result.buff_updates.iter().map(|(eid, _)| eid.0).collect();
+    let mut threat_cleared_entity_ids: Vec<u64> =
+        result.threat_updates.iter().map(|(eid, _)| eid.0).collect();
 
-    // Removed entities are excluded from buff update snapshots, but their
-    // stale DB rows still need to be deleted. Include them in the cleared list.
+    // Removed entities are excluded from buff/threat update snapshots, but their
+    // stale DB rows still need to be deleted. Include them in the cleared lists.
     for (eid, state) in &result.entity_state_updates {
         if *state == game_schema::EntityState::Removed {
             buff_cleared_entity_ids.push(eid.0);
+            threat_cleared_entity_ids.push(eid.0);
         }
     }
 
@@ -417,16 +416,6 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
             pos_x: s.position.x,
             pos_y: s.position.y,
             pos_z: s.position.z,
-            layer: s.layer,
-        })
-        .collect();
-
-    let interactable_updates = result
-        .interactable_updates
-        .iter()
-        .map(|(eid, new_state)| CommitInteractableUpdate {
-            entity_id: eid.0,
-            new_state: *new_state,
         })
         .collect();
 
@@ -441,11 +430,10 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
         region_updates,
         buff_updates,
         buff_cleared_entity_ids,
+        threat_updates,
+        threat_cleared_entity_ids,
         npc_state_updates,
         director_spawns,
-        interactable_updates,
-        boss_phase_updates: result.boss_phase_updates,
-        zone_counter_deltas: result.zone_counter_deltas,
     }
 }
 
@@ -561,7 +549,7 @@ fn classify_events(events: &[SimEvent]) -> (Vec<CommitCombatEvent>, Vec<CommitWo
                     source_entity: source.0,
                     target_entity: target.0,
                     event_sequence: e.event_sequence,
-                    event_kind: CommitCombatEventKind::TelegraphWarning {
+                    event_kind: CommitCombatEventKind::LockOnWarning {
                         target: target.0,
                         impact_tick: *impact_tick,
                     },
@@ -649,59 +637,6 @@ fn classify_events(events: &[SimEvent]) -> (Vec<CommitCombatEvent>, Vec<CommitWo
                     }),
                 });
             }
-            EventPayload::Healed { amount, source } => {
-                combat_events.push(CommitCombatEvent {
-                    source_entity: source.0,
-                    target_entity: e.entity_id.0,
-                    event_sequence: e.event_sequence,
-                    event_kind: CommitCombatEventKind::Healed { amount: *amount },
-                });
-            }
-            EventPayload::LockOnSessionStarted { source, ability_id } => {
-                combat_events.push(CommitCombatEvent {
-                    source_entity: source.0,
-                    target_entity: 0,
-                    event_sequence: e.event_sequence,
-                    event_kind: CommitCombatEventKind::LockOnSessionStarted {
-                        ability_id: *ability_id,
-                    },
-                });
-            }
-            EventPayload::LockOnCanceled { source, target } => {
-                combat_events.push(CommitCombatEvent {
-                    source_entity: source.0,
-                    target_entity: target.0,
-                    event_sequence: e.event_sequence,
-                    event_kind: CommitCombatEventKind::LockOnCanceled {
-                        target: target.0,
-                    },
-                });
-            }
-            EventPayload::LockOnFired { source, targets } => {
-                combat_events.push(CommitCombatEvent {
-                    source_entity: source.0,
-                    target_entity: 0,
-                    event_sequence: e.event_sequence,
-                    event_kind: CommitCombatEventKind::LockOnFired {
-                        targets: targets.iter().map(|target| target.0).collect(),
-                    },
-                });
-            }
-            EventPayload::Teleported { entity, from, to } => {
-                combat_events.push(CommitCombatEvent {
-                    source_entity: entity.0,
-                    target_entity: entity.0,
-                    event_sequence: e.event_sequence,
-                    event_kind: CommitCombatEventKind::Teleported {
-                        from_x: from.x,
-                        from_y: from.y,
-                        from_z: from.z,
-                        to_x: to.x,
-                        to_y: to.y,
-                        to_z: to.z,
-                    },
-                });
-            }
             // Internal pipeline events — not committed to DB.
             EventPayload::Jumped
             | EventPayload::EntitySpawned
@@ -710,16 +645,12 @@ fn classify_events(events: &[SimEvent]) -> (Vec<CommitCombatEvent>, Vec<CommitWo
             | EventPayload::HitboxRemoved { .. }
             | EventPayload::CooldownReady { .. }
             | EventPayload::TickBoundary
-            | EventPayload::CompensationApplied { .. }
-            => {}
-            EventPayload::LockOnWarning { source, target } => {
-                combat_events.push(CommitCombatEvent {
-                    source_entity: source.0,
-                    target_entity: target.0,
-                    event_sequence: e.event_sequence,
-                    event_kind: CommitCombatEventKind::LockOnAcquired,
-                });
-            }
+            // Lock-on session events — not yet in SpacetimeDB schema; TODO: add schema entries.
+            | EventPayload::LockOnSessionStarted { .. }
+            | EventPayload::LockOnCanceled { .. }
+            | EventPayload::LockOnFired { .. }
+            | EventPayload::LockOnWarning { .. }
+            | EventPayload::Teleported { .. } => {}
             // Weapon swap events — committed as combat events.
             EventPayload::WeaponSwapped { new_set } => {
                 combat_events.push(CommitCombatEvent {
@@ -928,12 +859,10 @@ mod tests {
             ],
             health_updates: vec![(EntityId(100), 75.0, 100.0)],
             buff_updates: Vec::new(),
+            threat_updates: Vec::new(),
             npc_state_updates: Vec::new(),
             region_updates: Vec::new(),
             director_spawns: Vec::new(),
-            interactable_updates: Vec::new(),
-            boss_phase_updates: Vec::new(),
-            zone_counter_deltas: Vec::new(),
         }
     }
 
@@ -1235,12 +1164,10 @@ mod tests {
             entity_state_updates: Vec::new(),
             health_updates: Vec::new(),
             buff_updates: Vec::new(),
+            threat_updates: Vec::new(),
             npc_state_updates: Vec::new(),
             region_updates: Vec::new(),
             director_spawns: Vec::new(),
-            interactable_updates: Vec::new(),
-            boss_phase_updates: Vec::new(),
-            zone_counter_deltas: Vec::new(),
         };
         let pkg = build(result, Vec::new());
 
@@ -1252,53 +1179,5 @@ mod tests {
         assert!(pkg.consumed_intent_ids.is_empty());
         assert!(pkg.entity_state_updates.is_empty());
         assert!(pkg.region_updates.is_empty());
-    }
-
-    #[test]
-    fn build_marshals_director_spawn_with_layer() {
-        use game_core::director::DirectorSpawn;
-
-        let result = TickResult {
-            tick_id: TickId(50),
-            transforms: Vec::new(),
-            events: Vec::new(),
-            summary: Default::default(),
-            entity_state_updates: Vec::new(),
-            health_updates: Vec::new(),
-            buff_updates: Vec::new(),
-            npc_state_updates: Vec::new(),
-            region_updates: Vec::new(),
-            director_spawns: vec![
-                DirectorSpawn {
-                    kind: game_schema::EntityKind::Npc,
-                    max_hp: 500.0,
-                    position: Vec3f { x: 10.0, y: 1.0, z: -5.0 },
-                    layer: 105,
-                },
-                DirectorSpawn {
-                    kind: game_schema::EntityKind::Npc,
-                    max_hp: 100.0,
-                    position: Vec3f { x: 0.0, y: 0.0, z: 0.0 },
-                    layer: 0,
-                },
-            ],
-            interactable_updates: Vec::new(),
-            boss_phase_updates: Vec::new(),
-            zone_counter_deltas: Vec::new(),
-        };
-        let pkg = build(result, Vec::new());
-
-        assert_eq!(pkg.director_spawns.len(), 2);
-
-        let s0 = &pkg.director_spawns[0];
-        assert_eq!(s0.kind, game_schema::EntityKind::Npc);
-        assert_eq!(s0.max_hp, 500.0);
-        assert_eq!(s0.pos_x, 10.0);
-        assert_eq!(s0.pos_y, 1.0);
-        assert_eq!(s0.pos_z, -5.0);
-        assert_eq!(s0.layer, 105);
-
-        let s1 = &pkg.director_spawns[1];
-        assert_eq!(s1.layer, 0);
     }
 }

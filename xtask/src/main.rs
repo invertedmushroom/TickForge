@@ -42,24 +42,20 @@ enum TopLevel {
 #[derive(Subcommand)]
 enum DevCmd {
     Server,
-    /// Publish schema and regenerate bindings.
-    /// The WASM module is always built with Cargo's release profile.
     Schema,
     Reset(ResetArgs),
     WorkerRegister(WorkerRegisterArgs),
     Worker(RunWorkerArgs),
-    /// Capture a deterministic replay fixture to a JSON file.
-    CaptureFixture(CaptureFixtureArgs),
-    ClientTest(ClientTestArgs),
-    Client(RunClientArgs),
+    ClientTest(PassthroughArgs),
+    Client(PassthroughArgs),
 }
 
 #[derive(Subcommand)]
 enum BuildCmd {
-    Worker(BuildProfileArgs),
-    Client(BuildProfileArgs),
+    Worker,
+    Client,
     Wasm,
-    All(BuildProfileArgs),
+    All,
 }
 
 #[derive(Subcommand)]
@@ -67,17 +63,7 @@ enum TestCmd {
     Fast,
     Worker,
     Cli,
-    /// Run multi-client integration tests (requires running server + worker)
-    MultiClient,
     Workspace,
-    /// Run the deterministic replay test suite (uses fixtures in crates/simulation_worker/tests/fixtures)
-    Replay(BuildProfileArgs),
-}
-
-#[derive(Args)]
-struct BuildProfileArgs {
-    #[arg(long)]
-    release: bool,
 }
 
 #[derive(Args)]
@@ -94,9 +80,6 @@ struct ResetArgs {
 struct WorkerRegisterArgs {
     #[arg(long)]
     seed_npc: bool,
-
-    #[arg(long)]
-    release: bool,
 }
 
 #[derive(Args)]
@@ -108,28 +91,7 @@ struct RunWorkerArgs {
 }
 
 #[derive(Args)]
-struct CaptureFixtureArgs {
-    #[arg(long, default_value = "crates/simulation_worker/tests/fixtures/combat_lifecycle_v1.generated.json")]
-    out: String,
-
-    #[arg(long)]
-    release: bool,
-}
-
-#[derive(Args)]
-struct ClientTestArgs {
-    #[arg(long)]
-    release: bool,
-
-    #[arg(last = true)]
-    args: Vec<String>,
-}
-
-#[derive(Args)]
-struct RunClientArgs {
-    #[arg(long)]
-    release: bool,
-
+struct PassthroughArgs {
     #[arg(last = true)]
     args: Vec<String>,
 }
@@ -150,7 +112,6 @@ fn run_dev(cmd: DevCmd) -> Result<()> {
         DevCmd::Reset(args) => dev_reset(args),
         DevCmd::WorkerRegister(args) => dev_worker_register(args),
         DevCmd::Worker(args) => dev_worker(args),
-        DevCmd::CaptureFixture(args) => dev_capture_fixture(args),
         DevCmd::ClientTest(args) => dev_client_test(args),
         DevCmd::Client(args) => dev_client(args),
     }
@@ -158,14 +119,20 @@ fn run_dev(cmd: DevCmd) -> Result<()> {
 
 fn run_build(cmd: BuildCmd) -> Result<()> {
     match cmd {
-        BuildCmd::Worker(args) => run_command(cargo_build_command(
-            ["-p", "simulation_worker", "--features", "connected"],
-            args.release,
-        )),
-        BuildCmd::Client(args) => run_command(cargo_build_command(
-            ["-p", "game_client", "--features", "connected"],
-            args.release,
-        )),
+        BuildCmd::Worker => run_command(cargo_cmd([
+            "build",
+            "-p",
+            "simulation_worker",
+            "--features",
+            "connected",
+        ])),
+        BuildCmd::Client => run_command(cargo_cmd([
+            "build",
+            "-p",
+            "game_client",
+            "--features",
+            "connected",
+        ])),
         BuildCmd::Wasm => run_command(cargo_cmd([
             "build",
             "-p",
@@ -174,14 +141,10 @@ fn run_build(cmd: BuildCmd) -> Result<()> {
             "wasm32-unknown-unknown",
             "--release",
         ])),
-        BuildCmd::All(args) => {
+        BuildCmd::All => {
             run_build(BuildCmd::Wasm)?;
-            run_build(BuildCmd::Worker(BuildProfileArgs {
-                release: args.release,
-            }))?;
-            run_build(BuildCmd::Client(BuildProfileArgs {
-                release: args.release,
-            }))
+            run_build(BuildCmd::Worker)?;
+            run_build(BuildCmd::Client)
         }
     }
 }
@@ -199,18 +162,14 @@ fn run_test(cmd: TestCmd) -> Result<()> {
             "--features",
             "connected",
         ])),
-        TestCmd::Cli => dev_client_test(ClientTestArgs {
-            release: false,
-            args: Vec::new(),
-        }),
-        TestCmd::MultiClient => run_command(cargo_cmd([
+        TestCmd::Cli => run_command(cargo_cmd([
             "run",
             "-p",
             "game_client",
             "--features",
             "connected",
             "--",
-            "--test-multi",
+            "--test",
         ])),
         TestCmd::Workspace => run_command(cargo_cmd([
             "test",
@@ -218,12 +177,6 @@ fn run_test(cmd: TestCmd) -> Result<()> {
             "--exclude",
             "server_module",
         ])),
-        TestCmd::Replay(args) => run_command(cargo_test_command([
-            "-p",
-            "simulation_worker",
-            "--test",
-            "deterministic_replay",
-        ], args.release)),
     }
 }
 
@@ -301,10 +254,8 @@ fn dev_worker_register(args: WorkerRegisterArgs) -> Result<()> {
         bail!("SpacetimeDB is not running. Start it with `cargo xtask dev server`.");
     }
 
-    run_build(BuildCmd::Worker(BuildProfileArgs {
-        release: args.release,
-    }))?;
-    let identity = capture_worker_identity(args.release)?;
+    run_build(BuildCmd::Worker)?;
+    let identity = capture_worker_identity()?;
     println!("Captured worker identity: {identity}");
 
     let id_json = format!(r#"{{"__identity__":"0x{identity}"}}"#);
@@ -359,43 +310,35 @@ fn dev_worker(args: RunWorkerArgs) -> Result<()> {
     run_command(command)
 }
 
-fn dev_client_test(args: ClientTestArgs) -> Result<()> {
-    let mut command = cargo_run_command(
-        ["-p", "game_client", "--features", "connected"],
-        args.release,
-    );
-    command.args(["--", "--test"]);
-    command.args(args.args);
-    run_command(command)
-}
-
-fn dev_client(args: RunClientArgs) -> Result<()> {
-    let mut command = cargo_run_command(
-        ["-p", "game_client_bevy", "--features", "connected"],
-        args.release,
-    );
-    command.arg("--");
-    command.args(args.args);
-    run_command(command)
-}
-
-fn dev_capture_fixture(args: CaptureFixtureArgs) -> Result<()> {
-    let mut command = cargo_test_command([
+fn dev_client_test(args: PassthroughArgs) -> Result<()> {
+    let mut command = cargo_cmd([
+        "run",
         "-p",
-        "simulation_worker",
+        "game_client",
+        "--features",
+        "connected",
+        "--",
         "--test",
-        "deterministic_replay",
-    ],
-    args.release);
-    command.args(["capture_combat_lifecycle_fixture_to_json", "--", "--ignored", "--exact", "--nocapture"]);
-
-    command.env("REPLAY_FIXTURE_OUT", args.out);
+    ]);
+    command.args(args.args);
     run_command(command)
 }
 
-fn capture_worker_identity(release: bool) -> Result<String> {
-    let mut child = cargo_run_command(["-p", "simulation_worker", "--features", "connected"], release)
-        .env("RUST_LOG", "simulation_worker=info")
+fn dev_client(args: PassthroughArgs) -> Result<()> {
+    let mut command = cargo_cmd([
+        "run",
+        "-p",
+        "game_client_bevy",
+        "--features",
+        "connected",
+        "--",
+    ]);
+    command.args(args.args);
+    run_command(command)
+}
+
+fn capture_worker_identity() -> Result<String> {
+    let mut child = cargo_cmd(["run", "-p", "simulation_worker", "--features", "connected"])
         .stderr(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
@@ -456,33 +399,6 @@ fn is_server_up() -> bool {
 
 fn cargo_cmd<const N: usize>(args: [&str; N]) -> Command {
     command("cargo", args)
-}
-
-fn cargo_build_command<const N: usize>(args: [&str; N], release: bool) -> Command {
-    let mut command = cargo_cmd(["build"]);
-    command.args(args);
-    if release {
-        command.arg("--release");
-    }
-    command
-}
-
-fn cargo_run_command<const N: usize>(args: [&str; N], release: bool) -> Command {
-    let mut command = cargo_cmd(["run"]);
-    command.args(args);
-    if release {
-        command.arg("--release");
-    }
-    command
-}
-
-fn cargo_test_command<const N: usize>(args: [&str; N], release: bool) -> Command {
-    let mut command = cargo_cmd(["test"]);
-    command.args(args);
-    if release {
-        command.arg("--release");
-    }
-    command
 }
 
 fn command<const N: usize>(program: &str, args: [&str; N]) -> Command {

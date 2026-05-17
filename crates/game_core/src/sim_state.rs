@@ -183,7 +183,6 @@ pub fn is_ownership_allowed(domain: AuditDomain, subsystem: AuditSubsystem, phas
         AuditDomain::Health => {
             (subsystem == AuditSubsystem::Combat && phase == 6)
                 || (subsystem == AuditSubsystem::StatusEffects && phase == 8)
-                || (subsystem == AuditSubsystem::Controller && phase == 2)
         }
         AuditDomain::Threat => {
             (subsystem == AuditSubsystem::Combat && phase == 6)
@@ -513,41 +512,6 @@ pub struct AiState {
     pub npc_passive: SparseSet<bool>,
     /// No-chase NPCs fight back but don’t move toward the target.
     pub npc_no_chase: SparseSet<bool>,
-    /// Max distance from home before the NPC evades back. 0 = no leash.
-    pub npc_leash_radius: SparseSet<f32>,
-    /// Proximity aggro scan radius. 0 = disabled.
-    pub npc_aggro_radius: SparseSet<f32>,
-}
-
-// ── Interactable runtime state ──────────────────────────────────────
-
-/// Runtime interactable kind (mirrors the DB InteractKind).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SimInteractKind {
-    Switch,
-    Gate,
-    Grab,
-    Chest,
-}
-
-/// Runtime interactable state (mirrors the DB InteractState).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SimInteractState {
-    Idle,
-    Active,
-    /// TODO: no code path transitions to Cooldown yet — add a cooldown timer
-    /// in handle_interact when repeatable interactions are needed.
-    Cooldown,
-}
-
-/// Per-entity interactable info tracked by the simulation.
-// TODO: carry `required_buff` and `required_item` from InteractableConfig
-// so handle_interact can enforce gated interactions.
-#[derive(Clone, Debug)]
-pub struct InteractableInfo {
-    pub kind: SimInteractKind,
-    pub linked_entity: Option<EntityId>,
-    pub state: SimInteractState,
 }
 
 /// Runtime simulation state for one region.
@@ -575,8 +539,6 @@ pub struct SimState {
     /// Per-tick mutation counters (debug/test only).
     #[cfg(any(debug_assertions, test))]
     pub audit: MutationAudit,
-    /// Interactable entity state (entity_id → info). Populated from DB subscription.
-    pub interactables: HashMap<EntityId, InteractableInfo>,
 }
 
 impl SimState {
@@ -595,11 +557,10 @@ impl SimState {
                 loadouts: SparseSet::new(),
             },
             status: StatusState::new(),
-            ai: AiState { npc_ai: SparseSet::new(), home_positions: SparseSet::new(), npc_ability_ids: SparseSet::new(), npc_passive: SparseSet::new(), npc_no_chase: SparseSet::new(), npc_leash_radius: SparseSet::new(), npc_aggro_radius: SparseSet::new() },
+            ai: AiState { npc_ai: SparseSet::new(), home_positions: SparseSet::new(), npc_ability_ids: SparseSet::new(), npc_passive: SparseSet::new(), npc_no_chase: SparseSet::new() },
             stats: StatsStore::new(),
             #[cfg(any(debug_assertions, test))]
             audit: MutationAudit::new(),
-            interactables: HashMap::new(),
         }
     }
 
@@ -618,8 +579,6 @@ impl SimState {
         debug_assert_eq!(self.ai.npc_ability_ids.sparse_len(), n, "npc_ability_ids desync");
         debug_assert_eq!(self.ai.npc_passive.sparse_len(), n, "npc_passive desync");
         debug_assert_eq!(self.ai.npc_no_chase.sparse_len(), n, "npc_no_chase desync");
-        debug_assert_eq!(self.ai.npc_leash_radius.sparse_len(), n, "npc_leash_radius desync");
-        debug_assert_eq!(self.ai.npc_aggro_radius.sparse_len(), n, "npc_aggro_radius desync");
         debug_assert_eq!(self.combat.loadouts.sparse_len(), n, "loadouts desync");
         debug_assert_eq!(self.stats.len(), n, "stats desync");
     }
@@ -638,16 +597,7 @@ impl SimState {
             self.combat.health.reset(idx, max_hp);
             self.status.clear_at(idx);
             self.status.mark_dirty(idx);
-            // Unconditionally clear all sparse components from previous occupant.
-            self.combat.threat_tables.remove(idx);
-            self.ai.npc_ai.remove(idx);
-            self.ai.home_positions.remove(idx);
-            self.ai.npc_ability_ids.remove(idx);
-            self.ai.npc_passive.remove(idx);
-            self.ai.npc_no_chase.remove(idx);
-            self.ai.npc_leash_radius.remove(idx);
-            self.ai.npc_aggro_radius.remove(idx);
-            // Re-insert defaults for NPC/Boss.
+            // SparseSet slots already exist; insert only for NPC/Boss.
             if kind == EntityKind::Npc || kind == EntityKind::Boss {
                 self.combat.threat_tables.insert(idx, ThreatTable::default());
                 self.ai.npc_ai.insert(idx, NpcAiState::Idle);
@@ -675,8 +625,6 @@ impl SimState {
             self.ai.npc_ability_ids.push_slot();
             self.ai.npc_passive.push_slot();
             self.ai.npc_no_chase.push_slot();
-            self.ai.npc_leash_radius.push_slot();
-            self.ai.npc_aggro_radius.push_slot();
             if kind == EntityKind::Npc || kind == EntityKind::Boss {
                 self.combat.threat_tables.insert(idx, ThreatTable::default());
                 self.ai.npc_ai.insert(idx, NpcAiState::Idle);
@@ -721,10 +669,6 @@ impl SimState {
             self.ai.npc_ability_ids.remove(idx);
             self.ai.npc_passive.remove(idx);
             self.ai.npc_no_chase.remove(idx);
-            self.ai.npc_leash_radius.remove(idx);
-            self.ai.npc_aggro_radius.remove(idx);
-            // Clean up interactable info (switches, gates, chests).
-            self.interactables.remove(&id);
             true
         } else {
             false
@@ -993,9 +937,9 @@ mod tests {
 
     #[test]
     fn health_ownership_rejects_non_combat_writer() {
-        // Health may only be written by Combat/6, StatusEffects/8, or Controller/2 (fall damage).
+        // Health may only be written by Combat in phase 6.
         assert!(!is_ownership_allowed(AuditDomain::Health, AuditSubsystem::Lifecycle, 8));
-        assert!( is_ownership_allowed(AuditDomain::Health, AuditSubsystem::Controller, 2));
+        assert!(!is_ownership_allowed(AuditDomain::Health, AuditSubsystem::Controller, 2));
         assert!(!is_ownership_allowed(AuditDomain::Health, AuditSubsystem::Combat, 3));
         assert!(!is_ownership_allowed(AuditDomain::Health, AuditSubsystem::AiDecisions, 7));
     }

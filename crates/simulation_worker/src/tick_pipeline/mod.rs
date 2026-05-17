@@ -9,8 +9,7 @@ pub(super) use game_core::physics_backend::{ColliderKind, PhysicsBackend, Sensor
 pub(super) use game_core::combat::skill::{
     AbilityAction, AbilityParams, AbilityTimeline, AbilityRegistry,
     AbilityExecutionContext, AbilityExecutionId, CastFacingPolicy, ChargingState,
-    ResolvedTargeting, ScheduledAction, ScheduledActionType, SkillShape, TargetFilter,
-    TargetingMode,
+    ResolvedTargeting, ScheduledAction, ScheduledActionType, SkillShape, TargetingMode,
 };
 pub(super) use game_core::director::{DirectorSpawn, DirectorState};
 pub(super) use game_core::entity::entity_index::EntityIndex;
@@ -56,15 +55,6 @@ impl RegionCell {
             region_x: (pos.x / CELL_SIZE).floor() as i32,
             region_z: (pos.z / CELL_SIZE).floor() as i32,
             layer: 0,
-        }
-    }
-
-    /// Compute the grid cell for a world position on a specific visibility layer.
-    pub fn from_position_on_layer(pos: &Vec3f, layer: u32) -> Self {
-        Self {
-            region_x: (pos.x / CELL_SIZE).floor() as i32,
-            region_z: (pos.z / CELL_SIZE).floor() as i32,
-            layer,
         }
     }
 
@@ -162,6 +152,11 @@ pub struct TickResult {
     /// (entity_id, Vec<ActiveBuff>). Written as delete-all-then-insert
     /// per entity in the reducer.
     pub buff_updates: Vec<(EntityId, Vec<game_core::combat::status::ActiveBuff>)>,
+    /// Threat persistence snapshots for NPCs/bosses.
+    ///
+    /// At most one entry (the current aggro holder) is emitted per NPC, and only
+    /// when that holder changes or clears. Full threat ordering remains in-memory.
+    pub threat_updates: Vec<(EntityId, Vec<game_core::combat::status::ThreatEntry>)>,
     /// NPC AI state snapshot for all active NPCs/bosses.
     /// Each entry is (entity_id, NpcAiState, top_threat target).
     pub npc_state_updates: Vec<(EntityId, game_schema::NpcAiState, Option<EntityId>)>,
@@ -171,12 +166,6 @@ pub struct TickResult {
     /// Entities spawned by the world director this tick.
     /// Coordinator marshals these into DB insert calls so the entities are persisted.
     pub director_spawns: Vec<DirectorSpawn>,
-    /// Interactable state changes this tick (entity_id, new SimInteractState).
-    pub interactable_updates: Vec<(EntityId, game_core::sim_state::SimInteractState)>,
-    /// Boss phase transitions from the encounter executor (boss_entity_id, phase, tick).
-    pub boss_phase_updates: Vec<(u64, u32, u64)>,
-    /// Zone counter increments from the encounter executor and combat system.
-    pub zone_counter_deltas: Vec<(u32, i32, i32, String, f64)>,
 }
 
 /// The canonical 10-phase simulation tick pipeline per spec.
@@ -242,14 +231,6 @@ pub struct TickPipeline {
     /// Seeded at spawn (from initial position → cell), updated each tick when
     /// a transition is emitted. Entries are removed in `force_remove_entity`.
     pub(super) entity_regions: HashMap<EntityId, RegionCell>,
-    /// Dense layer cache indexed by entity slot (EntityIndex.as_usize()).
-    /// Mirrors `entity_regions[id].layer` for O(1) access in hot paths.
-    /// Updated in `spawn_entity_from_snapshot` and `set_entity_layer`.
-    pub(super) entity_layer_cache: Vec<u32>,
-    /// Dense team cache indexed by entity slot (EntityIndex.as_usize()).
-    /// Mirrors the `entity_team` DB table for O(1) access in combat checks.
-    /// Updated in `set_entity_team`; 0 = unassigned/no team.
-    pub(super) entity_team_cache: Vec<u32>,
     /// Last transform snapshot sent to the commit reducer per entity.
     ///
     /// Used to emit transform deltas instead of a full-world snapshot every tick.
@@ -262,15 +243,6 @@ pub struct TickPipeline {
     pub(super) transform_history: TransformHistory,
     /// World director — evaluates dynamic event triggers and spawns NPCs.
     pub(super) director: DirectorState,
-    /// World phase projections from the DB — keyed by zone_id → phase_name.
-    /// Updated by coordinator callbacks when world_phase rows change.
-    pub(super) world_phases: HashMap<u32, String>,
-    /// NPC goal directives from the DB (Tier 2 world_clock output).
-    /// Keyed by entity_id → (goal_kind, priority). Phase 7 AI reads before decisions.
-    pub(super) npc_goals: HashMap<EntityId, (String, u32)>,
-    /// Active boss encounters — keyed by boss entity ID.
-    /// Phase 7.5 evaluates encounter rules after director spawns.
-    pub(crate) encounters: HashMap<EntityId, game_core::encounter::EncounterState>,
     /// Entities whose cached `StatBlock` needs recalculation.
     /// Populated by: (a) equipment changes (via `mark_stats_dirty`),
     /// (b) buff changes (copied from `StatusState::dirty_entities` at Phase 10).
@@ -299,16 +271,6 @@ pub struct TickPipeline {
     /// blocking || block_grace is true. Built once at the start of Phase 6 so that
     /// the cover check iterates only active blockers instead of all tactical slots.
     pub(super) cover_blockers: Vec<(usize, EntityId)>,
-    /// Global maximum lag compensation rewind depth (ticks).
-    /// Sourced from `TickConfig::global_max_rewind_ticks` at startup.
-    pub(super) global_max_rewind_ticks: u32,
-    /// Interactable state changes accumulated this tick.
-    /// Each entry is (entity_id, new_state). Drained in Phase 10 commit.
-    pub(super) pending_interactable_updates: Vec<(EntityId, game_core::sim_state::SimInteractState)>,
-    /// Deferred heals queued during Phase 7 (AI decisions) and drained in Phase 8b.
-    /// Keeps Health mutations centralised in combat/finalization phases.
-    /// Each entry is (entity_id, heal_amount, heal_source).
-    pub(super) pending_heals: Vec<(EntityId, f32, EntityId)>,
 }
 
 impl TickPipeline {
@@ -316,23 +278,10 @@ impl TickPipeline {
     /// Returns `true` if an entity was actually removed from `SimState`, `false` if it
     /// was not present.
     pub fn force_remove_entity(&mut self, id: EntityId) -> bool {
-        self.force_remove_entities(&[id]) > 0
-    }
+        use std::collections::HashSet;
 
-    /// Batch hard teardown for multiple entities. Performs each cleanup pass once
-    /// against a `HashSet` of removed IDs instead of per-entity, converting
-    /// O(N × world) into O(world) for threat tables, fear references, cooldowns, etc.
-    ///
-    /// Returns the number of entities actually removed from `SimState`.
-    pub fn force_remove_entities(&mut self, ids: &[EntityId]) -> usize {
-        if ids.is_empty() {
-            return 0;
-        }
-
-        let removed_set: HashSet<EntityId> = ids.iter().copied().collect();
-
-        // 1) Determine all execution IDs owned by ANY removed caster so we can
-        //    fully remove dependent runtime objects (scheduled actions, sensors, hitboxes).
+        // 1) Determine all execution IDs owned by this caster so we can fully
+        //    remove any dependent runtime objects (scheduled actions, sensors, hitboxes).
         let execs_to_remove: HashSet<AbilityExecutionId> = self
             .state
             .combat
@@ -344,15 +293,16 @@ impl TickPipeline {
                     .combat
                     .executions
                     .get(eid)
-                    .map(|ctx| removed_set.contains(&ctx.caster))
+                    .map(|ctx| ctx.caster == id)
                     .unwrap_or(false)
             })
             .collect();
 
-        // 2) Remove any future actions that target a removed entity OR are sourced
-        //    from an execution owned by a removed entity.
+        // 2) Remove any future actions that target this entity OR are sourced from
+        //    an execution owned by this entity (prevents orphaned actions referencing
+        //    dead executions). Use retain to keep only actions that are unrelated.
         self.scheduled_actions.retain(|a| {
-            if removed_set.contains(&a.entity) {
+            if a.entity == id {
                 return false;
             }
             match a.source {
@@ -361,42 +311,45 @@ impl TickPipeline {
             }
         });
 
-        // 3) Single-pass cooldown cleanup.
-        self.cooldowns.retain(|&(eid, _), _| !removed_set.contains(&eid));
+        // 3) Remove cooldown entries for this entity
+        self.cooldowns.retain(|&(eid, _), _| eid != id);
 
-        // 4) Single-pass follow-up windows + charging cleanup.
-        self.state.combat.active_windows.retain(|&(eid, _), _| !removed_set.contains(&eid));
-        for id in &removed_set {
-            self.state.combat.charging.remove(id);
-        }
+        // 4) Remove follow-up windows for this entity.
+        self.state.combat.active_windows.retain(|&(eid, _), _| eid != id);
+        self.state.combat.charging.remove(&id);
 
-        // 4b) Single-pass threat table scrub — one iteration of all NPC threat
-        //     tables, retaining only entries whose source is not in the removed set.
+        // 4b) Scrub this entity from all NPC threat tables so they acquire new targets.
+        // Leaving a removed entity in threat tables can cause NPCs to lock onto a
+        // non-existent target and no-op during movement (physics transform missing).
         for (_, table) in self.state.combat.threat_tables.iter_mut() {
-            table.entries.retain(|e| !removed_set.contains(&e.source));
+            table.entries.retain(|e| e.source != id);
         }
 
-        // 4c) Single-pass fear cleanup — one scan of all tactical slots.
+        // 4c) Clear fear_source references so feared entities don't freeze in place.
+        // Without this, a feared entity whose fear source dies becomes fully stuck:
+        // drive_fear_movement skips movement when get_transform(fear_source) returns None,
+        // but FEARED flag keeps is_cc_disabled() returning true, blocking all intents.
+        //
         // Collect affected slot indices first, then remove debuffs in a second pass
         // (tactical and status live in separate fields, so we can't do both in one loop).
         let mut fear_cleared_slots: Vec<usize> = Vec::new();
         for (i, t) in self.state.combat.tactical.iter_mut().enumerate() {
-            if let Some(src) = t.fear_source {
-                if removed_set.contains(&src) {
-                    t.fear_source = None;
-                    t.movement_conditions.remove(
-                        game_core::combat::tactical::MovementConditions::FEARED,
-                    );
-                    fear_cleared_slots.push(i);
-                }
+            if t.fear_source == Some(id) {
+                t.fear_source = None;
+                t.movement_conditions.remove(
+                    game_core::combat::tactical::MovementConditions::FEARED,
+                );
+                fear_cleared_slots.push(i);
             }
         }
+        // Remove the fear debuff (buff 504) only for entities whose fear_source
+        // pointed at the removed entity — not from every entity in the world.
         for slot in fear_cleared_slots {
             let idx = self.state.entities.index_at(slot);
             self.state.status.remove_cc_debuff(idx, game_schema::CCEffect::Fear);
         }
 
-        // 5) Remove hitbox sensors and execution contexts owned by removed entities.
+        // 5) Remove hitbox sensors and execution contexts owned by this entity
         for exec_id in execs_to_remove.iter().copied() {
             if let Some(handle) = self
                 .state
@@ -411,55 +364,26 @@ impl TickPipeline {
             self.state.combat.executions.remove(exec_id);
         }
 
-        // 6) Drop region tracking and dirty-tracking for each removed entity.
-        //    Also zero out dense cache slots so stale layer/team values are never
-        //    inherited when the slot is recycled by a future spawn.
-        for id in &removed_set {
-            if let Some(idx) = self.state.entities.lookup(*id) {
-                let slot = idx.as_usize();
-                if slot < self.entity_layer_cache.len() { self.entity_layer_cache[slot] = 0; }
-                if slot < self.entity_team_cache.len() { self.entity_team_cache[slot] = 0; }
+        // 6) Drop region tracking and dirty-tracking for this entity.
+        self.entity_regions.remove(&id);
+        self.last_committed_transforms.remove(&id);
+        self.npc_state_prev.remove(&id);
+        self.equipment_modifiers.remove(&id);
+        self.weapon_swap_cooldowns.remove(&id);
+
+        // 6b) Cancel any active lock-on session owned by this entity.
+        // Emit LockOnCanceled for every tagged target so clients clear their indicators.
+        if let Some(session) = self.active_lock_on_sessions.remove(&id) {
+            for target in &session.tagged {
+                self.emit_event(id, EventPayload::LockOnCanceled { source: id, target: *target });
             }
-            self.entity_regions.remove(id);
-            self.last_committed_transforms.remove(id);
-            self.npc_state_prev.remove(id);
-            self.equipment_modifiers.remove(id);
-            self.weapon_swap_cooldowns.remove(id);
         }
 
-        // 6b) Cancel any active lock-on sessions owned by removed entities,
-        //     and scrub removed targets from other sessions' tagged lists.
-        for &id in &removed_set {
-            if let Some(session) = self.active_lock_on_sessions.remove(&id) {
-                for target in &session.tagged {
-                    self.emit_event(id, EventPayload::LockOnCanceled { source: id, target: *target });
-                }
-            }
-        }
-        for session in self.active_lock_on_sessions.values_mut() {
-            session.tagged.retain(|t| !removed_set.contains(t));
-        }
-
-        // 7) Remove entities from SimState and physics world.
-        //    Character bodies (Player/NPC/Boss) are pooled via disable_entity
-        //    for cheap reuse on respawn. Other kinds are fully removed.
-        let mut count = 0usize;
-        for &id in &removed_set {
-            let kind = self.state.entities.lookup(id)
-                .map(|idx| self.state.entities.kinds[idx.as_usize()]);
-            if self.state.remove_entity(id) {
-                count += 1;
-            }
-            match kind {
-                Some(EntityKind::Player | EntityKind::Npc | EntityKind::Boss) => {
-                    self.physics.disable_entity(id, kind.unwrap());
-                }
-                _ => {
-                    self.physics.remove_entity(id);
-                }
-            }
-        }
-        count
+        // 7) Finally, remove entity from SimState and physics world
+        let removed = self.state.remove_entity(id);
+        // Always attempt to remove physics body; remove_entity is idempotent there.
+        self.physics.remove_entity(id);
+        removed
     }
 
     pub fn new(
@@ -483,14 +407,9 @@ impl TickPipeline {
             next_scheduled_id: 0,
             summary: TickSummary::default(),
             entity_regions: HashMap::new(),
-            entity_layer_cache: Vec::new(),
-            entity_team_cache: Vec::new(),
             last_committed_transforms: HashMap::new(),
             transform_history: TransformHistory::new(),
             director: DirectorState::new(),
-            world_phases: HashMap::new(),
-            npc_goals: HashMap::new(),
-            encounters: HashMap::new(),
             stats_dirty: HashSet::new(),
             equipment_modifiers: HashMap::new(),
             npc_state_prev: HashMap::new(),
@@ -498,37 +417,11 @@ impl TickPipeline {
             region_types: HashMap::new(),
             active_lock_on_sessions: HashMap::new(),
             cover_blockers: Vec::new(),
-            global_max_rewind_ticks: lag_compensation::MAX_REWIND_TICKS,
-            pending_interactable_updates: Vec::new(),
-            pending_heals: Vec::new(),
         }
     }
 
     pub fn physics_mut(&mut self) -> &mut dyn PhysicsBackend {
         &mut *self.physics
-    }
-
-    // ── Test support accessors ──────────────────────────────────
-    //
-    // Expose internals that integration tests need to set up encounter
-    // scenarios. Not part of the public API contract.
-
-    /// Direct access to `SimState` for test setup (e.g. manipulating HP).
-    #[doc(hidden)]
-    pub fn state_mut(&mut self) -> &mut SimState {
-        &mut self.state
-    }
-
-    /// Direct access to the encounter map for test registration.
-    #[doc(hidden)]
-    pub fn encounters_mut(&mut self) -> &mut HashMap<EntityId, game_core::encounter::EncounterState> {
-        &mut self.encounters
-    }
-
-    /// Read-only access to encounters for assertions.
-    #[doc(hidden)]
-    pub fn encounters(&self) -> &HashMap<EntityId, game_core::encounter::EncounterState> {
-        &self.encounters
     }
 
     pub fn set_current_tick(&mut self, tick: TickId) {
@@ -554,47 +447,6 @@ impl TickPipeline {
         game_core::region::RepulsionRules::for_region(region_type)
     }
 
-    /// Returns the visibility layer for an entity, defaulting to 0 (open world).
-    /// Uses the dense layer cache for O(1) access when an EntityIndex is available.
-    pub(super) fn layer_of(&self, entity: EntityId) -> u32 {
-        if let Some(idx) = self.state.entities.lookup(entity) {
-            let slot = idx.as_usize();
-            if slot < self.entity_layer_cache.len() {
-                return self.entity_layer_cache[slot];
-            }
-        }
-        // Fallback to HashMap for entities not yet in the cache.
-        self.entity_regions.get(&entity).map_or(0, |c| c.layer)
-    }
-
-    /// O(1) layer lookup by dense index — preferred in tight loops where the
-    /// EntityIndex is already known.
-    #[inline(always)]
-    pub(super) fn layer_of_idx(&self, idx: EntityIndex) -> u32 {
-        let slot = idx.as_usize();
-        if slot < self.entity_layer_cache.len() {
-            self.entity_layer_cache[slot]
-        } else {
-            0
-        }
-    }
-
-    /// Check whether two entities share the same visibility layer.
-    pub(super) fn same_layer(&self, a: EntityId, b: EntityId) -> bool {
-        self.layer_of(a) == self.layer_of(b)
-    }
-
-    /// O(1) team lookup by dense index — used in combat target filtering.
-    #[inline(always)]
-    pub(super) fn team_of_idx(&self, idx: EntityIndex) -> u32 {
-        let slot = idx.as_usize();
-        if slot < self.entity_team_cache.len() {
-            self.entity_team_cache[slot]
-        } else {
-            0
-        }
-    }
-
     /// Ingest an entity from a DB snapshot row into the simulation.
     ///
     /// Registers the entity in SimState and creates the appropriate physics body
@@ -607,7 +459,6 @@ impl TickPipeline {
         tick: TickId,
         max_hp: f32,
         position: Vec3f,
-        layer: u32,
     ) {
         // Idempotency guard — the coordinator's on_insert callback already checks
         // contains() before calling here, but this defence-in-depth prevents a double-
@@ -617,25 +468,9 @@ impl TickPipeline {
             return;
         }
         self.state.spawn_entity(id, kind, tick, max_hp);
-
-        // Grow or set the dense layer cache.
-        if let Some(idx) = self.state.entities.lookup(id) {
-            let slot = idx.as_usize();
-            if slot >= self.entity_layer_cache.len() {
-                self.entity_layer_cache.resize(slot + 1, 0);
-            }
-            self.entity_layer_cache[slot] = layer;
-            // Grow team cache in parallel and reset to 0 (unassigned) so slot
-            // reuse never inherits the previous occupant's team.
-            if slot >= self.entity_team_cache.len() {
-                self.entity_team_cache.resize(slot + 1, 0);
-            }
-            self.entity_team_cache[slot] = 0;
-        }
-
         match kind {
             EntityKind::Player | EntityKind::Npc | EntityKind::Boss => {
-                self.physics.reuse_or_spawn_character(id, position, kind);
+                self.physics.spawn_character_body(id, position, kind);
             }
             EntityKind::Prop => {
                 // Props get a dynamic box body; default half-extents 0.5m cube.
@@ -651,12 +486,10 @@ impl TickPipeline {
                 self.state.ai.home_positions.insert(idx, position);
             }
 
-        // Seed the entity's region so collect_region_updates uses the correct
-        // visibility layer from the first tick onward.
-        self.entity_regions.insert(id, RegionCell::from_position_on_layer(&position, layer));
-        // Mirror the layer into the physics runtime so scene-query predicates
-        // can filter cross-layer interactions.
-        self.physics.set_entity_layer(id, layer);
+        // NOTE: entity_regions is NOT seeded here. collect_region_updates() will
+        // discover the entity on its first tick (via the `None` branch) and emit
+        // an initial region update, which guarantees the DB receives the correct
+        // cell computed from the actual spawn position.
     }
 
     /// Seed runtime state from DB rows recovered on worker restart.
@@ -667,6 +500,7 @@ impl TickPipeline {
     pub fn seed_runtime_state(
         &mut self,
         buffs: &[(EntityId, Vec<game_core::combat::status::ActiveBuff>)],
+        threats: &[(EntityId, Vec<game_core::combat::status::ThreatEntry>)],
         npc_states: &[(EntityId, game_schema::NpcAiState, Option<EntityId>)],
     ) {
         for (eid, entity_buffs) in buffs {
@@ -677,19 +511,16 @@ impl TickPipeline {
                 self.stats_dirty.insert(*eid);
             }
         }
-        for (eid, ai_state, target) in npc_states {
+        for (eid, entries) in threats {
+            if let Some(idx) = self.state.entities.lookup(*eid)
+                && let Some(table) = self.state.combat.threat_tables.get_mut(idx) {
+                    table.entries = entries.clone();
+                }
+        }
+        for (eid, ai_state, _target) in npc_states {
             if let Some(idx) = self.state.entities.lookup(*eid) {
                 if let Some(ai) = self.state.ai.npc_ai.get_mut(idx) {
                     *ai = *ai_state;
-                }
-                // Reconstruct a minimal in-memory threat table from npc_state.target_entity
-                // so restart recovery preserves the current aggro holder.
-                if let Some(target_id) = target {
-                    if let Some(table) = self.state.combat.threat_tables.get_mut(idx) {
-                        if table.entries.is_empty() {
-                            table.add_threat(*target_id, 1.0);
-                        }
-                    }
                 }
             }
         }
@@ -792,7 +623,7 @@ impl TickPipeline {
         })
     }
 
-    fn set_entity_body_facing(&mut self, entity_id: EntityId, dir: Vec3f, _audit_detail: &'static str) -> Option<Vec3f> {
+    fn set_entity_body_facing(&mut self, entity_id: EntityId, dir: Vec3f, audit_detail: &'static str) -> Option<Vec3f> {
         let facing = Self::normalize_horizontal_direction(dir)?;
         let yaw = facing.x.atan2(facing.z);
         let half_yaw = yaw * 0.5;
@@ -803,7 +634,7 @@ impl TickPipeline {
             w: half_yaw.cos(),
         };
         self.physics.set_kinematic_rotation(entity_id, rotation);
-        audit!(self.state, Transform, Controller, 2, Some(entity_id), _audit_detail);
+        audit!(self.state, Transform, Controller, 2, Some(entity_id), audit_detail);
         Some(facing)
     }
 
@@ -1132,7 +963,6 @@ impl TickPipeline {
         self.state.audit.reset();
         self.event_sequence = 0;
         self.pending_events.clear();
-        self.pending_heals.clear();
         self.summary = TickSummary::default();
 
         // Phase 1: Input ingestion — filter intents for this tick
@@ -1168,31 +998,6 @@ impl TickPipeline {
 
         // Phase 7.5: World orchestration — director evaluates triggers and spawns
         let director_spawns = self.phase_world_orchestration();
-
-        // Phase 7.5b: Encounter execution — evaluate boss encounter rules
-        let encounter_outputs = self.phase_encounter_execution();
-        let mut boss_phase_updates = Vec::new();
-        let mut zone_counter_deltas = Vec::new();
-        for output in encounter_outputs {
-            match output {
-                game_core::encounter::EncounterOutput::ChangeBossPhase {
-                    boss_entity_id,
-                    new_phase,
-                    entered_at_tick,
-                } => {
-                    boss_phase_updates.push((boss_entity_id.0, new_phase, entered_at_tick));
-                }
-                game_core::encounter::EncounterOutput::IncrementZoneCounter {
-                    layer,
-                    region_x,
-                    region_z,
-                    counter_name,
-                    delta,
-                } => {
-                    zone_counter_deltas.push((layer, region_x, region_z, counter_name, delta));
-                }
-            }
-        }
 
         // Snapshot health for entities that took damage this tick — must happen BEFORE
         // phase_state_finalization removes dead entity slots from the EntityStore.
@@ -1238,6 +1043,7 @@ impl TickPipeline {
         self.summary.scheduled_actions_len = self.scheduled_actions.len();
         // Collect runtime domain snapshots for persistence.
         let buff_updates = self.collect_buff_updates();
+        let threat_updates = self.collect_threat_updates();
         let npc_state_updates = self.collect_npc_state_updates();
 
         let all_transforms = self.physics.get_all_transforms();
@@ -1262,12 +1068,10 @@ impl TickPipeline {
             entity_state_updates,
             health_updates,
             buff_updates,
+            threat_updates,
             npc_state_updates,
             region_updates,
             director_spawns,
-            interactable_updates: std::mem::take(&mut self.pending_interactable_updates),
-            boss_phase_updates,
-            zone_counter_deltas,
         };
 
         self.current_tick = self.current_tick.next();

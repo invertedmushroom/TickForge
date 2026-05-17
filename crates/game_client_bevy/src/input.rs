@@ -5,7 +5,7 @@ use spacetimedb_sdk::Table;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::ability_bar::{all_abilities, AbilityCooldowns, BLOCK_ABILITY_ID, ClientTargetingMode};
+use crate::ability_bar::{ALL_ABILITIES, AbilityCooldowns, BLOCK_ABILITY_ID, ClientTargetingMode};
 #[allow(unused)]
 use crate::camera::CursorCaptured;
 use crate::camera::GameCamera;
@@ -92,25 +92,6 @@ pub struct CrosshairAim {
 pub struct LockOnSession {
     /// The lock-on ability id currently in tagging phase, if any.
     pub active_ability: Option<u32>,
-    /// The observed sim tick when the client should locally expire this session.
-    pub expires_at_tick: Option<u64>,
-}
-
-const LOCK_ON_DEFAULT_TIMEOUT_TICKS: u64 = 400;
-
-fn lock_on_timeout_ticks_for(ability_id: u32) -> u64 {
-    all_abilities()
-        .iter()
-        .find(|a| a.id == ability_id)
-        .and_then(|a| a.lock_on_timeout_ticks)
-        .map(u64::from)
-        .filter(|ticks| *ticks > 0)
-        .unwrap_or(LOCK_ON_DEFAULT_TIMEOUT_TICKS)
-}
-
-fn clear_lock_on_session(lock_on: &mut LockOnSession) {
-    lock_on.active_ability = None;
-    lock_on.expires_at_tick = None;
 }
 
 fn clamp_ground_target_position(player_pos: Vec3, point: &Vec3F, max_range: f32) -> Vec3F {
@@ -593,17 +574,6 @@ fn handle_lock_on_input(
         return;
     };
 
-    if let (Some(ability_id), Some(expires_at_tick)) =
-        (lock_on.active_ability, lock_on.expires_at_tick)
-    {
-        if tick_counter.last_tick >= expires_at_tick {
-            clear_lock_on_session(&mut lock_on);
-            log::info!(
-                "Lock-on timeout: ability {ability_id} expired at tick {expires_at_tick}"
-            );
-        }
-    }
-
     let keys = [
         KeyCode::Digit1,
         KeyCode::Digit2,
@@ -620,7 +590,7 @@ fn handle_lock_on_input(
     for (i, key) in keys.iter().enumerate() {
         if keyboard.just_pressed(*key) {
             let id = bindings.slots[i];
-            let is_lock_on = all_abilities()
+            let is_lock_on = ALL_ABILITIES
                 .iter()
                 .any(|a| a.id == id && a.targeting == ClientTargetingMode::LockOn);
             if !is_lock_on {
@@ -643,7 +613,7 @@ fn handle_lock_on_input(
                     tick_counter.last_tick,
                     "LockOnFire",
                 );
-                clear_lock_on_session(&mut lock_on);
+                lock_on.active_ability = None;
                 cooldowns.activate(id, tick_counter.last_tick);
                 diag.record_intent();
                 log::info!("Lock-on FIRE: ability {id}");
@@ -660,7 +630,6 @@ fn handle_lock_on_input(
                         tick_counter.last_tick,
                         "LockOnCancelOld",
                     );
-                    lock_on.expires_at_tick = None;
                     log::info!("Lock-on cancel (switching): ability {old}");
                 }
                 // First press → open lock-on session.
@@ -679,9 +648,6 @@ fn handle_lock_on_input(
                     "LockOnOpen",
                 );
                 lock_on.active_ability = Some(id);
-                lock_on.expires_at_tick = Some(
-                    tick_counter.last_tick + lock_on_timeout_ticks_for(id),
-                );
                 diag.record_intent();
                 log::info!("Lock-on OPEN: ability {id} — click targets to tag");
             }
@@ -706,7 +672,7 @@ fn handle_lock_on_input(
             tick_counter.last_tick,
             "LockOnCancel",
         );
-        clear_lock_on_session(&mut lock_on);
+        lock_on.active_ability = None;
         log::info!("Lock-on CANCEL: ability {ability_id}");
         return;
     }
@@ -829,7 +795,7 @@ fn handle_abilities(
             if id == 0 {
                 break;
             }
-            let is_lock_on = all_abilities()
+            let is_lock_on = ALL_ABILITIES
                 .iter()
                 .any(|a| a.id == id && a.targeting == ClientTargetingMode::LockOn);
             if is_lock_on {
@@ -893,7 +859,7 @@ fn handle_abilities(
         if keyboard.just_pressed(*key) {
             let id = bindings.slots[i];
             if id != 0 && id != BLOCK_ABILITY_ID {
-                let is_lock_on = all_abilities()
+                let is_lock_on = ALL_ABILITIES
                     .iter()
                     .any(|a| a.id == id && a.targeting == ClientTargetingMode::LockOn);
                 if !is_lock_on {
@@ -908,9 +874,8 @@ fn handle_abilities(
         return;
     };
 
-    let ability_def = all_abilities().iter().find(|a| a.id == ability_id).cloned();
+    let ability_def = ALL_ABILITIES.iter().find(|a| a.id == ability_id).copied();
     let ability_targeting = ability_def
-        .as_ref()
         .map(|a| a.targeting)
         .unwrap_or(ClientTargetingMode::DirectionTarget);
 

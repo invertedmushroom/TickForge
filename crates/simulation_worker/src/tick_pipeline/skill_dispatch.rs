@@ -59,8 +59,8 @@ impl TickPipeline {
             .filter(|&id| !Self::execution_is_alive(id, &scheduled_sources, &self.state.combat.hitboxes))
             .collect();
         for id in dead {
-            if let Some(_ctx) = self.state.combat.executions.get(id) {
-                audit!(self.state, Execution, AbilityTimeline, 3, Some(_ctx.caster), "cull");
+            if let Some(ctx) = self.state.combat.executions.get(id) {
+                audit!(self.state, Execution, AbilityTimeline, 3, Some(ctx.caster), "cull");
             }
             self.state.combat.executions.remove(id);
         }
@@ -83,7 +83,6 @@ impl TickPipeline {
                 let allow_reentry        = self.ability_prop(ability_id, |ad| ad.allow_reentry, false);
                 let damage_interval_ticks = self.ability_prop(ability_id, |ad| ad.damage_interval_ticks, 0);
                 let pierce                = self.ability_prop(ability_id, |ad| ad.pierce, false);
-                let max_rewind_ticks      = self.ability_prop(ability_id, |ad| ad.max_rewind_ticks, None);
                 // Declare the hitbox logically — no Rapier sensor yet.
                 //
                 // The sensor is deferred to `ApplyDamageFrame` so that the Rapier
@@ -92,7 +91,7 @@ impl TickPipeline {
                 // Before this fix, SpawnHitbox spawned the sensor immediately, so
                 // Rapier fired contacts one tick early and damage landed on the spawn
                 // tick rather than the intended damage-frame tick.
-                self.state.combat.hitboxes.spawn(execution_id, entity, ability_id, self.current_tick, *shape, *offset, rewind_ticks, allow_reentry, damage_interval_ticks, pierce, max_rewind_ticks);
+                self.state.combat.hitboxes.spawn(execution_id, entity, ability_id, self.current_tick, *shape, *offset, rewind_ticks, allow_reentry, damage_interval_ticks, pierce);
                 audit!(self.state, Hitbox, AbilityTimeline, 3, Some(entity), "spawn");
                 self.emit_event(entity, EventPayload::HitboxSpawned { ability_id });
             }
@@ -112,8 +111,7 @@ impl TickPipeline {
                     let max_range = self.ability_prop(ability_id, |ad| ad.max_range, None)
                         .unwrap_or(game_core::physics_constants::DEFAULT_ABILITY_MAX_RANGE);
                     let range_sq = max_range * max_range;
-                    let caster_layer = self.layer_of(entity);
-                    // Validate each target: active, in 3-D range, same layer, and clear LoS.
+                    // Validate each target: active, in 3-D range, and clear LoS.
                     let mut valid: Vec<(EntityId, EntityIndex)> = Vec::new();
                     let mut invalid: Vec<EntityId> = Vec::new();
                     for &target in &targets {
@@ -125,8 +123,7 @@ impl TickPipeline {
                             let dy = p.y - caster_pos.y;
                             let dz = p.z - caster_pos.z;
                             dx*dx + dy*dy + dz*dz <= range_sq
-                                && self.layer_of(target) == caster_layer
-                                && self.physics.line_of_sight_on_layer(caster_pos, p, caster_layer)
+                                && self.physics.line_of_sight(caster_pos, p)
                         });
                         if ok {
                             if let Some(idx) = self.state.entities.lookup(target) {
@@ -633,8 +630,7 @@ impl TickPipeline {
                     y: target_t.position.y,
                     z: target_t.position.z - target_forward.z * distance,
                 };
-                let caster_layer = self.layer_of(entity);
-                let destination = self.physics.cast_to_wall_on_layer(caster_pos, raw_dest, caster_layer);
+                let destination = self.physics.cast_to_wall(caster_pos, raw_dest);
                 if self.physics.teleport_entity(entity, destination) {
                     self.emit_event(entity, EventPayload::Teleported {
                         entity,
@@ -654,8 +650,7 @@ impl TickPipeline {
                     y: caster_pos.y,
                     z: caster_pos.z + facing.z * distance,
                 };
-                let caster_layer = self.layer_of(entity);
-                let destination = self.physics.cast_to_wall_on_layer(caster_pos, raw_dest, caster_layer);
+                let destination = self.physics.cast_to_wall(caster_pos, raw_dest);
                 if self.physics.teleport_entity(entity, destination) {
                     self.emit_event(entity, EventPayload::Teleported {
                         entity,

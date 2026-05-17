@@ -73,10 +73,6 @@ pub struct ActiveHitbox {
     /// If true, this projectile passes through targets (hits all in path).
     /// False = removed on first hit (single-target).
     pub pierce: bool,
-    /// Per-ability cap on lag compensation rewind depth.
-    /// When the compensated hit pass runs, the effective rewind is
-    /// `min(rewind_ticks, max_rewind_ticks.unwrap_or(global_max))`.
-    pub max_rewind_ticks: Option<u32>,
 }
 
 /// Runtime state for a travelling world-space projectile hitbox.
@@ -114,7 +110,7 @@ impl HitboxStore {
 
     /// Register a new unarmed hitbox (logical declaration only — no Rapier sensor yet).
     /// Call `arm()` when `ApplyDamageFrame` fires to materialise the physics sensor.
-    pub fn spawn(&mut self, execution_id: AbilityExecutionId, owner: EntityId, ability_id: u32, tick: TickId, shape: SkillShape, offset: Vec3f, rewind_ticks: u32, allow_reentry: bool, damage_interval_ticks: u32, pierce: bool, max_rewind_ticks: Option<u32>) {
+    pub fn spawn(&mut self, execution_id: AbilityExecutionId, owner: EntityId, ability_id: u32, tick: TickId, shape: SkillShape, offset: Vec3f, rewind_ticks: u32, allow_reentry: bool, damage_interval_ticks: u32, pierce: bool) {
         self.active.insert(execution_id, ActiveHitbox {
             execution_id,
             owner,
@@ -133,14 +129,13 @@ impl HitboxStore {
             world_sensor: false,
             projectile: None,
             pierce,
-            max_rewind_ticks,
         });
     }
 
     /// Register a hitbox that is already armed (Rapier sensor already live).
     /// Use this in tests that bypass the timeline and inject sensors directly.
     pub fn spawn_armed(&mut self, execution_id: AbilityExecutionId, owner: EntityId, ability_id: u32, tick: TickId, shape: SkillShape, offset: Vec3f, sensor_handle: u64) {
-        self.spawn(execution_id, owner, ability_id, tick, shape, offset, 0, false, 0, false, None);
+        self.spawn(execution_id, owner, ability_id, tick, shape, offset, 0, false, 0, false);
         self.arm_at_tick(execution_id, sensor_handle, tick);
     }
 
@@ -348,7 +343,7 @@ mod tests {
     #[test]
     fn spawn_and_remove() {
         let mut store = HitboxStore::new();
-        store.spawn(exec(1), eid(1), 100, TickId(5), SkillShape::Sphere, Vec3f::ZERO, 0, false, 0, false, None);
+        store.spawn(exec(1), eid(1), 100, TickId(5), SkillShape::Sphere, Vec3f::ZERO, 0, false, 0, false);
         assert_eq!(store.len(), 1);
         assert!(store.get(exec(1)).is_some());
 
@@ -360,7 +355,7 @@ mod tests {
     #[test]
     fn hit_dedup() {
         let mut store = HitboxStore::new();
-        store.spawn(exec(42), eid(1), 42, TickId(0), SkillShape::Sphere, Vec3f::ZERO, 0, false, 0, false, None);
+        store.spawn(exec(42), eid(1), 42, TickId(0), SkillShape::Sphere, Vec3f::ZERO, 0, false, 0, false);
 
         assert!(!store.has_hit(exec(42), eid(2)));
         assert!(store.record_hit(exec(42), eid(2))); // first hit → true
@@ -371,9 +366,9 @@ mod tests {
     #[test]
     fn remove_all_for_entity() {
         let mut store = HitboxStore::new();
-        store.spawn(exec(10), eid(1), 10, TickId(0), SkillShape::Sphere, Vec3f::ZERO, 0, false, 0, false, None);
-        store.spawn(exec(20), eid(1), 20, TickId(1), SkillShape::Sphere, Vec3f::ZERO, 0, false, 0, false, None);
-        store.spawn(exec(30), eid(2), 10, TickId(0), SkillShape::Sphere, Vec3f::ZERO, 0, false, 0, false, None);
+        store.spawn(exec(10), eid(1), 10, TickId(0), SkillShape::Sphere, Vec3f::ZERO, 0, false, 0, false);
+        store.spawn(exec(20), eid(1), 20, TickId(1), SkillShape::Sphere, Vec3f::ZERO, 0, false, 0, false);
+        store.spawn(exec(30), eid(2), 10, TickId(0), SkillShape::Sphere, Vec3f::ZERO, 0, false, 0, false);
 
         let mut removed = store.remove_all_for_entity(eid(1));
         removed.sort_by_key(|id| id.0);
@@ -387,8 +382,8 @@ mod tests {
         // With execution-ID keys an entity can have two live hitboxes from the
         // same ability simultaneously — the key concern that motivated this refactor.
         let mut store = HitboxStore::new();
-        store.spawn(exec(1), eid(1), 5, TickId(0), SkillShape::Sphere, Vec3f::ZERO, 0, false, 0, false, None);
-        store.spawn(exec(2), eid(1), 5, TickId(1), SkillShape::Sphere, Vec3f::ZERO, 0, false, 0, false, None);
+        store.spawn(exec(1), eid(1), 5, TickId(0), SkillShape::Sphere, Vec3f::ZERO, 0, false, 0, false);
+        store.spawn(exec(2), eid(1), 5, TickId(1), SkillShape::Sphere, Vec3f::ZERO, 0, false, 0, false);
 
         assert_eq!(store.len(), 2, "two casts must produce two independent entries");
         assert!(store.get(exec(1)).is_some());
@@ -410,7 +405,7 @@ mod tests {
     fn arm_gates_damage_frame() {
         let mut store = HitboxStore::new();
         let e1 = exec(5);
-        store.spawn(e1, eid(1), 5, TickId(0), SkillShape::Sphere, Vec3f::ZERO, 0, false, 0, false, None);
+        store.spawn(e1, eid(1), 5, TickId(0), SkillShape::Sphere, Vec3f::ZERO, 0, false, 0, false);
         assert_eq!(store.armed_count(), 0, "freshly spawned hitbox must not be armed");
 
         assert!(store.arm(e1, 100), "arm() must return true when hitbox exists and is unarmed");
@@ -447,7 +442,6 @@ mod tests {
             false,
             2,
             false,
-            None,
         );
 
         assert!(store.arm_at_tick(execution_id, 500, TickId(7)));
@@ -460,7 +454,7 @@ mod tests {
     fn clear_hit_reentry() {
         let mut store = HitboxStore::new();
         // allow_reentry = true
-        store.spawn(exec(1), eid(1), 5, TickId(0), SkillShape::Sphere, Vec3f::ZERO, 0, true, 0, false, None);
+        store.spawn(exec(1), eid(1), 5, TickId(0), SkillShape::Sphere, Vec3f::ZERO, 0, true, 0, false);
         assert!(store.record_hit(exec(1), eid(9)));
         assert!(!store.record_hit(exec(1), eid(9)), "duplicate still blocked before clear");
 
@@ -472,7 +466,7 @@ mod tests {
     fn clear_hit_ignored_when_not_reentry() {
         let mut store = HitboxStore::new();
         // allow_reentry = false (default)
-        store.spawn(exec(1), eid(1), 5, TickId(0), SkillShape::Sphere, Vec3f::ZERO, 0, false, 0, false, None);
+        store.spawn(exec(1), eid(1), 5, TickId(0), SkillShape::Sphere, Vec3f::ZERO, 0, false, 0, false);
         assert!(store.record_hit(exec(1), eid(9)));
 
         store.clear_hit(exec(1), eid(9));

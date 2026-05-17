@@ -69,7 +69,7 @@ pub enum IntentAction {
     /// Only valid when the player has an active lock-on session (started by
     /// `UseAbility` for a `TargetingMode::LockOn` ability). The server validates
     /// range, LoS, and max-target count; invalid tags are silently dropped.
-    /// Emits `LockOnAcquired` to the tagged entity on success.
+    /// Emits `LockOnWarning` to the tagged entity on success.
     TagTarget(u64),
 }
 

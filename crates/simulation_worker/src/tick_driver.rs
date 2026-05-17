@@ -74,14 +74,9 @@ impl TickDriver {
         }
 
         let tick_to_process = commit.next_expected_tick();
-        let gap = canonical_tick.saturating_sub(tick_to_process);
-        if gap > commit.pipeline_depth() as u64 {
+        if canonical_tick > tick_to_process {
             warn!(
-                "tick backlog: canonical={canonical_tick} processing_contiguous_tick={tick_to_process} gap={gap}"
-            );
-        } else if gap > 0 {
-            debug!(
-                "tick pipelining: canonical={canonical_tick} processing_contiguous_tick={tick_to_process} gap={gap}"
+                "tick backlog: canonical={canonical_tick} processing_contiguous_tick={tick_to_process}"
             );
         }
 
@@ -166,8 +161,6 @@ mod tests {
             projectile_speed: None,
             max_range: None,
             lock_on_timeout_ticks: None,
-            max_rewind_ticks: None,
-            target_filter: game_core::combat::skill::TargetFilter::Hostile,
         });
         reg.register_timeline(AbilityTimeline {
             ability_id: 1,

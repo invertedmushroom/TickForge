@@ -173,13 +173,12 @@ impl Default for TransformHistory {
 /// (repurposed from wall-clock timestamp to tick number by the client).
 ///
 /// If `client_observed_tick == 0`, no rewind is applied (legacy or local client).
-/// The result is clamped to `global_max` (from `TickConfig::global_max_rewind_ticks`).
-pub fn compute_rewind_ticks(current_tick: TickId, client_observed_tick: u64, global_max: u32) -> u32 {
+pub fn compute_rewind_ticks(current_tick: TickId, client_observed_tick: u64) -> u32 {
     if client_observed_tick == 0 {
         return 0;
     }
     let delta = current_tick.0.saturating_sub(client_observed_tick);
-    (delta as u32).min(global_max)
+    (delta as u32).min(MAX_REWIND_TICKS)
 }
 
 // ── Shape intersection ──────────────────────────────────────────
@@ -331,29 +330,23 @@ mod tests {
 
     #[test]
     fn compute_rewind_zero_observed() {
-        assert_eq!(compute_rewind_ticks(TickId(100), 0, MAX_REWIND_TICKS), 0);
+        assert_eq!(compute_rewind_ticks(TickId(100), 0), 0);
     }
 
     #[test]
     fn compute_rewind_normal_delta() {
-        assert_eq!(compute_rewind_ticks(TickId(100), 98, MAX_REWIND_TICKS), 2);
+        assert_eq!(compute_rewind_ticks(TickId(100), 98), 2);
     }
 
     #[test]
     fn compute_rewind_clamped_to_max() {
-        assert_eq!(compute_rewind_ticks(TickId(100), 90, MAX_REWIND_TICKS), MAX_REWIND_TICKS);
+        assert_eq!(compute_rewind_ticks(TickId(100), 90), MAX_REWIND_TICKS);
     }
 
     #[test]
     fn compute_rewind_future_observed_returns_zero() {
         // Client claims to have observed a future tick — impossible, return 0.
-        assert_eq!(compute_rewind_ticks(TickId(100), 105, MAX_REWIND_TICKS), 0);
-    }
-
-    #[test]
-    fn compute_rewind_respects_custom_global_max() {
-        // With global_max=2, a delta of 3 should clamp to 2.
-        assert_eq!(compute_rewind_ticks(TickId(100), 97, 2), 2);
+        assert_eq!(compute_rewind_ticks(TickId(100), 105), 0);
     }
 
     #[test]

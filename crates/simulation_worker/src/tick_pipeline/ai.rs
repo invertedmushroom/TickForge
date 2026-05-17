@@ -5,12 +5,10 @@ impl TickPipeline {
 
     pub(super) fn phase_ai_decisions(&mut self) {
         use game_core::entity::lifecycle::{EntityKind, NpcAiState};
-        use game_core::combat::status::{AiOverride, ThreatTable};
+        use game_core::combat::status::AiOverride;
 
         let npcs = self.state.active_indices_of_kind(EntityKind::Npc);
         let bosses = self.state.active_indices_of_kind(EntityKind::Boss);
-        // Pre-compute player indices once for proximity aggro scanning.
-        let players = self.state.active_indices_of_kind(EntityKind::Player);
 
         for idx in npcs.iter().chain(bosses.iter()) {
             // Passive NPCs never run AI (training dummies).
@@ -89,45 +87,6 @@ impl TickPipeline {
                                 if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) { *ai = NpcAiState::Combat; }
                                 audit!(self.state, Ai, AiDecisions, 7, None, "to_combat");
                             }
-                        else {
-                            // Proximity aggro: scan for players within aggro_radius.
-                            // TODO: O(NPCs × Players) — replace with spatial partitioning
-                            // (e.g. region-cell query) when populations exceed ~50 idle NPCs.
-                            let aggro = self.state.ai.npc_aggro_radius.get(*idx).copied().unwrap_or(0.0);
-                            if aggro > 0.0 {
-                                let npc_id = self.state.entities.id_of(*idx);
-                                let npc_layer = self.layer_of_idx(*idx);
-                                if let Some(npc_t) = self.physics.get_transform(npc_id) {
-                                    let npc_pos = npc_t.position;
-                                    let aggro_sq = aggro * aggro;
-                                    for &p_idx in &players {
-                                        let p_id = self.state.entities.id_of(p_idx);
-                                        // Layer isolation: NPCs only aggro players on the same layer.
-                                        if self.layer_of_idx(p_idx) != npc_layer { continue; }
-                                        if let Some(p_t) = self.physics.get_transform(p_id) {
-                                            let dx = p_t.position.x - npc_pos.x;
-                                            let dz = p_t.position.z - npc_pos.z;
-                                            if dx * dx + dz * dz <= aggro_sq {
-                                                // Add initial threat + enter combat.
-                                                if !self.state.combat.threat_tables.contains(*idx) {
-                                                    self.state.combat.threat_tables.insert(*idx, ThreatTable::default());
-                                                }
-                                                let table = self.state.combat.threat_tables.get_mut(*idx).unwrap();
-                                                if table.entries.iter().all(|e| e.source != p_id) {
-                                                    table.entries.push(game_core::combat::status::ThreatEntry {
-                                                        source: p_id,
-                                                        threat: 1.0,
-                                                    });
-                                                }
-                                                if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) { *ai = NpcAiState::Combat; }
-                                                audit!(self.state, Ai, AiDecisions, 7, Some(npc_id), "aggro_proximity");
-                                                break; // One target is enough to enter combat.
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
                     }
                     NpcAiState::Combat => {
                         // If threat table is empty, return to Idle.
@@ -139,21 +98,7 @@ impl TickPipeline {
                                 audit!(self.state, Ai, AiDecisions, 7, None, "combat_to_idle");
                             }
                             Some(_) => {
-                                // Leash check: if NPC exceeds leash radius from home → Evade.
-                                let leash = self.state.ai.npc_leash_radius.get(*idx).copied().unwrap_or(0.0);
-                                if leash > 0.0 {
-                                    if let Some(&home) = self.state.ai.home_positions.get(*idx) {
-                                        let npc_id = self.state.entities.id_of(*idx);
-                                        if let Some(npc_t) = self.physics.get_transform(npc_id) {
-                                            let dx = npc_t.position.x - home.x;
-                                            let dz = npc_t.position.z - home.z;
-                                            if dx * dx + dz * dz > leash * leash {
-                                                if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) { *ai = NpcAiState::Evade; }
-                                                audit!(self.state, Ai, AiDecisions, 7, Some(npc_id), "leash_evade");
-                                            }
-                                        }
-                                    }
-                                }
+                                // stay in Combat; action execution below will handle movement
                             }
                         }
                     }
@@ -168,24 +113,7 @@ impl TickPipeline {
                         }
                     }
                     NpcAiState::Scripted => {
-                        // Scripted NPCs check npc_goals for directives.
-                        // V1: "go_idle" causes transition back to Idle.
-                        let npc_id = self.state.entities.id_of(*idx);
-                        if let Some((goal_kind, _priority)) = self.npc_goals.get(&npc_id) {
-                            match goal_kind.as_str() {
-                                "go_idle" => {
-                                    if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) { *ai = NpcAiState::Idle; }
-                                    audit!(self.state, Ai, AiDecisions, 7, Some(npc_id), "goal_idle");
-                                }
-                                _ => {
-                                    // Unknown goal kind — log and ignore.
-                                    log::trace!("NPC {} has unknown goal '{}'", npc_id.0, goal_kind);
-                                }
-                            }
-                        }
-                    }
-                    NpcAiState::Evade => {
-                        // Evade→Idle: handled in action execution when NPC reaches home.
+                        // No scripted behavior yet — placeholder.
                     }
                 }
             }
@@ -205,21 +133,8 @@ impl TickPipeline {
             let current_state = self.state.ai.npc_ai.get(*idx).copied().unwrap();
             match current_state {
                 NpcAiState::Combat => {
-                    // Sanitize threat table: remove entries for entities on a different layer.
-                    let npc_id = self.state.entities.id_of(*idx);
-                    let npc_layer = self.layer_of_idx(*idx);
-                    if let Some(table) = self.state.combat.threat_tables.get_mut(*idx) {
-                        let entities = &self.state.entities;
-                        let cache = &self.entity_layer_cache;
-                        table.entries.retain(|e| {
-                            entities.lookup(e.source).map_or(false, |src_idx| {
-                                let slot = src_idx.as_usize();
-                                let src_layer = if slot < cache.len() { cache[slot] } else { 0 };
-                                src_layer == npc_layer
-                            })
-                        });
-                    }
                     if let Some(target_id) = self.state.combat.threat_tables.get(*idx).and_then(|t| t.top_threat()) {
+                        let npc_id = self.state.entities.id_of(*idx);
                         let no_chase = self.state.ai.npc_no_chase.get(*idx).copied() == Some(true);
                         if !no_chase {
                             self.npc_move_toward(npc_id, *idx, target_id, self.dt);
@@ -245,13 +160,8 @@ impl TickPipeline {
                 NpcAiState::Flee => {
                     if let Some(threat_source) = self.state.combat.threat_tables.get(*idx).and_then(|t| t.top_threat()) {
                         let npc_id = self.state.entities.id_of(*idx);
-                        let npc_layer = self.layer_of_idx(*idx);
-                        if self.layer_of(threat_source) != npc_layer {
-                            // Threat source is on a different layer; skip flee movement.
-                        } else {
-                            self.npc_move_away(npc_id, *idx, threat_source, self.dt);
-                            audit!(self.state, Transform, AiDecisions, 7, Some(npc_id), "flee");
-                        }
+                        self.npc_move_away(npc_id, *idx, threat_source, self.dt);
+                        audit!(self.state, Transform, AiDecisions, 7, Some(npc_id), "flee");
                     }
                 }
                 NpcAiState::Patrol => {
@@ -259,43 +169,6 @@ impl TickPipeline {
                         let npc_id = self.state.entities.id_of(*idx);
                         self.npc_move_toward_pos(npc_id, home, self.dt);
                         audit!(self.state, Transform, AiDecisions, 7, Some(npc_id), "patrol");
-                    }
-                }
-                NpcAiState::Evade => {
-                    // Walk home, clear threat, reset HP on arrival.
-                    let npc_id = self.state.entities.id_of(*idx);
-                    if let Some(&home) = self.state.ai.home_positions.get(*idx) {
-                        self.npc_move_toward_pos(npc_id, home, self.dt);
-                        audit!(self.state, Transform, AiDecisions, 7, Some(npc_id), "evade_walk");
-
-                        // Check arrival.
-                        if let Some(npc_t) = self.physics.get_transform(npc_id) {
-                            let dx = npc_t.position.x - home.x;
-                            let dz = npc_t.position.z - home.z;
-                            const R: f32 = game_core::physics_constants::EVADE_ARRIVE_RADIUS;
-                            if dx * dx + dz * dz <= R * R {
-                                // Arrived home: clear threat, reset HP, return to Idle.
-                                if let Some(table) = self.state.combat.threat_tables.get_mut(*idx) {
-                                    table.entries.clear();
-                                }
-                                // Queue full heal — applied in Phase 8b so Health
-                                // mutations stay centralised in combat/finalization.
-                                let max_hp = self.state.combat.health.max_hp[idx.as_usize()];
-                                let current_hp = self.state.combat.health.hp[idx.as_usize()];
-                                if current_hp < max_hp {
-                                    self.pending_heals.push((npc_id, max_hp - current_hp, npc_id));
-                                }
-                                if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) { *ai = NpcAiState::Idle; }
-                                audit!(self.state, Ai, AiDecisions, 7, Some(npc_id), "evade_home");
-                            }
-                        }
-                    } else {
-                        // No home recorded — snap to Idle.
-                        if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) { *ai = NpcAiState::Idle; }
-                    }
-                    // Clear threat each tick while evading so NPC doesn't re-enter combat.
-                    if let Some(table) = self.state.combat.threat_tables.get_mut(*idx) {
-                        table.entries.clear();
                     }
                 }
                 _ => {}
@@ -425,41 +298,7 @@ impl TickPipeline {
         // coordinator can send them to SpacetimeDB via commit_tick_results.
         // The DB assigns canonical IDs and broadcasts entity.on_insert, which
         // the coordinator handles to materialize them into the local sim.
-        self.director.evaluate(&region_player_counts, self.current_tick, &self.world_phases)
-    }
-
-    // ── Phase 7.5b: Encounter execution ─────────────────────────
-
-    /// Evaluate encounter rules for all active boss encounters.
-    ///
-    /// Checks boss HP thresholds and timers, fires one-shot triggers,
-    /// and returns outputs (phase changes, counter increments) for the
-    /// commit pipeline.
-    pub(super) fn phase_encounter_execution(&mut self) -> Vec<game_core::encounter::EncounterOutput> {
-        let mut outputs = Vec::new();
-
-        // Collect boss entity IDs first to avoid borrow issues.
-        let boss_ids: Vec<EntityId> = self.encounters.keys().copied().collect();
-
-        for boss_id in boss_ids {
-            let hp_pct = if let Some(idx) = self.state.entities.lookup(boss_id) {
-                let i = idx.as_usize();
-                let hp = self.state.combat.health.hp[i];
-                let max_hp = self.state.combat.health.max_hp[i];
-                if max_hp > 0.0 { hp / max_hp } else { 0.0 }
-            } else {
-                // Boss entity no longer exists — clean up encounter.
-                self.encounters.remove(&boss_id);
-                continue;
-            };
-
-            if let Some(enc) = self.encounters.get_mut(&boss_id) {
-                let enc_outputs = enc.evaluate(hp_pct, self.current_tick);
-                outputs.extend(enc_outputs);
-            }
-        }
-
-        outputs
+        self.director.evaluate(&region_player_counts, self.current_tick)
     }
 
     /// Get mutable access to the director state for event registration.

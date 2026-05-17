@@ -46,11 +46,6 @@ impl SimulationRunner {
         }
     }
 
-    /// Access the buff template registry for rehydration lookups.
-    pub fn buff_registry(&self) -> &game_core::combat::status::BuffRegistry {
-        &self.pipeline.buff_registry
-    }
-
     /// Attempt to process one simulation tick.
     pub fn run_tick(
         &mut self,
@@ -74,16 +69,6 @@ impl SimulationRunner {
             &mut self.pipeline,
             &mut self.commit,
         )
-    }
-
-    /// Returns `true` when a catch-up tick can be processed: there is
-    /// backlog (canonical ahead of next-expected) and the pipeline has room.
-    pub fn can_catch_up(&self, canonical_tick: u64) -> bool {
-        canonical_tick >= self.commit.next_expected_tick()
-            && matches!(
-                self.commit.can_process_tick(canonical_tick),
-                crate::commit_authority::CanProcessResult::Proceed
-            )
     }
 
     /// Seed the commit cursor and pipeline tick counter from a
@@ -131,10 +116,9 @@ impl SimulationRunner {
         tick: TickId,
         max_hp: f32,
         position: Vec3f,
-        layer: u32,
     ) {
         self.pipeline
-            .spawn_entity_from_snapshot(id, kind, tick, max_hp, position, layer);
+            .spawn_entity_from_snapshot(id, kind, tick, max_hp, position);
     }
 
     /// Restore buff, threat, and NPC AI state from DB rows after a worker restart.
@@ -144,9 +128,10 @@ impl SimulationRunner {
     pub fn seed_runtime_state(
         &mut self,
         buffs: &[(EntityId, Vec<game_core::combat::status::ActiveBuff>)],
+        threats: &[(EntityId, Vec<game_core::combat::status::ThreatEntry>)],
         npc_states: &[(EntityId, game_schema::NpcAiState, Option<EntityId>)],
     ) {
-        self.pipeline.seed_runtime_state(buffs, npc_states);
+        self.pipeline.seed_runtime_state(buffs, threats, npc_states);
     }
 
     /// Hard teardown for an entity from all runtime stores.
@@ -164,16 +149,6 @@ impl SimulationRunner {
             if cfg.no_chase {
                 self.pipeline.state.ai.npc_no_chase.insert(idx, true);
             }
-            if cfg.leash_radius > 0.0 {
-                self.pipeline.state.ai.npc_leash_radius.insert(idx, cfg.leash_radius);
-            } else {
-                self.pipeline.state.ai.npc_leash_radius.remove(idx);
-            }
-            if cfg.aggro_radius > 0.0 {
-                self.pipeline.state.ai.npc_aggro_radius.insert(idx, cfg.aggro_radius);
-            } else {
-                self.pipeline.state.ai.npc_aggro_radius.remove(idx);
-            }
             if !cfg.ability_ids.is_empty() {
                 // Replace default NPC abilities assigned during spawn.
                 self.pipeline.state.ai.npc_ability_ids.remove(idx);
@@ -183,49 +158,6 @@ impl SimulationRunner {
                     .npc_ability_ids
                     .insert(idx, cfg.ability_ids);
             }
-        }
-    }
-
-    /// Insert or update an interactable entry in the sim state.
-    pub fn set_interactable(&mut self, id: EntityId, info: game_core::sim_state::InteractableInfo) {
-        self.pipeline.state.interactables.insert(id, info);
-    }
-
-    /// Remove an interactable entry from the sim state.
-    pub fn remove_interactable(&mut self, id: EntityId) {
-        self.pipeline.state.interactables.remove(&id);
-    }
-
-    /// Returns the visibility layer for an entity (0 = open world).
-    pub fn entity_layer(&self, id: EntityId) -> u32 {
-        self.pipeline.layer_of(id)
-    }
-
-    /// Update the visibility layer for an entity in the sim's region map and physics.
-    /// Called when instance join/leave changes the entity's layer.
-    pub fn set_entity_layer(&mut self, id: EntityId, layer: u32) {
-        if let Some(cell) = self.pipeline.entity_regions.get_mut(&id) {
-            cell.layer = layer;
-        }
-        // Update the dense layer cache for O(1) same_layer checks.
-        if let Some(idx) = self.pipeline.state.entities.lookup(id) {
-            let slot = idx.as_usize();
-            if slot >= self.pipeline.entity_layer_cache.len() {
-                self.pipeline.entity_layer_cache.resize(slot + 1, 0);
-            }
-            self.pipeline.entity_layer_cache[slot] = layer;
-        }
-        self.pipeline.physics.set_entity_layer(id, layer);
-    }
-
-    /// Update an entity's team membership in the dense cache.
-    pub fn set_entity_team(&mut self, id: EntityId, team_id: u32) {
-        if let Some(idx) = self.pipeline.state.entities.lookup(id) {
-            let slot = idx.as_usize();
-            if slot >= self.pipeline.entity_team_cache.len() {
-                self.pipeline.entity_team_cache.resize(slot + 1, 0);
-            }
-            self.pipeline.entity_team_cache[slot] = team_id;
         }
     }
 
@@ -247,40 +179,6 @@ impl SimulationRunner {
     /// Whether the entity has a live index mapping (not yet fully removed).
     pub fn entity_exists(&self, id: EntityId) -> bool {
         self.pipeline.state.entities.lookup(id).is_some()
-    }
-
-    /// Mutable access to the physics backend (for instance collider management).
-    pub fn physics_mut(&mut self) -> &mut dyn game_core::physics_backend::PhysicsBackend {
-        self.pipeline.physics_mut()
-    }
-
-    // ── Tier 2 projections ──────────────────────────────────────────
-
-    /// Set or update a world_phase projection for a zone.
-    pub fn set_world_phase(&mut self, zone_id: u32, phase_name: String) {
-        self.pipeline.world_phases.insert(zone_id, phase_name);
-    }
-
-    /// Remove a world_phase projection.
-    pub fn remove_world_phase(&mut self, zone_id: u32) {
-        self.pipeline.world_phases.remove(&zone_id);
-    }
-
-    /// Set or update an NPC goal projection.
-    pub fn set_npc_goal(&mut self, entity_id: EntityId, goal_kind: String, priority: u32) {
-        self.pipeline.npc_goals.insert(entity_id, (goal_kind, priority));
-    }
-
-    /// Remove an NPC goal projection.
-    pub fn remove_npc_goal(&mut self, entity_id: EntityId) {
-        self.pipeline.npc_goals.remove(&entity_id);
-    }
-
-    // ── Encounter management ────────────────────────────────────────
-
-    /// Register an encounter for a boss entity.
-    pub fn register_encounter(&mut self, boss_entity: EntityId, encounter: game_core::encounter::EncounterState) {
-        self.pipeline.encounters.insert(boss_entity, encounter);
     }
 }
 
@@ -326,8 +224,6 @@ mod tests {
             projectile_speed: None,
             max_range: None,
             lock_on_timeout_ticks: None,
-            max_rewind_ticks: None,
-            target_filter: game_core::combat::skill::TargetFilter::Hostile,
         });
         reg.register_timeline(AbilityTimeline {
             ability_id: 1,
@@ -534,7 +430,6 @@ mod tests {
                 y: 1.0,
                 z: 0.0,
             },
-            0,
         );
         assert!(runner.contains(eid));
         assert!(runner.entity_exists(eid));
@@ -560,7 +455,6 @@ mod tests {
                 y: 1.0,
                 z: 0.0,
             },
-            0,
         );
 
         // Activate the entity so is_active returns true.

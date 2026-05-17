@@ -223,9 +223,3 @@ impl ThreatTable {
             .map(|e| e.source)
     }
 }
-
-/// On-disk serialization format for `data/buffs.ron`.
-#[derive(Clone, Debug, Deserialize)]
-pub struct BuffFile {
-    pub buffs: Vec<BuffTemplate>,
-}

@@ -8,5 +8,3 @@ license.workspace = true
 game_protocol = { workspace = true }
 game_schema = { workspace = true }
 serde = { workspace = true }
-ron = { workspace = true }
-log = { workspace = true }

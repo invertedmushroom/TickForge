@@ -74,21 +74,6 @@ pub enum CastFacingPolicy {
     FaceResolvedTarget,
 }
 
-/// Which entities a hitbox is allowed to affect based on team membership.
-///
-/// Checked in `apply_hit_damage` after layer isolation passes.
-/// Team 0 (unassigned) is treated as hostile to everyone.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TargetFilter {
-    /// Damages/affects only entities on a different team (or team 0).
-    #[default]
-    Hostile,
-    /// Heals/buffs only entities on the same team (team must match and be non-zero).
-    Friendly,
-    /// Affects all entities regardless of team (e.g. environmental hazards).
-    All,
-}
-
 /// Runtime parameters for a single ability cast.
 ///
 /// Created in Phase 2 alongside `AbilityExecutionContext` so that a single
@@ -193,7 +178,7 @@ pub enum AbilityAction {
     /// `move_character`. The arc ends automatically when `MoveResult::grounded`
     /// is true (after the launch tick) or when a `StanceEnd` fires.
     ArcMovement { speed: f32, lift: f32, gravity: f32 },
-    /// Emit a `TelegraphWarning` event to the resolved target.
+    /// Emit a `LockOnWarning` event to the resolved target.
     ///
     /// `impact_delay` is the number of ticks from now until the damage frame lands.
     /// Phase 3 reads the execution context's `ResolvedTargeting` to determine the
@@ -420,16 +405,6 @@ pub struct AbilityData {
     /// `None` = default 400 ticks (20 s at 20 Hz).
     #[serde(default)]
     pub lock_on_timeout_ticks: Option<u32>,
-    /// Per-ability cap on lag compensation rewind depth.
-    /// `None` = use the global `TickConfig::global_max_rewind_ticks` (default 4).
-    /// Lower values reduce the compensation window for skills that don't need it
-    /// (e.g. melee AoE). Higher values extend it for precise skill-shots (capped by global).
-    #[serde(default)]
-    pub max_rewind_ticks: Option<u32>,
-    /// Which entities this ability's hitbox is allowed to affect.
-    /// `Hostile` (default) = only enemies. `Friendly` = only allies. `All` = everything.
-    #[serde(default)]
-    pub target_filter: TargetFilter,
 }
 
 /// Registry of all known abilities, keyed by ability_id.
@@ -586,19 +561,4 @@ impl AbilityExecutionStore {
     pub fn is_empty(&self) -> bool {
         self.active.is_empty()
     }
-}
-
-// ── On-disk format ──────────────────────────────────────────
-
-/// On-disk serialization format for `data/abilities.ron`.
-///
-/// Both `AbilityData` and `AbilityTimeline` already derive `serde::Deserialize`,
-/// so any crate with `ron` in its deps can parse the file directly:
-/// ```ignore
-/// let file = ron::from_str::<AbilityFile>(include_str!("../../../../data/abilities.ron"))?;
-/// ```
-#[derive(serde::Deserialize)]
-pub struct AbilityFile {
-    pub abilities: Vec<AbilityData>,
-    pub timelines: Vec<AbilityTimeline>,
 }

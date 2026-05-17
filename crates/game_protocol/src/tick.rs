@@ -29,10 +29,6 @@ pub struct TickConfig {
     /// Fixed delta time in seconds, derived from rate_hz.
     /// Stored explicitly to avoid repeated division.
     pub dt: f32,
-    /// Global maximum lag compensation rewind depth (ticks).
-    /// Per-ability `max_rewind_ticks` is capped by this value.
-    /// Default: 4 (200 ms at 20 Hz).
-    pub global_max_rewind_ticks: u32,
 }
 
 impl TickConfig {
@@ -40,7 +36,6 @@ impl TickConfig {
         Self {
             rate_hz,
             dt: 1.0 / rate_hz as f32,
-            global_max_rewind_ticks: 4,
         }
     }
 

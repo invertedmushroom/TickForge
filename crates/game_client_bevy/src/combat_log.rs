@@ -79,8 +79,6 @@ fn poll_combat_events(
     mut hitbox_spawn: EventWriter<crate::vfx::HitboxSpawnedEvent>,
     mut hitbox_dmg: EventWriter<crate::vfx::HitboxDamageFrameEvent>,
     mut hitbox_remove: EventWriter<crate::vfx::HitboxRemovedEvent>,
-    mut buff_applied: EventWriter<crate::vfx::BuffAppliedVfxEvent>,
-    mut teleported: EventWriter<crate::vfx::TeleportVfxEvent>,
 ) {
     use game_client::module_bindings::*;
     use spacetimedb_sdk::Table;
@@ -131,16 +129,6 @@ fn poll_combat_events(
             });
         }
 
-        // Emit floating heal number (green, negative convention).
-        if let CombatEventKind::Healed(ref h) = ev.event_kind {
-            damage_events.send(crate::vfx::DamageNumberEvent {
-                target_entity_id: ev.target_entity,
-                amount: -h.amount,
-                is_crit: false,
-                is_self: is_us_target,
-            });
-        }
-
         // Emit death notification for VFX (death marker + "YOU DIED" screen).
         if matches!(&ev.event_kind, CombatEventKind::EntityDied(_)) {
             death_events.send(crate::vfx::DeathNotification {
@@ -163,22 +151,12 @@ fn poll_combat_events(
                 });
             }
             CombatEventKind::HazardSpawned(h) => {
-                // SelfOnly abilities (e.g. Flame Aura) already get a caster-following
-                // hitbox visual via CastStart — skip the static ground disc.
-                use crate::ability_bar::{all_abilities, ClientTargetingMode};
-                let is_self_only = all_abilities().iter()
-                    .find(|a| a.id == h.ability_id)
-                    .map(|a| a.targeting == ClientTargetingMode::SelfOnly)
-                    .unwrap_or(false);
-                if !is_self_only {
-                    hazard_spawn.send(crate::vfx::HazardSpawnEvent {
-                        execution_id: h.execution_id,
-                        ability_id: h.ability_id,
-                        source_entity_id: ev.source_entity,
-                        position: Vec3::new(h.pos_x, h.pos_y, h.pos_z),
-                        radius: h.radius,
-                    });
-                }
+                hazard_spawn.send(crate::vfx::HazardSpawnEvent {
+                    execution_id: h.execution_id,
+                    ability_id: h.ability_id,
+                    position: Vec3::new(h.pos_x, h.pos_y, h.pos_z),
+                    radius: h.radius,
+                });
             }
             CombatEventKind::SkillObjectRemoved(exec_id) => {
                 skill_obj_remove.send(crate::vfx::SkillObjectRemoveEvent {
@@ -200,59 +178,21 @@ fn poll_combat_events(
                 });
             }
             // Proxy CastStart → HitboxSpawned event so melee shapes appear on cast.
-            // Skip HazardZone abilities (GroundTarget/CasterOffset) — those get
-            // their own HazardSpawnEvent with the correct world position.
             CombatEventKind::CastStart(c) => {
-                use crate::ability_bar::{all_abilities, ClientTargetingMode};
-                let is_hazard = all_abilities().iter()
-                    .find(|a| a.id == c.ability_id)
-                    .map(|a| matches!(a.targeting,
-                        ClientTargetingMode::GroundTarget | ClientTargetingMode::CasterOffset))
-                    .unwrap_or(false);
-                if !is_hazard {
-                    hitbox_spawn.send(crate::vfx::HitboxSpawnedEvent {
-                        source_entity_id: ev.source_entity,
-                        ability_id: c.ability_id,
-                    });
-                }
+                hitbox_spawn.send(crate::vfx::HitboxSpawnedEvent {
+                    source_entity_id: ev.source_entity,
+                    ability_id: c.ability_id,
+                });
             }
             // Proxy SkillHit → HitboxDamageFrame event so shape flashes red on contact.
-            // For periodic / lingering abilities, don't immediately remove the hitbox
-            // visual — it persists until its linger timer expires.
             CombatEventKind::SkillHit(ability_id) => {
                 hitbox_dmg.send(crate::vfx::HitboxDamageFrameEvent {
                     source_entity_id: ev.source_entity,
                     ability_id: *ability_id,
                 });
-                let is_periodic = crate::ability_bar::all_abilities().iter()
-                    .find(|a| a.id == *ability_id)
-                    .map(|a| a.damage_interval_ticks > 0)
-                    .unwrap_or(false);
-                if !is_periodic {
-                    hitbox_remove.send(crate::vfx::HitboxRemovedEvent {
-                        source_entity_id: ev.source_entity,
-                        ability_id: *ability_id,
-                    });
-                }
-            }
-            CombatEventKind::BuffApplied(b) => {
-                use game_core::combat::status::BuffKind;
-                let is_boon = crate::hud::all_buffs()
-                    .iter()
-                    .find(|t| t.buff_id == b.buff_id)
-                    .map(|t| t.buff_kind == BuffKind::Boon)
-                    .unwrap_or(true);
-                buff_applied.send(crate::vfx::BuffAppliedVfxEvent {
-                    target_entity_id: ev.target_entity,
-                    buff_id: b.buff_id,
-                    is_boon,
-                });
-            }
-            CombatEventKind::Teleported(t) => {
-                teleported.send(crate::vfx::TeleportVfxEvent {
-                    entity_id: ev.source_entity,
-                    from: Vec3::new(t.from_x, t.from_y, t.from_z),
-                    to: Vec3::new(t.to_x, t.to_y, t.to_z),
+                hitbox_remove.send(crate::vfx::HitboxRemovedEvent {
+                    source_entity_id: ev.source_entity,
+                    ability_id: *ability_id,
                 });
             }
             _ => {}
@@ -335,20 +275,7 @@ fn format_combat_event(
             } else {
                 Color::srgb(0.7, 0.7, 0.7)
             };
-            let damage_type = match d.damage_type {
-                game_client::module_bindings::DamageType::Physical => "Physical",
-                game_client::module_bindings::DamageType::Magical => "Magical",
-                game_client::module_bindings::DamageType::True => "True",
-            };
-            (format!("{src} hit {tgt} for {:.0} {damage_type}", d.amount), color)
-        }
-        CombatEventKind::Healed(h) => {
-            let color = if is_us_target {
-                Color::srgb(0.2, 1.0, 0.3) // green — we were healed
-            } else {
-                Color::srgb(0.5, 0.9, 0.5)
-            };
-            (format!("{src} healed {tgt} for {:.0}", h.amount), color)
+            (format!("{src} hit {tgt} for {:.0} {:?}", d.amount, d.damage_type), color)
         }
         CombatEventKind::SkillHit(_) => {
             // Suppressed — redundant with Damage line and CastStart.
@@ -382,26 +309,8 @@ fn format_combat_event(
         CombatEventKind::BuffExpired(buff_id) => {
             (format!("{tgt} lost buff #{buff_id}"), Color::srgb(0.6, 0.6, 0.6))
         }
-        CombatEventKind::TelegraphWarning(w) => {
-            (format!("⚠ {src} telegraph on {tgt} (impact tick {})", w.impact_tick), Color::srgb(1.0, 0.6, 0.0))
-        }
-        CombatEventKind::LockOnAcquired => {
-            (format!("🎯 {src} locked on to {tgt}"), Color::srgb(1.0, 0.5, 0.0))
-        }
-        CombatEventKind::LockOnSessionStarted(s) => {
-            let name = ability_name(s.ability_id);
-            (format!("{src} opened lock-on with {name}"), Color::srgb(1.0, 0.8, 0.2))
-        }
-        CombatEventKind::LockOnCanceled(c) => {
-            let canceled_target = if is_us_target || c.target == ev.target_entity {
-                tgt.clone()
-            } else {
-                format!("#{}", c.target)
-            };
-            (format!("{src} canceled lock-on on {canceled_target}"), Color::srgb(0.7, 0.7, 0.7))
-        }
-        CombatEventKind::LockOnFired(f) => {
-            (format!("{src} fired lock-on at {} target(s)", f.targets.len()), Color::srgb(1.0, 0.75, 0.25))
+        CombatEventKind::LockOnWarning(w) => {
+            (format!("⚠ {src} locked on to {tgt} (impact tick {})", w.impact_tick), Color::srgb(1.0, 0.6, 0.0))
         }
         CombatEventKind::CastStart(c) => {
             let name = ability_name(c.ability_id);
@@ -434,18 +343,6 @@ fn format_combat_event(
         // Projectile events produce VFX, not log lines — return empty.
         CombatEventKind::ProjectileLaunched(_) | CombatEventKind::HazardSpawned(_) | CombatEventKind::SkillObjectRemoved(_) => {
             (String::new(), Color::srgba(0.0, 0.0, 0.0, 0.0))
-        }
-        CombatEventKind::Teleported(t) => {
-            (
-                format!(
-                    "{src} teleported ({:.1}, {:.1}) -> ({:.1}, {:.1})",
-                    t.from_x,
-                    t.from_z,
-                    t.to_x,
-                    t.to_z,
-                ),
-                Color::srgb(0.4, 0.95, 1.0),
-            )
         }
         CombatEventKind::Knockback(k) => {
             (format!("{tgt} knocked back (force {:.0})", k.force), Color::srgb(1.0, 0.5, 0.1))
@@ -498,10 +395,10 @@ fn local_player_matches(kid: u64, is_us_source: bool, source_entity: u64) -> boo
 }
 
 fn ability_name(id: u32) -> &'static str {
-    crate::ability_bar::all_abilities()
+    crate::ability_bar::ALL_ABILITIES
         .iter()
         .find(|a| a.id == id)
-        .map(|a| a.name.as_str())
+        .map(|a| a.name)
         .unwrap_or("Unknown")
 }
 

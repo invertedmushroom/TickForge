@@ -98,7 +98,6 @@ fn orbit_input(
     mut scroll_events: EventReader<MouseWheel>,
     mut orbit: ResMut<OrbitState>,
     captured: Res<CursorCaptured>,
-    menu_state: Option<Res<crate::ability_bar::SkillMenuState>>,
 ) {
     // Mouse-look when cursor is captured, OR right-mouse-drag when free.
     if captured.0 || mouse_button.pressed(MouseButton::Right) {
@@ -114,13 +113,8 @@ fn orbit_input(
     orbit.pitch = orbit.pitch.clamp(-1.4, -0.1);
 
     // Scroll zoom.
-    let menu_open = menu_state.as_ref().is_some_and(|state| state.active_slot.is_some());
-    if !menu_open {
-        for ev in scroll_events.read() {
-            orbit.distance -= ev.y * 2.0;
-        }
-    } else {
-        scroll_events.clear();
+    for ev in scroll_events.read() {
+        orbit.distance -= ev.y * 2.0;
     }
     orbit.distance = orbit.distance.clamp(5.0, 60.0);
 }

@@ -10,7 +10,6 @@
 pub mod types;
 pub mod entity;
 pub mod damage;
-pub mod dungeon;
 pub mod equipment;
 pub mod intent;
 pub mod cc;
@@ -18,7 +17,6 @@ pub mod cc;
 pub use types::Vec3f;
 pub use entity::{EntityKind, EntityState, NpcAiState};
 pub use damage::DamageType;
-pub use dungeon::LayerCollisionPolicy;
 pub use equipment::EquipmentSlot;
 pub use intent::{AbilityTarget, BlockData, IntentAction, MoveDir, UseAbilityData};
 pub use cc::CCEffect;

@@ -39,7 +39,4 @@ pub enum NpcAiState {
     Combat,
     Flee,
     Scripted,
-    /// Walking back to home position after exceeding leash radius.
-    /// Clears threat, resets HP on arrival.
-    Evade,
 }

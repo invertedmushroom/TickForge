@@ -37,7 +37,7 @@ impl TickPipeline {
     pub(super) fn collect_health_updates(&self) -> Vec<(EntityId, f32, f32)> {
         let damaged: HashSet<EntityId> = self.pending_events.iter()
             .filter_map(|e| match &e.payload {
-                EventPayload::Damage { .. } | EventPayload::FallDamage { .. } | EventPayload::Healed { .. } => Some(e.entity_id),
+                EventPayload::Damage { .. } | EventPayload::FallDamage { .. } => Some(e.entity_id),
                 _ => None,
             })
             .collect();
@@ -66,6 +66,43 @@ impl TickPipeline {
             let eid = self.state.entities.id_of(self.state.entities.index_at(*i));
             self.stats_dirty.insert(eid);
             out.push((eid, self.state.status.clone_buffs(*i)));
+        }
+        out
+    }
+
+    /// Snapshot current aggro holders for persistence.
+    ///
+    /// The simulation keeps the full threat table in memory for AI decisions, but
+    /// the DB only needs a coarse recovery checkpoint: who currently has aggro.
+    /// Emit at most one threat entry (the current top target) when that holder
+    /// changes, or an empty snapshot when aggro clears so stale DB rows are deleted.
+    pub(super) fn collect_threat_updates(&mut self) -> Vec<(EntityId, Vec<game_core::combat::status::ThreatEntry>)> {
+        let mut out = Vec::new();
+        for (idx, table) in self.state.combat.threat_tables.iter() {
+            if self.state.entities.states[idx.as_usize()] == game_core::entity::lifecycle::EntityState::Removed {
+                continue;
+            }
+            let eid = self.state.entities.id_of(idx);
+            let current_top = table.top_threat();
+            let previous_top = self.npc_state_prev
+                .get(&eid)
+                .map(|(_, target)| *target)
+                .flatten();
+
+            if current_top == previous_top {
+                continue;
+            }
+
+            match current_top {
+                Some(source) => {
+                    let threat = table.entries.iter()
+                        .find(|entry| entry.source == source)
+                        .cloned()
+                        .unwrap_or(game_core::combat::status::ThreatEntry { source, threat: 1.0 });
+                    out.push((eid, vec![threat]));
+                }
+                None => out.push((eid, Vec::new())),
+            }
         }
         out
     }
@@ -103,19 +140,10 @@ impl TickPipeline {
         let mut out = Vec::new();
         for &(eid, ref tf) in transforms {
             let pos = &tf.position;
-            let layer = self.layer_of(eid);
             let new_cell = match self.entity_regions.get(&eid) {
-                Some(current) if current.layer == layer => {
-                    RegionCell::from_position_with_hysteresis(pos, current)
-                }
-                Some(current) => {
-                    // Layer changed — carry it through so the region update
-                    // propagates to entity_region even if XZ didn't move.
-                    let mut cell = RegionCell::from_position_with_hysteresis(pos, current);
-                    cell.layer = layer;
-                    cell
-                }
-                None => RegionCell::from_position_on_layer(pos, layer),
+                Some(current) => RegionCell::from_position_with_hysteresis(pos, current),
+                // Entity not tracked yet (expected on first tick after spawn).
+                None => RegionCell::from_position(pos),
             };
             let changed = self.entity_regions.get(&eid) != Some(&new_cell);
             if changed {

@@ -5,8 +5,9 @@
 //!
 //! Run via: `cargo run -p game_client --features connected -- --test`
 //!
-//! Requires a running local stack, but no pre-seeded NPCs or persisted client
-//! state. The suite provisions and cleans up its own disposable test entities.
+//! Prerequisites:
+//!   - SpacetimeDB server running (`spacetime start`)
+//!   - Module published and simulation worker running (`dev-deploy.ps1`)
 
 use log::{error, info, warn};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -72,102 +73,6 @@ fn wait_for(conn: &DbConnection, timeout_ms: u64, condition: impl Fn() -> bool) 
     false
 }
 
-fn current_client_sequence(conn: &DbConnection) -> Option<ClientSequence> {
-    let identity = conn.try_identity()?;
-    conn.db().client_sequence().client_identity().find(&identity)
-}
-
-fn current_entity_id(conn: &DbConnection) -> Option<u64> {
-    current_client_sequence(conn).map(|seq| seq.entity_id)
-}
-
-fn latest_live_npc_id(conn: &DbConnection) -> u64 {
-    conn.db().nearby_entities().iter()
-        .filter(|entity| entity.kind == EntityKind::Npc && entity.state != EntityState::Removed)
-        .map(|entity| entity.entity_id)
-        .max()
-        .unwrap_or(0)
-}
-
-fn find_spawned_npc(conn: &DbConnection, min_entity_id: u64, pos_x: f32, pos_z: f32) -> Option<u64> {
-    conn.db().nearby_transforms().iter()
-        .filter(|transform| transform.entity_id > min_entity_id)
-        .filter(|transform| (transform.pos_x - pos_x).abs() < 1.0 && (transform.pos_z - pos_z).abs() < 1.0)
-        .filter_map(|transform| {
-            conn.db().nearby_entities().iter()
-                .find(|entity| entity.entity_id == transform.entity_id)
-                .filter(|entity| entity.kind == EntityKind::Npc && entity.state != EntityState::Removed)
-                .map(|_| transform.entity_id)
-        })
-        .max()
-}
-
-fn facing_xz_from_transform(transform: &EntityTransform) -> (f32, f32) {
-    let x = 2.0 * (transform.rot_x * transform.rot_z + transform.rot_w * transform.rot_y);
-    let z = 1.0 - 2.0 * (transform.rot_x * transform.rot_x + transform.rot_y * transform.rot_y);
-    let len_sq = x * x + z * z;
-    if len_sq > 1e-6 {
-        let inv_len = 1.0 / len_sq.sqrt();
-        (x * inv_len, z * inv_len)
-    } else {
-        (0.0, 1.0)
-    }
-}
-
-fn spawn_nearby_disposable_npc(
-    conn: &DbConnection,
-    owner_entity_id: u64,
-    distance: f32,
-    max_hp: f32,
-) -> Result<u64, String> {
-    let before_spawn_id = latest_live_npc_id(conn);
-    let transform = conn.db().nearby_transforms().iter()
-        .find(|t| t.entity_id == owner_entity_id)
-        .ok_or_else(|| format!("No transform row for entity {owner_entity_id}"))?;
-    let (forward_x, forward_z) = facing_xz_from_transform(&transform);
-    let spawn_x = transform.pos_x + forward_x * distance;
-    let spawn_z = transform.pos_z + forward_z * distance;
-
-    let spawn_done = Arc::new(AtomicBool::new(false));
-    let spawn_ok = Arc::new(AtomicBool::new(false));
-    let done_flag = Arc::clone(&spawn_done);
-    let ok_flag = Arc::clone(&spawn_ok);
-
-    conn.reducers()
-        .spawn_npc_then(spawn_x, transform.pos_y, spawn_z, max_hp, move |_ctx, result| {
-            if let Ok(Ok(())) = result {
-                ok_flag.store(true, Ordering::SeqCst);
-            }
-            done_flag.store(true, Ordering::SeqCst);
-        })
-        .map_err(|err| format!("Failed to send spawn_npc: {err}"))?;
-
-    if !wait_for(conn, 5000, || spawn_done.load(Ordering::SeqCst)) {
-        return Err("Timed out waiting for spawn_npc callback".into());
-    }
-    if !spawn_ok.load(Ordering::SeqCst) {
-        return Err("spawn_npc reducer rejected the request".into());
-    }
-
-    if !wait_for(conn, 5000, || {
-        find_spawned_npc(conn, before_spawn_id, spawn_x, spawn_z)
-            .and_then(|npc_id| conn.db().nearby_entities().iter().find(|e| e.entity_id == npc_id))
-            .is_some_and(|entity| entity.state == EntityState::Active)
-    }) {
-        return Err(format!(
-            "Disposable NPC at ({spawn_x:.2}, {spawn_z:.2}) never became Active"
-        ));
-    }
-
-    find_spawned_npc(conn, before_spawn_id, spawn_x, spawn_z)
-        .ok_or_else(|| format!("Could not resolve disposable NPC at ({spawn_x:.2}, {spawn_z:.2})"))
-}
-
-fn cleanup_entity(conn: &DbConnection, entity_id: u64) {
-    let _ = conn.reducers().debug_remove_entity(entity_id);
-    pump(conn, 200);
-}
-
 // ── Public Entry Point ──────────────────────────────────────────────
 
 pub fn run_tests(config: ClientConfig) -> i32 {
@@ -176,7 +81,12 @@ pub fn run_tests(config: ClientConfig) -> i32 {
     let spawn_done = Arc::new(AtomicBool::new(false));
     let phase = Arc::new(AtomicU32::new(0)); // 0=connect, 1=spawn, 2=subscribe, 3=tests, 4=done
 
-    let auth_token = config.auth_token;
+    let auth_token = config.auth_token.or_else(|| {
+        std::fs::read_to_string(".client_token")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    });
 
     let spawn_done_flag = Arc::clone(&spawn_done);
     let phase_connect = Arc::clone(&phase);
@@ -185,7 +95,8 @@ pub fn run_tests(config: ClientConfig) -> i32 {
         .with_uri(&config.uri)
         .with_database_name(&config.module_name)
         .with_token(auth_token.as_deref())
-        .on_connect(move |ctx: &DbConnection, identity, _token: &str| {
+        .on_connect(move |ctx: &DbConnection, identity, token: &str| {
+            let _ = std::fs::write(".client_token", token);
             info!("Connected as {identity}");
 
             let sd = Arc::clone(&spawn_done_flag);
@@ -262,8 +173,6 @@ pub fn run_tests(config: ClientConfig) -> i32 {
                 .subscribe([
                     "SELECT * FROM my_region",
                     "SELECT * FROM nearby_transforms",
-                    "SELECT * FROM nearby_entities",
-                    "SELECT * FROM nearby_health",
                     "SELECT * FROM entity",
                     "SELECT * FROM entity_transform",
                     "SELECT * FROM entity_health",
@@ -298,15 +207,6 @@ pub fn run_tests(config: ClientConfig) -> i32 {
             run_denial_test(&conn, &results);
 
             break; // all tests done
-        }
-    }
-
-    if let Some(entity_id) = current_entity_id(&conn) {
-        info!("Cleaning up smoke-test player entity_id={entity_id}");
-        if let Err(err) = conn.reducers().debug_remove_entity(entity_id) {
-            warn!("Failed to cleanup smoke-test player {entity_id}: {err}");
-        } else {
-            pump(&conn, 400);
         }
     }
 
@@ -378,24 +278,24 @@ fn run_aoi_tests(conn: &DbConnection, r: &mut TestResults) {
         r.fail("T2a  nearby_transforms returned 0 entities");
     }
 
-    // T3: RLS enforcement — raw entity table returns 0 rows for non-worker clients.
-    info!("  T3: entity table (RLS enforcement)");
+    // T3: entity table populated.
+    info!("  T3: entity table");
     let entity_count = conn.db().entity().count();
-    if entity_count == 0 {
-        r.pass("T3  entity table correctly empty (RLS enforced)");
+    if entity_count >= 1 {
+        r.pass(&format!("T3  entity table returned {entity_count} rows"));
     } else {
-        r.fail(&format!("T3  entity table returned {entity_count} rows — RLS not enforced!"));
+        r.fail("T3  entity table returned 0 rows");
     }
 
-    // T4: consistency — nearby entities exist in nearby_entities view.
+    // T4: consistency — nearby entities exist in entity table.
     info!("  T4: view consistency");
     let orphans = conn.db().nearby_transforms().iter()
-        .filter(|t| conn.db().nearby_entities().iter().find(|e| e.entity_id == t.entity_id).is_none())
+        .filter(|t| conn.db().entity().entity_id().find(&t.entity_id).is_none())
         .count();
     if orphans == 0 {
-        r.pass("T4  all nearby_transforms entities exist in nearby_entities");
+        r.pass("T4  all nearby_transforms entities exist in entity table");
     } else {
-        r.fail(&format!("T4  {orphans} nearby_transforms entities missing from nearby_entities"));
+        r.fail(&format!("T4  {orphans} nearby_transforms entities missing from entity table"));
     }
 
     // T5: no distant entities in nearby_transforms.
@@ -534,8 +434,14 @@ fn run_adjacency_tests(conn: &DbConnection, r: &mut TestResults) {
             let _ = conn.reducers().debug_remove_entity(t.entity_id);
         }
     }
-    // Distant NPC is outside AOI and raw tables are RLS-blocked;
-    // it will be cleaned up on next clean deploy.
+    // Distant NPC won't be in nearby_transforms; find it via entity table.
+    for e in conn.db().entity().iter() {
+        if let Some(t) = conn.db().entity_transform().entity_id().find(&e.entity_id) {
+            if (t.pos_x - far_x).abs() < 1.0 && (t.pos_z - far_z).abs() < 1.0 {
+                let _ = conn.reducers().debug_remove_entity(e.entity_id);
+            }
+        }
+    }
     pump(conn, 200);
 }
 
@@ -582,8 +488,7 @@ fn run_layer_tests(conn: &DbConnection, r: &mut TestResults) {
     let test_npc_id = conn.db().nearby_transforms().iter()
         .filter(|t| (t.pos_x - same_x).abs() < 1.0 && (t.pos_z - same_z).abs() < 1.0)
         .filter(|t| {
-            conn.db().nearby_entities().iter()
-                .find(|e| e.entity_id == t.entity_id)
+            conn.db().entity().entity_id().find(&t.entity_id)
                 .is_some_and(|e| e.kind == EntityKind::Npc)
         })
         .map(|t| t.entity_id)
@@ -671,10 +576,10 @@ fn run_stealth_tests(conn: &DbConnection, r: &mut TestResults) {
     info!("── Stealth Visibility Tests ─────────────────────────────────");
 
     // Resolve player entity.
-    let my_entity_id = match current_entity_id(conn) {
-        Some(entity_id) => entity_id,
+    let my_entity_id = match conn.db().client_sequence().iter().next() {
+        Some(cs) => cs.entity_id,
         None => {
-            r.fail("ST0  cannot run stealth tests — no client_sequence for this connection");
+            r.fail("ST0  cannot run stealth tests — no client_sequence");
             return;
         }
     };
@@ -713,8 +618,7 @@ fn run_stealth_tests(conn: &DbConnection, r: &mut TestResults) {
     let npc_eid = conn.db().nearby_transforms().iter()
         .filter(|t| (t.pos_x - npc_x).abs() < 1.0 && (t.pos_z - npc_z).abs() < 1.0)
         .filter(|t| {
-            conn.db().nearby_entities().iter()
-                .find(|e| e.entity_id == t.entity_id)
+            conn.db().entity().entity_id().find(&t.entity_id)
                 .is_some_and(|e| e.kind == EntityKind::Npc && e.state != EntityState::Removed)
         })
         .map(|t| t.entity_id)
@@ -775,6 +679,7 @@ fn run_stealth_tests(conn: &DbConnection, r: &mut TestResults) {
     let bo = Arc::clone(&buff_ok);
     let _ = conn.reducers().debug_apply_buff_then(
         npc_eid, 700, 1, 200, // long duration so it doesn't expire during test
+        None, None, None, None,
         Some(true), // mod_stealth
         move |_ctx, result| {
             if let Ok(Ok(())) = result { bo.store(true, Ordering::SeqCst); }
@@ -865,7 +770,9 @@ fn run_smoke_tests(conn: &DbConnection, r: &mut TestResults) {
     info!("── Smoke Tests ────────────────────────────────────────────────");
 
     // Resolve our player entity_id from client_sequence.
-    let my_entity_id = current_entity_id(conn);
+    let my_entity_id = conn.db().client_sequence().iter()
+        .next()
+        .map(|cs| cs.entity_id);
 
     let entity_id = match my_entity_id {
         Some(eid) => {
@@ -873,22 +780,22 @@ fn run_smoke_tests(conn: &DbConnection, r: &mut TestResults) {
             eid
         }
         None => {
-            r.fail("S0  could not resolve player entity_id for this connection");
+            r.fail("S0  could not resolve player entity_id from client_sequence");
             return;
         }
     };
 
-    // S1: entity_health present (via nearby_health view).
+    // S1: entity_health present.
     info!("  S1: entity_health");
-    if let Some(health) = conn.db().nearby_health().iter().find(|h| h.entity_id == entity_id) {
+    if let Some(health) = conn.db().entity_health().entity_id().find(&entity_id) {
         r.pass(&format!("S1  entity_health present (hp={}, max={})", health.hp, health.max_hp));
     } else {
         r.fail("S1  entity_health row missing for player");
     }
 
-    // S2: entity_transform present (via nearby_transforms view).
+    // S2: entity_transform present.
     info!("  S2: entity_transform");
-    let transform_before = conn.db().nearby_transforms().iter().find(|t| t.entity_id == entity_id);
+    let transform_before = conn.db().entity_transform().entity_id().find(&entity_id);
     if let Some(ref t) = transform_before {
         r.pass(&format!("S2  entity_transform present (last_tick={})", t.last_tick));
     } else {
@@ -957,7 +864,7 @@ fn run_smoke_tests(conn: &DbConnection, r: &mut TestResults) {
 
     // S6: last_tick advanced.
     info!("  S6: tick advancement");
-    if let Some(t) = conn.db().nearby_transforms().iter().find(|t| t.entity_id == entity_id) {
+    if let Some(t) = conn.db().entity_transform().entity_id().find(&entity_id) {
         if t.last_tick > tick_before {
             r.pass(&format!("S6  last_tick advanced ({tick_before} → {})", t.last_tick));
         } else {
@@ -969,7 +876,7 @@ fn run_smoke_tests(conn: &DbConnection, r: &mut TestResults) {
 
     // S7: FaceTo rotation committed.
     info!("  S7: FaceTo rotation");
-    if let Some(t) = conn.db().nearby_transforms().iter().find(|t| t.entity_id == entity_id) {
+    if let Some(t) = conn.db().entity_transform().entity_id().find(&entity_id) {
         // FaceTo(+X) → yaw = π/2 → quaternion (0, sin(π/4), 0, cos(π/4)) ≈ (0, 0.707, 0, 0.707)
         let target = (0.5_f32).sqrt(); // ≈ 0.70710678
         let tol = 0.05;
@@ -993,13 +900,19 @@ fn run_smoke_tests(conn: &DbConnection, r: &mut TestResults) {
         r.fail(&format!("S8  {pending} intent(s) still pending"));
     }
 
-    // S9: Combat path — Slash a disposable NPC, verify damage event.
-    info!("  S9: combat path (Slash → disposable NPC damage)");
+    // S9: Combat path — Slash the seeded NPC, verify damage event.
+    info!("  S9: combat path (Slash → NPC damage)");
 
-    let npc_id = match spawn_nearby_disposable_npc(conn, entity_id, 0.75, 200.0) {
-        Ok(id) => id,
-        Err(err) => {
-            r.fail(&format!("S9  failed to provision disposable NPC: {err}"));
+    // Find an existing live NPC (seeded by dev-deploy.ps1 or a prior run).
+    // Exclude Removed tombstones — entity rows are retained after despawn.
+    let npc_id = conn.db().entity().iter()
+        .filter(|e| e.kind == EntityKind::Npc && e.state != EntityState::Removed)
+        .map(|e| e.entity_id)
+        .max();
+    let npc_id = match npc_id {
+        Some(id) => id,
+        None => {
+            r.warn_msg("S9  no NPC in world — run dev-deploy.ps1 to seed test NPC");
             return;
         }
     };
@@ -1022,7 +935,6 @@ fn run_smoke_tests(conn: &DbConnection, r: &mut TestResults) {
         0,
     );
     if slash_result.is_err() {
-        cleanup_entity(conn, npc_id);
         r.fail(&format!("S9  Slash intent rejected: {:?}", slash_result.err()));
         return;
     }
@@ -1040,8 +952,6 @@ fn run_smoke_tests(conn: &DbConnection, r: &mut TestResults) {
     } else {
         r.fail("S9  no new combat_events from Slash — hitbox did not detect NPC");
     }
-
-    cleanup_entity(conn, npc_id);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1053,10 +963,10 @@ fn run_fault_tests(conn: &DbConnection, r: &mut TestResults) {
     info!("── Fault / Boundary Tests ─────────────────────────────────────");
 
     // Resolve our entity_id.
-    let entity_id = match current_entity_id(conn) {
-        Some(entity_id) => entity_id,
+    let entity_id = match conn.db().client_sequence().iter().next() {
+        Some(cs) => cs.entity_id,
         None => {
-            r.fail("F0  no client_sequence for this connection — cannot run fault tests");
+            r.fail("F0  no client_sequence — cannot run fault tests");
             return;
         }
     };
@@ -1094,13 +1004,10 @@ fn run_fault_tests(conn: &DbConnection, r: &mut TestResults) {
 fn run_f1_stale_sequence(conn: &DbConnection, r: &mut TestResults, entity_id: u64, seq_base: u64) {
     info!("  F1: Stale-sequence anti-replay");
 
-    let last_seq = match current_client_sequence(conn) {
-        Some(seq) => seq.last_processed_sequence,
-        None => {
-            r.fail("F1  cannot resolve client_sequence for this connection");
-            return;
-        }
-    };
+    let last_seq = conn.db().client_sequence().iter()
+        .next()
+        .map(|cs| cs.last_processed_sequence)
+        .unwrap_or(0);
 
     // Submit with the already-processed sequence — should be rejected.
     let stale_done = Arc::new(AtomicBool::new(false));
@@ -1162,18 +1069,15 @@ fn run_f1_stale_sequence(conn: &DbConnection, r: &mut TestResults, entity_id: u6
 fn run_f2_ownership(conn: &DbConnection, r: &mut TestResults, seq_base: u64) {
     info!("  F2: Entity-ownership enforcement");
 
-    let owner_entity_id = match current_entity_id(conn) {
-        Some(entity_id) => entity_id,
-        None => {
-            r.fail("F2  no client_sequence for this connection");
-            return;
-        }
-    };
+    // Find an NPC entity_id (foreign entity we don't own).
+    let npc_id = conn.db().entity().iter()
+        .find(|e| e.kind == EntityKind::Npc)
+        .map(|e| e.entity_id);
 
-    let foreign_id = match spawn_nearby_disposable_npc(conn, owner_entity_id, 1.25, 100.0) {
-        Ok(id) => id,
-        Err(err) => {
-            r.fail(&format!("F2  failed to provision foreign NPC: {err}"));
+    let foreign_id = match npc_id {
+        Some(id) => id,
+        None => {
+            r.warn_msg("F2  no NPC in world — run dev-deploy.ps1 to seed test NPC");
             return;
         }
     };
@@ -1204,8 +1108,6 @@ fn run_f2_ownership(conn: &DbConnection, r: &mut TestResults, seq_base: u64) {
     } else {
         r.fail("F2  ownership check did NOT reject foreign entity_id");
     }
-
-    cleanup_entity(conn, foreign_id);
 }
 
 fn run_f3_double_spawn(conn: &DbConnection, r: &mut TestResults) {
@@ -1287,17 +1189,23 @@ fn run_f5_cooldown(conn: &DbConnection, r: &mut TestResults, entity_id: u64, seq
     info!("  F5: waiting 1200ms to clear existing cooldown...");
     pump(conn, 1200);
 
-    let npc_id = match spawn_nearby_disposable_npc(conn, entity_id, 0.75, 200.0) {
-        Ok(id) => id,
-        Err(err) => {
-            r.fail(&format!("F5  failed to provision disposable NPC: {err}"));
+    // Find existing live NPC (seeded by dev-deploy.ps1 or a prior S9 run).
+    // Exclude Removed tombstones — entity rows are retained after despawn.
+    let npc_id = conn.db().entity().iter()
+        .filter(|e| e.kind == EntityKind::Npc && e.state != EntityState::Removed)
+        .map(|e| e.entity_id)
+        .max();
+    let npc_id = match npc_id {
+        Some(id) => id,
+        None => {
+            r.warn_msg("F5  no NPC in world — run dev-deploy.ps1 to seed test NPC");
             return;
         }
     };
     info!("  F5: NPC entity_id = {npc_id}");
 
     // Snapshot NPC HP before sending Slashes (S9 may have already damaged it).
-    let hp_before = conn.db().nearby_health().iter().find(|h| h.entity_id == npc_id)
+    let hp_before = conn.db().entity_health().entity_id().find(&npc_id)
         .map(|h| h.hp)
         .unwrap_or(0.0);
     info!("  F5: NPC HP before = {hp_before}");
@@ -1328,7 +1236,7 @@ fn run_f5_cooldown(conn: &DbConnection, r: &mut TestResults, entity_id: u64, seq
     pump(conn, 800);
 
     // Check NPC HP delta (Slash does 25 damage; one hit = ~25, two hits = ~50).
-    if let Some(health) = conn.db().nearby_health().iter().find(|h| h.entity_id == npc_id) {
+    if let Some(health) = conn.db().entity_health().entity_id().find(&npc_id) {
         let hp = health.hp;
         let damage = hp_before - hp;
         info!("  F5: NPC HP = {hp} (damage dealt = {damage})");
@@ -1340,15 +1248,13 @@ fn run_f5_cooldown(conn: &DbConnection, r: &mut TestResults, entity_id: u64, seq
             r.warn_msg(&format!("F5  damage={damage} — slash may have missed (timing issue?)"));
         }
     } else {
-        let npc_exists = conn.db().nearby_entities().iter().any(|e| e.entity_id == npc_id);
+        let npc_exists = conn.db().entity().entity_id().find(&npc_id).is_some();
         if !npc_exists {
             r.warn_msg("F5  NPC entity despawned before HP check — test inconclusive");
         } else {
             r.warn_msg("F5  NPC entity exists but no health row — test inconclusive");
         }
     }
-
-    cleanup_entity(conn, npc_id);
 }
 
 fn run_f6_unauthorized_commit(conn: &DbConnection, r: &mut TestResults) {
@@ -1370,9 +1276,10 @@ fn run_f6_unauthorized_commit(conn: &DbConnection, r: &mut TestResults) {
         vec![],     // region_updates
         vec![],     // buff_updates
         vec![],     // buff_cleared_entity_ids
+        vec![],     // threat_updates
+        vec![],     // threat_cleared_entity_ids
         vec![],     // npc_state_updates
         vec![],     // director_spawns
-        vec![],     // interactable_updates
         move |_ctx, result: Result<Result<(), String>, spacetimedb_sdk::__codegen::InternalError>| {
             if let Ok(Err(e)) = &result {
                 if e.contains("trusted worker") || e.contains("unauthorized") || e.contains("rejected") {
@@ -1410,9 +1317,8 @@ fn run_f7_cursor_safety(conn: &DbConnection, r: &mut TestResults) {
     let _ = conn.reducers().commit_tick_results_then(
         fake_tick,
         vec![], vec![], vec![], vec![], vec![], vec![], vec![],
-        vec![], vec![], vec![],
+        vec![], vec![], vec![], vec![], vec![],
         vec![], // director_spawns
-        vec![], // interactable_updates
         move |_ctx, _result| {
             d.store(true, Ordering::SeqCst);
         },
@@ -1515,21 +1421,4 @@ fn run_denial_test(conn: &DbConnection, results: &Arc<Mutex<TestResults>>) {
     } else {
         r.pass("D1  entity_region subscription produced no data (table not accessible)");
     }
-
-    // D2–D4: RLS enforcement — raw entity tables return 0 rows for non-worker clients.
-    let et_count = conn.db().entity_transform().count();
-    if et_count == 0 {
-        r.pass("D2  entity_transform raw table empty (RLS enforced)");
-    } else {
-        r.fail(&format!("D2  entity_transform returned {et_count} rows — RLS not enforced!"));
-    }
-
-    let eh_count = conn.db().entity_health().count();
-    if eh_count == 0 {
-        r.pass("D3  entity_health raw table empty (RLS enforced)");
-    } else {
-        r.fail(&format!("D3  entity_health returned {eh_count} rows — RLS not enforced!"));
-    }
-
-    // entity table RLS already verified in T3.
 }

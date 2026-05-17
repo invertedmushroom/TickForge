@@ -98,13 +98,6 @@ fn connect(mut commands: Commands) {
                     "SELECT * FROM player_inventory",
                     "SELECT * FROM player_equipment",
                     "SELECT * FROM module_config",
-                    "SELECT * FROM interactable_config",
-                    "SELECT * FROM boss_phase",
-                    "SELECT * FROM world_phase",
-                    "SELECT * FROM zone_counter",
-                    "SELECT * FROM instance",
-                    "SELECT * FROM instance_membership",
-                    "SELECT * FROM death_state",
                 ]);
 
             // Spawn the player.

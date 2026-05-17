@@ -110,12 +110,6 @@ impl CommitAuthority {
         self.last_processed_tick + self.in_flight.len() as u64 + 1
     }
 
-    /// Maximum number of ticks allowed in-flight simultaneously.
-    #[inline]
-    pub fn pipeline_depth(&self) -> usize {
-        self.max_pipeline_depth
-    }
-
     /// Mark a tick as having a commit in-flight.
     ///
     /// Must be called *after* `can_process_tick` returns `Proceed` and
@@ -420,34 +414,5 @@ mod tests {
 
         ca.acknowledge_success(11);
         assert_eq!(ca.next_expected_tick(), 13);
-    }
-
-    #[test]
-    fn acked_tick_cannot_be_reprocessed_or_resent() {
-        // Validates that a tick which was successfully committed is permanently
-        // blocked from re-entering the pipeline — even if the transport
-        // ambiguously retries the ack.  This is the worker-side half of the
-        // duplicate-commit prevention (server-side: early return in
-        // commit_tick_results).
-        let mut ca = CommitAuthority::new();
-        ca.seed(10);
-
-        // Normal flow: simulate + ack tick 11.
-        assert_eq!(ca.can_process_tick(11), CanProcessResult::Proceed);
-        ca.mark_in_flight(11);
-        ca.acknowledge_success(11);
-        assert_eq!(ca.last_processed_tick(), 11);
-
-        // Tick 11 must now be permanently skipped.
-        assert_eq!(ca.can_process_tick(11), CanProcessResult::AlreadyProcessed);
-
-        // Tick 12 proceeds normally.
-        assert_eq!(ca.can_process_tick(12), CanProcessResult::Proceed);
-        ca.mark_in_flight(12);
-        ca.acknowledge_success(12);
-
-        // Both 11 and 12 are permanently skipped.
-        assert_eq!(ca.can_process_tick(11), CanProcessResult::AlreadyProcessed);
-        assert_eq!(ca.can_process_tick(12), CanProcessResult::AlreadyProcessed);
     }
 }

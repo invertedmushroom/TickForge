@@ -1,10 +1,7 @@
-use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 
 #[cfg(feature = "connected")]
 use crate::input::SkillBindings;
-
-pub use crate::ability_visuals::{AbilityShape, ClientTargetingMode, SkillMenuCategory};
 
 pub struct AbilityBarPlugin;
 
@@ -18,8 +15,6 @@ impl Plugin for AbilityBarPlugin {
             update_ability_bar,
             handle_slot_clicks,
             handle_menu_clicks,
-            handle_filter_clicks,
-            handle_scroll_controls,
             update_skill_menu_visibility,
         ));
     }
@@ -28,18 +23,46 @@ impl Plugin for AbilityBarPlugin {
 /// Reserved ability ID for block — assignable to any skill slot.
 pub const BLOCK_ABILITY_ID: u32 = 100;
 
-#[derive(Clone)]
+/// Hitbox shape for client-side visualization.
+/// Variants match the simulation's `skill_shape_to_sensor()` output shapes.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub enum AbilityShape {
+    /// Capsule sensor (CapsuleSweep, LineSweep, Cone in the simulation).
+    Capsule { radius: f32, half_height: f32 },
+    /// Sphere sensor (PBAoE, HazardZone).
+    Sphere { radius: f32 },
+    /// No melee hitbox visual — projectiles use their own VFX path.
+    None,
+}
+
+/// Client-side targeting mode — mirrors the server's `TargetingMode` enum
+/// (game_core::combat::skill) without needing a crate dependency.
+/// Controls what `AbilityTarget` variant the client sends in the UseAbility intent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ClientTargetingMode {
+    /// Directional cast — client sends a normalized aim direction.
+    DirectionTarget,
+    /// Explicit tab-targeted single-entity cast.
+    EntityTarget,
+    /// Client sends a world position for AoE placement.
+    GroundTarget,
+    /// Client must send Direction — server raycasts to find a target.
+    RaycastStrict,
+    /// Soft-aim: send Direction plus an optional non-authoritative target hint.
+    AimAssist,
+    /// Always self-cast — no targeting data needed.
+    SelfOnly,
+    /// Stationary world placement resolved relative to the caster.
+    CasterOffset,
+    /// TERA-style multi-step lock-on (open → tag → fire).
+    LockOn,
+}
+
+#[derive(Clone, Copy)]
 pub struct AbilityDef {
     pub id: u32,
-    pub name: String,
-    pub damage_type: game_schema::DamageType,
-    pub on_hit_buffs: Vec<u32>,
-    pub stun_ticks: u32,
-    pub knockdown_ticks: u32,
-    pub sleep_ticks: u32,
-    pub silence_ticks: u32,
-    pub fear_ticks: u32,
-    pub category: SkillMenuCategory,
+    pub name: &'static str,
     pub cooldown_ticks: u32,
     pub color: Color,
     pub shape: AbilityShape,
@@ -51,286 +74,32 @@ pub struct AbilityDef {
     /// Client-side max range hint used for target clamping and preview feel.
     /// Must stay aligned with the server ability data when set.
     pub max_range: Option<f32>,
-    /// Projectile speed in units/tick from abilities.ron.
-    pub projectile_speed: Option<f32>,
-    /// Lock-on session timeout in ticks from abilities.ron.
-    pub lock_on_timeout_ticks: Option<u32>,
-    /// How many ticks the hitbox persists (RemoveHitbox - SpawnHitbox in the timeline).
-    /// 0 means single-frame or projectile (no lingering hitbox visual).
-    pub linger_ticks: u32,
-    /// Non-zero when the ability re-damages periodically (e.g. every 20 ticks).
-    pub damage_interval_ticks: u32,
-    /// Optional charge thresholds parsed from abilities.ron for UI/tooltips.
-    pub charge_tiers: Vec<game_core::combat::skill::ChargeTierDef>,
 }
 
-static ABILITY_DEFS: std::sync::OnceLock<Vec<AbilityDef>> = std::sync::OnceLock::new();
-
-/// Returns the full ability catalog, parsed from the embedded `data/abilities.ron`
-/// at first call and cached for the lifetime of the process.
-pub fn all_abilities() -> &'static [AbilityDef] {
-    ABILITY_DEFS.get_or_init(build_ability_defs)
-}
-
-fn build_ability_defs() -> Vec<AbilityDef> {
-    use game_core::combat::skill::{AbilityAction, AbilityFile};
-
-    let src = include_str!("../../../data/abilities.ron");
-    let file = ron::from_str::<AbilityFile>(src)
-        .expect("data/abilities.ron embedded at compile time must be valid RON");
-
-    let mut defs: Vec<AbilityDef> = file
-        .abilities
-        .iter()
-        .map(|data| {
-            let (category, color) = crate::ability_visuals::visual_for(data.ability_id);
-
-            let timeline = file
-                .timelines
-                .iter()
-                .find(|t| t.ability_id == data.ability_id);
-
-            let cooldown_ticks = timeline
-                .and_then(|t| {
-                    t.actions.iter().find_map(|a| match &a.action {
-                        AbilityAction::CooldownStart { duration_ticks } => Some(*duration_ticks),
-                        _ => None,
-                    })
-                })
-                .unwrap_or(0);
-
-            let timeline = file
-                .timelines
-                .iter()
-                .find(|t| t.ability_id == data.ability_id);
-
-            let (shape, offset) = timeline
-                .and_then(|t| {
-                    t.actions.iter().find_map(|a| match &a.action {
-                        AbilityAction::SpawnHitbox { shape, offset } => {
-                            Some((skill_shape_to_client(*shape), [offset.x, offset.y, offset.z]))
-                        }
-                        _ => None,
-                    })
-                })
-                .unwrap_or((AbilityShape::None, [0.0, 0.0, 0.0]));
-
-            // Compute linger duration from timeline: RemoveHitbox - SpawnHitbox.
-            let linger_ticks = timeline
-                .map(|t| {
-                    let spawn = t.actions.iter().find_map(|a| match &a.action {
-                        AbilityAction::SpawnHitbox { .. } => Some(a.tick_offset),
-                        _ => None,
-                    }).unwrap_or(0);
-                    let remove = t.actions.iter().find_map(|a| match &a.action {
-                        AbilityAction::RemoveHitbox => Some(a.tick_offset),
-                        _ => None,
-                    }).unwrap_or(0);
-                    remove.saturating_sub(spawn)
-                })
-                .unwrap_or(0);
-
-            AbilityDef {
-                id: data.ability_id,
-                name: data.name.clone(),
-                damage_type: data.damage_type,
-                on_hit_buffs: data.on_hit_buffs.clone(),
-                stun_ticks: data.stun_ticks,
-                knockdown_ticks: data.knockdown_ticks,
-                sleep_ticks: data.sleep_ticks,
-                silence_ticks: data.silence_ticks,
-                fear_ticks: data.fear_ticks,
-                category,
-                cooldown_ticks,
-                color,
-                shape,
-                offset,
-                targeting: targeting_mode_to_client(data.targeting_mode),
-                max_range: data.max_range,
-                projectile_speed: data.projectile_speed,
-                lock_on_timeout_ticks: data.lock_on_timeout_ticks,
-                linger_ticks,
-                damage_interval_ticks: data.damage_interval_ticks,
-                charge_tiers: data.charge_tiers.clone().unwrap_or_default(),
-            }
-        })
-        .collect();
-
-    // Block (ID 100) is client-only (hold-to-block) — add it if absent from the RON.
-    if !defs.iter().any(|d| d.id == BLOCK_ABILITY_ID) {
-        let (category, color) = crate::ability_visuals::visual_for(BLOCK_ABILITY_ID);
-        defs.push(AbilityDef {
-            id: BLOCK_ABILITY_ID,
-            name: "Block".to_string(),
-            damage_type: game_schema::DamageType::Physical,
-            on_hit_buffs: Vec::new(),
-            stun_ticks: 0,
-            knockdown_ticks: 0,
-            sleep_ticks: 0,
-            silence_ticks: 0,
-            fear_ticks: 0,
-            category,
-            cooldown_ticks: 0,
-            color,
-            shape: AbilityShape::None,
-            offset: [0.0, 0.0, 0.0],
-            targeting: ClientTargetingMode::SelfOnly,
-            max_range: None,
-            projectile_speed: None,
-            lock_on_timeout_ticks: None,
-            linger_ticks: 0,
-            damage_interval_ticks: 0,
-            charge_tiers: Vec::new(),
-        });
-    }
-
-    defs
-}
-
-fn skill_shape_to_client(shape: game_core::combat::skill::SkillShape) -> AbilityShape {
-    use game_core::combat::skill::SkillShape;
-    match shape {
-        SkillShape::CapsuleSweep => AbilityShape::Capsule { radius: 0.75, half_height: 1.0 },
-        SkillShape::LineSweep    => AbilityShape::Capsule { radius: 0.5,  half_height: 3.0 },
-        SkillShape::Cone         => AbilityShape::Capsule { radius: 0.75, half_height: 1.0 },
-        SkillShape::Sphere       => AbilityShape::Sphere  { radius: 2.0 },
-        SkillShape::HazardZone   => AbilityShape::Sphere  { radius: 5.0 },
-        SkillShape::Projectile   => AbilityShape::None,
-    }
-}
-
-fn targeting_mode_to_client(mode: game_core::combat::skill::TargetingMode) -> ClientTargetingMode {
-    use game_core::combat::skill::TargetingMode;
-    match mode {
-        TargetingMode::DirectionTarget => ClientTargetingMode::DirectionTarget,
-        TargetingMode::EntityTarget    => ClientTargetingMode::EntityTarget,
-        TargetingMode::GroundTarget    => ClientTargetingMode::GroundTarget,
-        TargetingMode::RaycastStrict   => ClientTargetingMode::RaycastStrict,
-        TargetingMode::AimAssist       => ClientTargetingMode::AimAssist,
-        TargetingMode::LockOn { .. }   => ClientTargetingMode::LockOn,
-        TargetingMode::SelfOnly        => ClientTargetingMode::SelfOnly,
-        TargetingMode::CasterOffset    => ClientTargetingMode::CasterOffset,
-    }
-}
-
-fn format_charge_summary(def: &AbilityDef) -> String {
-    if def.charge_tiers.is_empty() {
-        return String::new();
-    }
-
-    let tiers = def.charge_tiers.len();
-    let max_mult = def
-        .charge_tiers
-        .iter()
-        .map(|tier| tier.damage_mult)
-        .fold(1.0_f32, f32::max);
-    let max_ticks = def.charge_tiers.iter().map(|tier| tier.min_ticks).max().unwrap_or(0);
-    let max_secs = max_ticks as f32 / 20.0;
-
-    format!("Charge: {tiers} tiers, max x{max_mult:.1} at {max_secs:.1}s")
-}
-
-pub fn damage_type_label(damage_type: game_schema::DamageType) -> &'static str {
-    match damage_type {
-        game_schema::DamageType::Physical => "Physical",
-        game_schema::DamageType::Magical => "Magical",
-        game_schema::DamageType::True => "True",
-    }
-}
-
-fn format_ticks_secs(ticks: u32) -> String {
-    format!("{:.1}s", ticks as f32 / 20.0)
-}
-
-fn buff_name_label(buff_id: u32) -> String {
-    crate::hud::all_buffs()
-        .iter()
-        .find(|buff| buff.buff_id == buff_id)
-        .map(|buff| {
-            if buff.name.is_empty() {
-                format!("Buff #{buff_id}")
-            } else {
-                buff.name.clone()
-            }
-        })
-        .unwrap_or_else(|| format!("Buff #{buff_id}"))
-}
-
-fn format_effect_summary(def: &AbilityDef) -> String {
-    let mut effects = Vec::new();
-
-    if def.stun_ticks > 0 {
-        effects.push(format!("Stun {}", format_ticks_secs(def.stun_ticks)));
-    }
-    if def.knockdown_ticks > 0 {
-        effects.push(format!("KD {}", format_ticks_secs(def.knockdown_ticks)));
-    }
-    if def.sleep_ticks > 0 {
-        effects.push(format!("Sleep {}", format_ticks_secs(def.sleep_ticks)));
-    }
-    if def.silence_ticks > 0 {
-        effects.push(format!("Silence {}", format_ticks_secs(def.silence_ticks)));
-    }
-    if def.fear_ticks > 0 {
-        effects.push(format!("Fear {}", format_ticks_secs(def.fear_ticks)));
-    }
-
-    for buff_id in def.on_hit_buffs.iter().take(2) {
-        effects.push(format!("Applies {}", buff_name_label(*buff_id)));
-    }
-    if def.on_hit_buffs.len() > 2 {
-        effects.push(format!("+{} more", def.on_hit_buffs.len() - 2));
-    }
-
-    effects.join(" | ")
-}
-
-fn format_targeting_summary(def: &AbilityDef) -> String {
-    let mut parts = Vec::new();
-
-    match def.targeting {
-        ClientTargetingMode::GroundTarget => parts.push("Ground AoE".to_string()),
-        ClientTargetingMode::EntityTarget => parts.push("Targeted".to_string()),
-        ClientTargetingMode::RaycastStrict => parts.push("Raycast".to_string()),
-        ClientTargetingMode::AimAssist => parts.push("Aim Assist".to_string()),
-        ClientTargetingMode::SelfOnly => parts.push("Self".to_string()),
-        ClientTargetingMode::CasterOffset => parts.push("Front AoE".to_string()),
-        ClientTargetingMode::LockOn => parts.push("Lock-On".to_string()),
-        ClientTargetingMode::DirectionTarget => {}
-    }
-
-    if let Some(range) = def.max_range {
-        parts.push(format!("Range {range:.0}m"));
-    }
-
-    if let Some(projectile_speed) = def.projectile_speed {
-        parts.push(format!("Proj {:.0}u/s", projectile_speed * 20.0));
-    }
-
-    if let Some(timeout_ticks) = def.lock_on_timeout_ticks {
-        parts.push(format!("Lock {:.1}s", timeout_ticks as f32 / 20.0));
-    }
-
-    parts.join(" | ")
-}
-
-fn format_skill_menu_summary(def: &AbilityDef) -> String {
-    let mut parts = vec![damage_type_label(def.damage_type).to_string()];
-    let targeting_summary = format_targeting_summary(def);
-    if !targeting_summary.is_empty() {
-        parts.push(targeting_summary);
-    }
-    let charge_summary = format_charge_summary(def);
-    if !charge_summary.is_empty() {
-        parts.push(charge_summary);
-    }
-    let effect_summary = format_effect_summary(def);
-    if !effect_summary.is_empty() {
-        parts.push(effect_summary);
-    }
-    parts.join(" | ")
-}
-
+pub const ALL_ABILITIES: &[AbilityDef] = &[
+    // Sensor shapes match simulation's skill_shape_to_sensor() in tick_pipeline/mod.rs:
+    //   CapsuleSweep → Capsule { half_height: 1.0, radius: 0.75 }
+    //   LineSweep    → Capsule { half_height: 3.0, radius: 0.5  }
+    //   Projectile   → separate VFX path (AbilityShape::None)
+    // Offsets from abilities.ron timeline SpawnHitbox actions.
+    AbilityDef { id: 1,  name: "Slash",       cooldown_ticks: 20,  color: Color::srgb(1.0, 0.8, 0.2), shape: AbilityShape::Capsule { radius: 0.75, half_height: 1.0 }, offset: [0.0, 0.0, 0.0], targeting: ClientTargetingMode::DirectionTarget, max_range: None },
+    AbilityDef { id: 2,  name: "Fireball",    cooldown_ticks: 40,  color: Color::srgb(1.0, 0.4, 0.1), shape: AbilityShape::None, offset: [0.0, 1.0, 0.0], targeting: ClientTargetingMode::AimAssist, max_range: None },
+    AbilityDef { id: 3,  name: "Smash",       cooldown_ticks: 50,  color: Color::srgb(0.6, 0.3, 1.0), shape: AbilityShape::Capsule { radius: 0.5, half_height: 3.0 }, offset: [0.0, 0.0, 0.0], targeting: ClientTargetingMode::DirectionTarget, max_range: None },
+    AbilityDef { id: 4,  name: "Slash Combo", cooldown_ticks: 20,  color: Color::srgb(1.0, 0.9, 0.4), shape: AbilityShape::Capsule { radius: 0.75, half_height: 1.0 }, offset: [0.0, 0.0, 0.0], targeting: ClientTargetingMode::DirectionTarget, max_range: None },
+    AbilityDef { id: 10, name: "Shield Bash", cooldown_ticks: 60,  color: Color::srgb(0.5, 0.5, 0.5), shape: AbilityShape::Capsule { radius: 0.75, half_height: 1.0 }, offset: [0.0, 0.0, 0.0], targeting: ClientTargetingMode::DirectionTarget, max_range: None },
+    AbilityDef { id: 11, name: "Uppercut",    cooldown_ticks: 80,  color: Color::srgb(0.8, 0.1, 0.1), shape: AbilityShape::Capsule { radius: 0.75, half_height: 1.0 }, offset: [0.0, 0.0, 0.0], targeting: ClientTargetingMode::DirectionTarget, max_range: None },
+    AbilityDef { id: 12, name: "Grapple",     cooldown_ticks: 100, color: Color::srgb(0.1, 0.8, 0.1), shape: AbilityShape::None, offset: [0.0, 1.0, 0.0], targeting: ClientTargetingMode::EntityTarget, max_range: Some(20.0) },
+    AbilityDef { id: 13, name: "Leg Sweep",   cooldown_ticks: 40,  color: Color::srgb(0.6, 0.4, 0.2), shape: AbilityShape::Capsule { radius: 0.75, half_height: 1.0 }, offset: [0.0, 0.0, 0.0], targeting: ClientTargetingMode::DirectionTarget, max_range: None },
+    // Lock-on / teleport abilities
+    AbilityDef { id: 20, name: "Chain Ltng",  cooldown_ticks: 60,  color: Color::srgb(0.3, 0.7, 1.0), shape: AbilityShape::None, offset: [0.0, 0.0, 0.0], targeting: ClientTargetingMode::LockOn, max_range: Some(15.0) },
+    AbilityDef { id: 21, name: "Backstab",    cooldown_ticks: 80,  color: Color::srgb(0.8, 0.2, 0.5), shape: AbilityShape::Capsule { radius: 0.75, half_height: 1.0 }, offset: [0.0, 0.0, 0.0], targeting: ClientTargetingMode::RaycastStrict, max_range: None },
+    AbilityDef { id: 22, name: "Blink",       cooldown_ticks: 40,  color: Color::srgb(0.2, 0.9, 0.9), shape: AbilityShape::None, offset: [0.0, 0.0, 0.0], targeting: ClientTargetingMode::DirectionTarget, max_range: None },
+    // Caster-attached / hazard zone abilities
+    AbilityDef { id: 23, name: "Flame Aura",  cooldown_ticks: 200, color: Color::srgb(1.0, 0.5, 0.0), shape: AbilityShape::Sphere { radius: 2.0 }, offset: [0.0, 0.0, 0.0], targeting: ClientTargetingMode::SelfOnly, max_range: None },
+    AbilityDef { id: 24, name: "Fire Patch",  cooldown_ticks: 160, color: Color::srgb(0.9, 0.3, 0.0), shape: AbilityShape::Sphere { radius: 5.0 }, offset: [0.0, 0.0, 0.0], targeting: ClientTargetingMode::GroundTarget, max_range: Some(30.0) },
+    AbilityDef { id: 25, name: "Lava Pool",   cooldown_ticks: 100, color: Color::srgb(1.0, 0.2, 0.0), shape: AbilityShape::Sphere { radius: 5.0 }, offset: [0.0, 0.0, 2.0], targeting: ClientTargetingMode::CasterOffset, max_range: None },
+    AbilityDef { id: BLOCK_ABILITY_ID, name: "Block", cooldown_ticks: 0, color: Color::srgb(0.3, 0.6, 1.0), shape: AbilityShape::None, offset: [0.0, 0.0, 0.0], targeting: ClientTargetingMode::SelfOnly, max_range: None },
+];
 
 /// Tracks the tick at which each ability was last used.
 #[derive(Resource)]
@@ -507,25 +276,6 @@ fn spawn_ability_bar(mut commands: Commands) {
 #[derive(Resource, Default)]
 pub struct SkillMenuState {
     pub active_slot: Option<usize>,
-    pub active_category: SkillMenuCategory,
-    pub scroll_offset: usize,
-}
-
-impl SkillMenuState {
-    const VISIBLE_ROWS: usize = 6;
-
-    fn filtered_ability_ids(&self) -> Vec<u32> {
-        all_abilities()
-            .iter()
-            .filter(|def| self.active_category == SkillMenuCategory::All || def.category == self.active_category)
-            .map(|def| def.id)
-            .collect()
-    }
-
-    fn clamp_scroll(&mut self) {
-        let max_offset = self.filtered_ability_ids().len().saturating_sub(Self::VISIBLE_ROWS);
-        self.scroll_offset = self.scroll_offset.min(max_offset);
-    }
 }
 
 #[derive(Component)]
@@ -535,24 +285,6 @@ struct SkillMenuRoot;
 struct SkillMenuButton {
     ability_id: u32,
 }
-
-#[derive(Component)]
-struct SkillMenuFilterButton {
-    category: SkillMenuCategory,
-}
-
-#[derive(Component)]
-struct SkillMenuScrollButton {
-    delta: i32,
-}
-
-#[derive(Component)]
-struct SkillMenuEntry {
-    ability_id: u32,
-}
-
-#[derive(Component)]
-struct SkillMenuScrollLabel;
 
 fn spawn_skill_menu(mut commands: Commands) {
     commands.spawn((
@@ -564,7 +296,6 @@ fn spawn_skill_menu(mut commands: Commands) {
             flex_direction: FlexDirection::Column,
             row_gap: Val::Px(5.0),
             padding: UiRect::all(Val::Px(10.0)),
-            width: Val::Px(240.0),
             ..default()
         },
         BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.8)),
@@ -576,105 +307,26 @@ fn spawn_skill_menu(mut commands: Commands) {
             TextColor(Color::WHITE),
         ));
 
-        menu.spawn(Node {
-            display: Display::Flex,
-            flex_wrap: FlexWrap::Wrap,
-            column_gap: Val::Px(4.0),
-            row_gap: Val::Px(4.0),
-            margin: UiRect { bottom: Val::Px(6.0), ..default() },
-            ..default()
-        }).with_children(|filters| {
-            for category in SkillMenuCategory::FILTERS {
-                filters.spawn((
-                    Button,
-                    Node {
-                        width: Val::Px(70.0),
-                        height: Val::Px(26.0),
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgba(0.15, 0.15, 0.15, 0.95)),
-                    SkillMenuFilterButton { category },
-                )).with_children(|btn| {
-                    btn.spawn((
-                        Text::new(category.label()),
-                        TextFont { font_size: 12.0, ..default() },
-                        TextColor(Color::WHITE),
-                    ));
-                });
-            }
-        });
-
-        for def in all_abilities() {
+        for def in ALL_ABILITIES {
             menu.spawn((
                 Button,
                 Node {
-                    width: Val::Px(220.0),
-                    min_height: Val::Px(44.0),
-                    padding: UiRect::axes(Val::Px(8.0), Val::Px(6.0)),
+                    width: Val::Px(150.0),
+                    height: Val::Px(40.0),
                     justify_content: JustifyContent::Center,
-                    align_items: AlignItems::FlexStart,
-                    flex_direction: FlexDirection::Column,
-                    display: Display::Flex,
+                    align_items: AlignItems::Center,
                     ..default()
                 },
                 BackgroundColor(Color::srgba(0.2, 0.2, 0.2, 0.9)),
                 SkillMenuButton { ability_id: def.id },
-                SkillMenuEntry { ability_id: def.id },
             )).with_children(|btn| {
                 btn.spawn((
-                    Text::new(def.name.as_str()),
+                    Text::new(def.name),
                     TextFont { font_size: 16.0, ..default() },
                     TextColor(def.color),
                 ));
-
-                let summary = format_skill_menu_summary(def);
-                if !summary.is_empty() {
-                    btn.spawn((
-                        Text::new(summary),
-                        TextFont { font_size: 11.0, ..default() },
-                        TextColor(Color::srgba(0.85, 0.85, 0.85, 0.85)),
-                    ));
-                }
             });
         }
-
-        menu.spawn(Node {
-            display: Display::Flex,
-            justify_content: JustifyContent::SpaceBetween,
-            align_items: AlignItems::Center,
-            margin: UiRect { top: Val::Px(6.0), ..default() },
-            ..default()
-        }).with_children(|footer| {
-            for (label, delta) in [("Up", -1), ("Down", 1)] {
-                footer.spawn((
-                    Button,
-                    Node {
-                        width: Val::Px(72.0),
-                        height: Val::Px(28.0),
-                        justify_content: JustifyContent::Center,
-                        align_items: AlignItems::Center,
-                        ..default()
-                    },
-                    BackgroundColor(Color::srgba(0.15, 0.15, 0.15, 0.95)),
-                    SkillMenuScrollButton { delta },
-                )).with_children(|btn| {
-                    btn.spawn((
-                        Text::new(label),
-                        TextFont { font_size: 13.0, ..default() },
-                        TextColor(Color::WHITE),
-                    ));
-                });
-            }
-
-            footer.spawn((
-                Text::new(""),
-                TextFont { font_size: 12.0, ..default() },
-                TextColor(Color::srgb(0.8, 0.8, 0.8)),
-                SkillMenuScrollLabel,
-            ));
-        });
     });
 }
 
@@ -718,7 +370,7 @@ fn update_ability_bar(
 
     for (ov, mut node) in overlay_q.iter_mut() {
         let ability_id = bound_ids[ov.slot_index];
-        let def = all_abilities().iter().find(|a| a.id == ability_id);
+        let def = ALL_ABILITIES.iter().find(|a| a.id == ability_id);
         let Some(def) = def else {
             node.height = Val::Percent(0.0);
             continue;
@@ -729,7 +381,7 @@ fn update_ability_bar(
 
     for (slot, mut border, mut bg, children) in slot_q.iter_mut() {
         let ability_id = bound_ids[slot.slot_index];
-        let def = all_abilities().iter().find(|a| a.id == ability_id);
+        let def = ALL_ABILITIES.iter().find(|a| a.id == ability_id);
 
         // Block slot: highlight based on key held state.
         if ability_id == BLOCK_ABILITY_ID {
@@ -825,72 +477,9 @@ fn handle_menu_clicks(
     }
 }
 
-fn handle_filter_clicks(
-    mut interaction_q: Query<(&Interaction, &SkillMenuFilterButton, &mut BackgroundColor), Changed<Interaction>>,
-    mut menu_state: ResMut<SkillMenuState>,
-) {
-    for (interaction, btn, mut bg) in interaction_q.iter_mut() {
-        match *interaction {
-            Interaction::Pressed => {
-                menu_state.active_category = btn.category;
-                menu_state.scroll_offset = 0;
-            }
-            Interaction::Hovered => *bg = BackgroundColor(Color::srgba(0.25, 0.25, 0.25, 0.95)),
-            Interaction::None => {
-                *bg = if menu_state.active_category == btn.category {
-                    BackgroundColor(Color::srgba(0.25, 0.45, 0.7, 0.95))
-                } else {
-                    BackgroundColor(Color::srgba(0.15, 0.15, 0.15, 0.95))
-                };
-            }
-        }
-    }
-}
-
-fn handle_scroll_controls(
-    mut wheel_events: EventReader<MouseWheel>,
-    mut interaction_q: Query<(&Interaction, &SkillMenuScrollButton, &mut BackgroundColor), Changed<Interaction>>,
-    mut menu_state: ResMut<SkillMenuState>,
-) {
-    if menu_state.active_slot.is_some() {
-        let mut wheel_delta = 0;
-        for ev in wheel_events.read() {
-            wheel_delta += ev.y.round() as i32;
-        }
-        if wheel_delta != 0 {
-            let next = menu_state.scroll_offset as i32 - wheel_delta;
-            menu_state.scroll_offset = next.max(0) as usize;
-        }
-    } else {
-        wheel_events.clear();
-    }
-
-    for (interaction, btn, mut bg) in interaction_q.iter_mut() {
-        match *interaction {
-            Interaction::Pressed => {
-                let next = menu_state.scroll_offset as i32 + btn.delta;
-                menu_state.scroll_offset = next.max(0) as usize;
-            }
-            Interaction::Hovered => *bg = BackgroundColor(Color::srgba(0.25, 0.25, 0.25, 0.95)),
-            Interaction::None => *bg = BackgroundColor(Color::srgba(0.15, 0.15, 0.15, 0.95)),
-        }
-    }
-
-    menu_state.clamp_scroll();
-}
-
 fn update_skill_menu_visibility(
     menu_state: Res<SkillMenuState>,
-    mut root_q: Query<&mut Node, (With<SkillMenuRoot>, Without<SkillMenuEntry>)>,
-    mut filter_q: Query<
-        (&SkillMenuFilterButton, &mut BackgroundColor),
-        (Without<SkillMenuEntry>, Without<SkillMenuRoot>),
-    >,
-    mut entry_q: Query<
-        (&SkillMenuEntry, &mut Node, &mut BackgroundColor),
-        (Without<SkillMenuFilterButton>, Without<SkillMenuRoot>),
-    >,
-    mut scroll_label_q: Query<&mut Text, With<SkillMenuScrollLabel>>,
+    mut root_q: Query<&mut Node, With<SkillMenuRoot>>,
 ) {
     let Ok(mut node) = root_q.get_single_mut() else { return };
     if menu_state.active_slot.is_some() {
@@ -898,42 +487,6 @@ fn update_skill_menu_visibility(
     } else {
         node.display = Display::None;
     }
-
-    let filtered_ids = menu_state.filtered_ability_ids();
-    let start = menu_state.scroll_offset.min(filtered_ids.len().saturating_sub(SkillMenuState::VISIBLE_ROWS));
-    let end = (start + SkillMenuState::VISIBLE_ROWS).min(filtered_ids.len());
-    let visible_ids = &filtered_ids[start..end];
-
-    for (filter, mut bg) in filter_q.iter_mut() {
-        bg.0 = if menu_state.active_category == filter.category {
-            Color::srgba(0.25, 0.45, 0.7, 0.95)
-        } else {
-            Color::srgba(0.15, 0.15, 0.15, 0.95)
-        };
-    }
-
-    for (entry, mut entry_node, mut bg) in entry_q.iter_mut() {
-        let visible = visible_ids.contains(&entry.ability_id);
-        entry_node.display = if visible { Display::Flex } else { Display::None };
-
-        if let Some(def) = all_abilities().iter().find(|def| def.id == entry.ability_id) {
-            bg.0 = if visible && menu_state.active_category != SkillMenuCategory::All {
-                match def.color {
-                    Color::Srgba(tint) => Color::srgba(tint.red * 0.25, tint.green * 0.25, tint.blue * 0.25, 0.95),
-                    _ => Color::srgba(0.2, 0.2, 0.2, 0.9),
-                }
-            } else {
-                Color::srgba(0.2, 0.2, 0.2, 0.9)
-            };
-        }
-    }
-
-    let Ok(mut scroll_text) = scroll_label_q.get_single_mut() else { return };
-    **scroll_text = if filtered_ids.is_empty() {
-        "0 / 0".to_string()
-    } else {
-        format!("{}-{} / {}", start + 1, end, filtered_ids.len())
-    };
 }
 
 
