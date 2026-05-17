@@ -902,6 +902,8 @@ pub fn commit_tick_results(
     interactable_updates: Vec<InteractableUpdate>,
     death_state_inserts: Vec<DeathStateInsertInput>,
     sim_log_entries: Vec<SimLogInput>,
+    boss_phase_updates: Vec<BossPhaseUpdateInput>,
+    zone_counter_deltas: Vec<ZoneCounterDeltaInput>,
 ) -> Result<(), String> {
     // Accept only trusted worker identities (or module identity in internal calls).
     if !is_trusted_caller(ctx) {
@@ -1397,6 +1399,62 @@ pub fn commit_tick_results(
         });
     }
 
+
+    // Process boss_phase_updates inline.
+    for update in boss_phase_updates {
+        if ctx
+            .db
+            .boss_phase()
+            .boss_entity_id()
+            .find(&update.boss_entity_id)
+            .is_some()
+        {
+            ctx.db.boss_phase().boss_entity_id().update(BossPhase {
+                boss_entity_id: update.boss_entity_id,
+                phase: update.phase,
+                entered_at_tick: update.entered_at_tick,
+            });
+        } else {
+            ctx.db.boss_phase().insert(BossPhase {
+                boss_entity_id: update.boss_entity_id,
+                phase: update.phase,
+                entered_at_tick: update.entered_at_tick,
+            });
+        }
+    }
+
+    // Process zone_counter_deltas inline.
+    //
+    // Use the `by_zone` btree index (layer, region_x, region_z) to narrow
+    // the scan to the handful of counters in this cell, then linear-scan
+    // those by `counter_name`. This mirrors `increment_zone_counter` and
+    // avoids a full-table scan per delta.
+    for delta in zone_counter_deltas {
+        let existing = ctx
+            .db
+            .zone_counter()
+            .by_zone()
+            .filter((delta.layer, delta.region_x, delta.region_z..=delta.region_z))
+            .find(|c| c.counter_name == delta.counter_name);
+
+        if let Some(mut existing_row) = existing {
+            existing_row.value += delta.delta;
+            ctx.db
+                .zone_counter()
+                .counter_id()
+                .update(existing_row);
+        } else {
+            ctx.db.zone_counter().insert(ZoneCounter {
+                counter_id: 0,
+                layer: delta.layer,
+                region_x: delta.region_x,
+                region_z: delta.region_z,
+                counter_name: delta.counter_name,
+                value: delta.delta,
+            });
+        }
+    }
+
     // ── Advance last_committed_tick cursor (after all mutations) ────────
     // Deferred to the end so the guard at the top is read-only and any
     // mid-reducer failure leaves the cursor unchanged.
@@ -1419,6 +1477,24 @@ pub fn commit_tick_results(
 pub struct SimLogInput {
     pub level: u8,
     pub message: String,
+}
+
+/// Boss phase transition committed inline with `commit_tick_results`.
+#[derive(spacetimedb::SpacetimeType, Clone, Debug)]
+pub struct BossPhaseUpdateInput {
+    pub boss_entity_id: u64,
+    pub phase: u32,
+    pub entered_at_tick: u64,
+}
+
+/// Zone counter delta committed inline with `commit_tick_results`.
+#[derive(spacetimedb::SpacetimeType, Clone, Debug)]
+pub struct ZoneCounterDeltaInput {
+    pub layer: u32,
+    pub region_x: i32,
+    pub region_z: i32,
+    pub counter_name: String,
+    pub delta: f64,
 }
 
 #[derive(spacetimedb::SpacetimeType, Clone, Debug)]
@@ -2628,45 +2704,6 @@ pub fn remove_respawn_point(ctx: &ReducerContext, point_id: u64) -> Result<(), S
     }
     ctx.db.respawn_point().point_id().delete(&point_id);
     log::info!("Respawn point removed: id={}", point_id);
-    Ok(())
-}
-
-/// Update or create a boss phase entry. Trusted-worker only.
-#[reducer]
-pub fn commit_boss_phase(
-    ctx: &ReducerContext,
-    boss_entity_id: u64,
-    phase: u32,
-    entered_at_tick: u64,
-) -> Result<(), String> {
-    if !is_trusted_caller(ctx) {
-        return Err("commit_boss_phase: trusted worker only".into());
-    }
-    if ctx
-        .db
-        .boss_phase()
-        .boss_entity_id()
-        .find(&boss_entity_id)
-        .is_some()
-    {
-        ctx.db.boss_phase().boss_entity_id().update(BossPhase {
-            boss_entity_id,
-            phase,
-            entered_at_tick,
-        });
-    } else {
-        ctx.db.boss_phase().insert(BossPhase {
-            boss_entity_id,
-            phase,
-            entered_at_tick,
-        });
-    }
-    log::info!(
-        "Boss phase: entity={} phase={} tick={}",
-        boss_entity_id,
-        phase,
-        entered_at_tick
-    );
     Ok(())
 }
 

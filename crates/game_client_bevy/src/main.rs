@@ -27,6 +27,8 @@ mod spacetime;
 mod sync;
 #[cfg(feature = "connected")]
 mod vfx;
+#[cfg(feature = "connected")]
+mod encounter_panel;
 
 use bevy::pbr::{NotShadowCaster, NotShadowReceiver};
 use bevy::prelude::*;
@@ -61,6 +63,7 @@ fn main() {
         app.add_plugins(admin::AdminPlugin);
         app.add_plugins(inventory::InventoryPlugin);
         app.add_plugins(instance_panel::InstancePanelPlugin);
+        app.add_plugins(encounter_panel::EncounterPanelPlugin);
         app.add_plugins(dungeon_geometry::DungeonGeometryPlugin);
         app.add_plugins(terrain::TerrainPlugin);
         app.configure_sets(

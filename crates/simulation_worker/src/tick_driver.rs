@@ -6,6 +6,7 @@
 
 use std::time::Instant;
 
+#[allow(unused)]
 use log::{debug, info, warn};
 
 use crate::commit_authority::{CanProcessResult, CommitAuthority};
@@ -39,9 +40,10 @@ impl Default for TickDriver {
 }
 
 impl TickDriver {
+    
     pub fn new() -> Self {
         Self {
-            summary_interval: 150,
+            summary_interval: 100000,
         }
     }
 
@@ -114,21 +116,21 @@ impl TickDriver {
             || summary.despawns > 0
             || summary.intents_processed > 0
         {
-            info!(
-                "tick={tick} intents={} contacts={} damage={} deaths={} despawns={} entities={} hitboxes={} transforms={} region_updates={} actions={} tick_us={} retries={}",
-                summary.intents_processed,
-                summary.contacts,
-                summary.damage_events,
-                summary.deaths,
-                summary.despawns,
-                summary.active_entities,
-                summary.active_hitboxes,
-                summary.transform_updates,
-                summary.region_updates,
-                summary.scheduled_actions_len,
-                summary.tick_duration_us,
-                summary.commit_retries,
-            );
+            // info!(
+            //     "tick={tick} intents={} contacts={} damage={} deaths={} despawns={} entities={} hitboxes={} transforms={} region_updates={} actions={} tick_us={} retries={}",
+            //     summary.intents_processed,
+            //     summary.contacts,
+            //     summary.damage_events,
+            //     summary.deaths,
+            //     summary.despawns,
+            //     summary.active_entities,
+            //     summary.active_hitboxes,
+            //     summary.transform_updates,
+            //     summary.region_updates,
+            //     summary.scheduled_actions_len,
+            //     summary.tick_duration_us,
+            //     summary.commit_retries,
+            // );
         }
     }
 }

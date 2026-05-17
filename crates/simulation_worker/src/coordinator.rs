@@ -47,34 +47,9 @@ struct CoordinatorState {
     /// populate open-world director events, and by the `instance` subscription
     /// callbacks to register dungeon-scoped rules on instance creation.
     spawn_rules: game_core::spawn_rules::SpawnRulesRegistry,
-    /// Failed secondary reducer calls (boss_phase, zone_counter) that will be
-    /// retried on the next successful commit. Prevents "acknowledged then
-    /// forgotten" holes in progression tables.
-    pending_secondary: Vec<SecondaryWrite>,
     /// Voxel-terrain bindings, cached row→collider mapping, and the deferred
     /// edit queue. See `TerrainState` (§4.8b Phase 5).
     terrain: TerrainState,
-}
-
-/// If more than this many secondary writes accumulate without being delivered,
-/// the connection is likely broken and we should crash for a clean reseed.
-const MAX_PENDING_SECONDARY: usize = 50;
-
-/// A secondary reducer call that failed and should be retried.
-#[derive(Clone)]
-enum SecondaryWrite {
-    BossPhase {
-        boss_entity_id: u64,
-        phase: u32,
-        entered_at_tick: u64,
-    },
-    ZoneCounter {
-        layer: u32,
-        region_x: i32,
-        region_z: i32,
-        counter_name: String,
-        delta: f64,
-    },
 }
 
 /// Send (or re-send) a commit payload to SpacetimeDB.
@@ -124,64 +99,17 @@ fn send_commit(reducers: &RemoteReducers, pkg: CommitPackage, state: Arc<Mutex<C
         interactable_updates,
         death_state_inserts,
         sim_log_entries,
+        boss_phase_updates.into_iter().map(|(boss_entity_id, phase, entered_at_tick)| crate::module_bindings::BossPhaseUpdateInput {
+            boss_entity_id, phase, entered_at_tick
+        }).collect(),
+        zone_counter_deltas.into_iter().map(|(layer, region_x, region_z, counter_name, delta)| crate::module_bindings::ZoneCounterDeltaInput {
+            layer, region_x, region_z, counter_name, delta
+        }).collect(),
         move |rctx, outcome| {
             let reason = match &outcome {
                 Ok(Ok(())) => {
                     let mut guard = state_for_ack.lock().unwrap_or_else(|p| p.into_inner());
                     guard.sim.acknowledge_success(tick_id);
-
-                    // Retry any previously failed secondary writes first.
-                    let backlog = std::mem::take(&mut guard.pending_secondary);
-                    drop(guard); // release lock before reducer calls
-
-                    let mut failures = Vec::new();
-                    for item in backlog {
-                        if let Err(e) = send_secondary(&rctx.reducers, &item) {
-                            warn!("secondary retry failed: {e}");
-                            failures.push(item);
-                        }
-                    }
-
-                    // Attempt this tick's secondary writes.
-                    for (boss_eid, phase, entered_tick) in &boss_phase_updates {
-                        let item = SecondaryWrite::BossPhase {
-                            boss_entity_id: *boss_eid,
-                            phase: *phase,
-                            entered_at_tick: *entered_tick,
-                        };
-                        if let Err(e) = send_secondary(&rctx.reducers, &item) {
-                            warn!("commit_boss_phase failed: {e}");
-                            failures.push(item);
-                        }
-                    }
-                    for (layer, rx, rz, name, delta) in &zone_counter_deltas {
-                        let item = SecondaryWrite::ZoneCounter {
-                            layer: *layer,
-                            region_x: *rx,
-                            region_z: *rz,
-                            counter_name: name.clone(),
-                            delta: *delta,
-                        };
-                        if let Err(e) = send_secondary(&rctx.reducers, &item) {
-                            warn!("increment_zone_counter failed: {e}");
-                            failures.push(item);
-                        }
-                    }
-
-                    if !failures.is_empty() {
-                        let mut guard = state_for_ack.lock().unwrap_or_else(|p| p.into_inner());
-                        guard.pending_secondary.extend(failures);
-                        let total = guard.pending_secondary.len();
-                        if total > MAX_PENDING_SECONDARY {
-                            error!(
-                                "tick={tick_id} {total} secondary writes backlogged \
-                                 (cap={MAX_PENDING_SECONDARY}) — crashing for clean reseed"
-                            );
-                            std::process::exit(1);
-                        }
-                        warn!("tick={tick_id} {total} secondary write(s) pending retry");
-                    }
-
                     return;
                 }
                 Ok(Err(reducer_err)) => format!("reducer rejected: {reducer_err}"),
@@ -238,6 +166,28 @@ fn send_commit(reducers: &RemoteReducers, pkg: CommitPackage, state: Arc<Mutex<C
                 std::process::exit(1);
             }
         }
+    }
+}
+
+/// Dispatch a single secondary reducer call. Returns the error string on failure.
+fn send_secondary(reducers: &RemoteReducers, write: &SecondaryWrite) -> Result<(), String> {
+    match write {
+        SecondaryWrite::BossPhase {
+            boss_entity_id,
+            phase,
+            entered_at_tick,
+        } => reducers
+            .commit_boss_phase(*boss_entity_id, *phase, *entered_at_tick)
+            .map_err(|e| format!("commit_boss_phase: {e}")),
+        SecondaryWrite::ZoneCounter {
+            layer,
+            region_x,
+            region_z,
+            counter_name,
+            delta,
+        } => reducers
+            .increment_zone_counter(*layer, *region_x, *region_z, counter_name.clone(), *delta)
+            .map_err(|e| format!("increment_zone_counter: {e}")),
     }
 }
 
@@ -337,7 +287,6 @@ pub fn run(config: CoordinatorConfig) {
         dungeons,
         encounters,
         spawn_rules,
-        pending_secondary: Vec::new(),
         terrain: TerrainState::with_bindings(initial_terrain_bindings),
     }));
 

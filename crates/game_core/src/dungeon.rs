@@ -74,7 +74,9 @@ pub fn resolve_linked_entities(
 ) -> Vec<ResolvedInteractable> {
     defs.iter()
         .map(|def| {
-            let entity_id = local_to_entity[&def.local_id];
+            let entity_id = *local_to_entity.get(&def.local_id).unwrap_or_else(|| {
+                panic!("Missing entity ID for local_id {}", def.local_id)
+            });
             let linked_entity = def
                 .linked_to
                 .and_then(|lid| local_to_entity.get(&lid).copied());

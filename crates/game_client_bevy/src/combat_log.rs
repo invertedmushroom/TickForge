@@ -85,11 +85,14 @@ fn poll_combat_events(
     mut contact_hitbox_spawn: EventWriter<crate::vfx::ContactHitboxSpawnEvent>,
     mut charge_start: EventWriter<crate::vfx::ChargeStartEvent>,
     mut charge_tier: EventWriter<crate::vfx::ChargeTierReachedEvent>,
-    mut hitbox_spawn: EventWriter<crate::vfx::HitboxSpawnedEvent>,
-    mut hitbox_dmg: EventWriter<crate::vfx::HitboxDamageFrameEvent>,
-    mut hitbox_remove: EventWriter<crate::vfx::HitboxRemovedEvent>,
+    mut hitbox_events: (
+        EventWriter<'_, crate::vfx::HitboxSpawnedEvent>,
+        EventWriter<'_, crate::vfx::HitboxDamageFrameEvent>,
+        EventWriter<'_, crate::vfx::HitboxRemovedEvent>,
+    ),
     mut buff_applied: EventWriter<crate::vfx::BuffAppliedVfxEvent>,
     mut teleported: EventWriter<crate::vfx::TeleportVfxEvent>,
+    mut telegraph: EventWriter<crate::vfx::TelegraphVfxEvent>,
 ) {
     use game_client::module_bindings::*;
 
@@ -238,7 +241,7 @@ fn poll_combat_events(
                     })
                     .unwrap_or(false);
                 if !is_hazard {
-                    hitbox_spawn.send(crate::vfx::HitboxSpawnedEvent {
+                    hitbox_events.0.send(crate::vfx::HitboxSpawnedEvent {
                         source_entity_id: ev.source_entity,
                         ability_id: c.ability_id,
                     });
@@ -248,7 +251,7 @@ fn poll_combat_events(
             // For periodic / lingering abilities, don't immediately remove the hitbox
             // visual — it persists until its linger timer expires.
             CombatEventKind::SkillHit(ability_id) => {
-                hitbox_dmg.send(crate::vfx::HitboxDamageFrameEvent {
+                hitbox_events.1.send(crate::vfx::HitboxDamageFrameEvent {
                     source_entity_id: ev.source_entity,
                     ability_id: *ability_id,
                 });
@@ -258,7 +261,7 @@ fn poll_combat_events(
                     .map(|a| a.damage_interval_ticks > 0)
                     .unwrap_or(false);
                 if !is_periodic {
-                    hitbox_remove.send(crate::vfx::HitboxRemovedEvent {
+                    hitbox_events.2.send(crate::vfx::HitboxRemovedEvent {
                         source_entity_id: ev.source_entity,
                         ability_id: *ability_id,
                     });
@@ -282,6 +285,12 @@ fn poll_combat_events(
                     entity_id: ev.source_entity,
                     from: Vec3::new(t.from_x, t.from_y, t.from_z),
                     to: Vec3::new(t.to_x, t.to_y, t.to_z),
+                });
+            }
+            CombatEventKind::TelegraphWarning(w) => {
+                telegraph.send(crate::vfx::TelegraphVfxEvent {
+                    target: w.target,
+                    impact_tick: w.impact_tick,
                 });
             }
             _ => {}

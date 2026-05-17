@@ -24,6 +24,7 @@ impl Plugin for VfxPlugin {
         app.add_event::<HitboxRemovedEvent>();
         app.add_event::<BuffAppliedVfxEvent>();
         app.add_event::<TeleportVfxEvent>();
+        app.add_event::<TelegraphVfxEvent>();
         app.add_systems(
             Update,
             (
@@ -57,6 +58,8 @@ impl Plugin for VfxPlugin {
                 update_buff_flash_effects,
                 spawn_teleport_effects,
                 update_teleport_effects,
+                spawn_telegraph_visuals,
+                update_telegraph_visuals,
             ),
         );
     }
@@ -1398,6 +1401,64 @@ fn update_teleport_effects(
         }
         if effect.remaining <= 0.0 {
             commands.entity(entity).despawn();
+        }
+    }
+}
+
+// ── Visual Telegraphs ───────────────────────────────────────────────────
+
+#[derive(Event)]
+pub struct TelegraphVfxEvent {
+    pub target: u64,
+    pub impact_tick: u64,
+}
+
+#[derive(Component)]
+struct TelegraphVisual {
+    target: u64,
+    impact_tick: u64,
+}
+
+fn spawn_telegraph_visuals(
+    mut commands: Commands,
+    mut events: EventReader<TelegraphVfxEvent>,
+) {
+    for ev in events.read() {
+        commands.spawn(TelegraphVisual {
+            target: ev.target,
+            impact_tick: ev.impact_tick,
+        });
+    }
+}
+
+fn update_telegraph_visuals(
+    mut commands: Commands,
+    mut gizmos: Gizmos,
+    tick_counter: Option<Res<crate::spacetime::TickCounter>>,
+    query: Query<(bevy::ecs::entity::Entity, &TelegraphVisual)>,
+    targets: Query<(&ServerEntity, &Transform)>,
+) {
+    let current_tick = tick_counter.map(|tc| tc.last_tick).unwrap_or(0);
+
+    for (entity, visual) in query.iter() {
+        if current_tick >= visual.impact_tick {
+            commands.entity(entity).despawn();
+            continue;
+        }
+
+        let ticks_left = visual.impact_tick - current_tick;
+        let progress = 1.0 - (ticks_left as f32 / 40.0).clamp(0.0, 1.0); // Assuming 2s cast time = 40 ticks max
+
+        if let Some((_, target_tf)) = targets.iter().find(|(se, _)| se.entity_id == visual.target) {
+            let pos = target_tf.translation + Vec3::Y * 0.1;
+            // Draw a red ring that grows inward
+            let radius = 2.0 - progress * 1.5;
+            let alpha = 0.2 + progress * 0.8;
+            gizmos.circle(
+                Isometry3d::new(pos, Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+                radius,
+                Color::srgba(1.0, 0.1, 0.1, alpha),
+            );
         }
     }
 }

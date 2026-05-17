@@ -65,7 +65,7 @@
                 // Switch that opens the gate
                 (local_id: 2, kind: Switch, position: (5.0, 1.0, -8.0), linked_to: Some(1), required_buff: None, required_item: None, interact_range: Some(3.0)),
                 // Boss spawn on player side of the gate for unobstructed combat testing
-                (local_id: 3, kind: BossSpawn(npc_name: "TrainingDummy", encounter_name: Some("runtime_actions_demo")), position: (0.0, 1.0, -5.0), linked_to: None, required_buff: None, required_item: None, interact_range: None),
+                (local_id: 3, kind: BossSpawn(npc_name: "Cruicible Warden", encounter_name: Some("crucible_warden")), position: (0.0, 1.0, -5.0), linked_to: None, required_buff: None, required_item: None, interact_range: None),
             ],
         ),
     ],

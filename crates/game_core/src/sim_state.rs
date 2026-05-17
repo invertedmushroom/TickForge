@@ -318,7 +318,8 @@ impl HealthStore {
         } else {
             0.0
         };
-        let actual = amount.min(self.max_hp[i] - self.hp[i]);
+        let missing = (self.max_hp[i] - self.hp[i]).max(0.0);
+        let actual = amount.min(missing);
         self.hp[i] += actual;
         actual
     }

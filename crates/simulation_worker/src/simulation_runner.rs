@@ -27,6 +27,8 @@ pub struct SimulationRunner {
     tick_driver: TickDriver,
     /// Entity IDs that need stat recomputation on the next tick.
     pending_stat_recalcs: HashSet<EntityId>,
+    /// Team assignments received before the entity was spawned.
+    pending_teams: std::collections::HashMap<EntityId, u32>,
 }
 
 impl SimulationRunner {
@@ -44,6 +46,7 @@ impl SimulationRunner {
             commit: CommitAuthority::new(),
             tick_driver: TickDriver::new(),
             pending_stat_recalcs: HashSet::new(),
+            pending_teams: std::collections::HashMap::new(),
         }
     }
 
@@ -137,6 +140,9 @@ impl SimulationRunner {
     ) {
         self.pipeline
             .spawn_entity_from_snapshot(id, kind, tick, max_hp, position, layer);
+        if let Some(team_id) = self.pending_teams.remove(&id) {
+            self.set_entity_team(id, team_id);
+        }
     }
 
     /// Restore buff, threat, and NPC AI state from DB rows after a worker restart.
@@ -154,6 +160,7 @@ impl SimulationRunner {
     /// Hard teardown for an entity from all runtime stores.
     /// Returns `true` if the entity was present and removed.
     pub fn force_remove_entity(&mut self, id: EntityId) -> bool {
+        self.pending_teams.remove(&id);
         self.pipeline.force_remove_entity(id)
     }
 
@@ -354,6 +361,8 @@ impl SimulationRunner {
                 self.pipeline.entity_team_cache.resize(slot + 1, 0);
             }
             self.pipeline.entity_team_cache[slot] = team_id;
+        } else {
+            self.pending_teams.insert(id, team_id);
         }
     }
 
@@ -997,5 +1006,39 @@ mod tests {
             resolved.y,
             expected_y
         );
+    }
+
+    #[test]
+    fn unregister_encounter_add_clears_pipeline_tracking() {
+        use crate::physics::rapier_world::PhysicsWorld;
+
+        let mut world = PhysicsWorld::new(1.0 / 60.0);
+        world.step();
+
+        let mut runner = SimulationRunner::new(
+            TickId(1),
+            Box::new(world),
+            1.0 / 60.0,
+            test_registry(),
+            game_core::combat::status::BuffRegistry::new(),
+            crate::lag_compensation::MAX_REWIND_TICKS,
+        );
+
+        let add = EntityId(200);
+        let boss = EntityId(100);
+
+        // Register with tags
+        runner.register_encounter_add_with_tags(add, boss, &["my_tag".to_string()]);
+        
+        // Verify they are registered
+        assert_eq!(runner.pipeline.add_to_boss.get(&add), Some(&boss));
+        assert!(runner.pipeline.entity_tags.contains_key(&add));
+
+        // Unregister
+        runner.unregister_encounter_add(add);
+
+        // Verify cleared
+        assert!(!runner.pipeline.add_to_boss.contains_key(&add));
+        assert!(!runner.pipeline.entity_tags.contains_key(&add));
     }
 }

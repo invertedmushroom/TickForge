@@ -168,7 +168,7 @@
                 ),
                 (
                     id: "p1_telegraph_pattern",
-                    when: OnEvery(ticks: 30),
+                    when: OnEvery(ticks: 180),
                     cond: PhaseIs(phase: Phase1),
                     effects: [
                         Sequence(steps: [
@@ -177,7 +177,7 @@
                             CastSkill(skill_id: 24, target: TopThreat),
                         ]),
                     ],
-                    repeat: EveryNTicks(interval: 30, max_fires: None),
+                    repeat: EveryNTicks(interval: 180, max_fires: None),
                 ),
                 (
                     id: "p1_to_p2_at_60",

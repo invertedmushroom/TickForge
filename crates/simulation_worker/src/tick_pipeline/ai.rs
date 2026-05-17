@@ -1178,8 +1178,8 @@ impl TickPipeline {
             return;
         }
 
-        let resolved = self.resolve_encounter_target(boss_entity_id, idx, &target);
-        let Some(resolved_target) = resolved else {
+        let resolved_targets = self.resolve_encounter_targets(boss_entity_id, idx, &target);
+        if resolved_targets.is_empty() {
             log::debug!(
                 "Encounter: boss {} cast {} skipped (target {:?} unresolved)",
                 boss_entity_id.0,
@@ -1189,21 +1189,24 @@ impl TickPipeline {
             return;
         };
 
-        let casted = self.cast_ability(
-            boss_entity_id,
-            skill_id,
-            ResolvedTargeting::Entity {
-                target: resolved_target,
-            },
-            0,
-            0,
-        );
-        if !casted {
-            log::warn!(
-                "Encounter: boss {} cast {} rejected (cooldown, missing ability, or invalid cast geometry)",
-                boss_entity_id.0,
-                skill_id
+        for resolved_target in resolved_targets {
+            let casted = self.cast_ability(
+                boss_entity_id,
+                skill_id,
+                ResolvedTargeting::Entity {
+                    target: resolved_target,
+                },
+                0,
+                0,
             );
+            if !casted {
+                log::warn!(
+                    "Encounter: boss {} cast {} to target {} rejected (cooldown, missing ability, or invalid cast geometry)",
+                    boss_entity_id.0,
+                    skill_id,
+                    resolved_target.0
+                );
+            }
         }
     }
 
@@ -1219,7 +1222,8 @@ impl TickPipeline {
         let Some(idx) = self.state.entities.lookup(boss_entity_id) else {
             return;
         };
-        let Some(resolved) = self.resolve_encounter_target(boss_entity_id, idx, &target) else {
+        let resolved_targets = self.resolve_encounter_targets(boss_entity_id, idx, &target);
+        if resolved_targets.is_empty() {
             log::debug!(
                 "Encounter: boss {} telegraph skill {} skipped (target {:?} unresolved)",
                 boss_entity_id.0,
@@ -1229,51 +1233,55 @@ impl TickPipeline {
             return;
         };
         let impact_tick = self.current_tick.0.saturating_add(lead_ticks as u64);
-        log::info!(
-            "Encounter: boss {} telegraph skill_id={} → target {} impact_tick={} (lead={})",
-            boss_entity_id.0,
-            skill_id,
-            resolved.0,
-            impact_tick,
-            lead_ticks,
-        );
-        self.emit_event(
-            resolved,
-            EventPayload::TelegraphWarning {
-                source: boss_entity_id,
-                target: resolved,
+        for resolved in resolved_targets {
+            log::info!(
+                "Encounter: boss {} telegraph skill_id={} → target {} impact_tick={} (lead={})",
+                boss_entity_id.0,
+                skill_id,
+                resolved.0,
                 impact_tick,
-            },
-        );
+                lead_ticks,
+            );
+            self.emit_event(
+                resolved,
+                EventPayload::TelegraphWarning {
+                    source: boss_entity_id,
+                    target: resolved,
+                    impact_tick,
+                },
+            );
+        }
     }
 
-    /// Resolve an encounter `Target` enum to a concrete entity for scripted
-    /// boss casts. Returns `None` when the target cannot be resolved (e.g.,
-    /// `TopThreat` with empty threat table, no players for `RandomPlayer`).
-    fn resolve_encounter_target(
+    /// Resolve an encounter `Target` enum to the concrete entity list for
+    /// scripted boss casts. Returns an empty `Vec` when the target cannot be
+    /// resolved (e.g., `TopThreat` with empty threat table, no players for
+    /// `RandomPlayer`, or no matching volume occupants). Multi-target variants
+    /// (`AllPlayers`, `VolumeOccupants`) return every matching entity; the
+    /// callers iterate and dispatch one cast / telegraph per entry.
+    fn resolve_encounter_targets(
         &self,
         boss_id: EntityId,
         boss_idx: EntityIndex,
         target: &game_core::encounter::Target,
-    ) -> Option<EntityId> {
+    ) -> Vec<EntityId> {
         match target {
-            game_core::encounter::Target::Boss => Some(boss_id),
-            game_core::encounter::Target::TopThreat => self
-                .state
-                .combat
-                .threat_tables
-                .get(boss_idx)
-                .and_then(|table| table.top_threat()),
+            game_core::encounter::Target::Boss => vec![boss_id],
+            game_core::encounter::Target::TopThreat => {
+                if let Some(top) = self.state.combat.threat_tables.get(boss_idx).and_then(|table| table.top_threat()) {
+                    vec![top]
+                } else {
+                    Vec::new()
+                }
+            },
             game_core::encounter::Target::RandomPlayer
             | game_core::encounter::Target::AllPlayers => {
-                // Step 2: pick the first player by EntityId order. `AllPlayers`
-                // currently behaves like a single-target fallback because the
-                // cast pipeline takes one target; multi-target broadcast is a
-                // Step 3 follow-up.
-                //
-                // Layer scoping (Finding #4): only consider players sharing
-                // the boss's layer, so an instanced boss can never accidentally
-                // target an open-world player with a lower EntityId.
+                // Layer scoping: only consider players sharing the boss's
+                // layer, so an instanced boss can never accidentally target
+                // an open-world player. `RandomPlayer` deterministically
+                // picks one entry from the same set keyed by
+                // `current_tick ^ boss_id`; `AllPlayers` returns the full
+                // layer-scoped list for the caller to broadcast across.
                 let boss_layer = self.layer_of_idx(boss_idx);
                 let mut players: Vec<EntityId> = self
                     .state
@@ -1301,20 +1309,21 @@ impl TickPipeline {
                 if matches!(target, game_core::encounter::Target::RandomPlayer) {
                     let seed = self.current_tick.0 ^ boss_id.0;
                     if players.is_empty() {
-                        None
+                        Vec::new()
                     } else {
                         let idx = (seed % players.len() as u64) as usize;
-                        Some(players[idx])
+                        vec![players[idx]]
                     }
                 } else {
-                    players.first().copied()
+                    players
                 }
             }
             game_core::encounter::Target::VolumeOccupants { tag } => {
-                // Step 2.5: cast pipeline takes one target; collapse to the
-                // lowest-EntityId occupant across volumes matching `tag`.
-                // Multi-target broadcast follows in Step 3.
-                let store = self.volumes.get(&boss_id)?;
+                // Return every occupant across volumes matching `tag` whose
+                // owning boss is `boss_id`. Callers broadcast one cast per
+                // entry; layer scoping is implicit (volumes only enroll
+                // entities tracked by the boss's encounter on the same layer).
+                let store = if let Some(s) = self.volumes.get(&boss_id) { s } else { return Vec::new(); };
                 let mut occupants: Vec<EntityId> = Vec::new();
                 for v in store.iter_sorted() {
                     if v.tag == *tag {
@@ -1323,7 +1332,7 @@ impl TickPipeline {
                 }
                 occupants.sort_by_key(|e| e.0);
                 occupants.dedup();
-                occupants.first().copied()
+                occupants
             }
         }
     }

@@ -457,6 +457,9 @@ impl TickPipeline {
                     if !same_team {
                         continue;
                     }
+                    if self.layer_of_idx(blocker_idx) != self.layer_of_idx(target_idx) {
+                        continue;
+                    }
                     let Some(bp) = self.physics.get_transform(blocker_id) else {
                         continue;
                     };
