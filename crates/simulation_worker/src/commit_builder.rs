@@ -305,8 +305,14 @@ pub struct CommitPackage {
     pub npc_state_updates: Vec<CommitNpcState>,
     /// Entities spawned by the world director that need DB rows created.
     pub director_spawns: Vec<CommitDirectorSpawn>,
-    /// Interactable state changes to commit via `commit_interactable_updates`.
+    /// Interactable state changes committed inline via `commit_tick_results`.
     pub interactable_updates: Vec<CommitInteractableUpdate>,
+    /// Boss phase transitions from encounter executor.
+    /// Each entry is (boss_entity_id, phase_number, entered_at_tick).
+    pub boss_phase_updates: Vec<(u64, u32, u64)>,
+    /// Zone counter increments from encounter executor / combat system.
+    /// Each entry is (layer, region_x, region_z, counter_name, delta).
+    pub zone_counter_deltas: Vec<(u32, i32, i32, String, f64)>,
 }
 
 /// Build a `CommitPackage` from a `TickResult` and consumed intent IDs.
@@ -473,6 +479,8 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
         npc_state_updates,
         director_spawns,
         interactable_updates,
+        boss_phase_updates: result.boss_phase_updates,
+        zone_counter_deltas: result.zone_counter_deltas,
     }
 }
 
@@ -952,6 +960,8 @@ mod tests {
             region_updates: Vec::new(),
             director_spawns: Vec::new(),
             interactable_updates: Vec::new(),
+            boss_phase_updates: Vec::new(),
+            zone_counter_deltas: Vec::new(),
         }
     }
 
@@ -1258,6 +1268,8 @@ mod tests {
             region_updates: Vec::new(),
             director_spawns: Vec::new(),
             interactable_updates: Vec::new(),
+            boss_phase_updates: Vec::new(),
+            zone_counter_deltas: Vec::new(),
         };
         let pkg = build(result, Vec::new());
 
@@ -1301,6 +1313,8 @@ mod tests {
                 },
             ],
             interactable_updates: Vec::new(),
+            boss_phase_updates: Vec::new(),
+            zone_counter_deltas: Vec::new(),
         };
         let pkg = build(result, Vec::new());
 

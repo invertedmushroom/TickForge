@@ -6,9 +6,8 @@
 //!
 //! Run via: `cargo run -p game_client --features connected -- --test-multi`
 //!
-//! Prerequisites:
-//!   - SpacetimeDB 2.1.0+ server running (`spacetime start`)
-//!   - Module published and simulation worker running
+//! Requires a running local stack, but no pre-created clients or seeded world
+//! state. The suite provisions and removes its own players.
 
 use log::{error, info, warn};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

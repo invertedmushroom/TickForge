@@ -51,19 +51,29 @@ pub enum DirectorTrigger {
     PlayerCountAtLeast { threshold: u32 },
     /// Fires after a specific tick.
     AfterTick { tick: u64 },
+    /// Fires when a zone's world_phase matches `phase_name`.
+    WorldPhase { zone_id: u32, phase_name: String },
     /// Both conditions must be true.
     And(Box<DirectorTrigger>, Box<DirectorTrigger>),
 }
 
 impl DirectorTrigger {
     /// Evaluate the trigger against current region state.
-    pub fn evaluate(&self, player_count: u32, current_tick: TickId) -> bool {
+    pub fn evaluate(
+        &self,
+        player_count: u32,
+        current_tick: TickId,
+        world_phases: &HashMap<u32, String>,
+    ) -> bool {
         match self {
             Self::PlayerCountAtLeast { threshold } => player_count >= *threshold,
             Self::AfterTick { tick } => current_tick.0 >= *tick,
+            Self::WorldPhase { zone_id, phase_name } => {
+                world_phases.get(zone_id).map_or(false, |p| p == phase_name)
+            }
             Self::And(a, b) => {
-                a.evaluate(player_count, current_tick)
-                    && b.evaluate(player_count, current_tick)
+                a.evaluate(player_count, current_tick, world_phases)
+                    && b.evaluate(player_count, current_tick, world_phases)
             }
         }
     }
@@ -153,6 +163,7 @@ impl DirectorState {
         &mut self,
         region_player_counts: &HashMap<(i32, i32, u32), u32>,
         current_tick: TickId,
+        world_phases: &HashMap<u32, String>,
     ) -> Vec<DirectorSpawn> {
         let mut spawns = Vec::new();
 
@@ -173,7 +184,7 @@ impl DirectorState {
                 .copied()
                 .unwrap_or(0);
 
-            if rt.def.trigger.evaluate(player_count, current_tick) {
+            if rt.def.trigger.evaluate(player_count, current_tick, world_phases) {
                 let scaling = ScalingFactor::from_player_count(player_count);
                 let (rx, rz, _layer) = rt.def.region;
                 let center_x = (rx as f32 + 0.5) * REGION_CELL_SIZE;
@@ -265,17 +276,19 @@ mod tests {
     #[test]
     fn trigger_player_count() {
         let t = DirectorTrigger::PlayerCountAtLeast { threshold: 3 };
-        assert!(!t.evaluate(2, TickId(100)));
-        assert!(t.evaluate(3, TickId(100)));
-        assert!(t.evaluate(5, TickId(100)));
+        let wp = HashMap::new();
+        assert!(!t.evaluate(2, TickId(100), &wp));
+        assert!(t.evaluate(3, TickId(100), &wp));
+        assert!(t.evaluate(5, TickId(100), &wp));
     }
 
     #[test]
     fn trigger_after_tick() {
         let t = DirectorTrigger::AfterTick { tick: 50 };
-        assert!(!t.evaluate(0, TickId(49)));
-        assert!(t.evaluate(0, TickId(50)));
-        assert!(t.evaluate(0, TickId(100)));
+        let wp = HashMap::new();
+        assert!(!t.evaluate(0, TickId(49), &wp));
+        assert!(t.evaluate(0, TickId(50), &wp));
+        assert!(t.evaluate(0, TickId(100), &wp));
     }
 
     #[test]
@@ -284,9 +297,10 @@ mod tests {
             Box::new(DirectorTrigger::PlayerCountAtLeast { threshold: 2 }),
             Box::new(DirectorTrigger::AfterTick { tick: 100 }),
         );
-        assert!(!t.evaluate(2, TickId(99)));
-        assert!(!t.evaluate(1, TickId(100)));
-        assert!(t.evaluate(2, TickId(100)));
+        let wp = HashMap::new();
+        assert!(!t.evaluate(2, TickId(99), &wp));
+        assert!(!t.evaluate(1, TickId(100), &wp));
+        assert!(t.evaluate(2, TickId(100), &wp));
     }
 
     #[test]
@@ -308,15 +322,16 @@ mod tests {
         counts.insert((0, 0, 0), 1u32);
 
         // First evaluation fires.
-        let spawns = director.evaluate(&counts, TickId(1));
+        let wp = HashMap::new();
+        let spawns = director.evaluate(&counts, TickId(1), &wp);
         assert!(!spawns.is_empty());
 
         // Still on cooldown.
-        let spawns = director.evaluate(&counts, TickId(5));
+        let spawns = director.evaluate(&counts, TickId(5), &wp);
         assert!(spawns.is_empty());
 
         // Cooldown expired.
-        let spawns = director.evaluate(&counts, TickId(11));
+        let spawns = director.evaluate(&counts, TickId(11), &wp);
         assert!(!spawns.is_empty());
 
         assert_eq!(eid, EventId(1));
@@ -340,10 +355,11 @@ mod tests {
         let mut counts = HashMap::new();
         counts.insert((1, 2, 0), 3u32);
 
-        assert!(!director.evaluate(&counts, TickId(1)).is_empty());
-        assert!(!director.evaluate(&counts, TickId(2)).is_empty());
+        let wp = HashMap::new();
+        assert!(!director.evaluate(&counts, TickId(1), &wp).is_empty());
+        assert!(!director.evaluate(&counts, TickId(2), &wp).is_empty());
         // Max activations hit.
-        assert!(director.evaluate(&counts, TickId(3)).is_empty());
+        assert!(director.evaluate(&counts, TickId(3), &wp).is_empty());
     }
 
     #[test]

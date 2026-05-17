@@ -208,12 +208,101 @@ pub fn world_clock(ctx: &ReducerContext, _schedule: WorldClockSchedule) -> Resul
         return Err("world_clock may only be invoked by the scheduler".into());
     }
 
-    // Tier 2 evaluation logic will be added as zone_counter and world_phase
-    // content is populated. For now, this is a no-op placeholder that
-    // demonstrates the scheduled reducer pattern.
-    log::trace!("world_clock: tick");
+    // ── Tier 2 evaluation: zone_counter → world_phase transitions ───
+    //
+    // Aggregate zone_counter rows per (layer, region_x, region_z) and
+    // evaluate simple threshold rules.  When a threshold is met and no
+    // matching world_phase row exists (or the phase name differs), upsert
+    // the world_phase table.
+    //
+    // Threshold convention (V1 — hardcoded, future: data-driven):
+    //   "kills" >= 5.0  → phase "boss_ready"
+    //   "boss_killed" >= 1.0 → phase "completed"
+    //
+    // zone_id is synthesised as `layer * 1_000_000 + (region_x+500)*1000 + (region_z+500)`
+    // to produce a unique u32 per cell.  This is deliberately lossy outside
+    // ±499 but sufficient for the dungeon-instance use case.
 
+    struct ThresholdRule {
+        counter_name: &'static str,
+        threshold: f64,
+        phase_name: &'static str,
+        /// Higher priority wins when multiple rules match the same zone.
+        priority: u32,
+    }
+
+    const RULES: &[ThresholdRule] = &[
+        ThresholdRule { counter_name: "boss_killed", threshold: 1.0, phase_name: "completed", priority: 10 },
+        ThresholdRule { counter_name: "kills", threshold: 5.0, phase_name: "boss_ready", priority: 1 },
+    ];
+
+    // Collect all zone_counter rows into per-zone maps.
+    let mut zone_counters: std::collections::HashMap<(u32, i32, i32), Vec<(&str, f64)>> =
+        std::collections::HashMap::new();
+    // We can't borrow counter_name across the iterator because the row is owned,
+    // so collect tuples first.
+    let counter_rows: Vec<_> = ctx.db.zone_counter().iter().map(|c| {
+        (c.layer, c.region_x, c.region_z, c.counter_name.clone(), c.value)
+    }).collect();
+    for (layer, rx, rz, name, value) in &counter_rows {
+        zone_counters
+            .entry((*layer, *rx, *rz))
+            .or_default()
+            .push((name.as_str(), *value));
+    }
+
+    let now = ctx.timestamp.to_micros_since_unix_epoch();
+
+    for (&(layer, rx, rz), counters) in &zone_counters {
+        // Find the highest-priority matching rule for this zone.
+        let mut best: Option<&ThresholdRule> = None;
+        for rule in RULES {
+            let met = counters.iter().any(|(name, val)| *name == rule.counter_name && *val >= rule.threshold);
+            if met {
+                if best.map_or(true, |b| rule.priority > b.priority) {
+                    best = Some(rule);
+                }
+            }
+        }
+
+        if let Some(rule) = best {
+            let zone_id = synthesise_zone_id(layer, rx, rz);
+            let existing = ctx.db.world_phase().zone_id().find(&zone_id);
+            let needs_write = match &existing {
+                Some(wp) => wp.phase_name != rule.phase_name,
+                None => true,
+            };
+            if needs_write {
+                let wp = WorldPhase {
+                    zone_id,
+                    phase_name: rule.phase_name.to_string(),
+                    started_at: now,
+                    metadata: String::new(),
+                };
+                if existing.is_some() {
+                    ctx.db.world_phase().zone_id().update(wp);
+                } else {
+                    ctx.db.world_phase().insert(wp);
+                }
+                log::info!(
+                    "world_clock: zone ({},{},{}) → phase '{}' (counter '{}' >= {})",
+                    layer, rx, rz, rule.phase_name, rule.counter_name, rule.threshold
+                );
+            }
+        }
+    }
+
+    log::trace!("world_clock: evaluated {} zones", zone_counters.len());
     Ok(())
+}
+
+/// Synthesise a deterministic `zone_id: u32` from (layer, region_x, region_z).
+/// Covers ±499 cells per axis per layer.  Dungeon instances (layer ≥ 100) with
+/// small arenas are well within range.
+fn synthesise_zone_id(layer: u32, rx: i32, rz: i32) -> u32 {
+    layer.wrapping_mul(1_000_000)
+        .wrapping_add(((rx + 500) as u32).wrapping_mul(1000))
+        .wrapping_add((rz + 500) as u32)
 }
 
 // ── Player Input ────────────────────────────────────────────────────
@@ -1675,11 +1764,17 @@ pub fn create_instance(
     // Maps template-scoped local_id → real entity_id for linked_to resolution.
     let mut local_to_entity: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
 
-    // First pass: create all prop entities (so we have real IDs).
+    // First pass: create all prop/boss entities (so we have real IDs).
     for def in &template.interactables {
+        let (entity_kind, hp, max_hp) = match &def.kind {
+            game_schema::dungeon::InteractKindDef::BossSpawn { .. } => {
+                (EntityKind::Boss, 1000.0_f32, 1000.0_f32)
+            }
+            _ => (EntityKind::Prop, 1.0_f32, 1.0_f32),
+        };
         let entity = ctx.db.entity().insert(Entity {
             entity_id: 0,
-            kind: EntityKind::Prop,
+            kind: entity_kind,
             state: EntityState::Spawning,
             spawned_at_tick: current_tick,
             owner_identity: None,
@@ -1700,8 +1795,8 @@ pub fn create_instance(
 
         ctx.db.entity_health().insert(EntityHealth {
             entity_id: eid,
-            hp: 1.0,
-            max_hp: 1.0,
+            hp,
+            max_hp,
         });
 
         ctx.db.entity_region().insert(EntityRegion {
@@ -1710,6 +1805,22 @@ pub fn create_instance(
             region_z: (def.position[2] / 50.0).floor() as i32,
             layer,
         });
+
+        // BossSpawn entities get NpcConfig so the worker treats them as AI-driven.
+        if let game_schema::dungeon::InteractKindDef::BossSpawn { npc_name } = &def.kind {
+            ctx.db.npc_config().insert(NpcConfig {
+                entity_id: eid,
+                passive: false,
+                no_chase: false,
+                ability_id_1: None,
+                ability_id_2: None,
+                ability_id_3: None,
+                ability_id_4: None,
+                leash_radius: 30.0,
+                aggro_radius: 15.0,
+            });
+            log::info!("Boss entity {} ({npc_name}) spawned in instance layer={layer}", eid);
+        }
     }
 
     // Second pass: create interactable_config rows with resolved linked_entity IDs.
@@ -2136,8 +2247,8 @@ mod debug_reducers {
     }
 
     /// Force-remove an entity. Deletes companion rows (transform, health,
-    /// region, npc_state, buffs, threat). Use to clean up stuck or unwanted
-    /// entities during testing.
+    /// region, npc_state, buffs, threat, pending inputs, and client ownership).
+    /// Use to clean up stuck or unwanted entities during testing.
     #[reducer]
     pub fn debug_remove_entity(
         ctx: &ReducerContext,
@@ -2162,8 +2273,13 @@ mod debug_reducers {
         ctx.db.entity_transform().entity_id().delete(&entity_id);
         ctx.db.entity_region().entity_id().delete(&entity_id);
         ctx.db.entity_health().entity_id().delete(&entity_id);
+        ctx.db.player_intent().entity_id().delete(&entity_id);
         ctx.db.npc_state().entity_id().delete(&entity_id);
         ctx.db.npc_config().entity_id().delete(&entity_id);
+
+        if let Some(owner_identity) = entity.owner_identity {
+            ctx.db.client_sequence().client_identity().delete(&owner_identity);
+        }
 
         // Stealth + team.
         ctx.db.stealthed_entity().entity_id().delete(&entity_id);

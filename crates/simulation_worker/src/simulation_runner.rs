@@ -167,6 +167,11 @@ impl SimulationRunner {
         }
     }
 
+    /// Insert or update an interactable entry in the sim state.
+    pub fn set_interactable(&mut self, id: EntityId, info: game_core::sim_state::InteractableInfo) {
+        self.pipeline.state.interactables.insert(id, info);
+    }
+
     /// Whether the entity is in `Active` state.
     pub fn is_active(&self, id: EntityId) -> bool {
         self.pipeline.state.is_active(id)
@@ -190,6 +195,35 @@ impl SimulationRunner {
     /// Mutable access to the physics backend (for instance collider management).
     pub fn physics_mut(&mut self) -> &mut dyn game_core::physics_backend::PhysicsBackend {
         self.pipeline.physics_mut()
+    }
+
+    // ── Tier 2 projections ──────────────────────────────────────────
+
+    /// Set or update a world_phase projection for a zone.
+    pub fn set_world_phase(&mut self, zone_id: u32, phase_name: String) {
+        self.pipeline.world_phases.insert(zone_id, phase_name);
+    }
+
+    /// Remove a world_phase projection.
+    pub fn remove_world_phase(&mut self, zone_id: u32) {
+        self.pipeline.world_phases.remove(&zone_id);
+    }
+
+    /// Set or update an NPC goal projection.
+    pub fn set_npc_goal(&mut self, entity_id: EntityId, goal_kind: String, priority: u32) {
+        self.pipeline.npc_goals.insert(entity_id, (goal_kind, priority));
+    }
+
+    /// Remove an NPC goal projection.
+    pub fn remove_npc_goal(&mut self, entity_id: EntityId) {
+        self.pipeline.npc_goals.remove(&entity_id);
+    }
+
+    // ── Encounter management ────────────────────────────────────────
+
+    /// Register an encounter for a boss entity.
+    pub fn register_encounter(&mut self, boss_entity: EntityId, encounter: game_core::encounter::EncounterState) {
+        self.pipeline.encounters.insert(boss_entity, encounter);
     }
 }
 

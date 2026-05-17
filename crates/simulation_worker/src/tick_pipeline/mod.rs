@@ -168,6 +168,10 @@ pub struct TickResult {
     pub director_spawns: Vec<DirectorSpawn>,
     /// Interactable state changes this tick (entity_id, new SimInteractState).
     pub interactable_updates: Vec<(EntityId, game_core::sim_state::SimInteractState)>,
+    /// Boss phase transitions from the encounter executor (boss_entity_id, phase, tick).
+    pub boss_phase_updates: Vec<(u64, u32, u64)>,
+    /// Zone counter increments from the encounter executor and combat system.
+    pub zone_counter_deltas: Vec<(u32, i32, i32, String, f64)>,
 }
 
 /// The canonical 10-phase simulation tick pipeline per spec.
@@ -245,6 +249,15 @@ pub struct TickPipeline {
     pub(super) transform_history: TransformHistory,
     /// World director — evaluates dynamic event triggers and spawns NPCs.
     pub(super) director: DirectorState,
+    /// World phase projections from the DB — keyed by zone_id → phase_name.
+    /// Updated by coordinator callbacks when world_phase rows change.
+    pub(super) world_phases: HashMap<u32, String>,
+    /// NPC goal directives from the DB (Tier 2 world_clock output).
+    /// Keyed by entity_id → (goal_kind, priority). Phase 7 AI reads before decisions.
+    pub(super) npc_goals: HashMap<EntityId, (String, u32)>,
+    /// Active boss encounters — keyed by boss entity ID.
+    /// Phase 7.5 evaluates encounter rules after director spawns.
+    pub(crate) encounters: HashMap<EntityId, game_core::encounter::EncounterState>,
     /// Entities whose cached `StatBlock` needs recalculation.
     /// Populated by: (a) equipment changes (via `mark_stats_dirty`),
     /// (b) buff changes (copied from `StatusState::dirty_entities` at Phase 10).
@@ -418,6 +431,9 @@ impl TickPipeline {
             last_committed_transforms: HashMap::new(),
             transform_history: TransformHistory::new(),
             director: DirectorState::new(),
+            world_phases: HashMap::new(),
+            npc_goals: HashMap::new(),
+            encounters: HashMap::new(),
             stats_dirty: HashSet::new(),
             equipment_modifiers: HashMap::new(),
             npc_state_prev: HashMap::new(),
@@ -633,7 +649,7 @@ impl TickPipeline {
         })
     }
 
-    fn set_entity_body_facing(&mut self, entity_id: EntityId, dir: Vec3f, audit_detail: &'static str) -> Option<Vec3f> {
+    fn set_entity_body_facing(&mut self, entity_id: EntityId, dir: Vec3f, _audit_detail: &'static str) -> Option<Vec3f> {
         let facing = Self::normalize_horizontal_direction(dir)?;
         let yaw = facing.x.atan2(facing.z);
         let half_yaw = yaw * 0.5;
@@ -644,7 +660,7 @@ impl TickPipeline {
             w: half_yaw.cos(),
         };
         self.physics.set_kinematic_rotation(entity_id, rotation);
-        audit!(self.state, Transform, Controller, 2, Some(entity_id), audit_detail);
+        audit!(self.state, Transform, Controller, 2, Some(entity_id), _audit_detail);
         Some(facing)
     }
 
@@ -1009,6 +1025,31 @@ impl TickPipeline {
         // Phase 7.5: World orchestration — director evaluates triggers and spawns
         let director_spawns = self.phase_world_orchestration();
 
+        // Phase 7.5b: Encounter execution — evaluate boss encounter rules
+        let encounter_outputs = self.phase_encounter_execution();
+        let mut boss_phase_updates = Vec::new();
+        let mut zone_counter_deltas = Vec::new();
+        for output in encounter_outputs {
+            match output {
+                game_core::encounter::EncounterOutput::ChangeBossPhase {
+                    boss_entity_id,
+                    new_phase,
+                    entered_at_tick,
+                } => {
+                    boss_phase_updates.push((boss_entity_id.0, new_phase, entered_at_tick));
+                }
+                game_core::encounter::EncounterOutput::IncrementZoneCounter {
+                    layer,
+                    region_x,
+                    region_z,
+                    counter_name,
+                    delta,
+                } => {
+                    zone_counter_deltas.push((layer, region_x, region_z, counter_name, delta));
+                }
+            }
+        }
+
         // Snapshot health for entities that took damage this tick — must happen BEFORE
         // phase_state_finalization removes dead entity slots from the EntityStore.
         let mut health_updates = self.collect_health_updates();
@@ -1083,6 +1124,8 @@ impl TickPipeline {
             region_updates,
             director_spawns,
             interactable_updates: std::mem::take(&mut self.pending_interactable_updates),
+            boss_phase_updates,
+            zone_counter_deltas,
         };
 
         self.current_tick = self.current_tick.next();

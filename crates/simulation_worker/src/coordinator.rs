@@ -42,6 +42,7 @@ struct CoordinatorState {
     sim: SimulationRunner,
     items: game_core::stats::ItemRegistry,
     dungeons: game_core::dungeon::DungeonRegistry,
+    encounters: game_core::encounter::EncounterRegistry,
 }
 
 /// Send (or re-send) a commit payload to SpacetimeDB.
@@ -68,6 +69,8 @@ fn send_commit(reducers: &RemoteReducers, pkg: CommitPackage, state: Arc<Mutex<C
     let npc_state_updates = wire_npc_state_updates(&pkg);
     let director_spawns = wire_director_spawns(&pkg);
     let interactable_updates = wire_interactable_updates(&pkg);
+    let boss_phase_updates = pkg.boss_phase_updates.clone();
+    let zone_counter_deltas = pkg.zone_counter_deltas.clone();
 
     let state_for_ack = Arc::clone(&state);
 
@@ -92,6 +95,22 @@ fn send_commit(reducers: &RemoteReducers, pkg: CommitPackage, state: Arc<Mutex<C
                 Ok(Ok(())) => {
                     let mut guard = state_for_ack.lock().unwrap_or_else(|p| p.into_inner());
                     guard.sim.acknowledge_success(tick_id);
+
+                    // Fire-and-forget Tier 1/2 reducer calls after main commit succeeds.
+                    // These are separate reducers so they don't bloat the commit_tick_results
+                    // signature. Failure is logged but does not crash — these are eventually
+                    // consistent diagnostic/progression tables.
+                    for (boss_eid, phase, entered_tick) in &boss_phase_updates {
+                        if let Err(e) = rctx.reducers.commit_boss_phase(*boss_eid, *phase, *entered_tick) {
+                            warn!("commit_boss_phase failed: {e}");
+                        }
+                    }
+                    for (layer, rx, rz, name, delta) in &zone_counter_deltas {
+                        if let Err(e) = rctx.reducers.increment_zone_counter(*layer, *rx, *rz, name.clone(), *delta) {
+                            warn!("increment_zone_counter failed: {e}");
+                        }
+                    }
+
                     return;
                 }
                 Ok(Err(reducer_err)) => format!("reducer rejected: {reducer_err}"),
@@ -178,11 +197,13 @@ pub fn run(config: CoordinatorConfig) {
     let items = load_items();
     let buffs = load_buffs();
     let dungeons = load_dungeons();
+    let encounters = load_encounters();
 
     let state = Arc::new(Mutex::new(CoordinatorState {
         sim: SimulationRunner::new(TickId(0), Box::new(physics), tick_dt, abilities, buffs),
         items,
         dungeons,
+        encounters,
     }));
 
     let state_for_connect = Arc::clone(&state);
@@ -441,6 +462,16 @@ pub fn run(config: CoordinatorConfig) {
                 ..Default::default()
             },
         );
+
+        // Register encounter rules for Boss entities so the pipeline can
+        // evaluate phase transitions each tick.
+        if kind == game_schema::EntityKind::Boss {
+            if let Some(rules) = guard.encounters.rules_for("default") {
+                let enc_state = game_core::encounter::EncounterState::new(eid, rules.clone(), tick);
+                guard.sim.register_encounter(eid, enc_state);
+                info!("Registered encounter rules for boss entity {}", eid.0);
+            }
+        }
     });
 
     // entity.on_update — thin adapter over EntitySync::sync_update.
@@ -627,7 +658,7 @@ pub fn run(config: CoordinatorConfig) {
             Err(poisoned) => poisoned.into_inner(),
         };
         let info = convert_interactable_info(&row);
-        guard.sim.pipeline.state.interactables.insert(EntityId(row.entity_id), info);
+        guard.sim.set_interactable(EntityId(row.entity_id), info);
     });
 
     let state_for_interact_update = Arc::clone(&state);
@@ -637,12 +668,79 @@ pub fn run(config: CoordinatorConfig) {
             Err(poisoned) => poisoned.into_inner(),
         };
         let info = convert_interactable_info(&row);
-        guard.sim.pipeline.state.interactables.insert(EntityId(row.entity_id), info);
+        guard.sim.set_interactable(EntityId(row.entity_id), info);
     });
 
     // TODO: add on_delete callback to remove stale entries from
     // sim.pipeline.state.interactables when interactable_config rows
     // are deleted at runtime (e.g. instance teardown).
+
+    // ── World Phase projection ──────────────────────────────────────
+    // Project world_phase rows into the pipeline's world_phases map so
+    // the director and encounter executor can react to zone progression.
+
+    let state_for_wp_insert = Arc::clone(&state);
+    conn.db.world_phase().on_insert(move |_ctx, row| {
+        let mut guard = match state_for_wp_insert.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        info!("world_phase.on_insert: zone={} phase='{}'", row.zone_id, row.phase_name);
+        guard.sim.set_world_phase(row.zone_id, row.phase_name.clone());
+    });
+
+    let state_for_wp_update = Arc::clone(&state);
+    conn.db.world_phase().on_update(move |_ctx, _old, row| {
+        let mut guard = match state_for_wp_update.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        info!("world_phase.on_update: zone={} phase='{}'", row.zone_id, row.phase_name);
+        guard.sim.set_world_phase(row.zone_id, row.phase_name.clone());
+    });
+
+    let state_for_wp_delete = Arc::clone(&state);
+    conn.db.world_phase().on_delete(move |_ctx, row| {
+        let mut guard = match state_for_wp_delete.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        debug!("world_phase.on_delete: zone={}", row.zone_id);
+        guard.sim.remove_world_phase(row.zone_id);
+    });
+
+    // ── NPC Goal projection ─────────────────────────────────────────
+    // Project npc_goal rows so Phase 7 AI can read goal directives.
+
+    let state_for_goal_insert = Arc::clone(&state);
+    conn.db.npc_goal().on_insert(move |_ctx, row| {
+        let mut guard = match state_for_goal_insert.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        debug!("npc_goal.on_insert: entity={} kind='{}' priority={}", row.entity_id, row.goal_kind, row.priority);
+        guard.sim.set_npc_goal(EntityId(row.entity_id), row.goal_kind.clone(), row.priority);
+    });
+
+    let state_for_goal_update = Arc::clone(&state);
+    conn.db.npc_goal().on_update(move |_ctx, _old, row| {
+        let mut guard = match state_for_goal_update.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        debug!("npc_goal.on_update: entity={} kind='{}' priority={}", row.entity_id, row.goal_kind, row.priority);
+        guard.sim.set_npc_goal(EntityId(row.entity_id), row.goal_kind.clone(), row.priority);
+    });
+
+    let state_for_goal_delete = Arc::clone(&state);
+    conn.db.npc_goal().on_delete(move |_ctx, row| {
+        let mut guard = match state_for_goal_delete.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        debug!("npc_goal.on_delete: entity={}", row.entity_id);
+        guard.sim.remove_npc_goal(EntityId(row.entity_id));
+    });
 
     let state_for_equip_insert = Arc::clone(&state);
     conn.db.player_equipment().on_insert(move |ctx, row| {
@@ -750,6 +848,9 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
             "SELECT * FROM player_equipment",
             "SELECT * FROM instance",
             "SELECT * FROM interactable_config",
+            "SELECT * FROM world_phase",
+            "SELECT * FROM npc_goal",
+            "SELECT * FROM npc_config",
         ]);
 }
 
@@ -970,6 +1071,32 @@ fn load_dungeons() -> game_core::dungeon::DungeonRegistry {
         Err(e) => {
             warn!("Could not load {PATH} ({e}) — using empty dungeon registry");
             DungeonRegistry::new()
+        }
+    }
+}
+
+/// Load encounter definitions from `data/encounters.ron`.
+fn load_encounters() -> game_core::encounter::EncounterRegistry {
+    use game_core::encounter::{EncounterFile, EncounterRegistry};
+    const PATH: &str = "data/encounters.ron";
+    let result = std::fs::read_to_string(PATH)
+        .map_err(|e| format!("read '{PATH}': {e}"))
+        .and_then(|src| {
+            ron::from_str::<EncounterFile>(&src).map_err(|e| format!("parse '{PATH}': {e}"))
+        });
+    match result {
+        Ok(file) => {
+            let count = file.encounters.len();
+            let mut reg = EncounterRegistry::new();
+            for def in file.encounters {
+                reg.register(def.boss_name, def.rules);
+            }
+            info!("Loaded {count} encounter definition(s) from {PATH}");
+            reg
+        }
+        Err(e) => {
+            warn!("Could not load {PATH} ({e}) — using empty encounter registry");
+            EncounterRegistry::new()
         }
     }
 }

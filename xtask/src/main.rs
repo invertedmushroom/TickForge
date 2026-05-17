@@ -199,15 +199,10 @@ fn run_test(cmd: TestCmd) -> Result<()> {
             "--features",
             "connected",
         ])),
-        TestCmd::Cli => run_command(cargo_cmd([
-            "run",
-            "-p",
-            "game_client",
-            "--features",
-            "connected",
-            "--",
-            "--test",
-        ])),
+        TestCmd::Cli => dev_client_test(ClientTestArgs {
+            release: false,
+            args: Vec::new(),
+        }),
         TestCmd::MultiClient => run_command(cargo_cmd([
             "run",
             "-p",

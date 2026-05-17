@@ -59,8 +59,8 @@ impl TickPipeline {
             .filter(|&id| !Self::execution_is_alive(id, &scheduled_sources, &self.state.combat.hitboxes))
             .collect();
         for id in dead {
-            if let Some(ctx) = self.state.combat.executions.get(id) {
-                audit!(self.state, Execution, AbilityTimeline, 3, Some(ctx.caster), "cull");
+            if let Some(_ctx) = self.state.combat.executions.get(id) {
+                audit!(self.state, Execution, AbilityTimeline, 3, Some(_ctx.caster), "cull");
             }
             self.state.combat.executions.remove(id);
         }

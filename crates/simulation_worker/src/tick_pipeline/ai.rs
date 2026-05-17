@@ -165,7 +165,21 @@ impl TickPipeline {
                         }
                     }
                     NpcAiState::Scripted => {
-                        // No scripted behavior yet — placeholder.
+                        // Scripted NPCs check npc_goals for directives.
+                        // V1: "go_idle" causes transition back to Idle.
+                        let npc_id = self.state.entities.id_of(*idx);
+                        if let Some((goal_kind, _priority)) = self.npc_goals.get(&npc_id) {
+                            match goal_kind.as_str() {
+                                "go_idle" => {
+                                    if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) { *ai = NpcAiState::Idle; }
+                                    audit!(self.state, Ai, AiDecisions, 7, Some(npc_id), "goal_idle");
+                                }
+                                _ => {
+                                    // Unknown goal kind — log and ignore.
+                                    log::trace!("NPC {} has unknown goal '{}'", npc_id.0, goal_kind);
+                                }
+                            }
+                        }
                     }
                     NpcAiState::Evade => {
                         // Evade→Idle: handled in action execution when NPC reaches home.
@@ -385,7 +399,41 @@ impl TickPipeline {
         // coordinator can send them to SpacetimeDB via commit_tick_results.
         // The DB assigns canonical IDs and broadcasts entity.on_insert, which
         // the coordinator handles to materialize them into the local sim.
-        self.director.evaluate(&region_player_counts, self.current_tick)
+        self.director.evaluate(&region_player_counts, self.current_tick, &self.world_phases)
+    }
+
+    // ── Phase 7.5b: Encounter execution ─────────────────────────
+
+    /// Evaluate encounter rules for all active boss encounters.
+    ///
+    /// Checks boss HP thresholds and timers, fires one-shot triggers,
+    /// and returns outputs (phase changes, counter increments) for the
+    /// commit pipeline.
+    pub(super) fn phase_encounter_execution(&mut self) -> Vec<game_core::encounter::EncounterOutput> {
+        let mut outputs = Vec::new();
+
+        // Collect boss entity IDs first to avoid borrow issues.
+        let boss_ids: Vec<EntityId> = self.encounters.keys().copied().collect();
+
+        for boss_id in boss_ids {
+            let hp_pct = if let Some(idx) = self.state.entities.lookup(boss_id) {
+                let i = idx.as_usize();
+                let hp = self.state.combat.health.hp[i];
+                let max_hp = self.state.combat.health.max_hp[i];
+                if max_hp > 0.0 { hp / max_hp } else { 0.0 }
+            } else {
+                // Boss entity no longer exists — clean up encounter.
+                self.encounters.remove(&boss_id);
+                continue;
+            };
+
+            if let Some(enc) = self.encounters.get_mut(&boss_id) {
+                let enc_outputs = enc.evaluate(hp_pct, self.current_tick);
+                outputs.extend(enc_outputs);
+            }
+        }
+
+        outputs
     }
 
     /// Get mutable access to the director state for event registration.

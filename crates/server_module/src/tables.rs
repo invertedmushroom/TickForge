@@ -732,7 +732,7 @@ pub struct InstanceMembership {
 // Per-entity config for interactive world objects (gates, switches,
 // chests, grabs). Sim worker subscribes for physics-driven interactions.
 // Single writer: instance spawn path (create_instance) and
-// commit_interactable_updates reducer (trusted worker).
+// commit_tick_results reducer (trusted worker, inline interactable updates).
 
 #[derive(SpacetimeType, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InteractKind {

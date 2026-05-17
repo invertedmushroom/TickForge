@@ -663,6 +663,8 @@ impl SimState {
             self.ai.npc_ability_ids.push_slot();
             self.ai.npc_passive.push_slot();
             self.ai.npc_no_chase.push_slot();
+            self.ai.npc_leash_radius.push_slot();
+            self.ai.npc_aggro_radius.push_slot();
             if kind == EntityKind::Npc || kind == EntityKind::Boss {
                 self.combat.threat_tables.insert(idx, ThreatTable::default());
                 self.ai.npc_ai.insert(idx, NpcAiState::Idle);
