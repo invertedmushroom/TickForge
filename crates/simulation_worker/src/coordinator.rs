@@ -39,7 +39,7 @@ use std::path::Path;
 use log::{error, info, warn};
 use spacetimedb_sdk::{DbContext, Identity, Table, TableWithPrimaryKey};
 
-use crate::commit_builder::{self, CommitPackage, CommitCombatEvent, CommitCombatEventKind, CommitWorldEventKind, CommitEntityStateKind, CommitBuff, CommitThreat, CommitNpcState};
+use crate::commit_builder::{self, CommitPackage, CommitCombatEvent, CommitCombatEventKind, CommitWorldEventKind, CommitEntityStateKind};
 use crate::entity_sync::EntitySync;
 use crate::module_bindings::*;
 use crate::physics::rapier_world::PhysicsWorld;
@@ -155,7 +155,7 @@ pub fn run(config: CoordinatorConfig) {
                 entity_id: EntityId(row.entity_id),
                 sequence_id: row.sequence_id,
                 target_tick: TickId(row.target_tick),
-                client_time_ms: row.client_time_ms,
+                client_observed_tick: row.client_observed_tick,
                 action: convert_intent_action(row.action.clone()),
             }))
             .unzip();

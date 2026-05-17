@@ -5,4 +5,4 @@ pub mod module_bindings;
 pub mod client;
 
 #[cfg(feature = "connected")]
-pub mod aoi_test;
+pub mod smoke_test;

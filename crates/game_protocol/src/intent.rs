@@ -19,8 +19,9 @@ pub struct PlayerIntent {
     pub sequence_id: u64,
     /// The tick this intent should be processed on.
     pub target_tick: TickId,
-    /// Client-local timestamp for latency estimation.
-    pub client_time_ms: u64,
+    /// The tick the client had last rendered when the intent was created.
+    /// Used for lag compensation rewind. 0 means no rewind (legacy/local client).
+    pub client_observed_tick: u64,
     /// What the player wants to do.
     pub action: IntentAction,
 }

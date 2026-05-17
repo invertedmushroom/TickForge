@@ -15,8 +15,8 @@ fn main() {
         };
 
         if test_mode {
-            log::info!("Running AOI integration tests against {}:{}", config.uri, config.module_name);
-            let exit_code = game_client::aoi_test::run_tests(config);
+            log::info!("Running integration tests against {}:{}", config.uri, config.module_name);
+            let exit_code = game_client::smoke_test::run_tests(config);
             std::process::exit(exit_code);
         }
 

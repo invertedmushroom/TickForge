@@ -267,8 +267,17 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
         })
         .collect();
 
-    let buff_cleared_entity_ids = result.buff_updates.iter().map(|(eid, _)| eid.0).collect();
-    let threat_cleared_entity_ids = result.threat_updates.iter().map(|(eid, _)| eid.0).collect();
+    let mut buff_cleared_entity_ids: Vec<u64> = result.buff_updates.iter().map(|(eid, _)| eid.0).collect();
+    let mut threat_cleared_entity_ids: Vec<u64> = result.threat_updates.iter().map(|(eid, _)| eid.0).collect();
+
+    // Removed entities are excluded from buff/threat update snapshots, but their
+    // stale DB rows still need to be deleted. Include them in the cleared lists.
+    for (eid, state) in &result.entity_state_updates {
+        if *state == game_schema::EntityState::Removed {
+            buff_cleared_entity_ids.push(eid.0);
+            threat_cleared_entity_ids.push(eid.0);
+        }
+    }
 
     let region_updates = result
         .region_updates

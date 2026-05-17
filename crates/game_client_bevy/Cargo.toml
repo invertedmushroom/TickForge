@@ -1,0 +1,20 @@
+[package]
+name = "game_client_bevy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "jump_client"
+path = "src/main.rs"
+
+[features]
+default = ["connected"]
+connected = ["game_client/connected", "dep:spacetimedb-sdk"]
+
+[dependencies]
+game_client = { path = "../game_client" }
+spacetimedb-sdk = { workspace = true, optional = true }
+bevy = "0.15"
+log = { workspace = true }
+env_logger = { workspace = true }

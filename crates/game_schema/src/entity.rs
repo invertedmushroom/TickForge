@@ -24,7 +24,8 @@ pub enum EntityState {
     Active,
     /// Entity is marked for removal at end of tick.
     DespawnPending,
-    /// Physics handle freed, rows deleted. Terminal state.
+    /// Physics handle freed, DB row updated to Removed (not deleted) so clients
+    /// receive the terminal state event. Terminal state.
     Removed,
 }
 

@@ -23,7 +23,7 @@ pub enum AiOverride {
 /// - `damage_out_pct` / `damage_in_pct`: Phase 6 combat resolution (applied to damage value).
 /// - `speed_pct`: Phase 2 controller (multiplied into movement speed before position update).
 /// - `ai_override`: Phase 7 AI decisions (checked before standard NpcAiState transitions).
-/// - `cooldown_reduce_pct`: deferred — will be applied by Phase 8 CooldownTracker once wired.
+/// - `cooldown_reduce_pct`: Phase 3 CooldownStart (shortens cooldown duration, clamped to 99%).
 ///
 /// All fields are `Option` — `None` means the buff does not affect that domain.
 /// Positive `damage_out_pct` amplifies (e.g. 0.1 = +10%), negative reduces.
@@ -34,7 +34,7 @@ pub struct BuffModifiers {
     pub damage_out_pct: Option<f32>,
     /// Incoming damage multiplier delta. Applied in Phase 6 to damage the target receives.
     pub damage_in_pct: Option<f32>,
-    /// Cooldown reduction percentage applied at scheduling or drain (deferred, not yet wired).
+    /// Cooldown reduction percentage. Applied in Phase 3 when `CooldownStart` computes `ready_at`.\n    /// Positive values shorten cooldown (e.g. 0.2 = 20% reduction). Clamped to [0, 0.99).
     pub cooldown_reduce_pct: Option<f32>,
     /// Movement speed multiplier delta. Applied in Phase 2 to the entity’s base speed.
     pub speed_pct: Option<f32>,

@@ -104,7 +104,7 @@ pub struct PlayerIntent {
     pub entity_id: u64,
     pub sequence_id: u64,
     pub target_tick: u64,
-    pub client_time_ms: u64,
+    pub client_observed_tick: u64,
     pub action: IntentAction,
 }
 

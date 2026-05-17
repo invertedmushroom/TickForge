@@ -24,6 +24,22 @@
             shape: CapsuleSweep,
             threat_multiplier: 1.0,
         ),
+        (
+            ability_id: 2,
+            name: "Fireball",
+            base_damage: 40.0,
+            damage_type: Magical,
+            shape: Projectile,
+            threat_multiplier: 1.5,
+        ),
+        (
+            ability_id: 3,
+            name: "Smash",
+            base_damage: 60.0,
+            damage_type: Physical,
+            shape: LineSweep,
+            threat_multiplier: 2.0,
+        ),
     ],
     timelines: [
         (
@@ -35,6 +51,26 @@
                 // tick 1: damage frame — contacts this tick deal damage
                 (tick_offset: 1, action: ApplyDamageFrame),
                 // tick 2: hitbox gone
+                (tick_offset: 2, action: RemoveHitbox),
+            ],
+        ),
+        (
+            ability_id: 2,
+            actions: [
+                // Fireball: spawn projectile then apply damage a couple ticks later
+                (tick_offset: 0, action: SpawnHitbox(shape: Projectile, offset: (x: 0.0, y: 1.0, z: 0.0))),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 40)),
+                (tick_offset: 2, action: ApplyDamageFrame),
+                (tick_offset: 3, action: RemoveHitbox),
+            ],
+        ),
+        (
+            ability_id: 3,
+            actions: [
+                // Smash: heavy close-range frontal sweep
+                (tick_offset: 0, action: SpawnHitbox(shape: LineSweep, offset: (x: 0.0, y: 0.0, z: 0.0))),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 50)),
+                (tick_offset: 1, action: ApplyDamageFrame),
                 (tick_offset: 2, action: RemoveHitbox),
             ],
         ),

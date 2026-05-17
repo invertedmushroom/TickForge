@@ -122,7 +122,7 @@ impl Default for TransformHistory {
 /// Compute the rewind tick count from an intent's observed-tick field.
 ///
 /// `client_observed_tick` is the tick the client had last rendered when the player
-/// pressed the button — transmitted via the `client_time_ms` field on `PlayerIntent`
+/// pressed the button — transmitted via the `client_observed_tick` field on `PlayerIntent`
 /// (repurposed from wall-clock timestamp to tick number by the client).
 ///
 /// If `client_observed_tick == 0`, no rewind is applied (legacy or local client).

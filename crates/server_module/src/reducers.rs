@@ -131,7 +131,7 @@ pub fn submit_intent(
     entity_id: u64,
     sequence_id: u64,
     action: IntentAction,
-    client_time_ms: u64,
+    client_observed_tick: u64,
 ) -> Result<(), String> {
     let caller = ctx.sender();
 
@@ -184,7 +184,7 @@ pub fn submit_intent(
         entity_id,
         sequence_id,
         target_tick,
-        client_time_ms,
+        client_observed_tick,
         action,
     });
 

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use game_protocol::entity_id::EntityId;
 use game_protocol::tick::TickId;
 use game_protocol::types::Vec3f;
@@ -8,6 +8,7 @@ use crate::combat::hitbox::HitboxStore;
 use crate::combat::skill::AbilityExecutionStore;
 use crate::combat::status::{ActiveBuff, ThreatTable};
 use crate::combat::tactical::TacticalState;
+use crate::sparse_set::SparseSet;
 use crate::entity::entity_index::EntityIndex;
 use crate::entity::entity_store::EntityStore;
 use crate::physics_backend::CollisionEvent;
@@ -188,6 +189,7 @@ pub fn is_ownership_allowed(domain: AuditDomain, subsystem: AuditSubsystem, phas
         AuditDomain::Execution => {
             (subsystem == AuditSubsystem::Controller && phase == 2)
                 || (subsystem == AuditSubsystem::AbilityTimeline && phase == 3)
+                || (subsystem == AuditSubsystem::AiDecisions && phase == 7)
         }
         AuditDomain::Cooldown => {
             (subsystem == AuditSubsystem::AbilityTimeline && phase == 3)
@@ -280,8 +282,8 @@ pub struct PhysicsState {
 pub struct CombatState {
     /// Dense health arrays (hp, max_hp, last_damage_source).
     pub health: HealthStore,
-    /// Threat tables — `Some` for NPCs/bosses, `None` for other entity kinds.
-    pub threat_tables: Vec<Option<ThreatTable>>,
+    /// Threat tables — only NPC/Boss entities carry one.
+    pub threat_tables: SparseSet<ThreatTable>,
     /// Active hitbox colliders — tracks hit dedup, ownership, lifetime.
     pub hitboxes: HitboxStore,
     /// In-flight ability cast instances — one entry per accepted UseAbility cast,
@@ -304,16 +306,99 @@ pub struct CombatState {
 /// Buff/debuff status data.
 pub struct StatusState {
     /// Active buffs/debuffs per entity (empty Vec for entities without buffs).
-    pub buffs: Vec<Vec<ActiveBuff>>,
+    buffs: Vec<Vec<ActiveBuff>>,
+    /// Entity indices whose buff arrays were mutated this tick.
+    /// BTreeSet ensures deterministic iteration order for reproducible commits.
+    dirty_entities: BTreeSet<usize>,
+}
+
+impl StatusState {
+    pub fn new() -> Self {
+        Self {
+            buffs: Vec::new(),
+            dirty_entities: BTreeSet::new(),
+        }
+    }
+
+    /// Push an empty buff slot for a newly spawned entity.
+    pub fn push_empty(&mut self) {
+        self.buffs.push(Vec::new());
+    }
+
+    /// Number of buff slots (must equal entity count).
+    pub fn len(&self) -> usize {
+        self.buffs.len()
+    }
+
+    /// Read-only access to an entity's active buffs.
+    pub fn get_buffs(&self, idx: EntityIndex) -> &[ActiveBuff] {
+        &self.buffs[idx.as_usize()]
+    }
+
+    /// Clone an entity's active buffs (used by collect_buff_updates).
+    pub fn clone_buffs(&self, i: usize) -> Vec<ActiveBuff> {
+        self.buffs[i].clone()
+    }
+
+    /// Mutate an entity's buff array through a closure, automatically marking dirty.
+    pub fn modify_buffs<F>(&mut self, idx: EntityIndex, f: F)
+    where
+        F: FnOnce(&mut Vec<ActiveBuff>),
+    {
+        f(&mut self.buffs[idx.as_usize()]);
+        self.dirty_entities.insert(idx.as_usize());
+    }
+
+    /// Replace an entity's entire buff array, marking dirty.
+    pub fn replace_buffs(&mut self, idx: EntityIndex, buffs: Vec<ActiveBuff>) {
+        self.buffs[idx.as_usize()] = buffs;
+        self.dirty_entities.insert(idx.as_usize());
+    }
+
+    /// Mark an entity's buff array as changed this tick.
+    pub fn mark_dirty(&mut self, idx: EntityIndex) {
+        self.dirty_entities.insert(idx.as_usize());
+    }
+
+    /// Drain and return the set of dirty entity indices, clearing it.
+    /// Iteration order is deterministic (ascending) because BTreeSet is sorted.
+    pub fn take_dirty(&mut self) -> BTreeSet<usize> {
+        std::mem::take(&mut self.dirty_entities)
+    }
+
+    /// Expire buffs that have passed their expiration tick.
+    /// Returns (entity_id, buff_id) pairs for expired buffs.
+    /// Only marks entities dirty when at least one buff was actually removed.
+    pub(crate) fn expire(&mut self, entities: &EntityStore, current_tick: TickId) -> Vec<(EntityId, u32)> {
+        let mut expired = Vec::new();
+        for i in 0..entities.len() {
+            if entities.states[i] == EntityState::Removed {
+                continue;
+            }
+            let entity_id = entities.id_of(EntityIndex(i as u32));
+            let before = self.buffs[i].len();
+            self.buffs[i].retain(|b| {
+                if let Some(expires_at) = b.expires_at
+                    && expires_at <= current_tick {
+                        expired.push((entity_id, b.buff_id));
+                        return false;
+                    }
+                true
+            });
+            if self.buffs[i].len() != before {
+                self.dirty_entities.insert(i);
+            }
+        }
+        expired
+    }
 }
 
 /// NPC AI data.
 pub struct AiState {
-    /// NPC AI state — `Some` for NPCs/bosses, `None` for other entity kinds.
-    pub npc_ai: Vec<Option<NpcAiState>>,
+    /// NPC AI state — only NPC/Boss entities carry one.
+    pub npc_ai: SparseSet<NpcAiState>,
     /// Spawn position used as the patrol home point for NPCs/bosses.
-    /// Non-NPC slots hold `Vec3f::ZERO` and are never read.
-    pub home_positions: Vec<Vec3f>,
+    pub home_positions: SparseSet<Vec3f>,
 }
 
 /// Runtime simulation state for one region.
@@ -348,14 +433,14 @@ impl SimState {
             physics: PhysicsState { contacts: Vec::new() },
             combat: CombatState {
                 health: HealthStore::new(),
-                threat_tables: Vec::new(),
+                threat_tables: SparseSet::new(),
                 hitboxes: HitboxStore::new(),
                 executions: AbilityExecutionStore::new(),
                 active_windows: HashMap::new(),
                 tactical: Vec::new(),
             },
-            status: StatusState { buffs: Vec::new() },
-            ai: AiState { npc_ai: Vec::new(), home_positions: Vec::new() },
+            status: StatusState::new(),
+            ai: AiState { npc_ai: SparseSet::new(), home_positions: SparseSet::new() },
             #[cfg(any(debug_assertions, test))]
             audit: MutationAudit::new(),
         }
@@ -368,11 +453,11 @@ impl SimState {
         debug_assert_eq!(self.combat.health.hp.len(), n, "health.hp desync");
         debug_assert_eq!(self.combat.health.max_hp.len(), n, "health.max_hp desync");
         debug_assert_eq!(self.combat.health.last_damage_source.len(), n, "health.last_damage_source desync");
-        debug_assert_eq!(self.combat.threat_tables.len(), n, "threat_tables desync");
+        debug_assert_eq!(self.combat.threat_tables.sparse_len(), n, "threat_tables desync");
         debug_assert_eq!(self.combat.tactical.len(), n, "tactical desync");
-        debug_assert_eq!(self.status.buffs.len(), n, "buffs desync");
-        debug_assert_eq!(self.ai.npc_ai.len(), n, "npc_ai desync");
-        debug_assert_eq!(self.ai.home_positions.len(), n, "home_positions desync");
+        debug_assert_eq!(self.status.len(), n, "buffs desync");
+        debug_assert_eq!(self.ai.npc_ai.sparse_len(), n, "npc_ai desync");
+        debug_assert_eq!(self.ai.home_positions.sparse_len(), n, "home_positions desync");
     }
 
     /// Register a new entity, returning its dense index.
@@ -386,11 +471,18 @@ impl SimState {
         let idx = self.entities.spawn(id, kind, tick);
         // Push component slots in lockstep with the entity store.
         self.combat.health.push(max_hp);
-        self.status.buffs.push(Vec::new());
-        let is_npc = kind == EntityKind::Npc || kind == EntityKind::Boss;
-        self.combat.threat_tables.push(if is_npc { Some(ThreatTable::default()) } else { None });
-        self.ai.npc_ai.push(if is_npc { Some(NpcAiState::Idle) } else { None });
-        self.ai.home_positions.push(Vec3f::ZERO);
+        self.status.push_empty();
+        // Mark the new entity's buff slot dirty so the first commit clears any
+        // stale DB rows (e.g. after a worker restart where in-flight buffs were
+        // never committed).
+        self.status.mark_dirty(idx);
+        self.combat.threat_tables.push_slot();
+        self.ai.npc_ai.push_slot();
+        self.ai.home_positions.push_slot();
+        if kind == EntityKind::Npc || kind == EntityKind::Boss {
+            self.combat.threat_tables.insert(idx, ThreatTable::default());
+            self.ai.npc_ai.insert(idx, NpcAiState::Idle);
+        }
         self.combat.tactical.push(TacticalState::default());
         idx
     }
@@ -416,6 +508,10 @@ impl SimState {
             self.entities.mark_removed(idx);
             self.combat.hitboxes.remove_all_for_entity(id);
             self.combat.executions.remove_all_for_caster(id);
+            // Clean up sparse components so their dense arrays stay compact.
+            self.combat.threat_tables.remove(idx);
+            self.ai.npc_ai.remove(idx);
+            self.ai.home_positions.remove(idx);
             true
         } else {
             false
@@ -451,22 +547,7 @@ impl SimState {
 
     /// Expire buffs that have passed their expiration tick.
     pub fn expire_buffs(&mut self, current_tick: TickId) -> Vec<(EntityId, u32)> {
-        let mut expired = Vec::new();
-        for i in 0..self.entities.len() {
-            if self.entities.states[i] == EntityState::Removed {
-                continue;
-            }
-            let entity_id = self.entities.id_of(EntityIndex(i as u32));
-            self.status.buffs[i].retain(|b| {
-                if let Some(expires_at) = b.expires_at
-                    && expires_at <= current_tick {
-                        expired.push((entity_id, b.buff_id));
-                        return false;
-                    }
-                true
-            });
-        }
-        expired
+        self.status.expire(&self.entities, current_tick)
     }
 
     // ── Convenience accessors (EntityId → lookup → dense array) ─
@@ -491,7 +572,7 @@ impl SimState {
     /// Get threat table for an entity (if NPC/Boss).
     pub fn threat_table_of(&self, id: EntityId) -> Option<&ThreatTable> {
         self.entities.lookup(id)
-            .and_then(|idx| self.combat.threat_tables[idx.as_usize()].as_ref())
+            .and_then(|idx| self.combat.threat_tables.get(idx))
     }
 }
 
@@ -522,7 +603,7 @@ mod tests {
 
         assert_eq!(state.combat.health.hp[idx.as_usize()], 100.0);
         // Players don't get threat tables
-        assert!(state.combat.threat_tables[idx.as_usize()].is_none());
+        assert!(!state.combat.threat_tables.contains(idx));
     }
 
     #[test]
@@ -530,8 +611,8 @@ mod tests {
         let mut state = SimState::new();
         let idx = state.spawn_entity(eid(10), EntityKind::Npc, TickId(0), 500.0);
 
-        assert!(state.combat.threat_tables[idx.as_usize()].is_some());
-        assert_eq!(state.ai.npc_ai[idx.as_usize()], Some(NpcAiState::Idle));
+        assert!(state.combat.threat_tables.contains(idx));
+        assert_eq!(state.ai.npc_ai.get(idx).copied(), Some(NpcAiState::Idle));
     }
 
     #[test]
@@ -630,7 +711,7 @@ mod tests {
     fn expire_buffs_by_tick() {
         let mut state = SimState::new();
         let idx = state.spawn_entity(eid(1), EntityKind::Player, TickId(0), 100.0);
-        state.status.buffs[idx.as_usize()].push(ActiveBuff {
+        state.status.modify_buffs(idx, |buffs| buffs.push(ActiveBuff {
             buff_id: 42,
             source: eid(99),
             target: eid(1),
@@ -638,8 +719,8 @@ mod tests {
             max_stacks: 1,
             expires_at: Some(TickId(10)),
             modifiers: Default::default(),
-        });
-        state.status.buffs[idx.as_usize()].push(ActiveBuff {
+        }));
+        state.status.modify_buffs(idx, |buffs| buffs.push(ActiveBuff {
             buff_id: 43,
             source: eid(99),
             target: eid(1),
@@ -647,13 +728,13 @@ mod tests {
             max_stacks: 1,
             expires_at: None, // permanent
             modifiers: Default::default(),
-        });
+        }));
 
         let expired = state.expire_buffs(TickId(10));
         assert_eq!(expired, vec![(eid(1), 42)]);
         // Permanent buff remains
-        assert_eq!(state.status.buffs[idx.as_usize()].len(), 1);
-        assert_eq!(state.status.buffs[idx.as_usize()][0].buff_id, 43);
+        assert_eq!(state.status.get_buffs(idx).len(), 1);
+        assert_eq!(state.status.get_buffs(idx)[0].buff_id, 43);
     }
 
     // ── Ownership enforcement guardrail tests ───────────────────
