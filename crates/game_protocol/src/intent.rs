@@ -13,8 +13,8 @@ pub use game_schema::{IntentAction, AbilityTarget, MoveDir, UseAbilityData};
 /// The simulation worker only processes intents where target_tick == current_tick.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlayerIntent {
-    /// Which client sent this.
-    pub client_id: EntityId,
+    /// The entity performing this intent.
+    pub entity_id: EntityId,
     /// Client-assigned sequence number for reconciliation and replay protection.
     pub sequence_id: u64,
     /// The tick this intent should be processed on.

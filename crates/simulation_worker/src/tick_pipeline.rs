@@ -15,6 +15,23 @@ use game_core::sim_state::SimState;
 use game_protocol::types::{Quatf, Vec3f};
 use game_schema::EntityKind;
 
+/// Record a mutation in the audit log (no-op in release builds).
+macro_rules! audit {
+    ($state:expr, $domain:ident, $subsystem:ident, $phase:expr, $entity:expr, $detail:expr) => {
+        #[cfg(any(debug_assertions, test))]
+        {
+            use game_core::sim_state::{AuditDomain, AuditSubsystem};
+            $state.audit.record(
+                AuditDomain::$domain,
+                AuditSubsystem::$subsystem,
+                $phase,
+                $entity,
+                $detail,
+            );
+        }
+    };
+}
+
 /// Per-tick statistics for observability. One summary emitted per tick in the coordinator.
 /// Counters are incremented inline during pipeline phases — no post-hoc scanning.
 #[derive(Clone, Copy, Debug, Default)]
@@ -325,6 +342,8 @@ impl TickPipeline {
     /// Execute one full simulation tick, returning results for commit.
     pub fn run_tick(&mut self, intents: &[PlayerIntent]) -> TickResult {
         self.state.debug_assert_coherent();
+        #[cfg(any(debug_assertions, test))]
+        self.state.audit.reset();
         self.event_sequence = 0;
         self.pending_events.clear();
         self.summary = TickSummary::default();
@@ -394,6 +413,12 @@ impl TickPipeline {
         };
 
         self.current_tick = self.current_tick.next();
+
+        #[cfg(any(debug_assertions, test))]
+        if self.state.audit.total_writes() > 0 {
+            log::trace!("tick {} {}", result.tick_id.0, self.state.audit.summary_line());
+        }
+
         result
     }
 
@@ -437,7 +462,7 @@ impl TickPipeline {
         let mut cast_this_tick: HashSet<(EntityId, u32)> = HashSet::new();
 
         for intent in intents {
-            let entity_id = intent.client_id;
+            let entity_id = intent.entity_id;
 
             // Only process intents for active entities.
             let is_active = self.state.entities.lookup(entity_id)
@@ -469,6 +494,7 @@ impl TickPipeline {
                             w: half_yaw.cos(),
                         };
                         self.physics.set_kinematic_rotation(entity_id, rotation);
+                        audit!(self.state, Transform, Controller, 2, Some(entity_id), "face_to");
                     }
                 }
                 IntentAction::UseAbility(data) => {
@@ -519,6 +545,7 @@ impl TickPipeline {
                             origin,
                             facing,
                         });
+                        audit!(self.state, Execution, Controller, 2, Some(entity_id), "cast");
                         self.schedule_ability(entity_id, &timeline, self.current_tick, execution_id);
                         cast_this_tick.insert(cast_key);
                     }
@@ -554,6 +581,7 @@ impl TickPipeline {
                 y: t.position.y + vy * self.dt,
                 z: t.position.z + vz * self.dt,
             });
+            audit!(self.state, Transform, Controller, 2, Some(entity_id), "move");
         }
     }
 
@@ -642,6 +670,7 @@ impl TickPipeline {
                 // Rapier fired contacts one tick early and damage landed on the spawn
                 // tick rather than the intended damage-frame tick.
                 self.state.combat.hitboxes.spawn(execution_id, entity, ability_id, self.current_tick, *shape, *offset);
+                audit!(self.state, Hitbox, AbilityTimeline, 3, Some(entity), "spawn");
                 self.emit_event(entity, EventPayload::HitboxSpawned { ability_id });
             }
             AbilityAction::ApplyDamageFrame => {
@@ -664,6 +693,7 @@ impl TickPipeline {
                     ) {
                         // Only mark armed if the hitbox state transitions successfully.
                         if self.state.combat.hitboxes.arm(execution_id, handle) {
+                            audit!(self.state, Hitbox, AbilityTimeline, 3, Some(entity), "arm");
                         } else {
                             // If arm failed, remove the sensor we just created to avoid leaks.
                             self.physics.remove_sensor(handle);
@@ -674,6 +704,7 @@ impl TickPipeline {
             }
             AbilityAction::RemoveHitbox => {
                 if let Some(removed) = self.state.combat.hitboxes.remove(execution_id) {
+                    audit!(self.state, Hitbox, AbilityTimeline, 3, Some(entity), "remove");
                     if let Some(handle) = removed.sensor_handle {
                         self.physics.remove_sensor(handle);
                     }
@@ -681,6 +712,7 @@ impl TickPipeline {
                 // Cast complete — remove the execution context now that its last
                 // physics action has run and no dependent runtime object remains.
                 self.state.combat.executions.remove(execution_id);
+                audit!(self.state, Execution, AbilityTimeline, 3, Some(entity), "remove");
                 self.emit_event(entity, EventPayload::HitboxRemoved { ability_id });
             }
             AbilityAction::CooldownStart { duration_ticks } => {
@@ -689,6 +721,7 @@ impl TickPipeline {
                 // Retroactive cooldown reduction: mutate the ready_at value for the entry directly.
                 let ready_at = TickId(self.current_tick.0 + *duration_ticks as u64);
                 self.cooldowns.insert((entity, ability_id), ready_at);
+                audit!(self.state, Cooldown, AbilityTimeline, 3, Some(entity), "start");
             }
         }
     }
@@ -777,11 +810,13 @@ impl TickPipeline {
 
             // Apply damage via dense health arrays.
             let actual = self.state.combat.health.apply_damage(target_idx, base_damage, Some(attacker));
+            audit!(self.state, Health, Combat, 6, Some(target), "damage");
             self.summary.damage_events += 1;
 
             // Generate threat on NPC targets.
             if let Some(table) = self.state.combat.threat_tables[target_idx.as_usize()].as_mut() {
                 table.add_threat(attacker, actual * threat_mult);
+                audit!(self.state, Threat, Combat, 6, Some(target), "add_threat");
             }
 
             // Emit damage event on the target.
@@ -832,6 +867,7 @@ impl TickPipeline {
                     if let Some(ref table) = self.state.combat.threat_tables[i] {
                         if table.top_threat().is_some() {
                             self.state.ai.npc_ai[i] = Some(NpcAiState::Combat);
+                            audit!(self.state, Ai, AiDecisions, 7, None, "idle_to_combat");
                         }
                     }
                 }
@@ -843,6 +879,7 @@ impl TickPipeline {
                         .is_some();
                     if !has_threat {
                         self.state.ai.npc_ai[i] = Some(NpcAiState::Idle);
+                        audit!(self.state, Ai, AiDecisions, 7, None, "combat_to_idle");
                     }
                     // TODO: Chase top-threat target, use abilities.
                 }
@@ -894,6 +931,7 @@ impl TickPipeline {
             .collect();
         for (entity, ability_id) in expired {
             self.cooldowns.remove(&(entity, ability_id));
+            audit!(self.state, Cooldown, CooldownTracker, 8, Some(entity), "expire");
             self.emit_event(entity, EventPayload::CooldownReady { ability_id });
         }
     }
@@ -915,6 +953,7 @@ impl TickPipeline {
             let id = self.state.entities.id_of(idx);
             self.state.entities.mark_despawn(idx);
             state_updates.push((id, EntityState::DespawnPending));
+            audit!(self.state, Lifecycle, Lifecycle, 8, Some(id), "death_despawn");
             self.summary.deaths += 1;
             // Determine killer: prefer last_damage_source, fall back to top-threat.
             let killer = self.state.combat.health.last_damage_source[idx.as_usize()]
@@ -934,12 +973,14 @@ impl TickPipeline {
             // Hard teardown for this entity from all runtime stores and the physics backend.
             // Centralised here so external removal paths can call the same behaviour.
             self.force_remove_entity(id);
+            audit!(self.state, Lifecycle, Lifecycle, 8, Some(id), "remove");
             state_updates.push((id, EntityState::Removed));
         }
 
         // Expire buffs.
         let expired_buffs = self.state.expire_buffs(self.current_tick);
         for (entity_id, buff_id) in expired_buffs {
+            audit!(self.state, Buff, StatusEffects, 8, Some(entity_id), "expire");
             self.emit_event(entity_id, EventPayload::BuffExpired { buff_id });
         }
 
@@ -959,6 +1000,7 @@ impl TickPipeline {
         for idx in spawning {
             let id = self.state.entities.id_of(idx);
             self.state.entities.activate(idx);
+            audit!(self.state, Lifecycle, Lifecycle, 8, Some(id), "activate");
             state_updates.push((id, EntityState::Active));
         }
 
@@ -1210,7 +1252,8 @@ mod tests {
         pipeline.run_tick(&[]);
 
         // Add lethal hitbox after entities are Active.
-        // Use spawn_sensor so all three state structures stay in sync (invariant).
+        // Use spawn_sensor and attach the returned handle to ActiveHitbox so
+        // hitbox lifecycle ownership matches production.
         let exec_id = AbilityExecutionId(1);
         let sensor = pipeline.physics.spawn_sensor(
             attacker,
@@ -1268,7 +1311,7 @@ mod tests {
         // no Rapier sensor yet. CooldownStart also queued at offset 0.
         // The Rapier sensor will be spawned in Phase 3 of tick 2 (ApplyDamageFrame, offset 1).
         let cast_intent = PlayerIntent {
-            client_id: attacker,
+            entity_id: attacker,
             sequence_id: 1,
             target_tick: TickId(1),
             client_time_ms: 0,
@@ -1289,7 +1332,7 @@ mod tests {
         // so we confirm indirectly: sending the same ability again should NOT spawn a
         // second hitbox (the intent is silently dropped by the cooldown gate).
         let double_cast_intent = PlayerIntent {
-            client_id: attacker,
+            entity_id: attacker,
             sequence_id: 2,
             target_tick: TickId(2),
             client_time_ms: 0,
@@ -1329,7 +1372,8 @@ mod tests {
         assert!(result0.health_updates.is_empty(), "No damage this tick — health_updates should be empty");
 
         // Add hitbox sensor at the same position as target so they overlap.
-        // Use spawn_sensor so all three state structures stay in sync (invariant).
+        // Use spawn_sensor and attach the returned handle to ActiveHitbox so
+        // hitbox lifecycle ownership matches production.
         let exec_id = AbilityExecutionId(1);
         let sensor = pipeline.physics.spawn_sensor(
             attacker_id,
@@ -1382,7 +1426,8 @@ mod tests {
 
         pipeline.run_tick(&[]); // warm-up — entities go Active
 
-        // Use spawn_sensor so all three state structures stay in sync (invariant).
+        // Use spawn_sensor and attach the returned handle to ActiveHitbox so
+        // hitbox lifecycle ownership matches production.
         let exec_id = AbilityExecutionId(1);
         let sensor = pipeline.physics.spawn_sensor(
             attacker,
@@ -1442,7 +1487,7 @@ mod tests {
         // SpawnHitbox (offset 0): logical hitbox only, no Rapier sensor inserted.
         // No sensor → no collision event → no damage this tick.
         let slash_intent = PlayerIntent {
-            client_id: player,
+            entity_id: player,
             sequence_id: 1,
             target_tick: TickId(1),
             client_time_ms: 0,
@@ -1506,7 +1551,7 @@ mod tests {
 
         // Tick 1: UseAbility → SpawnHitbox registered logically. No damage.
         let slash_intent = PlayerIntent {
-            client_id: player,
+            entity_id: player,
             sequence_id: 1,
             target_tick: TickId(1),
             client_time_ms: 0,
@@ -1559,7 +1604,7 @@ mod tests {
 
         // Tick 1: FaceTo intent pointing right (+X direction = 90° yaw from +Z forward).
         let face_right = PlayerIntent {
-            client_id: player,
+            entity_id: player,
             sequence_id: 1,
             target_tick: TickId(1),
             client_time_ms: 0,
@@ -1602,7 +1647,7 @@ mod tests {
 
         // Zero-length direction must be a no-op (no panic, rotation unchanged).
         let face_zero = PlayerIntent {
-            client_id: player,
+            entity_id: player,
             sequence_id: 2,
             target_tick: TickId(2),
             client_time_ms: 0,
@@ -1654,7 +1699,7 @@ mod tests {
         // Tick 1: submit two identical UseAbility intents in the same tick slice.
         // They differ only in sequence_id (as a client might if it sent two queued intents).
         let cast_a = PlayerIntent {
-            client_id: attacker,
+            entity_id: attacker,
             sequence_id: 1,
             target_tick: TickId(1),
             client_time_ms: 0,
@@ -1664,7 +1709,7 @@ mod tests {
             }),
         };
         let cast_b = PlayerIntent {
-            client_id: attacker,
+            entity_id: attacker,
             sequence_id: 2,
             target_tick: TickId(1),
             client_time_ms: 0,
@@ -1822,7 +1867,7 @@ mod tests {
         // Culling pass at end of Phase 3: execution_is_alive() returns false (no scheduled
         // actions remain, no hitbox exists) → context is removed.
         let cast_intent = PlayerIntent {
-            client_id: player,
+            entity_id: player,
             sequence_id: 1,
             target_tick: TickId(1),
             client_time_ms: 0,
@@ -1930,5 +1975,109 @@ mod tests {
         assert_eq!(ea, e1);
         assert_eq!(eb, e2);
     }
-}
 
+    #[test]
+    fn audit_counters_track_combat_lifecycle() {
+        // Run the standard combat lifecycle: spawn → activate → cast → damage → death → despawn.
+        // Verify that the audit counters reflect the expected mutation pattern.
+        let reg = setup_ability_registry();
+        let mut pipeline = make_pipeline(reg);
+
+        let attacker = EntityId(1);
+        let target = EntityId(2);
+
+        pipeline.state.spawn_entity(attacker, EntityKind::Player, TickId(0), 100.0);
+        pipeline.state.spawn_entity(target, EntityKind::Npc, TickId(0), 50.0);
+
+        // Create physics bodies at the same position for collision.
+        let pos = rapier3d::math::Vector::new(0.0, 5.0, 0.0);
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(attacker, pos, 0.5, 0.3, 1.0, collision_groups::player_body_groups());
+            pw.add_dynamic_capsule(target, pos, 0.5, 0.3, 1.0, collision_groups::npc_body_groups());
+        }
+
+        // Tick 0: warmup (Spawning → Active)
+        pipeline.run_tick(&[]);
+        assert!(pipeline.state.audit.lifecycle_writes >= 2, "two entities should activate");
+
+        // Tick 1: cast slash (Phase 2: execution insert, Phase 3: hitbox spawn + cooldown start)
+        let cast = PlayerIntent {
+            entity_id: attacker,
+            sequence_id: 1,
+            target_tick: TickId(1),
+            client_time_ms: 0,
+            action: IntentAction::UseAbility(game_schema::UseAbilityData {
+                ability_id: 1,
+                target: game_schema::AbilityTarget::None,
+            }),
+        };
+        pipeline.run_tick(&[cast]);
+        assert!(pipeline.state.audit.execution_writes >= 1, "cast should register execution");
+        assert!(pipeline.state.audit.hitbox_writes >= 1, "hitbox should spawn");
+        assert!(pipeline.state.audit.cooldown_writes >= 1, "cooldown should start");
+
+        // Tick 2: damage frame → damage + death + despawn
+        pipeline.run_tick(&[]);
+        // Hitbox arm fires on this tick (ApplyDamageFrame), so hitbox_writes should be > 0.
+        assert!(pipeline.state.audit.hitbox_writes >= 1, "hitbox should arm on damage frame");
+        assert!(pipeline.state.audit.health_writes >= 1, "damage should apply");
+
+        // Verify summary_line produces valid output
+        let summary = pipeline.state.audit.summary_line();
+        assert!(summary.contains("health="), "summary should contain health counter");
+        assert!(summary.contains("lifecycle="), "summary should contain lifecycle counter");
+    }
+
+    #[test]
+    fn audit_ownership_violations_are_detectable() {
+        // Enable detailed recording and verify that every mutation record
+        // has the expected (domain, subsystem, phase) triple.
+        // This is the test CI can run to detect ownership violations.
+
+        let reg = setup_ability_registry();
+        let mut pipeline = make_pipeline(reg);
+        pipeline.state.audit.record_details = true;
+
+        let attacker = EntityId(1);
+        let target = EntityId(2);
+        pipeline.state.spawn_entity(attacker, EntityKind::Player, TickId(0), 100.0);
+        pipeline.state.spawn_entity(target, EntityKind::Npc, TickId(0), 50.0);
+
+        let pos = rapier3d::math::Vector::new(0.0, 5.0, 0.0);
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(attacker, pos, 0.5, 0.3, 1.0, collision_groups::player_body_groups());
+            pw.add_dynamic_capsule(target, pos, 0.5, 0.3, 1.0, collision_groups::npc_body_groups());
+        }
+
+        // Run 3 ticks: warmup, cast, damage
+        pipeline.run_tick(&[]);
+        let cast = PlayerIntent {
+            entity_id: attacker,
+            sequence_id: 1,
+            target_tick: TickId(1),
+            client_time_ms: 0,
+            action: IntentAction::UseAbility(game_schema::UseAbilityData {
+                ability_id: 1,
+                target: game_schema::AbilityTarget::None,
+            }),
+        };
+        pipeline.run_tick(&[cast]);
+        pipeline.state.audit.record_details = true; // reset cleared it, re-enable
+        pipeline.run_tick(&[]);
+
+        // Validate ownership rules on the detailed records from the last tick.
+        // Now uses the shared enforcement function — same rules as the debug_assert!
+        // in MutationAudit::record().
+        let violations: Vec<String> = pipeline.state.audit.records.iter().filter_map(|r| {
+            if game_core::sim_state::is_ownership_allowed(r.domain, r.subsystem, r.phase) {
+                None
+            } else {
+                Some(format!("{:?} written by {:?} in phase {} ({})", r.domain, r.subsystem, r.phase, r.detail))
+            }
+        }).collect();
+
+        assert!(violations.is_empty(), "Ownership violations detected:\n{}", violations.join("\n"));
+    }
+}

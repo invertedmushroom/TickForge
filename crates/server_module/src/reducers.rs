@@ -355,6 +355,12 @@ pub fn commit_tick_results(
 
     // Apply transform updates
     for t in transforms {
+        if ctx.db.entity_transform().entity_id().find(&t.entity_id).is_none() {
+            log::warn!(
+                "commit_tick_results tick={}: no entity_transform row for entity_id={} — update skipped",
+                tick_id, t.entity_id
+            );
+        }
         ctx.db.entity_transform().entity_id().update(EntityTransform {
             entity_id: t.entity_id,
             pos_x: t.pos_x, pos_y: t.pos_y, pos_z: t.pos_z,
@@ -367,6 +373,12 @@ pub fn commit_tick_results(
 
     // Apply health updates
     for h in health_updates {
+        if ctx.db.entity_health().entity_id().find(&h.entity_id).is_none() {
+            log::warn!(
+                "commit_tick_results tick={}: no entity_health row for entity_id={} — update skipped",
+                tick_id, h.entity_id
+            );
+        }
         ctx.db.entity_health().entity_id().update(EntityHealth {
             entity_id: h.entity_id,
             hp: h.hp,
@@ -412,6 +424,11 @@ pub fn commit_tick_results(
                 spawned_at_tick: existing.spawned_at_tick,
                 owner_identity: existing.owner_identity,
             });
+        } else {
+            log::warn!(
+                "commit_tick_results tick={}: no entity row for entity_id={} — state update skipped",
+                tick_id, u.entity_id
+            );
         }
     }
 

@@ -29,23 +29,25 @@
 //!   `entity.on_insert`        — Single spawn gate. `contains()` guard for idempotency.
 //!   `entity.on_update`        — Mirror external lifecycle transitions only.
 //!   `entity.on_delete`        — Force cleanup guard only.
-//!   `sim_tick.on_insert`      — Single tick gate. Advance `last_processed_tick` only on
-//!                               successful commit, preserving the truth boundary.
+//!   `sim_tick.on_insert`      — Single tick gate. Advance `last_processed_tick` only in the
+//!                               async commit acknowledgement callback.  A `pending_commit_tick`
+//!                               guard blocks new tick processing while a commit is in-flight.
 
 use std::sync::{Arc, Mutex};
 use std::path::Path;
 
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use spacetimedb_sdk::{DbContext, Identity, Table, TableWithPrimaryKey};
 
+use crate::commit_builder::{self, CommitPackage, CommitCombatEvent, CommitCombatEventKind, CommitWorldEventKind, CommitEntityStateKind};
+use crate::entity_sync::EntitySync;
 use crate::module_bindings::*;
 use crate::physics::rapier_world::PhysicsWorld;
-use crate::tick_pipeline::TickPipeline;
+use crate::simulation_runner::SimulationRunner;
 use game_core::combat::skill::{
     AbilityAction, AbilityData, AbilityRegistry, AbilityTimeline, ScheduledAbilityAction, SkillShape,
 };
 use game_protocol::entity_id::EntityId;
-use game_protocol::event::EventPayload;
 use game_protocol::tick::TickId;
 
 /// Configuration for connecting the worker to SpacetimeDB.
@@ -60,8 +62,7 @@ pub struct CoordinatorConfig {
 
 /// Shared mutable state accessed from subscription callbacks.
 struct CoordinatorState {
-    pipeline: TickPipeline,
-    last_processed_tick: u64,
+    sim: SimulationRunner,
 }
 
 const TOKEN_FILE: &str = ".worker_token";
@@ -85,11 +86,9 @@ pub fn run(config: CoordinatorConfig) {
     let tick_dt = 1.0 / 20.0; // 20 Hz — must match server TickConfig
     let physics = PhysicsWorld::new(tick_dt);
     let abilities = load_abilities();
-    let pipeline = TickPipeline::new(TickId(0), Box::new(physics), tick_dt, abilities);
 
     let state = Arc::new(Mutex::new(CoordinatorState {
-        pipeline,
-        last_processed_tick: 0,
+        sim: SimulationRunner::new(TickId(0), Box::new(physics), tick_dt, abilities),
     }));
 
     let state_for_connect = Arc::clone(&state);
@@ -153,7 +152,7 @@ pub fn run(config: CoordinatorConfig) {
             .iter()
             .filter(|i| i.target_tick == canonical_tick)
             .map(|row| (row.intent_id, game_protocol::intent::PlayerIntent {
-                client_id: EntityId(row.entity_id),
+                entity_id: EntityId(row.entity_id),
                 sequence_id: row.sequence_id,
                 target_tick: TickId(row.target_tick),
                 client_time_ms: row.client_time_ms,
@@ -161,99 +160,92 @@ pub fn run(config: CoordinatorConfig) {
             }))
             .unzip();
 
-        let mut guard = state_for_tick.lock().unwrap();
+        // ── Begin locked section ────────────────────────────────────────
+        // Acquire the lock for pipeline mutation (run_tick + marshal).
+        // The lock is dropped *before* the async reducer call so that commit
+        // acknowledgement, entity callbacks, and other SDK events are not
+        // blocked while the server processes the commit.
+        let pkg = {
+            let mut guard = match state_for_tick.lock() {
+                Ok(g) => g,
+                Err(poisoned) => {
+                    error!("CoordinatorState lock poisoned — recovering");
+                    poisoned.into_inner()
+                }
+            };
 
-        // Skip if we already processed this tick (idempotency).
-        if canonical_tick <= guard.last_processed_tick {
-            debug!("Tick {canonical_tick} already processed, skipping");
-            return;
-        }
+            // Delegate tick orchestration to SimulationRunner.
+            let result = match guard.sim.run_tick(canonical_tick, &intents) {
+                Ok(r) => r,
+                Err(_) => return, // already logged by TickDriver
+            };
 
-        // Guard: pipeline must be in sync with the canonical tick.
-        // If they differ, the inner target_tick filter in run_tick would silently
-        // drop every intent for this tick.  on_applied seeds pipeline.current_tick
-        // to max_tick+1; each successful run_tick advances it by one.
-        // A mismatch here indicates a gap (skipped tick) — align and warn.
-        let pipeline_tick = guard.pipeline.current_tick();
-        if pipeline_tick != TickId(canonical_tick) {
-            warn!(
-                "tick desync: canonical={canonical_tick} pipeline={} — advancing pipeline to match",
-                pipeline_tick.0
-            );
-            guard.pipeline.set_current_tick(TickId(canonical_tick));
-        }
+            // Marshal TickResult into SDK-free CommitPackage.
+            commit_builder::build(result, consumed_ids.clone())
+        };
+        // ── Lock released ───────────────────────────────────────────────
 
-        let result = guard.pipeline.run_tick(&intents);
-        let summary = result.summary;
+        // Convert CommitPackage into SDK wire types (1:1 mapping).
+        let tick_id_raw = pkg.tick_id;
+        let transforms = wire_transforms(&pkg);
+        let health_updates = wire_health_updates(&pkg);
+        let combat_events = wire_combat_events(&pkg);
+        let world_events = wire_world_events(&pkg);
+        let entity_state_updates = wire_entity_state_updates(&pkg);
 
-        // NOTE: last_processed_tick is NOT advanced here — only after a successful commit.
-        // If commit fails the tick remains unacknowledged and can be retried on reconnect.
-        // Advancing before commit (Bug #13) would permanently lose the tick.
-
-        // Marshal transforms as typed structs.
-        let transforms: Vec<TransformUpdate> = result
-            .transforms
-            .iter()
-            .map(|(eid, t)| TransformUpdate {
-                entity_id: eid.0,
-                pos_x: t.position.x, pos_y: t.position.y, pos_z: t.position.z,
-                rot_x: t.rotation.x, rot_y: t.rotation.y, rot_z: t.rotation.z, rot_w: t.rotation.w,
-                vel_x: t.linear_velocity.x, vel_y: t.linear_velocity.y, vel_z: t.linear_velocity.z,
-                angvel_x: t.angular_velocity.x, angvel_y: t.angular_velocity.y, angvel_z: t.angular_velocity.z,
-            })
-            .collect();
-
-        // Classify pipeline events into typed wire types for the commit reducer.
-        let (combat_events, world_events) = classify_events(&result.events);
-
-        // Marshal entity lifecycle transitions captured by Phase 8.
-        let entity_state_updates: Vec<EntityStateUpdate> = result.entity_state_updates
-            .iter()
-            .map(|(eid, state)| EntityStateUpdate {
-                entity_id: eid.0,
-                new_state: convert_entity_state(*state),
-            })
-            .collect();
-
-        // Marshal health deltas — entities whose hp changed this tick (includes hp=0 for deaths).
-        let health_updates: Vec<HealthUpdate> = result.health_updates
-            .iter()
-            .map(|(eid, hp, max_hp)| HealthUpdate { entity_id: eid.0, hp: *hp, max_hp: *max_hp })
-            .collect();
-
-        // Commit results to SpacetimeDB.
-        let commit_ok = match ctx.reducers.commit_tick_results(
-            result.tick_id.0,
+        // Commit results to SpacetimeDB via the acknowledgement-aware path.
+        // `commit_tick_results_then` is fire-and-forget for the *send*; the
+        // closure fires asynchronously when the server confirms (or rejects)
+        // the reducer invocation.  `last_processed_tick` is advanced only
+        // inside the success branch of the callback — never optimistically.
+        let state_for_ack = Arc::clone(&state_for_tick);
+        let send_result = ctx.reducers.commit_tick_results_then(
+            tick_id_raw,
             transforms,
             health_updates,
             combat_events,
             world_events,
-            consumed_ids,
+            pkg.consumed_intent_ids.clone(),
             entity_state_updates,
-            Vec::new(), // region_updates
-        ) {
-            Ok(_) => true,
-            Err(e) => { error!("commit_tick_results failed tick={canonical_tick}: {e}"); false }
-        };
+            wire_region_updates(&pkg),
+            move |_rctx, outcome| {
+                let mut guard = match state_for_ack.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => {
+                        error!("CoordinatorState lock poisoned in commit callback — recovering");
+                        poisoned.into_inner()
+                    }
+                };
 
-        // Advance tick cursor only after a successful commit (Bug #13 fix).
-        // A failed commit leaves last_processed_tick unchanged so the tick is not
-        // silently dropped — the worker will halt at reconnect and resync cleanly.
-        if commit_ok {
-            guard.last_processed_tick = canonical_tick;
-        } else {
-            error!("tick={canonical_tick} commit failed — last_processed_tick not advanced; worker will resync on reconnect");
-        }
+                match outcome {
+                    Ok(Ok(())) => {
+                        guard.sim.acknowledge_success(canonical_tick);
+                    }
+                    Ok(Err(reducer_err)) => {
+                        guard.sim.acknowledge_failure(
+                            canonical_tick,
+                            &format!("reducer rejected: {reducer_err}"),
+                        );
+                    }
+                    Err(internal_err) => {
+                        guard.sim.acknowledge_failure(
+                            canonical_tick,
+                            &format!("internal error: {internal_err:?}"),
+                        );
+                    }
+                }
+            },
+        );
 
-        // Structured tick summary — one line when interesting or every 20 ticks.
-        if canonical_tick % 20 == 0 || summary.damage_events > 0 || summary.deaths > 0
-            || summary.despawns > 0 || summary.intents_processed > 0
-        {
-            info!(
-                "tick={canonical_tick} intents={} contacts={} damage={} deaths={} despawns={} entities={} hitboxes={} commit={}",
-                summary.intents_processed, summary.contacts, summary.damage_events,
-                summary.deaths, summary.despawns, summary.active_entities, summary.active_hitboxes,
-                if commit_ok { "ok" } else { "err" }
+        // Handle send failure (unable to enqueue the reducer call at all).
+        if let Err(e) = send_result {
+            let mut guard = match state_for_tick.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.sim.acknowledge_failure(
+                canonical_tick,
+                &format!("send failed: {e}"),
             );
         }
 
@@ -263,7 +255,7 @@ pub fn run(config: CoordinatorConfig) {
         // Runs every 100 ticks (5 s) to keep the per-tick cost negligible.
         const EVENT_RETAIN_TICKS: u64 = 40;
         const EVENT_PRUNE_INTERVAL: u64 = 100;
-        if commit_ok && canonical_tick % EVENT_PRUNE_INTERVAL == 0
+        if canonical_tick % EVENT_PRUNE_INTERVAL == 0
             && canonical_tick > EVENT_RETAIN_TICKS
         {
             let before_tick = canonical_tick - EVENT_RETAIN_TICKS;
@@ -273,34 +265,17 @@ pub fn run(config: CoordinatorConfig) {
         }
     });
 
-    // entity.on_insert is the single spawn gate.
-    //
-    // SpacetimeDB fires on_insert for every row in the initial subscription batch
-    // (after on_applied returns) AND for every row inserted during live operation.
-    // The `contains()` guard makes this idempotent against both cases, with no
-    // special-casing needed for fresh start vs. worker restart.
+    // entity.on_insert — thin adapter over EntitySync::sync_insert.
+    // SDK cache reads happen before the lock; decision logic lives in EntitySync.
     conn.db.entity().on_insert(move |ctx, new_entity| {
         let eid = EntityId(new_entity.entity_id);
-
-        // Guard: never spawn entities that have already passed their useful lifecycle.
-        // On worker restart the subscription snapshot contains every row including
-        // Removed and DespawnPending entities. Without this guard they would enter
-        // SimState as Spawning, and Phase 8 would activate them the next tick —
-        // resurrecting dead NPCs and players.
-        match new_entity.state {
-            EntityState::Removed | EntityState::DespawnPending => {
-                debug!("Entity {} is {:?} in DB — skipping spawn", eid.0, new_entity.state);
-                return;
-            }
-            _ => {}
-        }
+        let kind = convert_entity_kind(new_entity.kind);
+        let state = convert_entity_state(new_entity.state);
+        let tick = TickId(new_entity.spawned_at_tick);
 
         // Look up companion rows before acquiring the state lock — these reads
         // are from the SDK cache (no contention) and must not be done under the
         // lock to avoid holding it across I/O.
-        let kind = convert_entity_kind(new_entity.kind);
-        let tick = TickId(new_entity.spawned_at_tick);
-
         let max_hp = ctx.db
             .entity_health()
             .entity_id()
@@ -315,60 +290,44 @@ pub fn run(config: CoordinatorConfig) {
             .map(|t| game_protocol::types::Vec3f { x: t.pos_x, y: t.pos_y, z: t.pos_z })
             .unwrap_or(game_protocol::types::Vec3f { x: 0.0, y: 1.0, z: 0.0 });
 
-        // Single lock acquisition — check and spawn under the same guard so no
-        // other callback thread can slip in between (eliminates the previous
-        // read-lock → release → write-lock race window).
-        let mut guard = state_for_entity.lock().unwrap();
-        if guard.pipeline.state.entities.contains(eid) {
-            debug!("Entity {} already tracked — ignoring duplicate on_insert", eid.0);
-            return;
-        }
-        guard.pipeline.spawn_entity_from_snapshot(eid, kind, tick, max_hp, pos);
-        info!("Entity {} ({kind:?}) spawned into simulation at tick {:?} pos=({},{},{})",
-            eid.0, tick, pos.x, pos.y, pos.z);
+        let mut guard = match state_for_entity.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                error!("CoordinatorState lock poisoned in entity.on_insert — recovering");
+                poisoned.into_inner()
+            }
+        };
+        EntitySync::sync_insert(&mut guard.sim, eid, kind, state, tick, max_hp, pos);
     });
 
-    // Watch for external entity state changes (e.g. force-despawn from a server reducer).
-    // The simulation is authoritative for Spawning→Active (Phase 8) and for normal
-    // combat deaths, so we only act on transitions that the pipeline didn't initiate.
+    // entity.on_update — thin adapter over EntitySync::sync_update.
     let state_for_entity_update = Arc::clone(&state);
     conn.db.entity().on_update(move |_ctx, old_entity, new_entity| {
         let eid = EntityId(new_entity.entity_id);
-        let mut guard = state_for_entity_update.lock().unwrap();
-        match (old_entity.state, new_entity.state) {
-            // External reducer set DespawnPending without going through combat death.
-            (EntityState::Active, EntityState::DespawnPending) => {
-                if guard.pipeline.state.is_active(eid) {
-                    guard.pipeline.state.mark_despawn(eid);
-                    info!("Entity {} externally marked DespawnPending — mirrored to simulation", eid.0);
-                }
+        let old_state = convert_entity_state(old_entity.state);
+        let new_state = convert_entity_state(new_entity.state);
+        let mut guard = match state_for_entity_update.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                error!("CoordinatorState lock poisoned in entity.on_update — recovering");
+                poisoned.into_inner()
             }
-            // Hard removal by a server-side reducer; skip if already cleaned up.
-            (_, EntityState::Removed) => {
-                if guard.pipeline.state.entities.lookup(eid).is_some() {
-                    let removed = guard.pipeline.force_remove_entity(eid);
-                    if removed {
-                        info!("Entity {} externally set Removed — cleaned up from simulation", eid.0);
-                    } else {
-                        info!("Entity {} externally set Removed — no-op (not present)", eid.0);
-                    }
-                }
-            }
-            _ => {} // Spawning→Active handled by pipeline Phase 8; other transitions ignored.
-        }
+        };
+        EntitySync::sync_update(&mut guard.sim, eid, old_state, new_state);
     });
 
-    // Watch for hard row deletions (cleanup reducers, admin tools, etc.).
-    // In the normal despawn flow the simulation already called remove_entity before the
-    // DB row is deleted, so remove_entity returns false and this is a cheap no-op.
+    // entity.on_delete — thin adapter over EntitySync::sync_delete.
     let state_for_entity_delete = Arc::clone(&state);
     conn.db.entity().on_delete(move |_ctx, deleted_entity| {
         let eid = EntityId(deleted_entity.entity_id);
-        let mut guard = state_for_entity_delete.lock().unwrap();
-        let removed = guard.pipeline.force_remove_entity(eid);
-        if removed {
-            warn!("Entity {} row deleted while still in simulation — forced cleanup", eid.0);
-        }
+        let mut guard = match state_for_entity_delete.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                error!("CoordinatorState lock poisoned in entity.on_delete — recovering");
+                poisoned.into_inner()
+            }
+        };
+        EntitySync::sync_delete(&mut guard.sim, eid);
     });
 
     // Block on the connection thread — the callbacks above drive the simulation.
@@ -394,14 +353,14 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
             // from replaying already-processed ticks after a worker restart.
             let max_tick = ctx.db.sim_tick().iter().map(|t| t.tick_id).max().unwrap_or(0);
             {
-                let mut guard = state.lock().unwrap();
-                guard.last_processed_tick = max_tick;
-                // Sync the pipeline's internal tick counter to the next live tick.
-                // The coordinator will deliver canonical_tick = max_tick + 1 first via
-                // sim_tick.on_insert.  The inner filter in run_tick compares
-                // i.target_tick == self.current_tick, so they must agree or every
-                // intent is silently dropped.
-                guard.pipeline.set_current_tick(TickId(max_tick + 1));
+                let mut guard = match state.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => {
+                        error!("CoordinatorState lock poisoned in on_applied — recovering");
+                        poisoned.into_inner()
+                    }
+                };
+                guard.sim.seed(max_tick);
             }
             info!(
                 "Subscription applied — {} sim_tick rows, {} intent rows, {} entity rows; seeding last_processed_tick={} pipeline_start_tick={}",
@@ -557,15 +516,6 @@ fn convert_ability_target(target: crate::module_bindings::AbilityTarget) -> game
     }
 }
 
-/// Convert game_schema DamageType → generated binding's DamageType.
-fn convert_damage_type(dt: game_schema::DamageType) -> DamageType {
-    match dt {
-        game_schema::DamageType::Physical => DamageType::Physical,
-        game_schema::DamageType::Magical => DamageType::Magical,
-        game_schema::DamageType::True => DamageType::True,
-    }
-}
-
 /// Convert generated binding's EntityKind → game_schema's EntityKind.
 fn convert_entity_kind(kind: crate::module_bindings::EntityKind) -> game_schema::EntityKind {
     match kind {
@@ -577,95 +527,113 @@ fn convert_entity_kind(kind: crate::module_bindings::EntityKind) -> game_schema:
     }
 }
 
-/// Convert game_schema EntityState → generated binding's EntityState.
-fn convert_entity_state(state: game_schema::EntityState) -> EntityState {
+fn convert_entity_state(state: crate::module_bindings::EntityState) -> game_schema::EntityState {
     match state {
-        game_schema::EntityState::Spawning => EntityState::Spawning,
-        game_schema::EntityState::Active => EntityState::Active,
-        game_schema::EntityState::DespawnPending => EntityState::DespawnPending,
-        game_schema::EntityState::Removed => EntityState::Removed,
+        crate::module_bindings::EntityState::Spawning => game_schema::EntityState::Spawning,
+        crate::module_bindings::EntityState::Active => game_schema::EntityState::Active,
+        crate::module_bindings::EntityState::DespawnPending => game_schema::EntityState::DespawnPending,
+        crate::module_bindings::EntityState::Removed => game_schema::EntityState::Removed,
     }
 }
 
-/// Convert pipeline `SimEvent`s into wire `CombatEventInput` and `WorldEventInput`.
-///
-/// Made `pub` so integration tests can exercise end-to-end preservation of
-/// `event_sequence` during marshalling.
-pub fn classify_events(events: &[game_protocol::event::SimEvent]) -> (Vec<CombatEventInput>, Vec<WorldEventInput>) {
-    let mut combat_events: Vec<CombatEventInput> = Vec::new();
-    let mut world_events: Vec<WorldEventInput> = Vec::new();
+// ── CommitPackage → SDK wire type conversions ───────────────────
+//
+// Each function does a 1:1 structural mapping from the SDK-free
+// intermediate types in `commit_builder` to the generated SDK bindings.
 
-    for e in events {
-        match &e.payload {
-            EventPayload::Damage { source, amount, damage_type } => {
-                combat_events.push(CombatEventInput {
-                    source_entity: source.0,
-                    target_entity: e.entity_id.0,
-                    event_sequence: e.event_sequence,
-                    event_kind: CombatEventKind::Damage(DamageData {
-                        amount: *amount,
-                        damage_type: convert_damage_type(*damage_type),
-                    }),
-                });
-            }
-            EventPayload::SkillHit { skill_id, source } => {
-                combat_events.push(CombatEventInput {
-                    source_entity: source.0,
-                    target_entity: e.entity_id.0,
-                    event_sequence: e.event_sequence,
-                    event_kind: CombatEventKind::SkillHit(*skill_id),
-                });
-            }
-            EventPayload::BuffApplied { buff_id, source, duration_ticks } => {
-                combat_events.push(CombatEventInput {
-                    source_entity: source.0,
-                    target_entity: e.entity_id.0,
-                    event_sequence: e.event_sequence,
-                    event_kind: CombatEventKind::BuffApplied(BuffAppliedData {
-                        buff_id: *buff_id,
-                        duration_ticks: *duration_ticks,
-                    }),
-                });
-            }
-            EventPayload::BuffExpired { buff_id } => {
-                combat_events.push(CombatEventInput {
-                    source_entity: e.entity_id.0,
-                    target_entity: e.entity_id.0,
-                    event_sequence: e.event_sequence,
-                    event_kind: CombatEventKind::BuffExpired(*buff_id),
-                });
-            }
-            EventPayload::EntityDied { killer } => {
-                combat_events.push(CombatEventInput {
-                    source_entity: killer.map(|k| k.0).unwrap_or(0),
-                    target_entity: e.entity_id.0,
-                    event_sequence: e.event_sequence,
-                    event_kind: CombatEventKind::EntityDied(killer.map(|k| k.0)),
-                });
-            }
-            EventPayload::EntityDespawned => {
-                world_events.push(WorldEventInput {
-                    entity_id: e.entity_id.0,
-                    event_sequence: e.event_sequence,
-                    event_kind: WorldEventKind::EntityDespawned,
-                });
-            }
-            EventPayload::PickupCollected { item_id } => {
-                world_events.push(WorldEventInput {
-                    entity_id: e.entity_id.0,
-                    event_sequence: e.event_sequence,
-                    event_kind: WorldEventKind::PickupCollected(*item_id),
-                });
-            }
-            // Internal pipeline events — not committed to DB.
-            EventPayload::EntitySpawned
-            | EventPayload::HitboxSpawned { .. }
-            | EventPayload::DamageFrame { .. }
-            | EventPayload::HitboxRemoved { .. }
-            | EventPayload::CooldownReady { .. }
-            | EventPayload::TickBoundary => {}
-        }
+fn wire_transforms(pkg: &CommitPackage) -> Vec<TransformUpdate> {
+    pkg.transforms
+        .iter()
+        .map(|t| TransformUpdate {
+            entity_id: t.entity_id,
+            pos_x: t.pos_x, pos_y: t.pos_y, pos_z: t.pos_z,
+            rot_x: t.rot_x, rot_y: t.rot_y, rot_z: t.rot_z, rot_w: t.rot_w,
+            vel_x: t.vel_x, vel_y: t.vel_y, vel_z: t.vel_z,
+            angvel_x: t.angvel_x, angvel_y: t.angvel_y, angvel_z: t.angvel_z,
+        })
+        .collect()
+}
+
+fn wire_health_updates(pkg: &CommitPackage) -> Vec<HealthUpdate> {
+    pkg.health_updates
+        .iter()
+        .map(|h| HealthUpdate {
+            entity_id: h.entity_id,
+            hp: h.hp,
+            max_hp: h.max_hp,
+        })
+        .collect()
+}
+
+fn wire_combat_events(pkg: &CommitPackage) -> Vec<CombatEventInput> {
+    pkg.combat_events.iter().map(wire_combat_event).collect()
+}
+
+fn wire_combat_event(e: &CommitCombatEvent) -> CombatEventInput {
+    CombatEventInput {
+        source_entity: e.source_entity,
+        target_entity: e.target_entity,
+        event_sequence: e.event_sequence,
+        event_kind: match &e.event_kind {
+            CommitCombatEventKind::Damage(d) => CombatEventKind::Damage(DamageData {
+                amount: d.amount,
+                damage_type: wire_damage_type(d.damage_type),
+            }),
+            CommitCombatEventKind::SkillHit(id) => CombatEventKind::SkillHit(*id),
+            CommitCombatEventKind::BuffApplied(b) => CombatEventKind::BuffApplied(BuffAppliedData {
+                buff_id: b.buff_id,
+                duration_ticks: b.duration_ticks,
+            }),
+            CommitCombatEventKind::BuffExpired(id) => CombatEventKind::BuffExpired(*id),
+            CommitCombatEventKind::EntityDied(k) => CombatEventKind::EntityDied(*k),
+        },
     }
+}
 
-    (combat_events, world_events)
+fn wire_world_events(pkg: &CommitPackage) -> Vec<WorldEventInput> {
+    pkg.world_events
+        .iter()
+        .map(|e| WorldEventInput {
+            entity_id: e.entity_id,
+            event_sequence: e.event_sequence,
+            event_kind: match &e.event_kind {
+                CommitWorldEventKind::EntityDespawned => WorldEventKind::EntityDespawned,
+                CommitWorldEventKind::PickupCollected(id) => WorldEventKind::PickupCollected(*id),
+            },
+        })
+        .collect()
+}
+
+fn wire_entity_state_updates(pkg: &CommitPackage) -> Vec<EntityStateUpdate> {
+    pkg.entity_state_updates
+        .iter()
+        .map(|u| EntityStateUpdate {
+            entity_id: u.entity_id,
+            new_state: match u.new_state {
+                CommitEntityStateKind::Spawning => EntityState::Spawning,
+                CommitEntityStateKind::Active => EntityState::Active,
+                CommitEntityStateKind::DespawnPending => EntityState::DespawnPending,
+                CommitEntityStateKind::Removed => EntityState::Removed,
+            },
+        })
+        .collect()
+}
+
+fn wire_region_updates(pkg: &CommitPackage) -> Vec<RegionUpdate> {
+    pkg.region_updates
+        .iter()
+        .map(|r| RegionUpdate {
+            entity_id: r.entity_id,
+            region_x: r.region_x,
+            region_z: r.region_z,
+        })
+        .collect()
+}
+
+fn wire_damage_type(dt: game_schema::DamageType) -> DamageType {
+    match dt {
+        game_schema::DamageType::Physical => DamageType::Physical,
+        game_schema::DamageType::Magical => DamageType::Magical,
+        game_schema::DamageType::True => DamageType::True,
+    }
 }

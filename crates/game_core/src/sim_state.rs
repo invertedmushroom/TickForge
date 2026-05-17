@@ -9,6 +9,177 @@ use crate::entity::entity_index::EntityIndex;
 use crate::entity::entity_store::EntityStore;
 use crate::physics_backend::CollisionEvent;
 
+// ── Mutation audit (debug/test only) ────────────────────────────────────────
+
+/// Subsystem tags for mutation audit records.
+#[cfg(any(debug_assertions, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AuditSubsystem {
+    Controller,
+    Physics,
+    Combat,
+    AbilityTimeline,
+    Lifecycle,
+    CooldownTracker,
+    StatusEffects,
+    AiDecisions,
+}
+
+/// Domain tags for mutation audit records.
+#[cfg(any(debug_assertions, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AuditDomain {
+    Transform,
+    Health,
+    Lifecycle,
+    Cooldown,
+    Hitbox,
+    Execution,
+    Threat,
+    Buff,
+    Ai,
+}
+
+/// A single audit record for one mutation event.
+#[cfg(any(debug_assertions, test))]
+#[derive(Clone, Debug)]
+pub struct AuditRecord {
+    pub domain: AuditDomain,
+    pub subsystem: AuditSubsystem,
+    pub phase: u8,
+    pub entity: Option<EntityId>,
+    pub detail: &'static str,
+}
+
+/// Per-tick mutation counters and optional detailed records.
+///
+/// Embedded in SimState, zeroed at the start of each tick.
+/// Provides counters per (domain, phase) pair for CI violation checks
+/// and an optional record log for debugging.
+#[cfg(any(debug_assertions, test))]
+#[derive(Clone, Debug, Default)]
+pub struct MutationAudit {
+    pub transform_writes: u32,
+    pub health_writes: u32,
+    pub lifecycle_writes: u32,
+    pub cooldown_writes: u32,
+    pub hitbox_writes: u32,
+    pub execution_writes: u32,
+    pub threat_writes: u32,
+    pub buff_writes: u32,
+    pub ai_writes: u32,
+    /// Detailed records for debugging. Only populated when `record_details` is true.
+    pub records: Vec<AuditRecord>,
+    pub record_details: bool,
+}
+
+#[cfg(any(debug_assertions, test))]
+impl MutationAudit {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reset counters for a new tick.
+    pub fn reset(&mut self) {
+        self.transform_writes = 0;
+        self.health_writes = 0;
+        self.lifecycle_writes = 0;
+        self.cooldown_writes = 0;
+        self.hitbox_writes = 0;
+        self.execution_writes = 0;
+        self.threat_writes = 0;
+        self.buff_writes = 0;
+        self.ai_writes = 0;
+        self.records.clear();
+    }
+
+    /// Record a mutation event. Increments the domain counter and optionally logs details.
+    ///
+    /// **Enforcement:** panics (via `debug_assert!`) if the (domain, subsystem, phase)
+    /// triple violates the ownership matrix. Active in debug and test builds only.
+    pub fn record(
+        &mut self,
+        domain: AuditDomain,
+        subsystem: AuditSubsystem,
+        phase: u8,
+        entity: Option<EntityId>,
+        detail: &'static str,
+    ) {
+        debug_assert!(
+            is_ownership_allowed(domain, subsystem, phase),
+            "Ownership violation: {:?} written by {:?} in phase {} ({})",
+            domain, subsystem, phase, detail
+        );
+        match domain {
+            AuditDomain::Transform => self.transform_writes += 1,
+            AuditDomain::Health => self.health_writes += 1,
+            AuditDomain::Lifecycle => self.lifecycle_writes += 1,
+            AuditDomain::Cooldown => self.cooldown_writes += 1,
+            AuditDomain::Hitbox => self.hitbox_writes += 1,
+            AuditDomain::Execution => self.execution_writes += 1,
+            AuditDomain::Threat => self.threat_writes += 1,
+            AuditDomain::Buff => self.buff_writes += 1,
+            AuditDomain::Ai => self.ai_writes += 1,
+        }
+        if self.record_details {
+            self.records.push(AuditRecord { domain, subsystem, phase, entity, detail });
+        }
+    }
+
+    /// Return total mutation count across all domains.
+    pub fn total_writes(&self) -> u32 {
+        self.transform_writes + self.health_writes + self.lifecycle_writes
+            + self.cooldown_writes + self.hitbox_writes + self.execution_writes
+            + self.threat_writes + self.buff_writes + self.ai_writes
+    }
+
+    /// Print a one-line summary of mutation counts.
+    pub fn summary_line(&self) -> String {
+        format!(
+            "audit: transform={} health={} lifecycle={} cooldown={} hitbox={} exec={} threat={} buff={} ai={}",
+            self.transform_writes, self.health_writes, self.lifecycle_writes,
+            self.cooldown_writes, self.hitbox_writes, self.execution_writes,
+            self.threat_writes, self.buff_writes, self.ai_writes,
+        )
+    }
+}
+
+/// Check whether a (domain, subsystem, phase) triple is a valid ownership combination.
+///
+/// Returns `true` if the subsystem is the documented owner for the given domain in the
+/// given phase. The allowed triples match the in-memory ownership matrix from
+/// `docs/architecture.md`. Enforcement is active in debug/test builds only —
+/// `MutationAudit::record()` calls this and panics on violation.
+///
+/// **Documented exceptions wired into the rules:**
+/// - `Execution`: writable by both `Controller` (phase 2, cast) and `AbilityTimeline`
+///    (phase 3, remove/cull).
+/// - `Cooldown`: writable by `AbilityTimeline` (phase 3, start) and `CooldownTracker`
+///    (phase 8, expire).
+/// - `Lifecycle` phase-8 cleanup through `force_remove_entity` mutates hitboxes,
+///    executions, and cooldowns directly without audit calls — those paths are owned
+///    by the lifecycle system and intentionally bypass per-record enforcement.
+#[cfg(any(debug_assertions, test))]
+pub fn is_ownership_allowed(domain: AuditDomain, subsystem: AuditSubsystem, phase: u8) -> bool {
+    match domain {
+        AuditDomain::Health => subsystem == AuditSubsystem::Combat && phase == 6,
+        AuditDomain::Threat => subsystem == AuditSubsystem::Combat && phase == 6,
+        AuditDomain::Transform => subsystem == AuditSubsystem::Controller && phase == 2,
+        AuditDomain::Lifecycle => subsystem == AuditSubsystem::Lifecycle && phase == 8,
+        AuditDomain::Hitbox => subsystem == AuditSubsystem::AbilityTimeline && phase == 3,
+        AuditDomain::Execution => {
+            (subsystem == AuditSubsystem::Controller && phase == 2)
+                || (subsystem == AuditSubsystem::AbilityTimeline && phase == 3)
+        }
+        AuditDomain::Cooldown => {
+            (subsystem == AuditSubsystem::AbilityTimeline && phase == 3)
+                || (subsystem == AuditSubsystem::CooldownTracker && phase == 8)
+        }
+        AuditDomain::Buff => subsystem == AuditSubsystem::StatusEffects && phase == 8,
+        AuditDomain::Ai => subsystem == AuditSubsystem::AiDecisions && phase == 7,
+    }
+}
+
 /// SoA health storage — hp, max_hp, and damage source as parallel arrays
 /// indexed by `EntityIndex`.
 pub struct HealthStore {
@@ -39,8 +210,12 @@ impl HealthStore {
     }
 
     /// Apply damage, clamping to 0. Returns actual damage dealt.
+    ///
+    /// Non-finite or negative amounts are treated as zero — callers should not
+    /// need to pre-validate, and bad data must never invert the effect.
     pub fn apply_damage(&mut self, idx: EntityIndex, amount: f32, source: Option<EntityId>) -> f32 {
         let i = idx.as_usize();
+        let amount = if amount.is_finite() { amount.max(0.0) } else { 0.0 };
         let actual = amount.min(self.hp[i]);
         self.hp[i] -= actual;
         if actual > 0.0 && source.is_some() {
@@ -50,8 +225,11 @@ impl HealthStore {
     }
 
     /// Apply healing, clamping to max. Returns actual healing done.
+    ///
+    /// Non-finite or negative amounts are treated as zero.
     pub fn apply_healing(&mut self, idx: EntityIndex, amount: f32) -> f32 {
         let i = idx.as_usize();
+        let amount = if amount.is_finite() { amount.max(0.0) } else { 0.0 };
         let actual = amount.min(self.max_hp[i] - self.hp[i]);
         self.hp[i] += actual;
         actual
@@ -115,6 +293,9 @@ pub struct SimState {
     pub status: StatusState,
     /// NPC AI.
     pub ai: AiState,
+    /// Per-tick mutation counters (debug/test only).
+    #[cfg(any(debug_assertions, test))]
+    pub audit: MutationAudit,
 }
 
 impl SimState {
@@ -130,6 +311,8 @@ impl SimState {
             },
             status: StatusState { buffs: Vec::new() },
             ai: AiState { npc_ai: Vec::new() },
+            #[cfg(any(debug_assertions, test))]
+            audit: MutationAudit::new(),
         }
     }
 
@@ -326,6 +509,62 @@ mod tests {
     }
 
     #[test]
+    fn damage_rejects_negative_and_non_finite() {
+        let mut store = HealthStore::new();
+        store.push(100.0);
+        let idx = EntityIndex(0);
+
+        // Negative damage must not heal
+        assert_eq!(store.apply_damage(idx, -50.0, Some(eid(1))), 0.0);
+        assert_eq!(store.hp[0], 100.0);
+
+        // NaN damage must not corrupt
+        assert_eq!(store.apply_damage(idx, f32::NAN, Some(eid(1))), 0.0);
+        assert_eq!(store.hp[0], 100.0);
+
+        // Positive infinity must not corrupt
+        assert_eq!(store.apply_damage(idx, f32::INFINITY, Some(eid(1))), 0.0);
+        assert_eq!(store.hp[0], 100.0);
+
+        // Negative infinity must not corrupt
+        assert_eq!(store.apply_damage(idx, f32::NEG_INFINITY, Some(eid(1))), 0.0);
+        assert_eq!(store.hp[0], 100.0);
+
+        // Confirm normal damage still works after rejections
+        assert_eq!(store.apply_damage(idx, 10.0, Some(eid(1))), 10.0);
+        assert_eq!(store.hp[0], 90.0);
+    }
+
+    #[test]
+    fn healing_rejects_negative_and_non_finite() {
+        let mut store = HealthStore::new();
+        store.push(100.0);
+        let idx = EntityIndex(0);
+        store.apply_damage(idx, 50.0, None);
+        assert_eq!(store.hp[0], 50.0);
+
+        // Negative healing must not damage
+        assert_eq!(store.apply_healing(idx, -30.0), 0.0);
+        assert_eq!(store.hp[0], 50.0);
+
+        // NaN healing must not corrupt
+        assert_eq!(store.apply_healing(idx, f32::NAN), 0.0);
+        assert_eq!(store.hp[0], 50.0);
+
+        // Positive infinity must not corrupt
+        assert_eq!(store.apply_healing(idx, f32::INFINITY), 0.0);
+        assert_eq!(store.hp[0], 50.0);
+
+        // Negative infinity must not corrupt
+        assert_eq!(store.apply_healing(idx, f32::NEG_INFINITY), 0.0);
+        assert_eq!(store.hp[0], 50.0);
+
+        // Confirm normal healing still works after rejections
+        assert_eq!(store.apply_healing(idx, 20.0), 20.0);
+        assert_eq!(store.hp[0], 70.0);
+    }
+
+    #[test]
     fn despawn_lifecycle() {
         let mut state = SimState::new();
         state.spawn_entity(eid(1), EntityKind::Player, TickId(0), 100.0);
@@ -365,5 +604,87 @@ mod tests {
         // Permanent buff remains
         assert_eq!(state.status.buffs[idx.as_usize()].len(), 1);
         assert_eq!(state.status.buffs[idx.as_usize()][0].buff_id, 43);
+    }
+
+    // ── Ownership enforcement guardrail tests ───────────────────
+
+    #[test]
+    fn ownership_allows_valid_triples() {
+        // Verify that every documented ownership triple passes.
+        assert!(is_ownership_allowed(AuditDomain::Health, AuditSubsystem::Combat, 6));
+        assert!(is_ownership_allowed(AuditDomain::Threat, AuditSubsystem::Combat, 6));
+        assert!(is_ownership_allowed(AuditDomain::Transform, AuditSubsystem::Controller, 2));
+        assert!(is_ownership_allowed(AuditDomain::Lifecycle, AuditSubsystem::Lifecycle, 8));
+        assert!(is_ownership_allowed(AuditDomain::Hitbox, AuditSubsystem::AbilityTimeline, 3));
+        assert!(is_ownership_allowed(AuditDomain::Execution, AuditSubsystem::Controller, 2));
+        assert!(is_ownership_allowed(AuditDomain::Execution, AuditSubsystem::AbilityTimeline, 3));
+        assert!(is_ownership_allowed(AuditDomain::Cooldown, AuditSubsystem::AbilityTimeline, 3));
+        assert!(is_ownership_allowed(AuditDomain::Cooldown, AuditSubsystem::CooldownTracker, 8));
+        assert!(is_ownership_allowed(AuditDomain::Buff, AuditSubsystem::StatusEffects, 8));
+        assert!(is_ownership_allowed(AuditDomain::Ai, AuditSubsystem::AiDecisions, 7));
+    }
+
+    #[test]
+    fn health_ownership_rejects_non_combat_writer() {
+        // Health may only be written by Combat in phase 6.
+        assert!(!is_ownership_allowed(AuditDomain::Health, AuditSubsystem::Lifecycle, 8));
+        assert!(!is_ownership_allowed(AuditDomain::Health, AuditSubsystem::Controller, 2));
+        assert!(!is_ownership_allowed(AuditDomain::Health, AuditSubsystem::Combat, 3));
+        assert!(!is_ownership_allowed(AuditDomain::Health, AuditSubsystem::AiDecisions, 7));
+    }
+
+    #[test]
+    #[should_panic(expected = "Ownership violation")]
+    fn health_enforcement_panics_on_invalid_write() {
+        let mut audit = MutationAudit::new();
+        audit.record(AuditDomain::Health, AuditSubsystem::Lifecycle, 8, None, "invalid");
+    }
+
+    #[test]
+    fn lifecycle_ownership_rejects_non_lifecycle_writer() {
+        // Lifecycle may only be written by Lifecycle in phase 8.
+        assert!(!is_ownership_allowed(AuditDomain::Lifecycle, AuditSubsystem::Combat, 6));
+        assert!(!is_ownership_allowed(AuditDomain::Lifecycle, AuditSubsystem::Controller, 2));
+        assert!(!is_ownership_allowed(AuditDomain::Lifecycle, AuditSubsystem::Lifecycle, 3));
+        assert!(!is_ownership_allowed(AuditDomain::Lifecycle, AuditSubsystem::AiDecisions, 7));
+    }
+
+    #[test]
+    #[should_panic(expected = "Ownership violation")]
+    fn lifecycle_enforcement_panics_on_invalid_write() {
+        let mut audit = MutationAudit::new();
+        audit.record(AuditDomain::Lifecycle, AuditSubsystem::Combat, 6, None, "invalid");
+    }
+
+    #[test]
+    fn transform_ownership_rejects_non_controller_writer() {
+        // Transform may only be written by Controller in phase 2.
+        assert!(!is_ownership_allowed(AuditDomain::Transform, AuditSubsystem::Combat, 6));
+        assert!(!is_ownership_allowed(AuditDomain::Transform, AuditSubsystem::Physics, 4));
+        assert!(!is_ownership_allowed(AuditDomain::Transform, AuditSubsystem::Controller, 8));
+        assert!(!is_ownership_allowed(AuditDomain::Transform, AuditSubsystem::Lifecycle, 8));
+    }
+
+    #[test]
+    #[should_panic(expected = "Ownership violation")]
+    fn transform_enforcement_panics_on_invalid_write() {
+        let mut audit = MutationAudit::new();
+        audit.record(AuditDomain::Transform, AuditSubsystem::Physics, 4, None, "invalid");
+    }
+
+    #[test]
+    fn cooldown_ownership_rejects_invalid_writer() {
+        // Cooldown may only be written by AbilityTimeline (phase 3) or CooldownTracker (phase 8).
+        assert!(!is_ownership_allowed(AuditDomain::Cooldown, AuditSubsystem::Combat, 6));
+        assert!(!is_ownership_allowed(AuditDomain::Cooldown, AuditSubsystem::Controller, 2));
+        assert!(!is_ownership_allowed(AuditDomain::Cooldown, AuditSubsystem::AbilityTimeline, 8));
+        assert!(!is_ownership_allowed(AuditDomain::Cooldown, AuditSubsystem::CooldownTracker, 3));
+    }
+
+    #[test]
+    #[should_panic(expected = "Ownership violation")]
+    fn cooldown_enforcement_panics_on_invalid_write() {
+        let mut audit = MutationAudit::new();
+        audit.record(AuditDomain::Cooldown, AuditSubsystem::Combat, 6, None, "invalid");
     }
 }
