@@ -299,6 +299,7 @@ mod tests {
             puzzle_group: None,
             puzzle_required_count: None,
             puzzle_window_ticks: None,
+            body_shape: None,
         }
     }
 

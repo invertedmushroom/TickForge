@@ -2801,6 +2801,34 @@ fn load_dungeon_template(
         .ok_or_else(|| format!("unknown template_id '{template_id}'"))
 }
 
+/// Clear all `active_buff` rows for an entity (and the derived
+/// `stealthed_entity` row).
+///
+/// Used by `leave_instance` and `expire_instances_inner` to prevent
+/// encounter-scoped buffs (notably the `MechanicLocked` Manaya marks
+/// 800/801/803) from following a player out of the instance. The
+/// reducer module has no access to `BuffRegistry`, so we cannot
+/// distinguish encounter-scoped from open-world buffs here; an instance
+/// exit unconditionally resets buff state, matching the typical MMO
+/// convention.
+fn clear_entity_buffs(ctx: &ReducerContext, entity_id: u64) -> usize {
+    let buff_ids: Vec<u64> = ctx
+        .db
+        .active_buff()
+        .entity_id()
+        .filter(&entity_id)
+        .map(|b| b.buff_instance_id)
+        .collect();
+    let n = buff_ids.len();
+    for bid in buff_ids {
+        ctx.db.active_buff().buff_instance_id().delete(&bid);
+    }
+    // `stealthed_entity` is derived from `ActiveBuff.mod_stealth`; with all
+    // buffs gone the row must also go or stealth would persist visibly.
+    ctx.db.stealthed_entity().entity_id().delete(&entity_id);
+    n
+}
+
 /// Atomically reposition an already-existing entity to `(spawn_point, layer)`.
 ///
 /// Overwrites `EntityTransform` (pos, zeroed velocities), `EntityRegion`
@@ -3204,6 +3232,15 @@ pub fn leave_instance(ctx: &ReducerContext) -> Result<(), String> {
     // Remove membership.
     ctx.db.instance_membership().entity_id().delete(&entity_id);
 
+    // Clear encounter-scoped buff state so MechanicLocked marks (e.g.
+    // Manaya Core marks 800/801/803) cannot ride out with the player.
+    let cleared = clear_entity_buffs(ctx, entity_id);
+    if cleared > 0 {
+        log::debug!(
+            "leave_instance: cleared {cleared} active_buff rows for entity {entity_id}"
+        );
+    }
+
     // Resolve exit destination on layer 0:
     //   1. `DungeonTemplate.exit_points` (designer-authored), if any.
     //   2. Open-world layer's spawn points / RespawnPoint rows via
@@ -3309,6 +3346,14 @@ fn expire_instances_inner(ctx: &ReducerContext, now: i64) -> Result<ExpireReport
             .collect();
         for eid in &members {
             ctx.db.instance_membership().entity_id().delete(eid);
+            // Clear encounter-scoped buffs (MechanicLocked marks etc.) so they
+            // don't survive instance expiry. Mirrors `leave_instance`.
+            let cleared = clear_entity_buffs(ctx, *eid);
+            if cleared > 0 {
+                log::debug!(
+                    "expire_instances: cleared {cleared} active_buff rows for entity {eid}"
+                );
+            }
             if let Some(er) = ctx.db.entity_region().entity_id().find(eid) {
                 ctx.db.entity_region().entity_id().update(EntityRegion {
                     entity_id: *eid,

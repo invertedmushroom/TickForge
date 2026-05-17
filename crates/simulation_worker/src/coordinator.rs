@@ -590,15 +590,35 @@ pub fn run(config: CoordinatorConfig) {
             .collect();
 
         // Resolve Y before the mutable borrow in sync_insert.
-        let spawn_pos = if matches!(
-            kind,
-            game_schema::EntityKind::Player
-                | game_schema::EntityKind::Npc
-                | game_schema::EntityKind::Boss
-        ) {
-            guard.sim.resolve_spawn_position(pos, layer)
+        let spawn_pos = if let Some(shape) = body_shape {
+            // Use capsule-specific spawn resolution when the body shape has capsule dimensions
+            if let Some((capsule_half_height, capsule_radius)) = shape.capsule_dims() {
+                guard.sim.resolve_spawn_position_with_capsule(pos, layer, capsule_half_height, capsule_radius)
+            } else {
+                // Fallback to standard resolution for non-capsule shapes
+                if matches!(
+                    kind,
+                    game_schema::EntityKind::Player
+                        | game_schema::EntityKind::Npc
+                        | game_schema::EntityKind::Boss
+                ) {
+                    guard.sim.resolve_spawn_position(pos, layer)
+                } else {
+                    pos
+                }
+            }
         } else {
-            pos
+            // No body shape defined, use standard resolution for character types
+            if matches!(
+                kind,
+                game_schema::EntityKind::Player
+                    | game_schema::EntityKind::Npc
+                    | game_schema::EntityKind::Boss
+            ) {
+                guard.sim.resolve_spawn_position(pos, layer)
+            } else {
+                pos
+            }
         };
 
         EntitySync::sync_insert(
