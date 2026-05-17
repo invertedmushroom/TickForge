@@ -129,11 +129,23 @@ pub struct ActiveBuff {
     #[primary_key]
     #[auto_inc]
     pub buff_instance_id: u64,
+    #[index(btree)]
     pub entity_id: u64,
     pub buff_id: u32,
     pub source_entity: u64,
     pub stacks: u32,
     pub expires_at_tick: Option<u64>,
+    // ── Modifier fields (flat columns) ──
+    pub mod_damage_out_pct: Option<f32>,
+    pub mod_damage_in_pct: Option<f32>,
+    pub mod_cooldown_reduce_pct: Option<f32>,
+    pub mod_speed_pct: Option<f32>,
+    /// AI override kind: 0=ForceFlee, 1=ForceIdle, 2=ForceFocus. None = no override.
+    pub mod_ai_override_kind: Option<u8>,
+    /// Target entity for ForceFocus override. Only meaningful when ai_override_kind == 2.
+    pub mod_ai_override_target: Option<u64>,
+    /// Root: prevents movement when `Some(true)`.
+    pub mod_root: Option<bool>,
 }
 
 // ── Aggro ───────────────────────────────────────────────────────────
@@ -144,6 +156,7 @@ pub struct ThreatEntry {
     #[primary_key]
     #[auto_inc]
     pub threat_id: u64,
+    #[index(btree)]
     pub npc_entity: u64,
     pub source_entity: u64,
     pub threat: f32,
@@ -191,12 +204,75 @@ pub struct BuffAppliedData {
 }
 
 #[derive(SpacetimeType, Clone, Debug)]
+pub struct CastStartData {
+    pub ability_id: u32,
+    pub cast_duration_ticks: u32,
+}
+
+#[derive(SpacetimeType, Clone, Debug)]
+pub struct ChargeStartData {
+    pub ability_id: u32,
+    pub max_ticks: u32,
+}
+
+#[derive(SpacetimeType, Clone, Debug)]
+pub struct ChargeTierReachedData {
+    pub ability_id: u32,
+    pub tier: u8,
+}
+
+#[derive(SpacetimeType, Clone, Debug)]
 pub enum CombatEventKind {
+    CastStart(CastStartData),
+    ChargeStart(ChargeStartData),
+    ChargeTierReached(ChargeTierReachedData),
+    BlockStart,
+    BlockEnd,
     Damage(DamageData),
     SkillHit(u32),
     BuffApplied(BuffAppliedData),
     BuffExpired(u32),
     EntityDied(Option<u64>),
+    Dodged(u32),
+    Blocked(BlockedData),
+    Covered(CoveredData),
+    LockOnWarning(LockOnWarningData),
+    ProjectileLaunched(ProjectileLaunchedData),
+    ProjectileRemoved(u64),
+}
+
+#[derive(SpacetimeType, Clone, Debug)]
+pub struct LockOnWarningData {
+    pub target: u64,
+    pub impact_tick: u64,
+}
+
+#[derive(SpacetimeType, Clone, Debug)]
+pub struct BlockedData {
+    pub ability_id: u32,
+    pub damage_taken: f32,
+    pub perfect: bool,
+}
+
+#[derive(SpacetimeType, Clone, Debug)]
+pub struct CoveredData {
+    pub blocker: u64,
+    pub ability_id: u32,
+    pub damage_taken: f32,
+}
+
+#[derive(SpacetimeType, Clone, Debug)]
+pub struct ProjectileLaunchedData {
+    pub execution_id: u64,
+    pub ability_id: u32,
+    pub origin_x: f32,
+    pub origin_y: f32,
+    pub origin_z: f32,
+    pub direction_x: f32,
+    pub direction_y: f32,
+    pub direction_z: f32,
+    pub speed: f32,
+    pub max_range: f32,
 }
 
 #[table(accessor = world_event, public)]

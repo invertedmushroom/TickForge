@@ -39,6 +39,7 @@ use std::path::Path;
 use log::{error, info, warn};
 use spacetimedb_sdk::{DbContext, Identity, Table, TableWithPrimaryKey};
 
+use crate::commit_authority::FailureAction;
 use crate::commit_builder::{self, CommitPackage, CommitCombatEvent, CommitCombatEventKind, CommitWorldEventKind, CommitEntityStateKind};
 use crate::entity_sync::EntitySync;
 use crate::module_bindings::*;
@@ -47,6 +48,7 @@ use crate::simulation_runner::SimulationRunner;
 use game_core::combat::skill::{
     AbilityAction, AbilityData, AbilityRegistry, AbilityTimeline, ScheduledAbilityAction, SkillShape,
 };
+use game_core::combat::status::{BuffRegistry, BuffTemplate};
 use game_protocol::entity_id::EntityId;
 use game_protocol::tick::TickId;
 
@@ -63,6 +65,120 @@ pub struct CoordinatorConfig {
 /// Shared mutable state accessed from subscription callbacks.
 struct CoordinatorState {
     sim: SimulationRunner,
+    items: game_core::stats::ItemRegistry,
+}
+
+/// Send (or re-send) a commit payload to SpacetimeDB.
+///
+/// On transient failure the function retries immediately from the ack
+/// callback — no dependency on `sim_tick.on_insert`, so it cannot
+/// deadlock with server-side backpressure.
+///
+/// On `FailureAction::Exhausted` (all retries spent) the process exits
+/// so the supervisor can restart the worker with a clean reseed.
+fn send_commit(
+    reducers: &RemoteReducers,
+    pkg: CommitPackage,
+    state: Arc<Mutex<CoordinatorState>>,
+) {
+    let tick_id = pkg.tick_id;
+    let transforms = wire_transforms(&pkg);
+    let health_updates = wire_health_updates(&pkg);
+    let combat_events = wire_combat_events(&pkg);
+    let world_events = wire_world_events(&pkg);
+    let consumed_intent_ids = pkg.consumed_intent_ids.clone();
+    let entity_state_updates = wire_entity_state_updates(&pkg);
+    let region_updates = wire_region_updates(&pkg);
+    let buff_updates = wire_buff_updates(&pkg);
+    let buff_cleared_entity_ids = pkg.buff_cleared_entity_ids.clone();
+    let threat_updates = wire_threat_updates(&pkg);
+    let threat_cleared_entity_ids = pkg.threat_cleared_entity_ids.clone();
+    let npc_state_updates = wire_npc_state_updates(&pkg);
+    let director_spawns = wire_director_spawns(&pkg);
+
+    let state_for_ack = Arc::clone(&state);
+
+    let send_result = reducers.commit_tick_results_then(
+        tick_id,
+        transforms,
+        health_updates,
+        combat_events,
+        world_events,
+        consumed_intent_ids,
+        entity_state_updates,
+        region_updates,
+        buff_updates,
+        buff_cleared_entity_ids,
+        threat_updates,
+        threat_cleared_entity_ids,
+        npc_state_updates,
+        director_spawns,
+        move |rctx, outcome| {
+            let reason = match &outcome {
+                Ok(Ok(())) => {
+                    let mut guard = state_for_ack.lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    guard.sim.acknowledge_success(tick_id);
+                    return;
+                }
+                Ok(Err(reducer_err)) => format!("reducer rejected: {reducer_err}"),
+                Err(internal_err) => format!("internal error: {internal_err:?}"),
+            };
+
+            let action = {
+                let mut guard = state_for_ack.lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                guard.sim.acknowledge_failure(tick_id, &reason)
+            };
+
+            match action {
+                FailureAction::Retry => {
+                    send_commit(&rctx.reducers, pkg, state_for_ack);
+                }
+                FailureAction::Exhausted => {
+                    error!(
+                        "tick={tick_id} commit permanently failed — \
+                         crashing for clean reseed"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        },
+    );
+
+    // Handle send failure (unable to enqueue the reducer call at all).
+    if let Err(e) = send_result {
+        let action = {
+            let mut guard = state.lock()
+                .unwrap_or_else(|p| p.into_inner());
+            guard.sim.acknowledge_failure(
+                tick_id,
+                &format!("send failed: {e}"),
+            )
+        };
+
+        match action {
+            FailureAction::Retry => {
+                warn!("tick={tick_id} send failed, retrying immediately");
+                // Cannot retry send without a reducers reference (the
+                // original borrow is from the on_insert ctx which we
+                // can't capture here).  Crash for reseed — the send
+                // path failing means the connection is likely broken.
+                error!(
+                    "tick={tick_id} send failed and cannot retry in-band — \
+                     crashing for clean reseed"
+                );
+                std::process::exit(1);
+            }
+            FailureAction::Exhausted => {
+                error!(
+                    "tick={tick_id} send permanently failed — \
+                     crashing for clean reseed"
+                );
+                std::process::exit(1);
+            }
+        }
+    }
 }
 
 const TOKEN_FILE: &str = ".worker_token";
@@ -86,9 +202,12 @@ pub fn run(config: CoordinatorConfig) {
     let tick_dt = 1.0 / 20.0; // 20 Hz — must match server TickConfig
     let physics = PhysicsWorld::new(tick_dt);
     let abilities = load_abilities();
+    let items = load_items();
+    let buffs = load_buffs();
 
     let state = Arc::new(Mutex::new(CoordinatorState {
-        sim: SimulationRunner::new(TickId(0), Box::new(physics), tick_dt, abilities),
+        sim: SimulationRunner::new(TickId(0), Box::new(physics), tick_dt, abilities, buffs),
+        items,
     }));
 
     let state_for_connect = Arc::clone(&state);
@@ -185,79 +304,10 @@ pub fn run(config: CoordinatorConfig) {
         };
         // ── Lock released ───────────────────────────────────────────────
 
-        // Convert CommitPackage into SDK wire types (1:1 mapping).
-        let tick_id_raw = pkg.tick_id;
-        let transforms = wire_transforms(&pkg);
-        let health_updates = wire_health_updates(&pkg);
-        let combat_events = wire_combat_events(&pkg);
-        let world_events = wire_world_events(&pkg);
-        let entity_state_updates = wire_entity_state_updates(&pkg);
-        let buff_updates = wire_buff_updates(&pkg);
-        let buff_cleared_entity_ids = pkg.buff_cleared_entity_ids.clone();
-        let threat_updates = wire_threat_updates(&pkg);
-        let threat_cleared_entity_ids = pkg.threat_cleared_entity_ids.clone();
-        let npc_state_updates = wire_npc_state_updates(&pkg);
-
-        // Commit results to SpacetimeDB via the acknowledgement-aware path.
-        // `commit_tick_results_then` is fire-and-forget for the *send*; the
-        // closure fires asynchronously when the server confirms (or rejects)
-        // the reducer invocation.  `last_processed_tick` is advanced only
-        // inside the success branch of the callback — never optimistically.
-        let state_for_ack = Arc::clone(&state_for_tick);
-        let send_result = ctx.reducers.commit_tick_results_then(
-            tick_id_raw,
-            transforms,
-            health_updates,
-            combat_events,
-            world_events,
-            pkg.consumed_intent_ids.clone(),
-            entity_state_updates,
-            wire_region_updates(&pkg),
-            buff_updates,
-            buff_cleared_entity_ids,
-            threat_updates,
-            threat_cleared_entity_ids,
-            npc_state_updates,
-            move |_rctx, outcome| {
-                let mut guard = match state_for_ack.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => {
-                        error!("CoordinatorState lock poisoned in commit callback — recovering");
-                        poisoned.into_inner()
-                    }
-                };
-
-                match outcome {
-                    Ok(Ok(())) => {
-                        guard.sim.acknowledge_success(canonical_tick);
-                    }
-                    Ok(Err(reducer_err)) => {
-                        guard.sim.acknowledge_failure(
-                            canonical_tick,
-                            &format!("reducer rejected: {reducer_err}"),
-                        );
-                    }
-                    Err(internal_err) => {
-                        guard.sim.acknowledge_failure(
-                            canonical_tick,
-                            &format!("internal error: {internal_err:?}"),
-                        );
-                    }
-                }
-            },
-        );
-
-        // Handle send failure (unable to enqueue the reducer call at all).
-        if let Err(e) = send_result {
-            let mut guard = match state_for_tick.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.sim.acknowledge_failure(
-                canonical_tick,
-                &format!("send failed: {e}"),
-            );
-        }
+        // Send the commit via the retry-aware path.  On transient failure
+        // the ack callback re-sends immediately; on exhaustion the process
+        // exits for a clean supervisor reseed.
+        send_commit(&ctx.reducers, pkg, Arc::clone(&state_for_tick));
 
         // Periodically prune old combat/world event rows so the event tables don't
         // grow unbounded. Keep a 2-second window (40 ticks at 20 Hz) so clients
@@ -311,17 +361,35 @@ pub fn run(config: CoordinatorConfig) {
             .active_buff()
             .iter()
             .filter(|b| b.entity_id == new_entity.entity_id)
-            .map(|b| game_core::combat::status::ActiveBuff {
-                buff_id: b.buff_id,
-                source: EntityId(b.source_entity),
-                target: EntityId(b.entity_id),
-                stacks: b.stacks,
-                // max_stacks is static registry data not stored in the DB.
-                // Use u32::MAX as an explicit "uncapped" sentinel — the correct
-                // value is restored next time this buff is applied from combat.
-                max_stacks: u32::MAX,
-                expires_at: b.expires_at_tick.map(game_protocol::tick::TickId),
-                modifiers: Default::default(),
+            .map(|b| {
+                use game_core::combat::status::{AiOverride, BuffModifiers};
+                let ai_override = match b.mod_ai_override_kind {
+                    Some(0) => Some(AiOverride::ForceFlee),
+                    Some(1) => Some(AiOverride::ForceIdle),
+                    Some(2) => Some(AiOverride::ForceFocus {
+                        target: EntityId(b.mod_ai_override_target.unwrap_or(0)),
+                    }),
+                    _ => None,
+                };
+                game_core::combat::status::ActiveBuff {
+                    buff_id: b.buff_id,
+                    source: EntityId(b.source_entity),
+                    target: EntityId(b.entity_id),
+                    stacks: b.stacks,
+                    // max_stacks is static registry data not stored in the DB.
+                    // Use u32::MAX as an explicit "uncapped" sentinel — the correct
+                    // value is restored next time this buff is applied from combat.
+                    max_stacks: u32::MAX,
+                    expires_at: b.expires_at_tick.map(game_protocol::tick::TickId),
+                    modifiers: BuffModifiers {
+                        damage_out_pct: b.mod_damage_out_pct,
+                        damage_in_pct: b.mod_damage_in_pct,
+                        cooldown_reduce_pct: b.mod_cooldown_reduce_pct,
+                        speed_pct: b.mod_speed_pct,
+                        ai_override,
+                        root: b.mod_root,
+                    },
+                }
             })
             .collect();
 
@@ -398,29 +466,29 @@ pub fn run(config: CoordinatorConfig) {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.sim.queue_stat_recalc(eid);
+        recompute_equipment(&ctx.db, &mut guard, eid);
     });
 
     let state_for_equip_update = Arc::clone(&state);
-    conn.db.player_equipment().on_update(move |_ctx, _old, new_row| {
+    conn.db.player_equipment().on_update(move |ctx, _old, new_row| {
         let eid = EntityId(new_row.owner_entity);
         info!("player_equipment.on_update: entity={} item={} slot={:?}", new_row.owner_entity, new_row.item_id, new_row.slot);
         let mut guard = match state_for_equip_update.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.sim.queue_stat_recalc(eid);
+        recompute_equipment(&ctx.db, &mut guard, eid);
     });
 
     let state_for_equip_delete = Arc::clone(&state);
-    conn.db.player_equipment().on_delete(move |_ctx, old_row| {
+    conn.db.player_equipment().on_delete(move |ctx, old_row| {
         let eid = EntityId(old_row.owner_entity);
         info!("player_equipment.on_delete: entity={} item={} slot={:?}", old_row.owner_entity, old_row.item_id, old_row.slot);
         let mut guard = match state_for_equip_delete.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.sim.queue_stat_recalc(eid);
+        recompute_equipment(&ctx.db, &mut guard, eid);
     });
 
     // Block on the connection thread — the callbacks above drive the simulation.
@@ -536,6 +604,11 @@ fn build_ability_registry() -> AbilityRegistry {
         damage_type: game_schema::DamageType::Physical,
         shape: SkillShape::CapsuleSweep,
         threat_multiplier: 1.0,
+        on_hit_buffs: vec![],
+        knockback_force: 0.0,
+        allow_reentry: false,
+        charge_tiers: None,
+        damage_interval_ticks: 0,
     });
     reg.register_timeline(AbilityTimeline {
         ability_id: 1,
@@ -565,6 +638,97 @@ fn build_ability_registry() -> AbilityRegistry {
     reg
 }
 
+// ── Item registry ───────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct ItemFile {
+    items: Vec<game_core::stats::ItemData>,
+}
+
+/// Load item definitions from `data/items.ron`.
+/// Falls back to the hardcoded registry if the file is missing or malformed.
+fn load_items() -> game_core::stats::ItemRegistry {
+    const PATH: &str = "data/items.ron";
+    let result = std::fs::read_to_string(PATH)
+        .map_err(|e| format!("read '{PATH}': {e}"))
+        .and_then(|src| ron::from_str::<ItemFile>(&src).map_err(|e| format!("parse '{PATH}': {e}")));
+    match result {
+        Ok(file) => {
+            let count = file.items.len();
+            let mut reg = game_core::stats::ItemRegistry::new();
+            for item in file.items { reg.register(item); }
+            info!("Loaded {count} item(s) from {PATH}");
+            reg
+        }
+        Err(e) => {
+            warn!("Could not load {PATH} ({e}) — using hardcoded fallback");
+            build_item_registry()
+        }
+    }
+}
+
+fn build_item_registry() -> game_core::stats::ItemRegistry {
+    use game_core::stats::{EquipmentModifiers, ItemData, ItemRegistry};
+    let mut reg = ItemRegistry::new();
+    reg.register(ItemData {
+        item_id: 1,
+        name: "Rusty Sword".into(),
+        modifiers: EquipmentModifiers { attack_power: 0.2, ..EquipmentModifiers::default() },
+    });
+    reg.register(ItemData {
+        item_id: 2,
+        name: "Leather Vest".into(),
+        modifiers: EquipmentModifiers { max_hp: 20.0, damage_in: -0.05, ..EquipmentModifiers::default() },
+    });
+    reg
+}
+
+// ── Buff registry ───────────────────────────────────────────────
+
+/// On-disk serialization format for `data/buffs.ron`.
+#[derive(serde::Deserialize)]
+struct BuffFile {
+    buffs: Vec<BuffTemplate>,
+}
+
+/// Load buff definitions from `data/buffs.ron`.
+/// Falls back to an empty registry if the file is missing or malformed.
+fn load_buffs() -> BuffRegistry {
+    const PATH: &str = "data/buffs.ron";
+    let result = std::fs::read_to_string(PATH)
+        .map_err(|e| format!("read '{PATH}': {e}"))
+        .and_then(|src| ron::from_str::<BuffFile>(&src).map_err(|e| format!("parse '{PATH}': {e}")));
+    match result {
+        Ok(file) => {
+            let count = file.buffs.len();
+            let mut reg = BuffRegistry::new();
+            for b in file.buffs { reg.register(b); }
+            info!("Loaded {count} buff(s) from {PATH}");
+            reg
+        }
+        Err(e) => {
+            warn!("Could not load {PATH} ({e}) — using empty buff registry");
+            BuffRegistry::new()
+        }
+    }
+}
+
+/// Aggregate equipment modifiers for `entity_id` from the SDK cache and push
+/// the result to the simulation runner.
+fn recompute_equipment(
+    db: &crate::module_bindings::RemoteTables,
+    state: &mut CoordinatorState,
+    entity_id: EntityId,
+) {
+    let modifiers = game_core::stats::EquipmentModifiers::aggregate(
+        db.player_equipment()
+            .iter()
+            .filter(|row| row.owner_entity == entity_id.0)
+            .map(|row| state.items.modifiers(row.item_id)),
+    );
+    state.sim.update_equipment(entity_id, modifiers);
+}
+
 // ── Binding conversions ─────────────────────────────────────────
 //
 // The generated bindings produce mirror types of game_schema types.
@@ -586,6 +750,9 @@ fn convert_intent_action(action: crate::module_bindings::IntentAction) -> game_p
                 target: convert_ability_target(u.target),
             })
         }
+        crate::module_bindings::IntentAction::ReleaseAbility(id) => {
+            game_protocol::intent::IntentAction::ReleaseAbility(id)
+        }
         crate::module_bindings::IntentAction::Stop => game_protocol::intent::IntentAction::Stop,
         crate::module_bindings::IntentAction::FaceTo(d) => {
             game_protocol::intent::IntentAction::FaceTo(game_schema::MoveDir {
@@ -597,6 +764,7 @@ fn convert_intent_action(action: crate::module_bindings::IntentAction) -> game_p
         crate::module_bindings::IntentAction::Interact(id) => {
             game_protocol::intent::IntentAction::Interact(id)
         }
+        crate::module_bindings::IntentAction::Block => game_protocol::intent::IntentAction::Block,
     }
 }
 
@@ -682,6 +850,26 @@ fn wire_combat_event(e: &CommitCombatEvent) -> CombatEventInput {
         target_entity: e.target_entity,
         event_sequence: e.event_sequence,
         event_kind: match &e.event_kind {
+            CommitCombatEventKind::CastStart { ability_id, cast_duration_ticks } => {
+                CombatEventKind::CastStart(CastStartData {
+                    ability_id: *ability_id,
+                    cast_duration_ticks: *cast_duration_ticks,
+                })
+            }
+            CommitCombatEventKind::ChargeStart { ability_id, max_ticks } => {
+                CombatEventKind::ChargeStart(ChargeStartData {
+                    ability_id: *ability_id,
+                    max_ticks: *max_ticks,
+                })
+            }
+            CommitCombatEventKind::ChargeTierReached { ability_id, tier } => {
+                CombatEventKind::ChargeTierReached(ChargeTierReachedData {
+                    ability_id: *ability_id,
+                    tier: *tier,
+                })
+            }
+            CommitCombatEventKind::BlockStart => CombatEventKind::BlockStart,
+            CommitCombatEventKind::BlockEnd => CombatEventKind::BlockEnd,
             CommitCombatEventKind::Damage(d) => CombatEventKind::Damage(DamageData {
                 amount: d.amount,
                 damage_type: wire_damage_type(d.damage_type),
@@ -693,6 +881,45 @@ fn wire_combat_event(e: &CommitCombatEvent) -> CombatEventInput {
             }),
             CommitCombatEventKind::BuffExpired(id) => CombatEventKind::BuffExpired(*id),
             CommitCombatEventKind::EntityDied(k) => CombatEventKind::EntityDied(*k),
+            CommitCombatEventKind::Dodged(ability_id) => CombatEventKind::Dodged(*ability_id),
+            CommitCombatEventKind::Blocked { ability_id, damage_taken, perfect } => {
+                CombatEventKind::Blocked(BlockedData {
+                    ability_id: *ability_id,
+                    damage_taken: *damage_taken,
+                    perfect: *perfect,
+                })
+            }
+            CommitCombatEventKind::Covered { blocker, ability_id, damage_taken } => {
+                CombatEventKind::Covered(CoveredData {
+                    blocker: *blocker,
+                    ability_id: *ability_id,
+                    damage_taken: *damage_taken,
+                })
+            }
+            CommitCombatEventKind::LockOnWarning { target, impact_tick } => {
+                CombatEventKind::LockOnWarning(LockOnWarningData {
+                    target: *target,
+                    impact_tick: *impact_tick,
+                })
+            }
+            CommitCombatEventKind::ProjectileLaunched {
+                execution_id, ability_id,
+                origin_x, origin_y, origin_z,
+                direction_x, direction_y, direction_z,
+                speed, max_range,
+            } => {
+                CombatEventKind::ProjectileLaunched(ProjectileLaunchedData {
+                    execution_id: *execution_id,
+                    ability_id: *ability_id,
+                    origin_x: *origin_x, origin_y: *origin_y, origin_z: *origin_z,
+                    direction_x: *direction_x, direction_y: *direction_y, direction_z: *direction_z,
+                    speed: *speed,
+                    max_range: *max_range,
+                })
+            }
+            CommitCombatEventKind::ProjectileRemoved { execution_id } => {
+                CombatEventKind::ProjectileRemoved(*execution_id)
+            }
         },
     }
 }
@@ -748,6 +975,13 @@ fn wire_buff_updates(pkg: &CommitPackage) -> Vec<BuffUpdate> {
             source_entity: b.source_entity,
             stacks: b.stacks,
             expires_at_tick: b.expires_at_tick,
+            mod_damage_out_pct: b.mod_damage_out_pct,
+            mod_damage_in_pct: b.mod_damage_in_pct,
+            mod_cooldown_reduce_pct: b.mod_cooldown_reduce_pct,
+            mod_speed_pct: b.mod_speed_pct,
+            mod_ai_override_kind: b.mod_ai_override_kind,
+            mod_ai_override_target: b.mod_ai_override_target,
+            mod_root: b.mod_root,
         })
         .collect()
 }
@@ -772,6 +1006,26 @@ fn wire_npc_state_updates(pkg: &CommitPackage) -> Vec<NpcStateUpdate> {
             target_entity: n.target_entity,
         })
         .collect()
+}
+
+fn wire_director_spawns(pkg: &CommitPackage) -> Vec<DirectorSpawnInput> {
+    pkg.director_spawns.iter().map(|s| DirectorSpawnInput {
+        kind: convert_entity_kind_to_wire(s.kind),
+        max_hp: s.max_hp,
+        pos_x: s.pos_x,
+        pos_y: s.pos_y,
+        pos_z: s.pos_z,
+    }).collect()
+}
+
+fn convert_entity_kind_to_wire(kind: game_schema::EntityKind) -> crate::module_bindings::EntityKind {
+    match kind {
+        game_schema::EntityKind::Player => crate::module_bindings::EntityKind::Player,
+        game_schema::EntityKind::Npc => crate::module_bindings::EntityKind::Npc,
+        game_schema::EntityKind::Projectile => crate::module_bindings::EntityKind::Projectile,
+        game_schema::EntityKind::Hazard => crate::module_bindings::EntityKind::Hazard,
+        game_schema::EntityKind::Boss => crate::module_bindings::EntityKind::Boss,
+    }
 }
 
 fn wire_npc_ai_state(state: game_schema::NpcAiState) -> NpcAiState {

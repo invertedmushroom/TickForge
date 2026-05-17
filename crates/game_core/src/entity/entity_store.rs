@@ -8,16 +8,22 @@ use super::entity_index::EntityIndex;
 
 /// Dense entity lifecycle store with EntityId ↔ EntityIndex mapping.
 ///
-/// Entities are assigned a stable `EntityIndex` on spawn. Component arrays
-/// throughout `SimState` use this index for O(1) access. Removed entities
-/// become tombstones — their index slot is kept but marked `Removed`, and
-/// the `EntityId` mapping is dropped so future lookups return `None`.
+/// Uses generational indexing: each slot carries a generation counter that
+/// is incremented when the slot is reused after an entity is removed.
+/// Stale `EntityIndex` values from a previous generation will not match
+/// the current generation and are safely rejected.
+///
+/// Removed entity slots are pushed to a free list and recycled by the
+/// next `spawn()` call. This keeps the dense arrays bounded by the number
+/// of *concurrent* entities rather than growing with total lifetime churn.
 pub struct EntityStore {
     id_to_index: HashMap<EntityId, EntityIndex>,
     index_to_id: Vec<EntityId>,
     pub kinds: Vec<EntityKind>,
     pub states: Vec<EntityState>,
     pub spawned_at: Vec<TickId>,
+    generations: Vec<u32>,
+    free_list: Vec<u32>,
 }
 
 impl EntityStore {
@@ -28,18 +34,37 @@ impl EntityStore {
             kinds: Vec::new(),
             states: Vec::new(),
             spawned_at: Vec::new(),
+            generations: Vec::new(),
+            free_list: Vec::new(),
         }
     }
 
-    /// Allocate a new entity slot and return its dense index.
-    pub fn spawn(&mut self, id: EntityId, kind: EntityKind, tick: TickId) -> EntityIndex {
-        let idx = EntityIndex(self.index_to_id.len() as u32);
-        self.index_to_id.push(id);
-        self.kinds.push(kind);
-        self.states.push(EntityState::Spawning);
-        self.spawned_at.push(tick);
-        self.id_to_index.insert(id, idx);
-        idx
+    /// Allocate an entity slot (reusing a free slot if available) and return
+    /// its dense index. The second element is `true` if a slot was reused.
+    pub fn spawn(&mut self, id: EntityId, kind: EntityKind, tick: TickId) -> (EntityIndex, bool) {
+        if let Some(slot) = self.free_list.pop() {
+            let s = slot as usize;
+            let g = self.generations[s] + 1;
+            self.generations[s] = g;
+            self.index_to_id[s] = id;
+            self.kinds[s] = kind;
+            self.states[s] = EntityState::Spawning;
+            self.spawned_at[s] = tick;
+            let idx = EntityIndex::new(slot, g);
+            self.id_to_index.insert(id, idx);
+            (idx, true)
+        } else {
+            let slot = self.index_to_id.len() as u32;
+            let g = 0;
+            self.generations.push(g);
+            self.index_to_id.push(id);
+            self.kinds.push(kind);
+            self.states.push(EntityState::Spawning);
+            self.spawned_at.push(tick);
+            let idx = EntityIndex::new(slot, g);
+            self.id_to_index.insert(id, idx);
+            (idx, false)
+        }
     }
 
     /// Resolve an `EntityId` to its dense index. Returns `None` for
@@ -59,6 +84,19 @@ impl EntityStore {
     #[inline]
     pub fn id_of(&self, idx: EntityIndex) -> EntityId {
         self.index_to_id[idx.as_usize()]
+    }
+
+    /// Get the `EntityId` at a raw slot index, if the slot is active.
+    ///
+    /// Used by systems that iterate dense component arrays (e.g. tactical)
+    /// and need to resolve the owning entity without an `EntityIndex`.
+    #[inline]
+    pub fn lookup_by_slot(&self, slot: usize) -> Option<EntityId> {
+        if slot < self.states.len() && self.states[slot] == EntityState::Active {
+            Some(self.index_to_id[slot])
+        } else {
+            None
+        }
     }
 
     /// Total number of slots (including tombstones).
@@ -87,11 +125,20 @@ impl EntityStore {
         self.states[idx.as_usize()] = EntityState::DespawnPending;
     }
 
-    /// Tombstone: mark as Removed and drop the id→index mapping.
+    /// Tombstone: mark as Removed, drop the id→index mapping, and return
+    /// the slot to the free list for reuse.
     pub fn mark_removed(&mut self, idx: EntityIndex) {
         self.states[idx.as_usize()] = EntityState::Removed;
         let id = self.index_to_id[idx.as_usize()];
         self.id_to_index.remove(&id);
+        self.free_list.push(idx.as_usize() as u32);
+    }
+
+    /// Build a generation-correct `EntityIndex` for a raw slot offset.
+    /// Used by internal iteration loops that scan `0..len()`.
+    #[inline]
+    pub fn index_at(&self, slot: usize) -> EntityIndex {
+        EntityIndex::new(slot as u32, self.generations[slot])
     }
 }
 

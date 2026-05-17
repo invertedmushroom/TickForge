@@ -1,4 +1,5 @@
 use rapier3d::prelude::*;
+use rapier3d::control::KinematicCharacterController;
 use rapier3d::math::{Pose, Vector};
 use std::collections::HashMap;
 use std::sync::mpsc;
@@ -7,7 +8,9 @@ use game_schema::EntityKind;
 use game_core::physics_backend::{
     ColliderKind,
     CollisionEvent as GameCollisionEvent,
+    MoveResult,
     PhysicsBackend,
+    RayHit,
 };
 use super::collision_groups;
 
@@ -53,6 +56,8 @@ pub struct PhysicsWorld {
     // Game-level opaque sensor handles: u64 → ColliderHandle.
     sensor_handle_counter: u64,
     sensor_handles: HashMap<u64, ColliderHandle>,
+    // World-space (parentless) sensors → owning entity for collision resolution.
+    world_sensor_owners: HashMap<ColliderHandle, EntityId>,
 }
 
 /// Result of a raycast query.
@@ -95,6 +100,7 @@ impl PhysicsWorld {
             collider_kinds: HashMap::new(),
             sensor_handle_counter: 0,
             sensor_handles: HashMap::new(),
+            world_sensor_owners: HashMap::new(),
         }
     }
 
@@ -155,8 +161,11 @@ impl PhysicsWorld {
     /// Resolve a collider handle to its parent entity ID.
     fn entity_for_collider(&self, collider_handle: ColliderHandle) -> Option<EntityId> {
         let collider = self.colliders.get(collider_handle)?;
-        let body_handle = collider.parent()?;
-        self.body_to_entity.get(&body_handle).copied()
+        if let Some(body_handle) = collider.parent() {
+            return self.body_to_entity.get(&body_handle).copied();
+        }
+        // Parentless (world-space) sensor — look up via world_sensor_owners.
+        self.world_sensor_owners.get(&collider_handle).copied()
     }
 
     /// Resolve a collider handle to its `ColliderKind`.
@@ -309,7 +318,10 @@ impl PhysicsWorld {
         // can register contacts against this kinematic body collider.
         // Rapier defaults exclude kinematic-kinematic pairs — without this, skill hitboxes
         // fired by kinematic player bodies never detect kinematic NPC bodies.
-        let active_types = ActiveCollisionTypes::default() | ActiveCollisionTypes::KINEMATIC_KINEMATIC;
+        // KINEMATIC_FIXED enables world-space sensors (HazardZone etc.) to detect these bodies.
+        let active_types = ActiveCollisionTypes::default()
+            | ActiveCollisionTypes::KINEMATIC_KINEMATIC
+            | ActiveCollisionTypes::KINEMATIC_FIXED;
         let collider = ColliderBuilder::capsule_y(half_height, radius)
             .collision_groups(groups)
             .active_events(ActiveEvents::COLLISION_EVENTS)
@@ -352,7 +364,10 @@ impl PhysicsWorld {
 
         // Skill hitboxes must detect kinematic NPC bodies — include KINEMATIC_KINEMATIC
         // so contacts fire even when both the caster and target are kinematic bodies.
-        let active_types = ActiveCollisionTypes::default() | ActiveCollisionTypes::KINEMATIC_KINEMATIC;
+        // KINEMATIC_FIXED enables world-space sensors (HazardZone etc.) to fire contacts.
+        let active_types = ActiveCollisionTypes::default()
+            | ActiveCollisionTypes::KINEMATIC_KINEMATIC
+            | ActiveCollisionTypes::KINEMATIC_FIXED;
         let collider = ColliderBuilder::new(shape)
             .position(offset)
             .sensor(true)
@@ -369,6 +384,7 @@ impl PhysicsWorld {
     /// Remove a specific collider (e.g. a skill hitbox sensor).
     pub fn remove_collider(&mut self, handle: ColliderHandle) {
         self.collider_kinds.remove(&handle);
+        self.world_sensor_owners.remove(&handle);
         self.colliders.remove(handle, &mut self.islands, &mut self.bodies, true);
     }
 
@@ -631,6 +647,53 @@ impl PhysicsBackend for PhysicsWorld {
         }
     }
 
+    fn spawn_world_sensor(
+        &mut self,
+        position: game_protocol::types::Vec3f,
+        shape: game_core::physics_backend::SensorShape,
+        kind: ColliderKind,
+        owner: EntityId,
+    ) -> u64 {
+        use game_core::physics_backend::SensorShape;
+        let rapier_shape: SharedShape = match shape {
+            SensorShape::Sphere { radius } => SharedShape::ball(radius),
+            SensorShape::Capsule { half_height, radius } => SharedShape::capsule_y(half_height, radius),
+        };
+        let groups = match kind {
+            ColliderKind::Hitbox(_) => collision_groups::skill_hitbox_groups(),
+            ColliderKind::Hurtbox  => collision_groups::skill_hurtbox_groups(),
+            _                      => collision_groups::skill_hitbox_groups(),
+        };
+        let active_types = ActiveCollisionTypes::default()
+            | ActiveCollisionTypes::KINEMATIC_KINEMATIC
+            | ActiveCollisionTypes::KINEMATIC_FIXED;
+        let collider = ColliderBuilder::new(rapier_shape)
+            .translation(Vector::new(position.x, position.y, position.z))
+            .sensor(true)
+            .collision_groups(groups)
+            .active_events(ActiveEvents::COLLISION_EVENTS)
+            .active_collision_types(active_types)
+            .build();
+        // Insert without a parent body — collider is free-standing in world space.
+        let col_handle = self.colliders.insert(collider);
+        self.collider_kinds.insert(col_handle, kind);
+        self.world_sensor_owners.insert(col_handle, owner);
+        let opaque = self.sensor_handle_counter;
+        self.sensor_handle_counter += 1;
+        self.sensor_handles.insert(opaque, col_handle);
+        opaque
+    }
+
+    fn set_sensor_position(&mut self, handle: u64, position: game_protocol::types::Vec3f) -> bool {
+        if let Some(&col_handle) = self.sensor_handles.get(&handle) {
+            if let Some(collider) = self.colliders.get_mut(col_handle) {
+                collider.set_translation(Vector::new(position.x, position.y, position.z));
+                return true;
+            }
+        }
+        false
+    }
+
     fn spawn_character_body(
         &mut self,
         entity_id: EntityId,
@@ -651,6 +714,92 @@ impl PhysicsBackend for PhysicsWorld {
         };
         self.add_kinematic_capsule(entity_id, pos, 0.5, 0.3, groups);
         true
+    }
+
+    fn move_character(
+        &mut self,
+        entity_id: EntityId,
+        desired_translation: game_protocol::types::Vec3f,
+    ) -> Option<MoveResult> {
+        let handle = *self.entity_to_body.get(&entity_id)?;
+        let body = self.bodies.get(handle)?;
+        let current_pos = *body.position();
+
+        // Use the entity's Body collider shape for the character controller sweep.
+        // The first collider attached to this body is always the Body capsule.
+        let body_collider_handle = body.colliders().first().copied()?;
+        let collider = self.colliders.get(body_collider_handle)?;
+        let shape = collider.shape();
+
+        // Build a query pipeline that excludes this character's own rigid body.
+        let filter = QueryFilter::default().exclude_rigid_body(handle);
+        let queries = self.broad_phase.as_query_pipeline(
+            self.narrow_phase.query_dispatcher(),
+            &self.bodies,
+            &self.colliders,
+            filter,
+        );
+
+        let controller = KinematicCharacterController::default();
+        let movement = controller.move_shape(
+            0.0, // dt=0: no gravity / slope friction needed (server controls Y)
+            &queries,
+            shape,
+            &current_pos,
+            Vector::new(desired_translation.x, desired_translation.y, desired_translation.z),
+            |_collision| {}, // no event handling needed
+        );
+
+        let new_pos = current_pos.translation + movement.translation;
+
+        // Apply the corrected position to the kinematic body.
+        let body = self.bodies.get_mut(handle)?;
+        let rotation = *body.rotation();
+        body.set_next_kinematic_position(Pose::from_parts(new_pos, rotation));
+
+        Some(MoveResult {
+            position: game_protocol::types::Vec3f {
+                x: new_pos.x,
+                y: new_pos.y,
+                z: new_pos.z,
+            },
+            grounded: movement.grounded,
+        })
+    }
+
+    fn raycast(
+        &self,
+        origin: game_protocol::types::Vec3f,
+        direction: game_protocol::types::Vec3f,
+        max_distance: f32,
+    ) -> Option<RayHit> {
+        let query = self.query_pipeline();
+        let ray = Ray::new(
+            Vector::new(origin.x, origin.y, origin.z),
+            Vector::new(direction.x, direction.y, direction.z),
+        );
+        query
+            .cast_ray_and_get_normal(&ray, max_distance, true)
+            .and_then(|(collider_handle, intersection)| {
+                let kind = self.collider_kinds.get(&collider_handle).copied()?;
+                let entity = self.entity_for_collider(collider_handle)?;
+                let toi = intersection.time_of_impact;
+                Some(RayHit {
+                    point: game_protocol::types::Vec3f {
+                        x: origin.x + direction.x * toi,
+                        y: origin.y + direction.y * toi,
+                        z: origin.z + direction.z * toi,
+                    },
+                    normal: game_protocol::types::Vec3f {
+                        x: intersection.normal.x,
+                        y: intersection.normal.y,
+                        z: intersection.normal.z,
+                    },
+                    toi: intersection.time_of_impact,
+                    entity,
+                    kind,
+                })
+            })
     }
 }
 

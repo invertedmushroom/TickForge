@@ -66,11 +66,10 @@ pub fn tick_trigger(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(),
     }
 
     // Find current tick
-    let current = ctx.db.sim_tick().iter()
+    let mut current_max = ctx.db.sim_tick().iter()
         .max_by_key(|t| t.tick_id)
-        .ok_or("No tick found")?;
-
-    let current_max = current.tick_id;
+        .ok_or("No tick found")?
+        .tick_id;
 
     // Backpressure guard: skip inserting a new tick if the simulation worker
     // has not committed recent ticks. This prevents sim_tick from accumulating
@@ -88,11 +87,29 @@ pub fn tick_trigger(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(),
     if last_committed > 0 {
         let backlog = current_max.saturating_sub(last_committed);
         if backlog > BACKLOG_LIMIT {
+            // Self-healing: the worker that created these sim_tick rows crashed
+            // before committing results. Delete the orphaned rows and reset
+            // last_committed_tick to 0 (cold-start mode). The next worker that
+            // connects will seed from MAX(sim_tick) normally, and its first
+            // commit will bootstrap the sequence via the cold-start bypass in
+            // commit_tick_results.
+            let to_delete: Vec<u64> = ctx.db.sim_tick().iter()
+                .filter(|t| t.tick_id > last_committed)
+                .map(|t| t.tick_id)
+                .collect();
+            let count = to_delete.len();
+            for id in to_delete {
+                ctx.db.sim_tick().tick_id().delete(&id);
+            }
+            if let Some(mut cfg) = ctx.db.module_config().key().find(0) {
+                cfg.last_committed_tick = 0;
+                ctx.db.module_config().key().update(cfg);
+            }
+            current_max = last_committed;
             log::warn!(
-                "tick backpressure: backlog={} (limit={}) last_committed={} — skipping tick {}",
-                backlog, BACKLOG_LIMIT, last_committed, current_max + 1
+                "tick_trigger: cleaned {count} orphaned sim_tick rows (last_committed was {last_committed}) — entering cold-start recovery"
             );
-            return Ok(());
+            // Fall through to insert the next tick normally.
         }
     }
 
@@ -353,6 +370,7 @@ pub fn commit_tick_results(
     threat_updates: Vec<ThreatUpdate>,
     threat_cleared_entity_ids: Vec<u64>,
     npc_state_updates: Vec<NpcStateUpdate>,
+    director_spawns: Vec<DirectorSpawnInput>,
 ) -> Result<(), String> {
     // Per spec (security_and_authority): trusted-only reducers must verify caller identity.
     // Accept the module itself (scheduler) or any registered simulation worker.
@@ -431,6 +449,22 @@ pub fn commit_tick_results(
                 spawned_at_tick: existing.spawned_at_tick,
                 owner_identity: existing.owner_identity,
             });
+
+            // Clean up companion rows for entities reaching terminal Removed state
+            // so they disappear from nearby_transforms and other views.
+            if u.new_state == EntityState::Removed {
+                ctx.db.entity_transform().entity_id().delete(&u.entity_id);
+                ctx.db.entity_region().entity_id().delete(&u.entity_id);
+                ctx.db.entity_health().entity_id().delete(&u.entity_id);
+                ctx.db.npc_state().entity_id().delete(&u.entity_id);
+                // Buffs and threat rows for Removed entities are already cleaned
+                // up by the buff_cleared / threat_cleared sections below — the
+                // worker explicitly adds Removed entity IDs to those lists.
+                log::info!(
+                    "commit_tick_results tick={}: entity {} removed — companion rows deleted",
+                    tick_id, u.entity_id
+                );
+            }
         } else {
             log::warn!(
                 "commit_tick_results tick={}: no entity row for entity_id={} — state update skipped",
@@ -474,6 +508,13 @@ pub fn commit_tick_results(
                 source_entity: b.source_entity,
                 stacks: b.stacks,
                 expires_at_tick: b.expires_at_tick,
+                mod_damage_out_pct: b.mod_damage_out_pct,
+                mod_damage_in_pct: b.mod_damage_in_pct,
+                mod_cooldown_reduce_pct: b.mod_cooldown_reduce_pct,
+                mod_speed_pct: b.mod_speed_pct,
+                mod_ai_override_kind: b.mod_ai_override_kind,
+                mod_ai_override_target: b.mod_ai_override_target,
+                mod_root: b.mod_root,
             });
         }
     }
@@ -520,14 +561,73 @@ pub fn commit_tick_results(
         }
     }
 
+    // Persist Director spawns: create entity + companion rows for each spawn.
+    // Uses auto_inc (entity_id: 0) just like player/NPC spawns — the DB
+    // assigns unique IDs. Entity kind is tracked via EntityKind, not ID range.
+    for s in director_spawns {
+        let entity = ctx.db.entity().insert(Entity {
+            entity_id: 0, // auto_inc
+            kind: s.kind,
+            state: EntityState::Spawning,
+            spawned_at_tick: tick_id,
+            owner_identity: None,
+        });
+        let eid = entity.entity_id;
+
+        ctx.db.entity_transform().insert(EntityTransform {
+            entity_id: eid,
+            pos_x: s.pos_x, pos_y: s.pos_y, pos_z: s.pos_z,
+            rot_x: 0.0, rot_y: 0.0, rot_z: 0.0, rot_w: 1.0,
+            vel_x: 0.0, vel_y: 0.0, vel_z: 0.0,
+            angvel_x: 0.0, angvel_y: 0.0, angvel_z: 0.0,
+            last_tick: tick_id,
+        });
+
+        ctx.db.entity_health().insert(EntityHealth {
+            entity_id: eid,
+            hp: s.max_hp,
+            max_hp: s.max_hp,
+        });
+
+        ctx.db.entity_region().insert(EntityRegion {
+            entity_id: eid,
+            region_x: (s.pos_x / 50.0).floor() as i32,
+            region_z: (s.pos_z / 50.0).floor() as i32,
+            layer: 0,
+        });
+    }
+
     // Advance the last_committed_tick cursor used by tick_trigger's backpressure guard.
-    // Only update if this commit is actually moving the cursor forward (guards against
-    // out-of-order or replayed commits, though the trusted-worker check above makes
-    // those unlikely).
+    // Strict sequence enforcement: the worker must commit ticks exactly in order.
+    // If a tick was lost or skipped, the worker should have retried or crashed;
+    // accepting a gap here would silently drop DB effects for the missing tick.
+    //
+    // Cold-start rule: when last_committed_tick == 0, no worker has committed yet
+    // (or the module was freshly deployed). Accept any tick_id to bootstrap the
+    // sequence. This mirrors tick_trigger's cold-start bypass of backpressure.
     if let Some(mut cfg) = ctx.db.module_config().key().find(0) {
-        if tick_id > cfg.last_committed_tick {
+        if cfg.last_committed_tick == 0 {
+            // Cold start — accept whatever tick the worker sends to bootstrap.
             cfg.last_committed_tick = tick_id;
             ctx.db.module_config().key().update(cfg);
+        } else {
+            let expected = cfg.last_committed_tick + 1;
+            if tick_id == expected {
+                cfg.last_committed_tick = tick_id;
+                ctx.db.module_config().key().update(cfg);
+            } else if tick_id <= cfg.last_committed_tick {
+                // Duplicate / replay — harmless, ignore.
+                log::warn!(
+                    "commit_tick_results: tick_id={} already committed (last={}), ignoring cursor advance",
+                    tick_id, cfg.last_committed_tick
+                );
+            } else {
+                // Gap detected — reject so the worker sees a reducer error and retries.
+                return Err(format!(
+                    "commit_tick_results: tick_id={} skips expected {} — gap rejected",
+                    tick_id, expected
+                ));
+            }
         }
     }
 
@@ -591,6 +691,13 @@ pub struct BuffUpdate {
     pub source_entity: u64,
     pub stacks: u32,
     pub expires_at_tick: Option<u64>,
+    pub mod_damage_out_pct: Option<f32>,
+    pub mod_damage_in_pct: Option<f32>,
+    pub mod_cooldown_reduce_pct: Option<f32>,
+    pub mod_speed_pct: Option<f32>,
+    pub mod_ai_override_kind: Option<u8>,
+    pub mod_ai_override_target: Option<u64>,
+    pub mod_root: Option<bool>,
 }
 
 #[derive(spacetimedb::SpacetimeType, Clone, Debug)]
@@ -605,6 +712,15 @@ pub struct NpcStateUpdate {
     pub entity_id: u64,
     pub ai_state: NpcAiState,
     pub target_entity: Option<u64>,
+}
+
+#[derive(spacetimedb::SpacetimeType, Clone, Debug)]
+pub struct DirectorSpawnInput {
+    pub kind: EntityKind,
+    pub max_hp: f32,
+    pub pos_x: f32,
+    pub pos_y: f32,
+    pub pos_z: f32,
 }
 
 // ── Worker Registration ─────────────────────────────────────────────

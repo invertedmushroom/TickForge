@@ -14,6 +14,7 @@
 //   CooldownStart(duration_ticks)  — start cooldown; 20 ticks = 1 second at 20 Hz
 //   ApplyDamageFrame               — mark contacts from this tick as authoritative damage frame
 //   RemoveHitbox                   — despawn the skill sensor collider
+//   OpenFollowUpWindow(d, id) — open a combo window for d ticks; next press casts ability id
 (
     abilities: [
         (
@@ -39,6 +40,20 @@
             damage_type: Physical,
             shape: LineSweep,
             threat_multiplier: 2.0,
+            charge_tiers: Some([
+                (min_ticks: 0,  damage_mult: 1.0),  // Tier 0: base (~0-1s)
+                (min_ticks: 20, damage_mult: 1.5),   // Tier 1: enhanced (~1-2s)
+                (min_ticks: 40, damage_mult: 2.0),   // Tier 2: max charge (2s+, auto-release)
+            ]),
+        ),
+        // Slash combo step 2 — follow-up from Slash with higher damage
+        (
+            ability_id: 4,
+            name: "Slash Combo",
+            base_damage: 35.0,
+            damage_type: Physical,
+            shape: CapsuleSweep,
+            threat_multiplier: 1.2,
         ),
     ],
     timelines: [
@@ -50,18 +65,20 @@
                 (tick_offset: 0, action: CooldownStart(duration_ticks: 20)),
                 // tick 1: damage frame — contacts this tick deal damage
                 (tick_offset: 1, action: ApplyDamageFrame),
-                // tick 2: hitbox gone
+                // tick 2: hitbox gone, open 10-tick combo window → press again for Slash Combo (id 4)
                 (tick_offset: 2, action: RemoveHitbox),
+                (tick_offset: 2, action: OpenFollowUpWindow(duration_ticks: 10, next_ability_id: 4)),
             ],
         ),
         (
             ability_id: 2,
             actions: [
-                // Fireball: spawn projectile then apply damage a couple ticks later
+                // Fireball: spawn projectile, arm it immediately, and let it travel
+                // until it hits something or exceeds max range (auto-removed by
+                // phase_projectile_movement). No timeline RemoveHitbox needed.
                 (tick_offset: 0, action: SpawnHitbox(shape: Projectile, offset: (x: 0.0, y: 1.0, z: 0.0))),
                 (tick_offset: 0, action: CooldownStart(duration_ticks: 40)),
-                (tick_offset: 2, action: ApplyDamageFrame),
-                (tick_offset: 3, action: RemoveHitbox),
+                (tick_offset: 0, action: ApplyDamageFrame),
             ],
         ),
         (
@@ -70,6 +87,16 @@
                 // Smash: heavy close-range frontal sweep
                 (tick_offset: 0, action: SpawnHitbox(shape: LineSweep, offset: (x: 0.0, y: 0.0, z: 0.0))),
                 (tick_offset: 0, action: CooldownStart(duration_ticks: 50)),
+                (tick_offset: 1, action: ApplyDamageFrame),
+                (tick_offset: 2, action: RemoveHitbox),
+            ],
+        ),
+        (
+            ability_id: 4,
+            actions: [
+                // Slash Combo: follow-up hit — wider sweep, faster cooldown
+                (tick_offset: 0, action: SpawnHitbox(shape: CapsuleSweep, offset: (x: 0.0, y: 0.0, z: 0.0))),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 20)),
                 (tick_offset: 1, action: ApplyDamageFrame),
                 (tick_offset: 2, action: RemoveHitbox),
             ],

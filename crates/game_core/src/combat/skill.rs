@@ -25,15 +25,30 @@ pub enum SkillShape {
 /// Runtime parameters for a single ability cast.
 ///
 /// Created in Phase 2 alongside `AbilityExecutionContext` so that a single
-/// `ability_id` can produce different execution paths (charge tiers, follow-up
-/// variants, etc.) without requiring separate ability IDs.
+/// `ability_id` can produce different execution paths (charge tiers, etc.)
+/// without requiring separate ability IDs.
 ///
 /// `charge_level`: 0 = base cast, higher values = extended hold time.
-/// `variant`: 0 = first press, 1+ = follow-up / combo press (resolved from `active_windows`).
+/// `variant`: reserved — combo routing now redirects to a separate ability via
+///   `active_windows`, so each combo step has its own `ability_id` and timeline.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AbilityParams {
     pub charge_level: u8,
-    pub variant: u8,
+    pub variant: u8, // reserved for future use (combo routing now uses separate ability IDs)
+}
+
+/// In-flight charging state for one entity.
+///
+/// Created when a UseAbility intent targets a chargeable ability.
+/// Consumed on ReleaseAbility or auto-release at max tier.
+#[derive(Clone, Debug)]
+pub struct ChargingState {
+    pub ability_id: u32,
+    pub started_at: TickId,
+    pub targeting: ResolvedTargeting,
+    pub rewind_ticks: u32,
+    /// Highest tier notified to the client so far (for event dedup).
+    pub notified_tier: u8,
 }
 
 /// Ability timing model — TERA-style frame windows.
@@ -67,20 +82,47 @@ pub enum AbilityAction {
     ApplyDamageFrame,
     RemoveHitbox,
     CooldownStart { duration_ticks: u32 },
-    /// Open a follow-up / combo eligibility window for this ability.
+    /// Open a combo / follow-up eligibility window.
     ///
-    /// Phase 3 writes the window into `CombatState::active_windows` so that a
-    /// second UseAbility intent for the same `ability_id` in a later tick is
-    /// recognised as a follow-up press and dispatched with `AbilityParams::variant = 1`.
-    /// Phase 8 drains expired entries alongside cooldowns.
-    OpenFollowUpWindow { duration_ticks: u32 },
-    /// Set tactical blocking/dodge flags on the caster for this tick.
+    /// Phase 3 writes `(next_ability_id, expiry)` into `CombatState::active_windows`
+    /// keyed by `(entity, this_ability_id)`.  When the player presses the *same*
+    /// ability again within the window, Phase 2 redirects the cast to
+    /// `next_ability_id` — a distinct ability with its own timeline, damage, and
+    /// cooldown — then consumes the window.  Phase 8 drains expired entries.
+    OpenFollowUpWindow { duration_ticks: u32, next_ability_id: u32 },
+    /// Apply a buff to the caster (self-buff) from the ability timeline.
     ///
-    /// Phase 3 writes flags into `CombatState::tactical`; Phase 8 clears all
-    /// flags so a new `StanceBegin` action must re-assert them each tick the
-    /// stance is active. This keeps stance state as data flow rather than
-    /// toggle logic.
-    StanceBegin { blocking: bool, dodge_active: bool },
+    /// Phase 3 looks up the `buff_id` in the `BuffRegistry` and creates an
+    /// `ActiveBuff` from the template with the caster as both source and target.
+    /// Stacking logic applies: if a buff with the same `buff_id` already exists,
+    /// stacks are incremented (up to `max_stacks`) and the duration is refreshed.
+    ApplyBuff { buff_id: u32 },
+    /// Set tactical iframe flags on the caster (timeline-driven).
+    ///
+    /// Phase 3 writes `dodge_active` into `CombatState::tactical`. The flag
+    /// persists until a corresponding `StanceEnd` action fires — Phase 8 does
+    /// NOT clear `dodge_active`.
+    ///
+    /// `blocking` is no longer set here — blocking is intent-driven (hold-to-block).
+    StanceBegin { dodge_active: bool, #[serde(default)] rooted: bool },
+    /// Clear tactical iframe flags on the caster (timeline-driven).
+    ///
+    /// Paired with `StanceBegin` to define a fixed-duration iframe window.
+    /// Phase 3 clears `dodge_active` when this action fires.
+    StanceEnd,
+    /// Launch the caster in a kinematic arc (vault / leap).
+    ///
+    /// Phase 3 sets `TacticalState::arc_velocity` and roots the caster.
+    /// Phase 2 integrates gravity each tick and feeds the result into
+    /// `move_character`. The arc ends automatically when `MoveResult::grounded`
+    /// is true (after the launch tick) or when a `StanceEnd` fires.
+    ArcMovement { speed: f32, lift: f32, gravity: f32 },
+    /// Emit a `LockOnWarning` event to the resolved target.
+    ///
+    /// `impact_delay` is the number of ticks from now until the damage frame lands.
+    /// Phase 3 reads the execution context's `ResolvedTargeting` to determine the
+    /// target entity — only `Entity` and `LockOn` targeting produce a warning.
+    Telegraph { impact_delay: u32 },
 }
 
 /// Per-entity scheduled action for the ability scheduler.
@@ -121,6 +163,18 @@ pub enum ScheduledActionType {
     // making this variant unnecessary and eliminating the O(n) queue scan in is_on_cooldown.
 }
 
+/// Discrete charge tier definition (TERA / Monster Hunter style).
+///
+/// Each tier has a minimum tick threshold and a damage multiplier.
+/// Tiers must be sorted ascending by `min_ticks`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChargeTierDef {
+    /// Minimum ticks of charging required to reach this tier.
+    pub min_ticks: u32,
+    /// Damage multiplier applied at this tier (1.0 = base).
+    pub damage_mult: f32,
+}
+
 /// Static definition of an ability — damage, shape, timing metadata.
 ///
 /// Abilities are data-driven: the tick pipeline looks up `AbilityData`
@@ -135,6 +189,28 @@ pub struct AbilityData {
     pub shape: SkillShape,
     /// Threat multiplier (1.0 = threat equal to damage dealt).
     pub threat_multiplier: f32,
+    /// Buff IDs applied to the target on each hit (looked up from `BuffRegistry`).
+    /// Empty by default (most abilities deal only damage).
+    #[serde(default)]
+    pub on_hit_buffs: Vec<u32>,
+    /// Knockback impulse magnitude applied to the target on hit.
+    /// Direction is computed as attacker→target at hit time.
+    /// 0.0 = no knockback (default). Blocked targets are immune.
+    #[serde(default)]
+    pub knockback_force: f32,
+    /// If true, targets that leave and re-enter the hitbox can be damaged again.
+    /// Default false (single-hit). Useful for lingering hazards and rolling projectiles.
+    #[serde(default)]
+    pub allow_reentry: bool,
+    /// Discrete charge tiers (TERA / Monster Hunter style). `None` = instant cast.
+    /// When present, UseAbility starts a charge; ReleaseAbility fires at the achieved tier.
+    /// The last tier's `min_ticks` is the auto-release threshold.
+    #[serde(default)]
+    pub charge_tiers: Option<Vec<ChargeTierDef>>,
+    /// Tick interval between periodic re-damage for lingering area effects (HazardZone).
+    /// 0 = single-hit only (default). e.g. 20 = re-damage every 20 ticks (1 second at 20 Hz).
+    #[serde(default)]
+    pub damage_interval_ticks: u32,
 }
 
 /// Registry of all known abilities, keyed by ability_id.
@@ -217,8 +293,8 @@ pub struct AbilityExecutionContext {
     pub origin: Vec3f,
     /// Caster facing direction (XZ-plane, unit length) at cast time.
     pub facing: Vec3f,
-    /// Runtime parameters for this cast (charge tier, follow-up variant, etc.).
-    /// Resolved in Phase 2 from intent data and `CombatState::active_windows`.
+    /// Runtime parameters for this cast (charge tier, etc.).
+    /// Resolved in Phase 2 from intent data.
     pub params: AbilityParams,
     /// Number of ticks to rewind target positions for lag compensation.
     /// Computed in Phase 2 from the intent's observed-tick delta, clamped to MAX_REWIND_TICKS.

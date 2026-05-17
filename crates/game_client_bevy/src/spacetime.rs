@@ -86,9 +86,17 @@ fn connect(mut commands: Commands) {
                     "SELECT * FROM my_region",
                     "SELECT * FROM nearby_transforms",
                     "SELECT * FROM entity",
+                    "SELECT * FROM client_sequence",
                     "SELECT * FROM entity_health",
                     "SELECT * FROM sim_tick",
                     "SELECT * FROM combat_event",
+                    "SELECT * FROM active_buff",
+                    "SELECT * FROM npc_state",
+                    "SELECT * FROM world_event",
+                    "SELECT * FROM threat_entry",
+                    "SELECT * FROM player_inventory",
+                    "SELECT * FROM player_equipment",
+                    "SELECT * FROM module_config",
                 ]);
 
             // Spawn the player.
@@ -131,6 +139,19 @@ fn pump_connection(
     for tick in stdb.conn.db.sim_tick().iter() {
         if tick.tick_id > tick_counter.last_tick {
             tick_counter.last_tick = tick.tick_id;
+        }
+    }
+
+    // Keep local intent sequence aligned with authoritative server sequence.
+    let identity = stdb.conn.identity();
+    if let Some(seq) = stdb.conn.db.client_sequence().client_identity().find(&identity) {
+        if tick_counter.intent_seq < seq.last_processed_sequence {
+            log::warn!(
+                "Resyncing intent sequence from {} -> {}",
+                tick_counter.intent_seq,
+                seq.last_processed_sequence
+            );
+            tick_counter.intent_seq = seq.last_processed_sequence;
         }
     }
 }

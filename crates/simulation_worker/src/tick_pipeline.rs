@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use log::warn;
 use game_protocol::event::{EventPayload, SimEvent};
 use game_protocol::intent::{IntentAction, MoveDir, PlayerIntent};
 use game_protocol::tick::TickId;
@@ -7,7 +8,7 @@ use game_protocol::types::Transform;
 use game_core::physics_backend::{ColliderKind, PhysicsBackend, SensorShape};
 use game_core::combat::skill::{
     AbilityAction, AbilityParams, AbilityTimeline, AbilityRegistry,
-    AbilityExecutionContext, AbilityExecutionId, ResolvedTargeting,
+    AbilityExecutionContext, AbilityExecutionId, ChargingState, ResolvedTargeting,
     ScheduledAction, ScheduledActionType, SkillShape,
 };
 use game_core::director::{DirectorSpawn, DirectorState};
@@ -113,6 +114,9 @@ pub struct TickSummary {
     pub despawns: usize,
     pub active_entities: usize,
     pub active_hitboxes: usize,
+    pub scheduled_actions_len: usize,
+    pub tick_duration_us: u64,
+    pub commit_retries: u32,
 }
 
 /// Output of a single simulation tick — committed atomically to SpacetimeDB.
@@ -174,6 +178,8 @@ pub struct TickPipeline {
     scheduled_actions: Vec<ScheduledAction>,
     /// Static ability definitions — looked up during combat resolution.
     abilities: AbilityRegistry,
+    /// Buff templates — looked up by ID when applying buffs from abilities.
+    buff_registry: game_core::combat::status::BuffRegistry,
     /// Runtime entity state — lifecycle, health, buffs, threat, AI, contacts.
     pub(crate) state: SimState,
     /// Explicit cooldown state — maps (EntityId, ability_id) → tick when the cooldown expires.
@@ -209,14 +215,24 @@ pub struct TickPipeline {
     transform_history: TransformHistory,
     /// World director — evaluates dynamic event triggers and spawns NPCs.
     director: DirectorState,
-    /// Entity ID counter for director-spawned entities.
-    /// Starts at a high value to avoid collisions with DB-assigned IDs.
-    next_director_entity_id: u64,
-    /// Entity indices whose cached `StatBlock` needs recalculation.
+    /// Entities whose cached `StatBlock` needs recalculation.
     /// Populated by: (a) equipment changes (via `mark_stats_dirty`),
     /// (b) buff changes (copied from `StatusState::dirty_entities` at Phase 10).
     /// Drained by Phase 1.5 stat recalculation.
-    stats_dirty: HashSet<usize>,
+    /// Keyed by EntityId (not dense index) so slot reuse cannot cause stale refs.
+    stats_dirty: HashSet<EntityId>,
+    /// Aggregated equipment modifiers per entity. Updated by the coordinator
+    /// when `player_equipment` rows change; read by `phase_stat_recalc`.
+    equipment_modifiers: HashMap<EntityId, game_core::stats::EquipmentModifiers>,
+    /// NPCs whose threat table has been emitted as non-empty at least once.
+    /// Used by `collect_threat_updates` to emit one final empty snapshot when
+    /// all entries decay to zero, then stop emitting entirely. Prevents
+    /// O(N) per-tick DB scans for idle NPCs with no threat history.
+    threat_has_db_rows: HashSet<EntityId>,
+    /// Last emitted (NpcAiState, target) per NPC. `collect_npc_state_updates`
+    /// only emits when the current value differs, eliminating redundant upserts
+    /// for idle NPCs whose state never changes.
+    npc_state_prev: HashMap<EntityId, (game_schema::NpcAiState, Option<EntityId>)>,
 }
 
 impl TickPipeline {
@@ -263,6 +279,7 @@ impl TickPipeline {
         // 4) Remove any pending impulses and follow-up windows for this entity.
         self.pending_impulses.retain(|&(eid, _)| eid != id);
         self.state.combat.active_windows.retain(|&(eid, _), _| eid != id);
+        self.state.combat.charging.remove(&id);
 
         // 4b) Scrub this entity from all NPC threat tables so they acquire new targets.
         // Leaving a removed entity in threat tables can cause NPCs to lock onto a
@@ -286,8 +303,11 @@ impl TickPipeline {
             self.state.combat.executions.remove(exec_id);
         }
 
-        // 6) Drop region tracking for this entity.
+        // 6) Drop region tracking and dirty-tracking for this entity.
         self.entity_regions.remove(&id);
+        self.threat_has_db_rows.remove(&id);
+        self.npc_state_prev.remove(&id);
+        self.equipment_modifiers.remove(&id);
 
         // 7) Finally, remove entity from SimState and physics world
         let removed = self.state.remove_entity(id);
@@ -300,6 +320,7 @@ impl TickPipeline {
         physics: Box<dyn PhysicsBackend>,
         dt: f32,
         abilities: AbilityRegistry,
+        buff_registry: game_core::combat::status::BuffRegistry,
     ) -> Self {
         Self {
             current_tick: start_tick,
@@ -309,6 +330,7 @@ impl TickPipeline {
             dt,
             scheduled_actions: Vec::new(),
             abilities,
+            buff_registry,
             state: SimState::new(),
             cooldowns: HashMap::new(),
             next_scheduled_id: 0,
@@ -317,8 +339,10 @@ impl TickPipeline {
             entity_regions: HashMap::new(),
             transform_history: TransformHistory::new(),
             director: DirectorState::new(),
-            next_director_entity_id: 1_000_000_000,
             stats_dirty: HashSet::new(),
+            equipment_modifiers: HashMap::new(),
+            threat_has_db_rows: HashSet::new(),
+            npc_state_prev: HashMap::new(),
 }
     }
 
@@ -398,6 +422,9 @@ impl TickPipeline {
         for (eid, entity_buffs) in buffs {
             if let Some(idx) = self.state.entities.lookup(*eid) {
                 self.state.status.replace_buffs(idx, entity_buffs.clone());
+                // Ensure stats are recalculated on the first tick so restored
+                // buff modifiers take effect immediately.
+                self.stats_dirty.insert(*eid);
             }
         }
         for (eid, entries) in threats {
@@ -411,8 +438,6 @@ impl TickPipeline {
                 if let Some(ai) = self.state.ai.npc_ai.get_mut(idx) {
                     *ai = *ai_state;
                 }
-                // target_entity is re-derived each tick from the threat table in the
-                // AI decisions phase — no need to persist it in NpcAiState.
             }
         }
     }
@@ -474,6 +499,8 @@ impl TickPipeline {
     /// `rewind_ticks` controls lag compensation depth: `0` for NPCs (no client lag),
     /// or computed from `client_observed_tick` for player intents.
     ///
+    /// `charge_level` is the resolved charge tier (0 for instant-cast or tier 0).
+    ///
     /// Returns `true` if the ability was successfully cast, `false` if rejected
     /// (on cooldown, unknown ability, entity has no physics body).
     pub(crate) fn cast_ability(
@@ -482,11 +509,28 @@ impl TickPipeline {
         ability_id: u32,
         targeting: ResolvedTargeting,
         rewind_ticks: u32,
+        charge_level: u8,
     ) -> bool {
-        if self.is_on_cooldown(caster, ability_id) {
+        // Combo redirect: if a follow-up window is open for (caster, ability_id),
+        // redirect the cast to the replacement ability.  Each combo step is a
+        // first-class ability with its own timeline, damage, and cooldown.
+        let resolved_id = if let Some(&(next_id, exp)) = self.state.combat.active_windows
+            .get(&(caster, ability_id))
+        {
+            if self.current_tick <= exp {
+                self.state.combat.active_windows.remove(&(caster, ability_id));
+                next_id
+            } else {
+                ability_id
+            }
+        } else {
+            ability_id
+        };
+
+        if self.is_on_cooldown(caster, resolved_id) {
             return false;
         }
-        let timeline = match self.abilities.get_timeline(ability_id).cloned() {
+        let timeline = match self.abilities.get_timeline(resolved_id).cloned() {
             Some(t) => t,
             None => return false,
         };
@@ -502,24 +546,11 @@ impl TickPipeline {
             (Vec3f::ZERO, Vec3f { x: 0.0, y: 0.0, z: 1.0 })
         };
 
-        // Resolve follow-up variant: if an active window exists for this
-        // (entity, ability) pair and has not expired, set variant = 1 so
-        // the timeline can branch to a combo/follow-up execution path.
-        let variant = if self.state.combat.active_windows
-            .get(&(caster, ability_id))
-            .is_some_and(|&exp| self.current_tick <= exp)
-        {
-            self.state.combat.active_windows.remove(&(caster, ability_id));
-            1
-        } else {
-            0
-        };
-
-        let params = AbilityParams { charge_level: 0, variant };
+        let params = AbilityParams { charge_level, variant: 0 };
         let execution_id = self.state.combat.executions.next_id();
         self.state.combat.executions.insert(AbilityExecutionContext {
             execution_id,
-            ability_id,
+            ability_id: resolved_id,
             caster,
             started_at: self.current_tick,
             targeting,
@@ -527,6 +558,14 @@ impl TickPipeline {
             facing,
             params,
             rewind_ticks,
+        });
+        let cast_duration_ticks = timeline.actions.iter()
+            .map(|a| a.tick_offset)
+            .max()
+            .unwrap_or(0) + 1;
+        self.emit_event(caster, EventPayload::CastStart {
+            ability_id: resolved_id,
+            cast_duration_ticks,
         });
         self.schedule_ability(caster, &timeline, self.current_tick, execution_id);
         true
@@ -551,6 +590,20 @@ impl TickPipeline {
         self.is_on_cooldown(entity, ability_id)
     }
 
+    /// Returns true if the entity cannot move this tick.
+    ///
+    /// Checks two sources:
+    /// - `TacticalState.rooted` (set by Block intent or StanceBegin)
+    /// - Any active buff with `root: Some(true)`
+    fn is_rooted(&self, idx: game_core::entity::entity_index::EntityIndex) -> bool {
+        if self.state.combat.tactical[idx.as_usize()].rooted {
+            return true;
+        }
+        self.state.status.get_buffs(idx)
+            .iter()
+            .any(|b| b.modifiers.root == Some(true))
+    }
+
     /// Returns true if this execution still owns any **runtime effect** that must be
     /// resolved before the context can be freed.
     ///
@@ -565,9 +618,9 @@ impl TickPipeline {
     ///   || self.state.combat.projectiles.contains(exec_id)
     ///   || self.state.combat.buffs.contains(exec_id)
     /// ```
-    fn execution_is_alive(&self, exec_id: AbilityExecutionId) -> bool {
-        self.scheduled_actions.iter().any(|a| a.source == Some(exec_id))
-            || self.state.combat.hitboxes.get(exec_id).is_some()
+    fn execution_is_alive(exec_id: AbilityExecutionId, scheduled_sources: &HashSet<AbilityExecutionId>, hitboxes: &game_core::combat::hitbox::HitboxStore) -> bool {
+        scheduled_sources.contains(&exec_id)
+            || hitboxes.get(exec_id).is_some()
     }
 
     /// Execute one full simulation tick, returning results for commit.
@@ -594,6 +647,9 @@ impl TickPipeline {
 
         // Phase 3: Skill scheduling
         self.phase_skill_scheduling();
+
+        // Phase 3.5: Projectile movement — advance world-space hitbox sensors
+        self.phase_projectile_movement();
 
         // Phase 4: Physics integration
         self.phase_physics_step();
@@ -640,6 +696,7 @@ impl TickPipeline {
             ))
             .count();
         self.summary.active_hitboxes = self.state.combat.hitboxes.len();
+        self.summary.scheduled_actions_len = self.scheduled_actions.len();
         // Collect runtime domain snapshots for persistence.
         let buff_updates = self.collect_buff_updates();
         let threat_updates = self.collect_threat_updates();
@@ -713,6 +770,15 @@ impl TickPipeline {
     // ── Phase 2: Controller update ──────────────────────────────
 
     fn phase_controller_update(&mut self, intents: &[&PlayerIntent]) {
+        // Sub-step: drive arc movement for entities mid-vault/leap.
+        // Runs before intent processing so arcs take priority over player input
+        // (the entity is also rooted, so apply_movement would early-exit anyway).
+        self.drive_arc_movement();
+
+        // Sub-step: advance charge timers, detect tier crossings, auto-release.
+        // Runs before intent processing so auto-releases fire before new intents.
+        self.drive_charging();
+
         // Track which (entity, ability) pairs have been cast in this Phase 2 pass.
         // Without this, two UseAbility intents for the same ability targeting the same
         // tick both pass is_on_cooldown() — the cooldown map isn’t updated until Phase 3.
@@ -762,6 +828,10 @@ impl TickPipeline {
                     if cast_this_tick.contains(&cast_key) {
                         continue;
                     }
+                    // Reject if already charging (prevent double-charge).
+                    if self.state.combat.charging.contains_key(&entity_id) {
+                        continue;
+                    }
                     // Resolve wire-format targeting to the runtime variant.
                     let targeting = match &data.target {
                         game_schema::AbilityTarget::None => ResolvedTargeting::SelfCast,
@@ -779,9 +849,84 @@ impl TickPipeline {
                         self.current_tick,
                         intent.client_observed_tick,
                     );
-                    if self.cast_ability(entity_id, ability_id, targeting, rewind_ticks) {
-                        audit!(self.state, Execution, Controller, 2, Some(entity_id), "cast");
-                        cast_this_tick.insert(cast_key);
+
+                    // Check if this ability is chargeable (needs ≥2 tiers).
+                    let is_chargeable = self.abilities.get(ability_id)
+                        .and_then(|ad| ad.charge_tiers.as_ref())
+                        .is_some_and(|tiers| tiers.len() >= 2);
+
+                    if is_chargeable {
+                        // Don't fire yet — start charging. Ability fires on
+                        // ReleaseAbility or auto-release at max tier.
+                        if self.is_on_cooldown(entity_id, ability_id) {
+                            continue;
+                        }
+                        let max_ticks = self.abilities.get(ability_id)
+                            .and_then(|ad| ad.charge_tiers.as_ref())
+                            .and_then(|tiers| tiers.last())
+                            .map(|t| t.min_ticks)
+                            .unwrap_or(1);
+                        self.state.combat.charging.insert(entity_id, ChargingState {
+                            ability_id,
+                            started_at: self.current_tick,
+                            targeting,
+                            rewind_ticks,
+                            notified_tier: 0,
+                        });
+                        // Root the entity while charging.
+                        if let Some(idx) = self.state.entities.lookup(entity_id) {
+                            self.state.combat.tactical[idx.as_usize()].rooted = true;
+                        }
+                        self.emit_event(entity_id, EventPayload::ChargeStart {
+                            ability_id,
+                            max_ticks,
+                        });
+                        audit!(self.state, Execution, Controller, 2, Some(entity_id), "charge_start");
+                    } else {
+                        if self.cast_ability(entity_id, ability_id, targeting, rewind_ticks, 0) {
+                            audit!(self.state, Execution, Controller, 2, Some(entity_id), "cast");
+                            cast_this_tick.insert(cast_key);
+                        }
+                    }
+                }
+                IntentAction::ReleaseAbility(ability_id) => {
+                    let ability_id = *ability_id;
+                    // Release a charging ability: resolve tier from elapsed ticks and fire.
+                    if let Some(charging) = self.state.combat.charging.remove(&entity_id) {
+                        if charging.ability_id == ability_id {
+                            let elapsed = self.current_tick.0.saturating_sub(charging.started_at.0) as u32;
+                            let tier = self.resolve_charge_tier(ability_id, elapsed);
+                            // Unroot the entity.
+                            if let Some(idx) = self.state.entities.lookup(entity_id) {
+                                self.state.combat.tactical[idx.as_usize()].rooted = false;
+                            }
+                            if self.cast_ability(entity_id, ability_id, charging.targeting, charging.rewind_ticks, tier) {
+                                audit!(self.state, Execution, Controller, 2, Some(entity_id), "charge_release");
+                                cast_this_tick.insert((entity_id, ability_id));
+                            }
+                        } else {
+                            // Wrong ability — re-insert the charge state.
+                            self.state.combat.charging.insert(entity_id, charging);
+                        }
+                    }
+                }
+                IntentAction::Block => {
+                    // Hold-to-block: set blocking flag each tick the button is held.
+                    // Phase 8 clears `blocking` every tick, so the intent must re-assert it.
+                    // `block_start_tick` is set on the first tick of a new block and preserved
+                    // across consecutive Block intents for perfect-block window calculation.
+                    // Blocking also roots the player (cannot move while holding block).
+                    if let Some(idx) = self.state.entities.lookup(entity_id) {
+                        let is_new_block = self.state.combat.tactical[idx.as_usize()].block_start_tick.is_none();
+                        let t = &mut self.state.combat.tactical[idx.as_usize()];
+                        t.blocking = true;
+                        t.rooted = true;
+                        t.block_grace = false;
+                        if is_new_block {
+                            t.block_start_tick = Some(self.current_tick);
+                            self.emit_event(entity_id, EventPayload::BlockStart);
+                        }
+                        audit!(self.state, Tactical, Controller, 2, Some(entity_id), "block");
                     }
                 }
                 IntentAction::Interact(target_id_raw) => {
@@ -807,6 +952,12 @@ impl TickPipeline {
     }
 
     fn apply_movement(&mut self, entity_id: EntityId, dir: &MoveDir) {
+        // Rooted entities cannot move — block stance, CC, or channeled skill.
+        if let Some(idx) = self.state.entities.lookup(entity_id) {
+            if self.is_rooted(idx) {
+                return;
+            }
+        }
         // Normalise direction and scale by the cached movement speed from StatBlock.
         // Grounded movement: ignore vertical component to prevent client "flight".
         let x = dir.dir_x;
@@ -828,14 +979,14 @@ impl TickPipeline {
         let vy = 0.0;
         let vz = z * inv_len * speed;
 
-        // Character bodies are kinematic_position_based — velocity calls have no effect.
-        // Integrate one timestep of desired velocity and set the explicit next position.
-        if let Some(t) = self.physics.get_transform(entity_id) {
-            self.physics.set_kinematic_position(entity_id, Vec3f {
-                x: t.position.x + vx * self.dt,
-                y: t.position.y + vy * self.dt,
-                z: t.position.z + vz * self.dt,
-            });
+        // Move via character controller — resolves contacts against static
+        // geometry (walls, obstacles) and slides along surfaces.
+        let desired = Vec3f {
+            x: vx * self.dt,
+            y: vy * self.dt,
+            z: vz * self.dt,
+        };
+        if self.physics.move_character(entity_id, desired).is_some() {
             audit!(self.state, Transform, Controller, 2, Some(entity_id), "move");
         }
     }
@@ -843,6 +994,135 @@ impl TickPipeline {
     fn apply_stop(&mut self, _entity_id: EntityId) {
         // For kinematic_position_based bodies, not issuing a set_kinematic_position
         // this tick is sufficient — the body remains at its current position.
+    }
+
+    /// Advance all entities currently in a kinematic arc (vault / leap).
+    ///
+    /// For each entity with `TacticalState::arc_state`:
+    /// 1. Apply gravity to the velocity's Y component.
+    /// 2. Feed `velocity * dt` into `move_character`.
+    /// 3. If `MoveResult::grounded` (and Y velocity is non-positive, so we're
+    ///    past the launch apex), end the arc and unroot the entity.
+    fn drive_arc_movement(&mut self) {
+        let dt = self.dt;
+
+        // Collect (entity_id, slot_index) for entities with active arcs.
+        // Two-pass avoids borrowing `self` mutably while iterating tactical.
+        let arc_entities: Vec<(EntityId, usize)> = self.state.combat.tactical.iter()
+            .enumerate()
+            .filter(|(_, t)| t.arc_state.is_some())
+            .filter_map(|(i, _)| {
+                let id = self.state.entities.lookup_by_slot(i)?;
+                Some((id, i))
+            })
+            .collect();
+
+        for (entity_id, slot) in arc_entities {
+            let arc = match &mut self.state.combat.tactical[slot].arc_state {
+                Some(a) => a,
+                None => continue,
+            };
+            // Integrate gravity (downward pull).
+            arc.velocity.y -= arc.gravity * dt;
+
+            let desired = Vec3f {
+                x: arc.velocity.x * dt,
+                y: arc.velocity.y * dt,
+                z: arc.velocity.z * dt,
+            };
+
+            if let Some(result) = self.physics.move_character(entity_id, desired) {
+                // End the arc when the character touches ground and is falling.
+                if result.grounded && arc.velocity.y <= 0.0 {
+                    let t = &mut self.state.combat.tactical[slot];
+                    t.arc_state = None;
+                    t.rooted = false;
+                    audit!(self.state, Tactical, Controller, 2, Some(entity_id), "arc_landed");
+                }
+                audit!(self.state, Transform, Controller, 2, Some(entity_id), "arc_move");
+            }
+        }
+    }
+
+    /// Advance charge timers for all entities currently charging a hold-release ability.
+    ///
+    /// For each charging entity:
+    /// 1. Compute elapsed ticks since `started_at`.
+    /// 2. If a new tier threshold was crossed, emit `ChargeTierReached`.
+    /// 3. If elapsed >= last tier's `min_ticks`, auto-release the ability at max tier.
+    /// 4. Re-assert `rooted` so movement stays blocked while charging.
+    fn drive_charging(&mut self) {
+        // Collect auto-releases to process after iteration (avoids borrow issues).
+        let mut auto_releases: Vec<(EntityId, ChargingState, u8)> = Vec::new();
+        // Collect tier-up events to emit.
+        let mut tier_events: Vec<(EntityId, u32, u8)> = Vec::new();
+
+        for (&entity_id, charging) in self.state.combat.charging.iter_mut() {
+            let elapsed = self.current_tick.0.saturating_sub(charging.started_at.0) as u32;
+            let tiers = match self.abilities.get(charging.ability_id)
+                .and_then(|ad| ad.charge_tiers.as_ref())
+            {
+                Some(t) => t,
+                None => continue,
+            };
+
+            // Determine current tier from elapsed ticks.
+            let current_tier = tiers.iter()
+                .rposition(|t| elapsed >= t.min_ticks)
+                .unwrap_or(0) as u8;
+
+            // Emit tier-up events for newly crossed thresholds.
+            if current_tier > charging.notified_tier {
+                for t in (charging.notified_tier + 1)..=current_tier {
+                    tier_events.push((entity_id, charging.ability_id, t));
+                }
+                charging.notified_tier = current_tier;
+            }
+
+            // Check auto-release: last tier reached.
+            let max_tier = (tiers.len() - 1) as u8;
+            if current_tier >= max_tier && elapsed >= tiers.last().unwrap().min_ticks {
+                auto_releases.push((entity_id, charging.clone(), max_tier));
+            }
+
+            // Re-assert rooted (in case something else cleared it).
+            if let Some(idx) = self.state.entities.lookup(entity_id) {
+                self.state.combat.tactical[idx.as_usize()].rooted = true;
+            }
+        }
+
+        // Emit tier events.
+        for (entity_id, ability_id, tier) in tier_events {
+            self.emit_event(entity_id, EventPayload::ChargeTierReached {
+                ability_id,
+                tier,
+            });
+        }
+
+        // Process auto-releases.
+        for (entity_id, charging, tier) in auto_releases {
+            self.state.combat.charging.remove(&entity_id);
+            // Unroot the entity.
+            if let Some(idx) = self.state.entities.lookup(entity_id) {
+                self.state.combat.tactical[idx.as_usize()].rooted = false;
+            }
+            if self.cast_ability(entity_id, charging.ability_id, charging.targeting, charging.rewind_ticks, tier) {
+                audit!(self.state, Execution, Controller, 2, Some(entity_id), "charge_auto_release");
+            }
+        }
+    }
+
+    /// Resolve the highest charge tier achieved for a given elapsed tick count.
+    /// Returns the tier index (0-based). If no tiers are defined, returns 0.
+    fn resolve_charge_tier(&self, ability_id: u32, elapsed_ticks: u32) -> u8 {
+        self.abilities.get(ability_id)
+            .and_then(|ad| ad.charge_tiers.as_ref())
+            .map(|tiers| {
+                tiers.iter()
+                    .rposition(|t| elapsed_ticks >= t.min_ticks)
+                    .unwrap_or(0) as u8
+            })
+            .unwrap_or(0)
     }
 
     // ── Phase 3: Skill scheduling ───────────────────────────────
@@ -869,7 +1149,11 @@ impl TickPipeline {
                         AbilityAction::RemoveHitbox => "RemoveHitbox",
                         AbilityAction::CooldownStart { .. } => "CooldownStart",
                         AbilityAction::OpenFollowUpWindow { .. } => "OpenFollowUpWindow",
+                        AbilityAction::ApplyBuff { .. } => "ApplyBuff",
                         AbilityAction::StanceBegin { .. } => "StanceBegin",
+                        AbilityAction::StanceEnd => "StanceEnd",
+                        AbilityAction::Telegraph { .. } => "Telegraph",
+                        AbilityAction::ArcMovement { .. } => "ArcMovement",
                     },
                     ScheduledActionType::BuffExpire { .. } => "BuffExpire",
                 },
@@ -896,13 +1180,18 @@ impl TickPipeline {
         // The `execution_is_alive` predicate defines what "still owning an effect"
         // means.  Extend that method when new effect types (projectiles, buffs) are
         // introduced — no changes here are needed.
+        let scheduled_sources: HashSet<AbilityExecutionId> = self
+            .scheduled_actions
+            .iter()
+            .filter_map(|a| a.source)
+            .collect();
         let dead: Vec<AbilityExecutionId> = self
             .state
             .combat
             .executions
             .active_ids()
             .into_iter()
-            .filter(|&id| !self.execution_is_alive(id))
+            .filter(|&id| !Self::execution_is_alive(id, &scheduled_sources, &self.state.combat.hitboxes))
             .collect();
         for id in dead {
             if let Some(ctx) = self.state.combat.executions.get(id) {
@@ -926,6 +1215,14 @@ impl TickPipeline {
                     .get(execution_id)
                     .map(|ctx| ctx.rewind_ticks)
                     .unwrap_or(0);
+                let allow_reentry = self.abilities
+                    .get(ability_id)
+                    .map(|ad| ad.allow_reentry)
+                    .unwrap_or(false);
+                let damage_interval_ticks = self.abilities
+                    .get(ability_id)
+                    .map(|ad| ad.damage_interval_ticks)
+                    .unwrap_or(0);
                 // Declare the hitbox logically — no Rapier sensor yet.
                 //
                 // The sensor is deferred to `ApplyDamageFrame` so that the Rapier
@@ -934,7 +1231,7 @@ impl TickPipeline {
                 // Before this fix, SpawnHitbox spawned the sensor immediately, so
                 // Rapier fired contacts one tick early and damage landed on the spawn
                 // tick rather than the intended damage-frame tick.
-                self.state.combat.hitboxes.spawn(execution_id, entity, ability_id, self.current_tick, *shape, *offset, rewind_ticks);
+                self.state.combat.hitboxes.spawn(execution_id, entity, ability_id, self.current_tick, *shape, *offset, rewind_ticks, allow_reentry, damage_interval_ticks);
                 audit!(self.state, Hitbox, AbilityTimeline, 3, Some(entity), "spawn");
                 self.emit_event(entity, EventPayload::HitboxSpawned { ability_id });
             }
@@ -945,23 +1242,119 @@ impl TickPipeline {
                 // here means Rapier generates CollisionEvent::started on this same tick.
                 // Phase 6 then resolves the contacts — damage fires exactly when the
                 // timeline says the damage frame is open.
+                //
+                // For projectile shapes, spawn a world-space sensor at the caster's
+                // origin and set up projectile travel state. Direction is resolved
+                // from the targeting intent: Direction/SelfCast use caster facing,
+                // Entity/LockOn aim toward the target, Position aims toward a world
+                // point (range-capped).
                 let stored = self.state.combat.hitboxes
                     .get(execution_id)
                     .map(|hb| (hb.shape, hb.offset));
+                let ctx_data = self.state.combat.executions.get(execution_id)
+                    .map(|ctx| (ctx.targeting.clone(), ctx.origin, ctx.facing));
                 if let Some((shape, offset)) = stored {
                     let sensor_shape = skill_shape_to_sensor(shape);
-                    if let Some(handle) = self.physics.spawn_sensor(
-                        entity,
-                        sensor_shape,
-                        offset,
-                        ColliderKind::Hitbox(execution_id.0),
-                    ) {
-                        // Only mark armed if the hitbox state transitions successfully.
+                    let is_projectile = shape == SkillShape::Projectile;
+                    let use_world_sensor = is_projectile;
+
+                    if use_world_sensor {
+                        let (targeting, origin, default_facing) = ctx_data.unwrap();
+                        // Resolve travel direction from targeting intent.
+                        let facing = match &targeting {
+                            game_core::combat::skill::ResolvedTargeting::Entity { target }
+                            | game_core::combat::skill::ResolvedTargeting::LockOn { target } => {
+                                // Aim toward the target entity's current position.
+                                self.physics.get_transform(*target)
+                                    .and_then(|t| {
+                                        let dx = t.position.x - origin.x;
+                                        let dz = t.position.z - origin.z;
+                                        let len_sq = dx * dx + dz * dz;
+                                        if len_sq > 1e-6 {
+                                            let inv = 1.0 / len_sq.sqrt();
+                                            Some(game_protocol::types::Vec3f::new(dx * inv, 0.0, dz * inv))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .unwrap_or(default_facing)
+                            }
+                            game_core::combat::skill::ResolvedTargeting::Position { point } => {
+                                // Aim toward the targeted world position.
+                                let dx = point.x - origin.x;
+                                let dz = point.z - origin.z;
+                                let len_sq = dx * dx + dz * dz;
+                                if len_sq > 1e-6 {
+                                    let inv = 1.0 / len_sq.sqrt();
+                                    game_protocol::types::Vec3f::new(dx * inv, 0.0, dz * inv)
+                                } else {
+                                    default_facing
+                                }
+                            }
+                            _ => default_facing,
+                        };
+                        // Spawn position: origin + offset (offset.z along facing direction)
+                        let spawn_pos = game_protocol::types::Vec3f {
+                            x: origin.x + facing.x * offset.z + offset.x,
+                            y: origin.y + offset.y,
+                            z: origin.z + facing.z * offset.z,
+                        };
+                        // For Position targeting, cap the projectile range to the
+                        // distance to the target point so it doesn't overshoot.
+                        const PROJECTILE_SPEED: f32 = 1.0; // units per tick (20 units/sec at 20Hz)
+                        const PROJECTILE_MAX_RANGE: f32 = 30.0;
+                        let max_range = match &targeting {
+                            game_core::combat::skill::ResolvedTargeting::Position { point } => {
+                                let dx = point.x - spawn_pos.x;
+                                let dz = point.z - spawn_pos.z;
+                                (dx * dx + dz * dz).sqrt().min(PROJECTILE_MAX_RANGE)
+                            }
+                            _ => PROJECTILE_MAX_RANGE,
+                        };
+                        let handle = self.physics.spawn_world_sensor(
+                            spawn_pos,
+                            sensor_shape,
+                            ColliderKind::Hitbox(execution_id.0),
+                            entity,
+                        );
                         if self.state.combat.hitboxes.arm(execution_id, handle) {
-                            audit!(self.state, Hitbox, AbilityTimeline, 3, Some(entity), "arm");
+                            // Set up projectile travel state.
+                            if let Some(hb) = self.state.combat.hitboxes.get_mut(execution_id) {
+                                hb.projectile = Some(game_core::combat::hitbox::ProjectileState {
+                                    position: spawn_pos,
+                                    prev_position: spawn_pos,
+                                    direction: facing,
+                                    speed: PROJECTILE_SPEED,
+                                    max_range_sq: max_range * max_range,
+                                    origin: spawn_pos,
+                                });
+                            }
+                            // Notify clients so they can spawn a predicted visual.
+                            self.emit_event(entity, EventPayload::ProjectileLaunched {
+                                execution_id: execution_id.0,
+                                ability_id,
+                                origin: spawn_pos,
+                                direction: facing,
+                                speed: PROJECTILE_SPEED,
+                                max_range,
+                            });
+                            audit!(self.state, Hitbox, AbilityTimeline, 3, Some(entity), "arm_world");
                         } else {
-                            // If arm failed, remove the sensor we just created to avoid leaks.
                             self.physics.remove_sensor(handle);
+                        }
+                    } else {
+                        // Entity-parented sensor (melee, PBAoE, etc.)
+                        if let Some(handle) = self.physics.spawn_sensor(
+                            entity,
+                            sensor_shape,
+                            offset,
+                            ColliderKind::Hitbox(execution_id.0),
+                        ) {
+                            if self.state.combat.hitboxes.arm(execution_id, handle) {
+                                audit!(self.state, Hitbox, AbilityTimeline, 3, Some(entity), "arm");
+                            } else {
+                                self.physics.remove_sensor(handle);
+                            }
                         }
                     }
                 }
@@ -972,6 +1365,12 @@ impl TickPipeline {
                     audit!(self.state, Hitbox, AbilityTimeline, 3, Some(entity), "remove");
                     if let Some(handle) = removed.sensor_handle {
                         self.physics.remove_sensor(handle);
+                    }
+                    // If this was a projectile, notify clients to kill the predicted visual.
+                    if removed.projectile.is_some() {
+                        self.emit_event(entity, EventPayload::ProjectileRemoved {
+                            execution_id: execution_id.0,
+                        });
                     }
                 }
                 // Execution context cleanup is deferred to the uniform culling pass
@@ -1005,25 +1404,150 @@ impl TickPipeline {
                 self.cooldowns.insert((entity, ability_id), ready_at);
                 audit!(self.state, Cooldown, AbilityTimeline, 3, Some(entity), "start");
             }
-            AbilityAction::OpenFollowUpWindow { duration_ticks } => {
-                // Write a follow-up eligibility window for (entity, ability).
-                // Phase 2 of subsequent ticks checks this to route a second UseAbility
-                // intent for the same ability_id as a combo/follow-up press (variant = 1).
+            AbilityAction::OpenFollowUpWindow { duration_ticks, next_ability_id } => {
+                // Write a combo / follow-up window for (entity, ability).
+                // Phase 2 of subsequent ticks checks this: if the player presses
+                // the same ability_id again within the window, the cast is
+                // redirected to next_ability_id.
                 let expiry = TickId(self.current_tick.0 + *duration_ticks as u64);
-                self.state.combat.active_windows.insert((entity, ability_id), expiry);
+                self.state.combat.active_windows.insert((entity, ability_id), (*next_ability_id, expiry));
                 audit!(self.state, Window, AbilityTimeline, 3, Some(entity), "open_window");
             }
-            AbilityAction::StanceBegin { blocking, dodge_active } => {
-                // Set tactical flags on the caster for this tick.
-                // Phase 6 reads these to route hit interactions through block/dodge paths.
-                // Phase 8 clears all flags so this action must fire again each tick the
-                // stance is active (typically by scheduling it on consecutive ticks).
+            AbilityAction::StanceBegin { dodge_active, rooted } => {
+                // Set iframe/root flags on the caster (timeline-driven).
+                // Persists until a corresponding StanceEnd action fires.
                 if let Some(idx) = self.state.entities.lookup(entity) {
                     let t = &mut self.state.combat.tactical[idx.as_usize()];
-                    t.blocking = *blocking;
-                    t.dodge_active = *dodge_active;
+                    if *dodge_active {
+                        t.dodge_stacks = t.dodge_stacks.saturating_add(1);
+                    }
+                    if *rooted {
+                        t.rooted = true;
+                    }
                     audit!(self.state, Tactical, AbilityTimeline, 3, Some(entity), "stance_begin");
                 }
+            }
+            AbilityAction::StanceEnd => {
+                // Clear iframe/root flags on the caster (timeline-driven).
+                if let Some(idx) = self.state.entities.lookup(entity) {
+                    let t = &mut self.state.combat.tactical[idx.as_usize()];
+                    t.dodge_stacks = t.dodge_stacks.saturating_sub(1);
+                    t.rooted = false;
+                    t.arc_state = None;
+                    audit!(self.state, Tactical, AbilityTimeline, 3, Some(entity), "stance_end");
+                }
+            }
+            AbilityAction::ArcMovement { speed, lift, gravity } => {
+                // Launch the caster in a kinematic arc.
+                // Initial velocity = facing * speed + up * lift.
+                // Phase 2 will integrate gravity each tick and feed into move_character.
+                if let Some(idx) = self.state.entities.lookup(entity) {
+                    let facing = self.state.combat.executions.get(execution_id)
+                        .map(|ctx| ctx.facing)
+                        .unwrap_or(Vec3f { x: 0.0, y: 0.0, z: 1.0 });
+                    let t = &mut self.state.combat.tactical[idx.as_usize()];
+                    t.arc_state = Some(game_core::combat::tactical::ArcState {
+                        velocity: Vec3f {
+                            x: facing.x * speed,
+                            y: *lift,
+                            z: facing.z * speed,
+                        },
+                        gravity: *gravity,
+                    });
+                    t.rooted = true;
+                    audit!(self.state, Tactical, AbilityTimeline, 3, Some(entity), "arc_begin");
+                }
+            }
+            AbilityAction::ApplyBuff { buff_id } => {
+                // Apply a buff to the caster (self-buff) with stacking.
+                if let Some(template) = self.buff_registry.get(*buff_id) {
+                    if let Some(idx) = self.state.entities.lookup(entity) {
+                        let active = game_core::combat::status::ActiveBuff::from_template(
+                            template, entity, entity, self.current_tick,
+                        );
+                        self.state.status.apply_or_stack_buff(idx, active);
+                        self.stats_dirty.insert(entity);
+                        audit!(self.state, Buff, AbilityTimeline, 3, Some(entity), "apply_buff");
+                        let duration = template.duration_ticks.unwrap_or(0);
+                        self.emit_event(entity, EventPayload::BuffApplied {
+                            buff_id: *buff_id,
+                            source: entity,
+                            duration_ticks: duration,
+                        });
+                    }
+                } else {
+                    warn!("ApplyBuff: buff_id {} not found in registry", buff_id);
+                }
+            }
+            AbilityAction::Telegraph { impact_delay } => {
+                // Emit a LockOnWarning to the resolved target so they can react.
+                if let Some(ctx) = self.state.combat.executions.get(execution_id) {
+                    let target = match &ctx.targeting {
+                        game_core::combat::skill::ResolvedTargeting::Entity { target } => Some(*target),
+                        game_core::combat::skill::ResolvedTargeting::LockOn { target } => Some(*target),
+                        _ => None,
+                    };
+                    if let Some(target) = target {
+                        let impact_tick = self.current_tick.0 + *impact_delay as u64;
+                        self.emit_event(target, EventPayload::LockOnWarning {
+                            source: entity,
+                            target,
+                            impact_tick,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Phase 3.5: Projectile movement ──────────────────────────
+
+    fn phase_projectile_movement(&mut self) {
+        let ids = self.state.combat.hitboxes.armed_projectile_ids();
+        let mut expired = Vec::new();
+        for exec_id in ids {
+            let hb = match self.state.combat.hitboxes.get_mut(exec_id) {
+                Some(hb) => hb,
+                None => continue,
+            };
+            let proj = match hb.projectile.as_mut() {
+                Some(p) => p,
+                None => continue,
+            };
+            // Snapshot current position for swept collision detection.
+            proj.prev_position = proj.position;
+            // Advance position along travel direction.
+            proj.position.x += proj.direction.x * proj.speed;
+            proj.position.y += proj.direction.y * proj.speed;
+            proj.position.z += proj.direction.z * proj.speed;
+
+            // Check range limit.
+            let dx = proj.position.x - proj.origin.x;
+            let dy = proj.position.y - proj.origin.y;
+            let dz = proj.position.z - proj.origin.z;
+            let dist_sq = dx * dx + dy * dy + dz * dz;
+            if dist_sq > proj.max_range_sq {
+                expired.push(exec_id);
+                continue;
+            }
+
+            // Move the world-space sensor.
+            if let Some(handle) = hb.sensor_handle {
+                self.physics.set_sensor_position(handle, proj.position);
+            }
+        }
+        // Remove projectiles that exceeded max range.
+        for exec_id in expired {
+            if let Some(removed) = self.state.combat.hitboxes.remove(exec_id) {
+                if let Some(handle) = removed.sensor_handle {
+                    self.physics.remove_sensor(handle);
+                }
+                self.emit_event(removed.owner, EventPayload::ProjectileRemoved {
+                    execution_id: exec_id.0,
+                });
+                self.emit_event(removed.owner, EventPayload::HitboxRemoved {
+                    ability_id: removed.ability_id,
+                });
             }
         }
     }
@@ -1053,11 +1577,13 @@ impl TickPipeline {
 
     fn phase_combat_resolution(&mut self) {
         self.resolve_hits();
+        self.resolve_projectile_hits();
         self.resolve_compensated_hits();
+        self.resolve_periodic_damage();
     }
 
     /// Shared damage pipeline: ability lookup → tactical routing → buff multipliers
-    /// → damage application → threat → events.
+    /// → charge tier multiplier → damage application → threat → events.
     fn apply_hit_damage(
         &mut self,
         attacker: EntityId,
@@ -1065,32 +1591,166 @@ impl TickPipeline {
         target_idx: EntityIndex,
         ability_id: u32,
         compensated: bool,
+        exec_id: Option<AbilityExecutionId>,
     ) {
         let ability = match self.abilities.get(ability_id) {
             Some(a) => a,
             None => return,
         };
 
-        let base_damage = ability.base_damage;
+        // Resolve charge-tier damage multiplier from execution context.
+        let charge_mult: f32 = exec_id
+            .and_then(|eid| self.state.combat.executions.get(eid))
+            .map(|ctx| {
+                let tier = ctx.params.charge_level as usize;
+                ability.charge_tiers.as_ref()
+                    .and_then(|tiers| tiers.get(tier))
+                    .map(|t| t.damage_mult)
+                    .unwrap_or(1.0)
+            })
+            .unwrap_or(1.0);
+
+        let base_damage = ability.base_damage * charge_mult;
         let damage_type = ability.damage_type;
         let threat_mult = ability.threat_multiplier;
+        let on_hit_buffs = ability.on_hit_buffs.clone();
+        let knockback_force = ability.knockback_force;
 
         let attacker_idx = self.state.entities.lookup(attacker);
 
-        // Tactical routing: dodge evades entirely, block halves damage.
+        // Tactical routing: dodge evades entirely, block reduces damage.
         let tactical = self.state.combat.tactical[target_idx.as_usize()];
-        if tactical.dodge_active {
+        if tactical.is_dodging() {
+            self.pending_events.push(SimEvent {
+                tick_id: self.current_tick,
+                event_sequence: self.event_sequence,
+                entity_id: target,
+                payload: EventPayload::Dodged {
+                    source: attacker,
+                    ability_id,
+                },
+            });
+            self.event_sequence += 1;
             return;
         }
+
+        // True damage bypasses block and damage-reduction modifiers entirely.
+        let is_true_damage = damage_type == game_protocol::event::DamageType::True;
+
+        // Directional block: block only mitigates damage from the front arc.
+        // True damage ignores blocking completely.
+        // Compute dot product between target's facing direction and the vector
+        // from target toward the attacker. If the attacker is behind the
+        // blocker (dot < 0), blocking is ineffective.
+        const BLOCK_DOT_THRESHOLD: f32 = 0.0; // 0 = 180° front arc
+        let facing_attacker = if tactical.blocking && !is_true_damage {
+            if let (Some(target_t), Some(attacker_t)) = (
+                self.physics.get_transform(target),
+                self.physics.get_transform(attacker),
+            ) {
+                let yaw = 2.0 * target_t.rotation.y.atan2(target_t.rotation.w);
+                let facing = (yaw.sin(), yaw.cos()); // (x, z)
+                let dx = attacker_t.position.x - target_t.position.x;
+                let dz = attacker_t.position.z - target_t.position.z;
+                let len = (dx * dx + dz * dz).sqrt();
+                if len > 1e-6 {
+                    let dot = facing.0 * (dx / len) + facing.1 * (dz / len);
+                    dot >= BLOCK_DOT_THRESHOLD
+                } else {
+                    true // overlapping positions — allow block
+                }
+            } else {
+                true // no transform available — allow block
+            }
+        } else {
+            false // not blocking at all, or true damage
+        };
+
+        // Perfect block window: first N ticks of a block sequence deal zero damage.
+        const PERFECT_BLOCK_TICKS: u64 = 3;
+        let (block_factor, perfect_block) = if tactical.blocking && facing_attacker {
+            let perfect = tactical.block_start_tick
+                .map_or(false, |start| self.current_tick.0.saturating_sub(start.0) < PERFECT_BLOCK_TICKS);
+            if perfect { (0.0, true) } else { (0.5, false) }
+        } else {
+            (1.0, false)
+        };
 
         // Apply damage_out_mult from attacker's cached StatBlock.
         let out_mult: f32 = attacker_idx.map_or(1.0, |idx| {
             self.state.stats.get(idx).damage_out_mult
         });
-        // Apply damage_in_mult from target's cached StatBlock.
-        let in_mult: f32 = self.state.stats.get(target_idx).damage_in_mult;
-        let block_factor = if tactical.blocking { 0.5 } else { 1.0 };
+        // True damage ignores damage_in_mult (incoming reduction/amplification).
+        let in_mult: f32 = if is_true_damage {
+            1.0
+        } else {
+            self.state.stats.get(target_idx).damage_in_mult
+        };
         let effective_damage = base_damage * out_mult * in_mult * block_factor;
+
+        // ── Cover check: allies behind a blocking player take reduced damage ──
+        // Iterates blocking entities to see if any friendly blocker is
+        // interposed between the attacker and the target within a rear cone.
+        // True damage bypasses cover (same as self-block).
+        const COVER_RADIUS_SQ: f32 = 16.0;     // 4 units
+        const COVER_DOT_THRESHOLD: f32 = -0.3;  // ~110° rear arc
+        const COVER_FACTOR: f32 = 0.7;          // 30% damage reduction
+        let (cover_factor, cover_source) = if !is_true_damage && block_factor >= 1.0 {
+            // Only check cover if the target isn't already self-blocking.
+            let target_kind = self.state.entities.kinds[target_idx.as_usize()];
+            if let (Some(tp), Some(ap)) = (
+                self.physics.get_transform(target),
+                self.physics.get_transform(attacker),
+            ) {
+                let mut best_factor = 1.0f32;
+                let mut best_blocker: Option<EntityId> = None;
+                for (i, slot) in self.state.combat.tactical.iter().enumerate() {
+                    if !slot.blocking { continue; }
+                    let blocker_id = match self.state.entities.lookup_by_slot(i) {
+                        Some(id) if id != target && id != attacker => id,
+                        _ => continue,
+                    };
+                    // Same-team check: blocker and target must be the same entity kind category.
+                    // Players cover players; NPCs/Bosses cover NPCs/Bosses.
+                    let blocker_kind = self.state.entities.kinds[i];
+                    let same_team = matches!(
+                        (blocker_kind, target_kind),
+                        (EntityKind::Player, EntityKind::Player)
+                        | (EntityKind::Npc | EntityKind::Boss, EntityKind::Npc | EntityKind::Boss)
+                    );
+                    if !same_team { continue; }
+                    let Some(bp) = self.physics.get_transform(blocker_id) else { continue };
+                    // Distance: target must be within COVER_RADIUS of blocker.
+                    let dx = tp.position.x - bp.position.x;
+                    let dz = tp.position.z - bp.position.z;
+                    let dist_sq = dx * dx + dz * dz;
+                    if dist_sq > COVER_RADIUS_SQ { continue; }
+                    // Cone: target must be behind blocker (relative to blocker's facing).
+                    let yaw = 2.0 * bp.rotation.y.atan2(bp.rotation.w);
+                    let facing = (yaw.sin(), yaw.cos());
+                    let len = dist_sq.sqrt();
+                    if len < 1e-6 { continue; }
+                    let dot = facing.0 * (dx / len) + facing.1 * (dz / len);
+                    if dot > COVER_DOT_THRESHOLD { continue; } // target not behind blocker
+                    // Interposition: blocker must be closer to attacker than target is.
+                    let bax = bp.position.x - ap.position.x;
+                    let baz = bp.position.z - ap.position.z;
+                    let tax = tp.position.x - ap.position.x;
+                    let taz = tp.position.z - ap.position.z;
+                    if bax * bax + baz * baz >= tax * tax + taz * taz { continue; }
+                    if COVER_FACTOR < best_factor {
+                        best_factor = COVER_FACTOR;
+                        best_blocker = Some(blocker_id);
+                    }
+                }
+                (best_factor, best_blocker)
+            } else {
+                (1.0, None)
+            }
+        } else {
+            (1.0, None)
+        };
+        let effective_damage = effective_damage * cover_factor;
 
         let actual = self.state.combat.health.apply_damage(target_idx, effective_damage, Some(attacker));
         if compensated {
@@ -1100,15 +1760,48 @@ impl TickPipeline {
         }
         self.summary.damage_events += 1;
 
-        if let Some(table) = self.state.combat.threat_tables.get_mut(target_idx) {
-            table.add_threat(attacker, actual * threat_mult);
-            if compensated {
-                audit!(self.state, Threat, Combat, 6, Some(target), "add_threat_compensated");
-            } else {
-                audit!(self.state, Threat, Combat, 6, Some(target), "add_threat");
+        // Only add threat if the attacker is still alive — a delayed projectile or
+        // DoT from a dead caster must not re-insert them into the threat table.
+        if self.state.entities.lookup(attacker).is_some() {
+            if let Some(table) = self.state.combat.threat_tables.get_mut(target_idx) {
+                table.add_threat(attacker, actual * threat_mult);
+                if compensated {
+                    audit!(self.state, Threat, Combat, 6, Some(target), "add_threat_compensated");
+                } else {
+                    audit!(self.state, Threat, Combat, 6, Some(target), "add_threat");
+                }
             }
         }
 
+        // Emit Blocked event when blocking from the front (even if perfect block dealt zero damage).
+        if tactical.blocking && facing_attacker {
+            self.pending_events.push(SimEvent {
+                tick_id: self.current_tick,
+                event_sequence: self.event_sequence,
+                entity_id: target,
+                payload: EventPayload::Blocked {
+                    source: attacker,
+                    ability_id,
+                    damage_taken: actual,
+                    perfect: perfect_block,
+                },
+            });
+            self.event_sequence += 1;
+        }
+        // Emit Covered event when an ally's block stance reduced our damage.
+        if let Some(blocker) = cover_source {
+            self.pending_events.push(SimEvent {
+                tick_id: self.current_tick,
+                event_sequence: self.event_sequence,
+                entity_id: target,
+                payload: EventPayload::Covered {
+                    blocker,
+                    ability_id,
+                    damage_taken: actual,
+                },
+            });
+            self.event_sequence += 1;
+        }
         self.pending_events.push(SimEvent {
             tick_id: self.current_tick,
             event_sequence: self.event_sequence,
@@ -1131,6 +1824,52 @@ impl TickPipeline {
             },
         });
         self.event_sequence += 1;
+
+        // Apply on-hit buffs/debuffs to the target.
+        for &bid in &on_hit_buffs {
+            if let Some(template) = self.buff_registry.get(bid) {
+                let active = game_core::combat::status::ActiveBuff::from_template(
+                    template, attacker, target, self.current_tick,
+                );
+                self.state.status.apply_or_stack_buff(target_idx, active);
+                self.stats_dirty.insert(target);
+                audit!(self.state, Buff, Combat, 6, Some(target), "on_hit_buff");
+                let duration = template.duration_ticks.unwrap_or(0);
+                self.emit_event(target, EventPayload::BuffApplied {
+                    buff_id: bid,
+                    source: attacker,
+                    duration_ticks: duration,
+                });
+            } else {
+                warn!("on_hit_buff: buff_id {} not found in registry", bid);
+            }
+        }
+
+        // ── Knockback impulse ──────────────────────────────────────
+        // Skip knockback if:
+        //   - knockback_force is zero (most abilities)
+        //   - target is successfully blocking from the front
+        //   - target is dodging (already returned above, but guard for clarity)
+        let blocked = tactical.blocking && facing_attacker;
+        if knockback_force > 0.0 && !blocked {
+            if let (Some(target_t), Some(attacker_t)) = (
+                self.physics.get_transform(target),
+                self.physics.get_transform(attacker),
+            ) {
+                let dx = target_t.position.x - attacker_t.position.x;
+                let dz = target_t.position.z - attacker_t.position.z;
+                let len = (dx * dx + dz * dz).sqrt();
+                let (dir_x, dir_z) = if len > 1e-6 {
+                    (dx / len, dz / len)
+                } else {
+                    (0.0, 1.0) // fallback: push along +Z
+                };
+                self.pending_impulses.push((
+                    target,
+                    Vec3f { x: dir_x * knockback_force, y: 0.0, z: dir_z * knockback_force },
+                ));
+            }
+        }
     }
 
     /// Hit resolution chain: contacts → dedup → ability lookup → damage → threat → events.
@@ -1165,10 +1904,29 @@ impl TickPipeline {
                 _ => continue,
             };
 
+            // Skip projectile hitboxes — world-space sensors are standalone
+            // colliders (no rigid body parent), so Rapier does not reliably fire
+            // Started events when they are moved via set_translation().
+            // resolve_projectile_hits handles them with manual Parry tests.
+            //
+            // Skip lag-compensated hitboxes — they are handled exclusively by
+            // resolve_compensated_hits against historical positions. Without
+            // this guard, the physical sensor hits entities at their *current*
+            // positions in addition to the compensated pass, causing double-hits
+            // on different targets.
+            if self.state.combat.hitboxes.get(exec_id)
+                .is_some_and(|hb| hb.rewind_ticks > 0 || hb.projectile.is_some())
+            {
+                continue;
+            }
+
             // Skip self-hits.
             if attacker == target {
                 continue;
             }
+
+            // Track overlapping for periodic damage (HazardZone).
+            self.state.combat.hitboxes.add_overlapping(exec_id, target);
 
             // Dedup: skip if this hitbox already hit this target.
             if !self.state.combat.hitboxes.record_hit(exec_id, target) {
@@ -1188,7 +1946,124 @@ impl TickPipeline {
                 _ => continue,
             };
 
-            self.apply_hit_damage(attacker, target, target_idx, ability_id, false);
+            self.apply_hit_damage(attacker, target, target_idx, ability_id, false, Some(exec_id));
+        }
+
+        // Second pass: process Stopped sensor events to clear already_hit for
+        // reentry-capable hitboxes and remove from overlapping set.
+        for contact in self.state.physics.contacts
+            .iter()
+            .filter(|c| !c.started && c.is_sensor)
+        {
+            let (acting, _receiving, _attacker, target) = normalize_contact_pair(
+                contact.kind1, contact.entity1,
+                contact.kind2, contact.entity2,
+            );
+            if let ColliderKind::Hitbox(eid_raw) = acting {
+                let eid = AbilityExecutionId(eid_raw);
+                self.state.combat.hitboxes.clear_hit(eid, target);
+                self.state.combat.hitboxes.remove_overlapping(eid, target);
+            }
+        }
+    }
+
+    /// Periodic re-damage for lingering area effects (HazardZone).
+    ///
+    /// Hitboxes with `damage_interval_ticks > 0` re-damage all entities that
+    /// remain inside the sensor volume. The `overlapping` set is maintained by
+    /// `resolve_hits` (Started → add, Stopped → remove). Every
+    /// `damage_interval_ticks` ticks, `already_hit` is cleared for overlapping
+    /// targets and damage is reapplied.
+    fn resolve_periodic_damage(&mut self) {
+        let due = self.state.combat.hitboxes.collect_periodic_due(self.current_tick);
+        for (exec_id, attacker, ability_id, targets) in due {
+            for target in targets {
+                if target == attacker {
+                    continue;
+                }
+                let target_idx = match self.state.entities.lookup(target) {
+                    Some(idx) if self.state.entities.is_active(idx) => idx,
+                    _ => continue,
+                };
+                // Clear dedup so record_hit succeeds on re-damage.
+                self.state.combat.hitboxes.get_mut(exec_id).map(|hb| {
+                    hb.already_hit.remove(&target);
+                });
+                if !self.state.combat.hitboxes.record_hit(exec_id, target) {
+                    continue;
+                }
+                self.apply_hit_damage(attacker, target, target_idx, ability_id, false, Some(exec_id));
+            }
+            self.state.combat.hitboxes.mark_periodic_tick(exec_id, self.current_tick);
+        }
+    }
+
+    /// Projectile hit detection — standalone Parry intersection tests.
+    ///
+    /// World-space projectile sensors are standalone colliders (no rigid body parent).
+    /// Rapier classifies them as "fixed" while character bodies are kinematic.
+    /// `ActiveCollisionTypes` does not include `KINEMATIC_FIXED`, so Rapier's narrow
+    /// phase never generates `Started` events when the sensor moves via
+    /// `set_translation()`. Rather than adding a kinematic body per projectile, we
+    /// run cheap Parry shape intersection tests each tick — the same proven pattern
+    /// used by lag compensation.
+    fn resolve_projectile_hits(&mut self) {
+        let projectiles: Vec<_> = self
+            .state
+            .combat
+            .hitboxes
+            .armed_projectile_ids()
+            .into_iter()
+            .filter_map(|eid| {
+                let hb = self.state.combat.hitboxes.get(eid)?;
+                let proj = hb.projectile.as_ref()?;
+                Some((eid, hb.owner, hb.ability_id, hb.shape, proj.prev_position, proj.position))
+            })
+            .collect();
+
+        if projectiles.is_empty() {
+            return;
+        }
+
+        let mut confirmed_hits: Vec<(EntityId, EntityId, EntityIndex, u32, AbilityExecutionId)> = Vec::new();
+
+        for (exec_id, attacker, ability_id, shape, prev_pos, curr_pos) in projectiles {
+            let hitbox_shape = lag_compensation::hitbox_sensor_shape(shape);
+
+            for slot in 0..self.state.entities.len() {
+                if self.state.entities.states[slot]
+                    != game_core::entity::lifecycle::EntityState::Active
+                {
+                    continue;
+                }
+                let target_idx = self.state.entities.index_at(slot);
+                let target_id = self.state.entities.id_of(target_idx);
+
+                if target_id == attacker {
+                    continue;
+                }
+                if self.state.combat.hitboxes.has_hit(exec_id, target_id) {
+                    continue;
+                }
+
+                let target_pos = match self.physics.get_transform(target_id) {
+                    Some(t) => t.position,
+                    None => continue,
+                };
+
+                if !lag_compensation::swept_shapes_intersect(hitbox_shape, prev_pos, curr_pos, target_pos) {
+                    continue;
+                }
+                if !self.state.combat.hitboxes.record_hit(exec_id, target_id) {
+                    continue;
+                }
+
+                confirmed_hits.push((attacker, target_id, target_idx, ability_id, exec_id));
+            }
+        }
+
+        for (attacker, target_id, target_idx, ability_id, exec_id) in confirmed_hits {
+            self.apply_hit_damage(attacker, target_id, target_idx, ability_id, false, Some(exec_id));
         }
     }
 
@@ -1217,7 +2092,7 @@ impl TickPipeline {
 
         // Two-pass approach: first collect confirmed hits (resolves borrow on
         // transform_history), then apply damage in a second pass.
-        let mut confirmed_hits: Vec<(EntityId, EntityId, EntityIndex, u32)> = Vec::new();
+        let mut confirmed_hits: Vec<(EntityId, EntityId, EntityIndex, u32, AbilityExecutionId)> = Vec::new();
 
         for (exec_id, attacker, ability_id, shape, offset, rewind_ticks) in compensated {
             // Resolve the hitbox's world position from the attacker's current
@@ -1280,13 +2155,13 @@ impl TickPipeline {
                     continue;
                 }
 
-                confirmed_hits.push((attacker, target_id, target_idx, ability_id));
+                confirmed_hits.push((attacker, target_id, target_idx, ability_id, exec_id));
             }
         }
 
         // Apply damage for all confirmed compensated hits.
-        for (attacker, target_id, target_idx, ability_id) in confirmed_hits {
-            self.apply_hit_damage(attacker, target_id, target_idx, ability_id, true);
+        for (attacker, target_id, target_idx, ability_id, exec_id) in confirmed_hits {
+            self.apply_hit_damage(attacker, target_id, target_idx, ability_id, true, Some(exec_id));
         }
     }
 
@@ -1323,27 +2198,31 @@ impl TickPipeline {
                         audit!(self.state, Ai, AiDecisions, 7, None, "override_idle");
                     }
                     AiOverride::ForceFocus { target } => {
-                        // Compute the maximum threat excluding the target itself, then
-                        // raise the target to just above that value. This avoids
-                        // repeatedly boosting the target using its own inflated value.
-                        if let Some(table) = self.state.combat.threat_tables.get_mut(*idx) {
-                            let max_other_threat = table.entries.iter()
-                                .filter(|e| e.source != target)
-                                .filter(|e| e.threat.is_finite())
-                                .map(|e| e.threat)
-                                .fold(0.0f32, f32::max);
-                            let forced_threat = max_other_threat + 10.0;
-                            if let Some(entry) = table.entries.iter_mut().find(|e| e.source == target) {
-                                entry.threat = entry.threat.max(forced_threat);
-                            } else {
-                                table.entries.push(game_core::combat::status::ThreatEntry {
-                                    source: target,
-                                    threat: forced_threat,
-                                });
+                        // Only force-focus if the target is still alive — the buff
+                        // may outlive the target entity.
+                        if self.state.entities.lookup(target).is_none() {
+                            audit!(self.state, Ai, AiDecisions, 7, None, "override_focus_dead_target");
+                        } else {
+                            if let Some(table) = self.state.combat.threat_tables.get_mut(*idx) {
+                                let max_other_threat = table.entries.iter()
+                                    .filter(|e| e.source != target)
+                                    .filter(|e| e.threat.is_finite())
+                                    .map(|e| e.threat)
+                                    .fold(0.0f32, f32::max);
+                                let forced_threat = max_other_threat + 10.0;
+                                if let Some(entry) = table.entries.iter_mut().find(|e| e.source == target) {
+                                    entry.threat = entry.threat.max(forced_threat);
+                                } else {
+                                    table.entries.push(game_core::combat::status::ThreatEntry {
+                                        source: target,
+                                        threat: forced_threat,
+                                    });
+                                }
                             }
+                            if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) { *ai = NpcAiState::Combat; }
+                            audit!(self.state, Threat, AiDecisions, 7, None, "override_focus_threat");
+                            audit!(self.state, Ai, AiDecisions, 7, None, "override_focus");
                         }
-                        if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) { *ai = NpcAiState::Combat; }
-                        audit!(self.state, Ai, AiDecisions, 7, None, "override_focus");
                     }
                 }
             } else {
@@ -1399,7 +2278,7 @@ impl TickPipeline {
                         // Attempt to cast ability 1 (Slash) at top-threat target.
                         // cast_ability is a no-op if the ability is on cooldown.
                         let targeting = ResolvedTargeting::Entity { target: target_id };
-                        if self.cast_ability(npc_id, 1, targeting, 0) {
+                        if self.cast_ability(npc_id, 1, targeting, 0, 0) {
                             audit!(self.state, Execution, AiDecisions, 7, Some(npc_id), "npc_cast");
                         }
                     }
@@ -1435,6 +2314,13 @@ impl TickPipeline {
             (Some(a), Some(b)) => (a.position, b.position),
             _ => return,
         };
+        // Stop if already within melee range to prevent overshoot jitter.
+        const CHASE_ARRIVE_RADIUS: f32 = 1.0;
+        let dx = target_pos.x - npc_pos.x;
+        let dz = target_pos.z - npc_pos.z;
+        if dx * dx + dz * dz <= CHASE_ARRIVE_RADIUS * CHASE_ARRIVE_RADIUS {
+            return;
+        }
         let kind = self.state.entities.kinds[npc_idx.as_usize()];
         self.npc_step_toward(npc_id, npc_pos, target_pos, kind, dt);
     }
@@ -1484,6 +2370,12 @@ impl TickPipeline {
     /// Shared step: move `npc_id` from `from_pos` toward `to_pos` by one tick of movement.
     /// Uses cached `StatBlock::movement_speed` (recalculated in Phase 1.5).
     fn npc_step_toward(&mut self, npc_id: EntityId, from: Vec3f, to: Vec3f, _kind: EntityKind, dt: f32) {
+        // Rooted NPCs cannot move.
+        if let Some(idx) = self.state.entities.lookup(npc_id) {
+            if self.is_rooted(idx) {
+                return;
+            }
+        }
         let dx = to.x - from.x;
         let dz = to.z - from.z;
         let dist_sq = dx * dx + dz * dz;
@@ -1495,12 +2387,16 @@ impl TickPipeline {
         } else {
             return;
         };
-        let inv = 1.0 / dist_sq.sqrt();
-        self.physics.set_kinematic_position(npc_id, Vec3f {
-            x: from.x + dx * inv * speed * dt,
-            y: from.y,
-            z: from.z + dz * inv * speed * dt,
-        });
+        let dist = dist_sq.sqrt();
+        // Clamp step to remaining distance so the NPC never overshoots the target.
+        let move_dist = (speed * dt).min(dist);
+        let inv = 1.0 / dist;
+        let desired = Vec3f {
+            x: dx * inv * move_dist,
+            y: 0.0,
+            z: dz * inv * move_dist,
+        };
+        self.physics.move_character(npc_id, desired);
     }
 
     // ── Phase 7.5: World orchestration ──────────────────────────
@@ -1529,22 +2425,11 @@ impl TickPipeline {
             }
         }
 
-        let spawns = self.director.evaluate(&region_player_counts, self.current_tick);
-
-        // Materialize spawns into the simulation immediately.
-        for spawn in &spawns {
-            let id = EntityId(self.next_director_entity_id);
-            self.next_director_entity_id += 1;
-            self.spawn_entity_from_snapshot(
-                id,
-                spawn.kind,
-                self.current_tick,
-                spawn.max_hp,
-                spawn.position,
-            );
-        }
-
-        spawns
+        // Director spawns are deferred: we return the spawn requests so the
+        // coordinator can send them to SpacetimeDB via commit_tick_results.
+        // The DB assigns canonical IDs and broadcasts entity.on_insert, which
+        // the coordinator handles to materialize them into the local sim.
+        self.director.evaluate(&region_player_counts, self.current_tick)
     }
 
     /// Get mutable access to the director state for event registration.
@@ -1562,9 +2447,17 @@ impl TickPipeline {
     /// Called by the coordinator (via `SimulationRunner`) when equipment changes
     /// are observed between ticks. Also used internally when buffs change.
     pub fn mark_stats_dirty(&mut self, entity_id: EntityId) {
-        if let Some(idx) = self.state.entities.lookup(entity_id) {
-            self.stats_dirty.insert(idx.as_usize());
+        if self.state.entities.contains(entity_id) {
+            self.stats_dirty.insert(entity_id);
         }
+    }
+
+    /// Update the aggregated equipment modifiers for an entity.
+    ///
+    /// Called by the coordinator when `player_equipment` rows change. The new
+    /// modifiers take effect on the next `phase_stat_recalc` pass.
+    pub fn set_equipment_modifiers(&mut self, entity_id: EntityId, modifiers: game_core::stats::EquipmentModifiers) {
+        self.equipment_modifiers.insert(entity_id, modifiers);
     }
 
     // ── Phase 1.5: Stat recalculation ───────────────────────────
@@ -1577,13 +2470,16 @@ impl TickPipeline {
         if self.stats_dirty.is_empty() {
             return;
         }
-        let dirty: Vec<usize> = self.stats_dirty.drain().collect();
-        for i in dirty {
+        let dirty: Vec<EntityId> = self.stats_dirty.drain().collect();
+        let no_equip = game_core::stats::EquipmentModifiers::default();
+        for eid in dirty {
+            let Some(idx) = self.state.entities.lookup(eid) else { continue };
+            let i = idx.as_usize();
             let kind = self.state.entities.kinds[i];
             let max_hp = self.state.combat.health.max_hp[i];
-            let idx = EntityIndex(i as u32);
             let buffs = self.state.status.get_buffs(idx);
-            let block = game_core::stats::StatBlock::compute(kind, max_hp, buffs);
+            let equip = self.equipment_modifiers.get(&eid).unwrap_or(&no_equip);
+            let block = game_core::stats::StatBlock::compute(kind, max_hp, buffs, equip);
             self.state.stats.set(idx, block);
         }
     }
@@ -1618,37 +2514,45 @@ impl TickPipeline {
         let dirty = self.state.status.take_dirty();
         let mut out = Vec::with_capacity(dirty.len());
         for i in &dirty {
-            // Mark buff-dirty entities for stat recalculation next tick.
-            self.stats_dirty.insert(*i);
             if self.state.entities.states[*i] == game_core::entity::lifecycle::EntityState::Removed {
                 continue;
             }
-            let eid = self.state.entities.id_of(EntityIndex(*i as u32));
+            // Mark buff-dirty entities for stat recalculation next tick.
+            let eid = self.state.entities.id_of(self.state.entities.index_at(*i));
+            self.stats_dirty.insert(eid);
             out.push((eid, self.state.status.clone_buffs(*i)));
         }
         out
     }
 
-    /// Snapshot all threat tables for persistence.
+    /// Snapshot threat tables for persistence — dirty-tracked.
     ///
-    /// Emits ALL non-Removed NPC/Boss entities (including those with an empty threat
-    /// table) so the reducer reliably clears stale rows when all threat decays to zero.
-    fn collect_threat_updates(&self) -> Vec<(EntityId, Vec<game_core::combat::status::ThreatEntry>)> {
+    /// Only emits NPCs whose threat table is non-empty (in-combat, post-decay),
+    /// plus NPCs that transitioned from non-empty to empty (cleanup emission so
+    /// the reducer deletes stale DB rows). NPCs that have never entered combat
+    /// are skipped entirely, eliminating O(N) DB scans for idle NPCs.
+    fn collect_threat_updates(&mut self) -> Vec<(EntityId, Vec<game_core::combat::status::ThreatEntry>)> {
         let mut out = Vec::new();
         for (idx, table) in self.state.combat.threat_tables.iter() {
             if self.state.entities.states[idx.as_usize()] == game_core::entity::lifecycle::EntityState::Removed {
                 continue;
             }
-            // Emit even when entries are empty — the reducer uses the entity ID
-            // to delete stale rows, so zero entries must still clear the DB.
             let eid = self.state.entities.id_of(idx);
-            out.push((eid, table.entries.clone()));
+            if !table.entries.is_empty() {
+                // In-combat: emit snapshot, mark as having DB presence.
+                self.threat_has_db_rows.insert(eid);
+                out.push((eid, table.entries.clone()));
+            } else if self.threat_has_db_rows.remove(&eid) {
+                // Just left combat: emit empty snapshot so reducer clears stale rows.
+                out.push((eid, Vec::new()));
+            }
+            // else: never had DB rows, skip entirely.
         }
         out
     }
 
-    /// Snapshot NPC AI state for all active NPCs/bosses.
-    fn collect_npc_state_updates(&self) -> Vec<(EntityId, game_schema::NpcAiState, Option<EntityId>)> {
+    /// Snapshot NPC AI state — only emits when state or target changed.
+    fn collect_npc_state_updates(&mut self) -> Vec<(EntityId, game_schema::NpcAiState, Option<EntityId>)> {
         let mut out = Vec::new();
         for (idx, &ai_state) in self.state.ai.npc_ai.iter() {
             if self.state.entities.states[idx.as_usize()] == game_core::entity::lifecycle::EntityState::Removed {
@@ -1657,7 +2561,12 @@ impl TickPipeline {
             let eid = self.state.entities.id_of(idx);
             let target = self.state.combat.threat_tables.get(idx)
                 .and_then(|t| t.top_threat());
-            out.push((eid, ai_state, target));
+            let current = (ai_state, target);
+            let changed = self.npc_state_prev.get(&eid) != Some(&current);
+            if changed {
+                self.npc_state_prev.insert(eid, current);
+                out.push((eid, ai_state, target));
+            }
         }
         out
     }
@@ -1699,8 +2608,9 @@ impl TickPipeline {
     /// HashMap key — duplicate entries for the same (entity, ability) are impossible.
     ///
     /// Also drains expired follow-up windows from `CombatState::active_windows` and
-    /// clears per-tick tactical flags (`CombatState::tactical`) so Phase 3 StanceBegin
-    /// actions must re-assert them each tick the stance is active.
+    /// clears the hold-to-block flag (`blocking`) so the `Block` intent must re-assert
+    /// it each tick. `dodge_stacks` is NOT cleared here — it persists across ticks and
+    /// is managed exclusively by `StanceBegin`/`StanceEnd` in Phase 3.
     fn phase_expire_cooldowns(&mut self) {
         let current = self.current_tick;
         // Collect first so the borrow on `self.cooldowns` ends before `emit_event` borrows `self`.
@@ -1717,7 +2627,7 @@ impl TickPipeline {
         }
 
         // Drain expired follow-up windows (expiry tick ≤ current tick).
-        self.state.combat.active_windows.retain(|_, &mut exp| {
+        self.state.combat.active_windows.retain(|_, &mut (_, exp)| {
             exp > current
         });
         // Audit a single Window drain record per tick if any windows were active.
@@ -1730,11 +2640,42 @@ impl TickPipeline {
             let _ = self; // suppress unused-warning if audit! expands to nothing
         }
 
-        // Clear per-tick tactical flags. Phase 3 StanceBegin must re-assert each tick.
-        for slot in self.state.combat.tactical.iter_mut() {
-            if slot.blocking || slot.dodge_active {
-                *slot = game_core::combat::tactical::TacticalState::default();
+        // Clear hold-to-block flag. Phase 2 must re-assert it each tick via Block intent.
+        // dodge_stacks is NOT cleared here — it is lifecycle-managed by StanceBegin/StanceEnd
+        // in Phase 3 and must persist across multiple ticks for the full iframe duration.
+        //
+        // Uses a 1-tick grace period to absorb timing gaps between the client’s
+        // intent throttle and the server tick rate. On the first missed tick,
+        // block_grace is set and blocking/root are preserved. On the second
+        // consecutive miss, the block sequence truly ends.
+        let mut block_ended: Vec<EntityId> = Vec::new();
+        for (i, slot) in self.state.combat.tactical.iter_mut().enumerate() {
+            if slot.blocking {
+                // Block was active this tick — clear the flag so it must be re-asserted,
+                // but preserve block_start_tick for perfect-block window continuity.
+                // Also clear the block-driven root. Timeline-driven root (StanceBegin)
+                // is NOT cleared here — it persists until StanceEnd in Phase 3.
+                slot.blocking = false;
+                slot.rooted = false;
+                slot.block_grace = false;
+            } else if slot.block_start_tick.is_some() {
+                if !slot.block_grace {
+                    // First missed tick — grant grace period. Keep block_start_tick
+                    // alive so Phase 6 still treats this entity as blocking for
+                    // damage reduction, and keep root so they can’t move.
+                    slot.block_grace = true;
+                } else {
+                    // Second consecutive miss — block sequence truly ended.
+                    slot.block_start_tick = None;
+                    slot.block_grace = false;
+                    if let Some(eid) = self.state.entities.lookup_by_slot(i) {
+                        block_ended.push(eid);
+                    }
+                }
             }
+        }
+        for eid in block_ended {
+            self.emit_event(eid, EventPayload::BlockEnd);
         }
     }
 
@@ -1745,7 +2686,7 @@ impl TickPipeline {
 
         // Check for newly dead entities and mark them for despawn.
         let dead_indices: Vec<EntityIndex> = (0..self.state.entities.len())
-            .map(|i| EntityIndex(i as u32))
+            .map(|i| self.state.entities.index_at(i))
             .filter(|&idx| {
                 self.state.entities.is_active(idx) && self.state.combat.health.is_dead(idx)
             })
@@ -1792,11 +2733,12 @@ impl TickPipeline {
         for table in self.state.combat.threat_tables.values_mut() {
             table.decay(THREAT_DECAY_FACTOR);
         }
+        audit!(self.state, Threat, Lifecycle, 8, None::<EntityId>, "decay");
 
         // Activate any Spawning entities (they've had one tick to set up physics).
         let spawning: Vec<EntityIndex> = (0..self.state.entities.len())
             .filter(|&i| self.state.entities.states[i] == EntityState::Spawning)
-            .map(|i| EntityIndex(i as u32))
+            .map(|i| self.state.entities.index_at(i))
             .collect();
         for idx in spawning {
             let id = self.state.entities.id_of(idx);
@@ -1843,7 +2785,7 @@ fn skill_shape_to_sensor(shape: SkillShape) -> SensorShape {
         SkillShape::Sphere       => SensorShape::Sphere { radius: 2.0 },
         SkillShape::Cone         => SensorShape::Capsule { half_height: 1.5, radius: 1.0 },
         SkillShape::CapsuleSweep => SensorShape::Capsule { half_height: 1.0, radius: 0.75 },
-        SkillShape::Projectile   => SensorShape::Sphere { radius: 0.3 },
+        SkillShape::Projectile   => SensorShape::Sphere { radius: 0.5 },
         SkillShape::LineSweep    => SensorShape::Capsule { half_height: 3.0, radius: 0.5 },
         SkillShape::HazardZone   => SensorShape::Sphere { radius: 5.0 },
     }
@@ -1901,7 +2843,7 @@ mod tests {
 
     fn make_pipeline(abilities: AbilityRegistry) -> TickPipeline {
         let physics = Box::new(PhysicsWorld::new(1.0 / 20.0));
-        TickPipeline::new(TickId(0), physics, 1.0 / 20.0, abilities)
+        TickPipeline::new(TickId(0), physics, 1.0 / 20.0, abilities, game_core::combat::status::BuffRegistry::new())
     }
 
     fn setup_ability_registry() -> AbilityRegistry {
@@ -1913,6 +2855,11 @@ mod tests {
             damage_type: DamageType::Physical,
             shape: SkillShape::CapsuleSweep,
             threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
         });
         // Timeline: hitbox + cooldown fire immediately (offset 0), damage frame on next tick.
         reg.register_timeline(AbilityTimeline {
@@ -2040,6 +2987,11 @@ mod tests {
             damage_type: DamageType::True,
             shape: SkillShape::Sphere,
             threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
         });
         let mut pipeline = make_pipeline(reg);
 
@@ -2216,6 +3168,11 @@ mod tests {
             damage_type: DamageType::True,
             shape: SkillShape::Sphere,
             threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
         });
         let mut pipeline = make_pipeline(reg);
 
@@ -2554,6 +3511,11 @@ mod tests {
             damage_type: DamageType::True,
             shape: SkillShape::Sphere,
             threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
         });
         let mut pipeline = make_pipeline(reg);
 
@@ -2639,6 +3601,11 @@ mod tests {
             damage_type: DamageType::True,
             shape: SkillShape::Sphere,
             threat_multiplier: 0.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
         });
         reg.register_timeline(AbilityTimeline {
             ability_id: 99,
@@ -3294,7 +4261,7 @@ mod tests {
         ).expect("attacker has body");
         pipeline.state.combat.hitboxes.spawn(
             exec_id, attacker_id, 1, TickId(3), SkillShape::Sphere,
-            Vec3f { x: 0.0, y: 0.0, z: 0.0 }, rewind_ticks,
+            Vec3f { x: 0.0, y: 0.0, z: 0.0 }, rewind_ticks, false, 0,
         );
         pipeline.state.combat.hitboxes.arm(exec_id, sensor);
 
@@ -3378,7 +4345,7 @@ mod tests {
         ).expect("attacker has body");
         pipeline.state.combat.hitboxes.spawn(
             exec_id, attacker_id, 1, TickId(2), SkillShape::Sphere,
-            Vec3f { x: 0.0, y: 0.0, z: 0.0 }, rewind_ticks,
+            Vec3f { x: 0.0, y: 0.0, z: 0.0 }, rewind_ticks, false, 0,
         );
         pipeline.state.combat.hitboxes.arm(exec_id, sensor);
 
@@ -3461,7 +4428,7 @@ mod tests {
         ).expect("attacker has body");
         pipeline.state.combat.hitboxes.spawn(
             exec_id, attacker_id, 1, TickId(2), SkillShape::Sphere,
-            Vec3f { x: 0.0, y: 0.0, z: 0.0 }, rewind_ticks,
+            Vec3f { x: 0.0, y: 0.0, z: 0.0 }, rewind_ticks, false, 0,
         );
         pipeline.state.combat.hitboxes.arm(exec_id, sensor);
 
@@ -3642,7 +4609,7 @@ mod tests {
         pipeline.run_tick(&[]);
 
         // NPC casts via cast_ability directly (no intent needed) at tick 1.
-        let ok = pipeline.cast_ability(caster, 1, ResolvedTargeting::SelfCast, 0);
+        let ok = pipeline.cast_ability(caster, 1, ResolvedTargeting::SelfCast, 0, 0);
         assert!(ok, "cast_ability should succeed for a valid ability");
 
         // Execution context should exist immediately after cast_ability.
@@ -3663,7 +4630,7 @@ mod tests {
         );
 
         // Second cast should fail (on cooldown).
-        let ok2 = pipeline.cast_ability(caster, 1, ResolvedTargeting::SelfCast, 0);
+        let ok2 = pipeline.cast_ability(caster, 1, ResolvedTargeting::SelfCast, 0, 0);
         assert!(!ok2, "Second cast should fail — on cooldown");
     }
 
@@ -3807,5 +4774,1888 @@ mod tests {
             pipeline.state.combat.executions.active_ids().len(), 0,
             "NPC in Patrol state should not cast abilities"
         );
+    }
+
+    /// A dead attacker's delayed hit must NOT re-insert them into the NPC's
+    /// threat table.  Verifies the liveness guard in `apply_hit_damage`.
+    #[test]
+    fn dead_attacker_hit_does_not_insert_threat() {
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 10,
+            name: "Poke".to_string(),
+            base_damage: 5.0,
+            damage_type: DamageType::Physical,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: true, // allow_reentry so we can test a delayed hit after death
+            charge_tiers: None,
+            damage_interval_ticks: 0,
+        });
+        let mut pipeline = make_pipeline(reg);
+
+        let attacker = EntityId(1);
+        let npc = EntityId(2);
+
+        pipeline.state.spawn_entity(attacker, EntityKind::Player, TickId(0), 100.0);
+        pipeline.state.spawn_entity(npc, EntityKind::Npc, TickId(0), 200.0);
+
+        let pos = rapier3d::math::Vector::new(0.0, 5.0, 0.0);
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(attacker, pos, 0.5, 0.3, 1.0, collision_groups::player_body_groups());
+            pw.add_dynamic_capsule(npc, pos, 0.5, 0.3, 1.0, collision_groups::npc_body_groups());
+        }
+
+        // Tick 0: warm-up — entities go Active.
+        pipeline.run_tick(&[]);
+
+        let npc_idx = pipeline.state.entities.lookup(npc).expect("NPC should exist");
+
+        // Kill and remove the attacker before the hit lands.
+        pipeline.force_remove_entity(attacker);
+        assert!(pipeline.state.entities.lookup(attacker).is_none(), "attacker should be gone");
+
+        // Simulate a delayed hit from the dead attacker.
+        pipeline.apply_hit_damage(attacker, npc, npc_idx, 10, false, None);
+
+        // Threat table for the NPC must NOT contain the dead attacker.
+        let threat = pipeline.state.combat.threat_tables.get(npc_idx)
+            .expect("NPC should have a threat table");
+        assert!(
+            !threat.entries.iter().any(|e| e.source == attacker),
+            "dead attacker must not appear in threat table after delayed hit"
+        );
+    }
+
+    /// Block mitigates damage when the defender faces the attacker (front 180° arc).
+    #[test]
+    fn directional_block_mitigates_when_facing_attacker() {
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 10,
+            name: "Poke".to_string(),
+            base_damage: 20.0,
+            damage_type: DamageType::Physical,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
+        });
+        let mut pipeline = make_pipeline(reg);
+
+        let attacker = EntityId(1);
+        let defender = EntityId(2);
+
+        pipeline.state.spawn_entity(attacker, EntityKind::Player, TickId(0), 100.0);
+        pipeline.state.spawn_entity(defender, EntityKind::Player, TickId(0), 100.0);
+
+        // Place attacker in front of defender (+Z direction).
+        // Defender faces +Z (default yaw = 0). Attacker is at z=3.
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(
+                defender,
+                rapier3d::math::Vector::new(0.0, 5.0, 0.0),
+                0.5, 0.3, 1.0,
+                collision_groups::player_body_groups(),
+            );
+            pw.add_dynamic_capsule(
+                attacker,
+                rapier3d::math::Vector::new(0.0, 5.0, 3.0),
+                0.5, 0.3, 1.0,
+                collision_groups::player_body_groups(),
+            );
+        }
+
+        // Tick 0: warm-up.
+        pipeline.run_tick(&[]);
+
+        let def_idx = pipeline.state.entities.lookup(defender).unwrap();
+
+        // Set blocking flag (normally done by Phase 2 Block intent).
+        // block_start_tick = None avoids triggering perfect-block window.
+        pipeline.state.combat.tactical[def_idx.as_usize()].blocking = true;
+        pipeline.state.combat.tactical[def_idx.as_usize()].block_start_tick = None;
+
+        // Apply damage — defender faces +Z, attacker is at +Z → front hit.
+        pipeline.apply_hit_damage(attacker, defender, def_idx, 10, false, None);
+
+        // Block should halve the 20 base damage → 10 actual.
+        let hp = pipeline.state.hp_of(defender).unwrap();
+        assert!(
+            (hp - 90.0).abs() < 0.01,
+            "Front-facing block should halve damage (expected 90 hp), got {}",
+            hp,
+        );
+    }
+
+    /// Block does NOT mitigate damage when the attacker is behind the defender.
+    #[test]
+    fn directional_block_fails_when_attacker_behind() {
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 10,
+            name: "Poke".to_string(),
+            base_damage: 20.0,
+            damage_type: DamageType::Physical,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
+        });
+        let mut pipeline = make_pipeline(reg);
+
+        let attacker = EntityId(1);
+        let defender = EntityId(2);
+
+        pipeline.state.spawn_entity(attacker, EntityKind::Player, TickId(0), 100.0);
+        pipeline.state.spawn_entity(defender, EntityKind::Player, TickId(0), 100.0);
+
+        // Defender faces +Z (yaw = 0). Attacker is behind at z=-3.
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(
+                defender,
+                rapier3d::math::Vector::new(0.0, 5.0, 0.0),
+                0.5, 0.3, 1.0,
+                collision_groups::player_body_groups(),
+            );
+            pw.add_dynamic_capsule(
+                attacker,
+                rapier3d::math::Vector::new(0.0, 5.0, -3.0),
+                0.5, 0.3, 1.0,
+                collision_groups::player_body_groups(),
+            );
+        }
+
+        // Tick 0: warm-up.
+        pipeline.run_tick(&[]);
+
+        let def_idx = pipeline.state.entities.lookup(defender).unwrap();
+
+        // Set blocking flag.
+        pipeline.state.combat.tactical[def_idx.as_usize()].blocking = true;
+        pipeline.state.combat.tactical[def_idx.as_usize()].block_start_tick = None;
+
+        // Apply damage — attacker is behind → block should NOT apply.
+        pipeline.apply_hit_damage(attacker, defender, def_idx, 10, false, None);
+
+        // Full 20 damage should land (no block mitigation).
+        let hp = pipeline.state.hp_of(defender).unwrap();
+        assert!(
+            (hp - 80.0).abs() < 0.01,
+            "Back-hit should deal full damage (expected 80 hp), got {}",
+            hp,
+        );
+    }
+
+    /// Blocking roots the player: Move intent is ignored while holding block.
+    #[test]
+    fn block_roots_player_movement() {
+        let reg = setup_ability_registry();
+        let mut pipeline = make_pipeline(reg);
+
+        let player = EntityId(1);
+        pipeline.state.spawn_entity(player, EntityKind::Player, TickId(0), 100.0);
+
+        // Add physics body so movement has something to move.
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(
+                player,
+                rapier3d::math::Vector::new(0.0, 0.0, 0.0),
+                0.5, 0.3, 1.0,
+                collision_groups::player_body_groups(),
+            );
+        }
+
+        // Tick 0: warm-up (initialises physics bodies).
+        pipeline.run_tick(&[]);
+
+        let pos_before = pipeline.physics.get_transform(player).unwrap();
+
+        // Tick 1: Send Block + Move simultaneously.
+        let intents = vec![
+            PlayerIntent {
+                entity_id: player,
+                sequence_id: 1,
+                target_tick: TickId(1),
+                client_observed_tick: 0,
+                action: IntentAction::Block,
+            },
+            PlayerIntent {
+                entity_id: player,
+                sequence_id: 2,
+                target_tick: TickId(1),
+                client_observed_tick: 0,
+                action: IntentAction::Move(game_protocol::intent::MoveDir { dir_x: 0.0, dir_y: 0.0, dir_z: 1.0 }),
+            },
+        ];
+        pipeline.run_tick(&intents);
+
+        let pos_after = pipeline.physics.get_transform(player).unwrap();
+        let dx = pos_after.position.x - pos_before.position.x;
+        let dz = pos_after.position.z - pos_before.position.z;
+        let dist = (dx * dx + dz * dz).sqrt();
+        assert!(
+            dist < 0.001,
+            "Player should not move while blocking (rooted). Moved {} units.",
+            dist,
+        );
+    }
+
+    /// Buff-driven root prevents NPC from stepping toward target.
+    #[test]
+    fn buff_root_prevents_npc_movement() {
+        use game_core::combat::status::{ActiveBuff, BuffModifiers};
+
+        let reg = setup_ability_registry();
+        let mut pipeline = make_pipeline(reg);
+
+        let npc = EntityId(10);
+        let player = EntityId(1);
+        pipeline.state.spawn_entity(npc, EntityKind::Npc, TickId(0), 100.0);
+        pipeline.state.spawn_entity(player, EntityKind::Player, TickId(0), 100.0);
+
+        // Place NPC and player far apart so AI would want to step toward player.
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(
+                npc,
+                rapier3d::math::Vector::new(0.0, 0.0, 0.0),
+                0.5, 0.3, 1.0,
+                collision_groups::npc_body_groups(),
+            );
+            pw.add_dynamic_capsule(
+                player,
+                rapier3d::math::Vector::new(0.0, 0.0, 20.0),
+                0.5, 0.3, 1.0,
+                collision_groups::player_body_groups(),
+            );
+        }
+
+        // Tick 0: warm-up.
+        pipeline.run_tick(&[]);
+
+        let npc_idx = pipeline.state.entities.lookup(npc).unwrap();
+
+        // Apply a root buff on the NPC.
+        pipeline.state.status.modify_buffs(npc_idx, |buffs| {
+            buffs.push(ActiveBuff {
+                buff_id: 999,
+                source: player,
+                target: npc,
+                stacks: 1,
+                max_stacks: 1,
+                expires_at: Some(TickId(100)),
+                modifiers: BuffModifiers {
+                    root: Some(true),
+                    ..Default::default()
+                },
+            });
+        });
+
+        assert!(pipeline.is_rooted(npc_idx), "NPC should be rooted by buff");
+
+        let pos_before = pipeline.physics.get_transform(npc).unwrap();
+
+        // Attempt to step NPC toward player — should be blocked by root.
+        let from = game_schema::Vec3f { x: 0.0, y: 0.0, z: 0.0 };
+        let to = game_schema::Vec3f { x: 0.0, y: 0.0, z: 20.0 };
+        pipeline.npc_step_toward(npc, from, to, EntityKind::Npc, pipeline.dt);
+
+        let pos_after = pipeline.physics.get_transform(npc).unwrap();
+        let dx = pos_after.position.x - pos_before.position.x;
+        let dz = pos_after.position.z - pos_before.position.z;
+        let dist = (dx * dx + dz * dz).sqrt();
+        assert!(
+            dist < 0.001,
+            "Rooted NPC should not move toward target. Moved {} units.",
+            dist,
+        );
+    }
+
+    /// Knockback impulse pushes the target away from the attacker.
+    #[test]
+    fn knockback_pushes_target_away() {
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 80,
+            name: "HeavySlam".to_string(),
+            base_damage: 10.0,
+            damage_type: DamageType::Physical,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 5.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
+        });
+        let mut pipeline = make_pipeline(reg);
+
+        let attacker = EntityId(1);
+        let target = EntityId(2);
+        pipeline.state.spawn_entity(attacker, EntityKind::Player, TickId(0), 100.0);
+        pipeline.state.spawn_entity(target, EntityKind::Player, TickId(0), 100.0);
+
+        // Place attacker at origin, target at +Z so knockback pushes along +Z.
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(
+                attacker,
+                rapier3d::math::Vector::new(0.0, 0.0, 0.0),
+                0.5, 0.3, 1.0,
+                collision_groups::player_body_groups(),
+            );
+            pw.add_dynamic_capsule(
+                target,
+                rapier3d::math::Vector::new(0.0, 0.0, 3.0),
+                0.5, 0.3, 1.0,
+                collision_groups::player_body_groups(),
+            );
+        }
+
+        pipeline.run_tick(&[]);
+
+        let tgt_idx = pipeline.state.entities.lookup(target).unwrap();
+        pipeline.apply_hit_damage(attacker, target, tgt_idx, 80, false, None);
+
+        // Knockback should have enqueued an impulse.
+        assert_eq!(pipeline.pending_impulses.len(), 1, "Should have one knockback impulse");
+        let (imp_eid, imp_vel) = &pipeline.pending_impulses[0];
+        assert_eq!(*imp_eid, target);
+        // Direction should be roughly +Z (away from attacker).
+        assert!(imp_vel.z > 0.0, "Knockback should push away from attacker along +Z");
+        let mag = (imp_vel.x * imp_vel.x + imp_vel.z * imp_vel.z).sqrt();
+        assert!(
+            (mag - 5.0).abs() < 0.01,
+            "Knockback magnitude should equal knockback_force (5.0), got {}",
+            mag,
+        );
+    }
+
+    /// Blocking negates knockback — a blocking defender is not pushed.
+    #[test]
+    fn block_prevents_knockback() {
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 80,
+            name: "HeavySlam".to_string(),
+            base_damage: 10.0,
+            damage_type: DamageType::Physical,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 5.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
+        });
+        let mut pipeline = make_pipeline(reg);
+
+        let attacker = EntityId(1);
+        let defender = EntityId(2);
+        pipeline.state.spawn_entity(attacker, EntityKind::Player, TickId(0), 100.0);
+        pipeline.state.spawn_entity(defender, EntityKind::Player, TickId(0), 100.0);
+
+        // Place attacker in front of defender (+Z) — defender faces +Z by default.
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(
+                attacker,
+                rapier3d::math::Vector::new(0.0, 0.0, 3.0),
+                0.5, 0.3, 1.0,
+                collision_groups::player_body_groups(),
+            );
+            pw.add_dynamic_capsule(
+                defender,
+                rapier3d::math::Vector::new(0.0, 0.0, 0.0),
+                0.5, 0.3, 1.0,
+                collision_groups::player_body_groups(),
+            );
+        }
+
+        pipeline.run_tick(&[]);
+
+        // Activate block on the defender (facing attacker).
+        let def_idx = pipeline.state.entities.lookup(defender).unwrap();
+        pipeline.state.combat.tactical[def_idx.as_usize()].blocking = true;
+
+        pipeline.apply_hit_damage(attacker, defender, def_idx, 80, false, None);
+
+        // No knockback impulse should have been enqueued.
+        assert!(
+            pipeline.pending_impulses.is_empty(),
+            "Blocking defender should not receive knockback impulse, got {} impulse(s)",
+            pipeline.pending_impulses.len(),
+        );
+    }
+
+    /// True damage ignores block mitigation — full base damage even when blocking.
+    #[test]
+    fn true_damage_ignores_block() {
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 50,
+            name: "TrueStrike".to_string(),
+            base_damage: 30.0,
+            damage_type: DamageType::True,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
+        });
+        let mut pipeline = make_pipeline(reg);
+
+        let attacker = EntityId(1);
+        let defender = EntityId(2);
+        pipeline.state.spawn_entity(attacker, EntityKind::Player, TickId(0), 100.0);
+        pipeline.state.spawn_entity(defender, EntityKind::Player, TickId(0), 100.0);
+
+        // Place attacker in front of defender so directional block would normally apply.
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(
+                defender,
+                rapier3d::math::Vector::new(0.0, 5.0, 0.0),
+                0.5, 0.3, 1.0,
+                collision_groups::player_body_groups(),
+            );
+            pw.add_dynamic_capsule(
+                attacker,
+                rapier3d::math::Vector::new(0.0, 5.0, 3.0),
+                0.5, 0.3, 1.0,
+                collision_groups::player_body_groups(),
+            );
+        }
+
+        pipeline.run_tick(&[]);
+        let def_idx = pipeline.state.entities.lookup(defender).unwrap();
+
+        // Defender is blocking from the front — would halve Physical/Magical.
+        pipeline.state.combat.tactical[def_idx.as_usize()].blocking = true;
+        pipeline.state.combat.tactical[def_idx.as_usize()].block_start_tick = None;
+
+        pipeline.apply_hit_damage(attacker, defender, def_idx, 50, false, None);
+
+        // True damage should deal full 30 (no block reduction).
+        let hp = pipeline.state.hp_of(defender).unwrap();
+        assert!(
+            (hp - 70.0).abs() < 0.01,
+            "True damage should ignore block (expected 70 hp), got {}",
+            hp,
+        );
+
+        // Verify no Blocked event was emitted.
+        let blocked = pipeline.pending_events.iter().any(|e| matches!(e.payload, EventPayload::Blocked { .. }));
+        assert!(!blocked, "True damage should not emit a Blocked event");
+    }
+
+    /// True damage ignores damage_in_pct reduction from buffs.
+    #[test]
+    fn true_damage_ignores_damage_reduction_buff() {
+        use game_core::combat::status::{ActiveBuff, BuffModifiers};
+
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 50,
+            name: "TrueStrike".to_string(),
+            base_damage: 20.0,
+            damage_type: DamageType::True,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
+        });
+        let mut pipeline = make_pipeline(reg);
+
+        let attacker = EntityId(1);
+        let target = EntityId(2);
+        pipeline.state.spawn_entity(attacker, EntityKind::Player, TickId(0), 100.0);
+        pipeline.state.spawn_entity(target, EntityKind::Player, TickId(0), 100.0);
+
+        pipeline.run_tick(&[]);
+        let tgt_idx = pipeline.state.entities.lookup(target).unwrap();
+
+        // Give target a -50% incoming damage reduction buff.
+        pipeline.state.status.modify_buffs(tgt_idx, |buffs| {
+            buffs.push(ActiveBuff {
+                buff_id: 100,
+                source: target,
+                target,
+                stacks: 1,
+                max_stacks: 1,
+                expires_at: Some(TickId(100)),
+                modifiers: BuffModifiers {
+                    damage_in_pct: Some(-50.0),
+                    ..Default::default()
+                },
+            });
+        });
+
+        // Recompute stats so damage_in_mult picks up the buff.
+        pipeline.stats_dirty.insert(target);
+        pipeline.phase_stat_recalc();
+
+        pipeline.apply_hit_damage(attacker, target, tgt_idx, 50, false, None);
+
+        // True damage ignores damage_in_mult → full 20 damage applied.
+        let hp = pipeline.state.hp_of(target).unwrap();
+        assert!(
+            (hp - 80.0).abs() < 0.01,
+            "True damage should ignore damage_in reduction (expected 80 hp), got {}",
+            hp,
+        );
+    }
+
+    /// ApplyBuff timeline action applies a self-buff to the caster.
+    #[test]
+    fn apply_buff_action_gives_caster_self_buff() {
+        use game_core::combat::status::BuffTemplate;
+
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 60,
+            name: "PowerUp".to_string(),
+            base_damage: 0.0,
+            damage_type: DamageType::Physical,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 0.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
+        });
+        reg.register_timeline(AbilityTimeline {
+            ability_id: 60,
+            actions: vec![
+                ScheduledAbilityAction {
+                    tick_offset: 0,
+                    action: AbilityAction::ApplyBuff {
+                        buff_id: 200,
+                    },
+                },
+                ScheduledAbilityAction {
+                    tick_offset: 0,
+                    action: AbilityAction::CooldownStart { duration_ticks: 60 },
+                },
+            ],
+        });
+        let mut pipeline = make_pipeline(reg);
+
+        // Register the buff template in the buff registry.
+        pipeline.buff_registry.register(BuffTemplate {
+            buff_id: 200,
+            name: "PowerUp".into(),
+            duration_ticks: Some(40),
+            max_stacks: 1,
+            modifiers: game_core::combat::status::BuffModifiers {
+                damage_out_pct: Some(0.25),
+                ..Default::default()
+            },
+        });
+
+        let caster = EntityId(1);
+        pipeline.state.spawn_entity(caster, EntityKind::Player, TickId(0), 100.0);
+
+        // Tick 0: warm-up.
+        pipeline.run_tick(&[]);
+
+        // Tick 1: cast the self-buff ability.
+        let cast = PlayerIntent {
+            entity_id: caster,
+            sequence_id: 1,
+            target_tick: TickId(1),
+            client_observed_tick: 0,
+            action: IntentAction::UseAbility(game_schema::UseAbilityData {
+                ability_id: 60,
+                target: game_schema::AbilityTarget::None,
+            }),
+        };
+        let result = pipeline.run_tick(&[cast]);
+
+        // Caster should have the buff.
+        let idx = pipeline.state.entities.lookup(caster).unwrap();
+        let buffs = pipeline.state.status.get_buffs(idx);
+        assert_eq!(buffs.len(), 1, "Caster should have exactly one buff");
+        assert_eq!(buffs[0].buff_id, 200);
+        assert_eq!(buffs[0].stacks, 1);
+        assert_eq!(buffs[0].modifiers.damage_out_pct, Some(0.25));
+        assert_eq!(buffs[0].expires_at, Some(TickId(41))); // tick 1 + 40
+
+        // BuffApplied event should have been emitted.
+        let buff_applied = result.events.iter().any(|e| {
+            matches!(e.payload, EventPayload::BuffApplied { buff_id: 200, .. })
+        });
+        assert!(buff_applied, "BuffApplied event should be emitted for self-buff");
+    }
+
+    /// on_hit_buffs applies a debuff to the target when the hit connects.
+    #[test]
+    fn on_hit_buff_applies_debuff_to_target() {
+        use game_core::combat::status::BuffTemplate;
+
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 70,
+            name: "FrostStrike".to_string(),
+            base_damage: 15.0,
+            damage_type: DamageType::Magical,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![300],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
+        });
+        let mut pipeline = make_pipeline(reg);
+
+        // Register the on-hit debuff template.
+        pipeline.buff_registry.register(BuffTemplate {
+            buff_id: 300,
+            name: "Chill".into(),
+            duration_ticks: Some(60),
+            max_stacks: 1,
+            modifiers: game_core::combat::status::BuffModifiers {
+                speed_pct: Some(-0.5),
+                ..Default::default()
+            },
+        });
+
+        let attacker = EntityId(1);
+        let target = EntityId(2);
+        pipeline.state.spawn_entity(attacker, EntityKind::Player, TickId(0), 100.0);
+        pipeline.state.spawn_entity(target, EntityKind::Player, TickId(0), 100.0);
+
+        pipeline.run_tick(&[]);
+
+        let tgt_idx = pipeline.state.entities.lookup(target).unwrap();
+
+        // Directly call apply_hit_damage to simulate a hit.
+        pipeline.apply_hit_damage(attacker, target, tgt_idx, 70, false, None);
+
+        // Target should now have the slow debuff.
+        let buffs = pipeline.state.status.get_buffs(tgt_idx);
+        assert_eq!(buffs.len(), 1, "Target should have one debuff from on-hit");
+        assert_eq!(buffs[0].buff_id, 300);
+        assert_eq!(buffs[0].source, attacker);
+        assert_eq!(buffs[0].modifiers.speed_pct, Some(-0.5));
+
+        // BuffApplied event should have been emitted on the target.
+        let buff_event = pipeline.pending_events.iter().any(|e| {
+            e.entity_id == target && matches!(e.payload, EventPayload::BuffApplied { buff_id: 300, .. })
+        });
+        assert!(buff_event, "BuffApplied event should fire on target for on-hit debuff");
+    }
+
+    /// Buff stacking: re-applying same buff_id increments stacks and refreshes duration.
+    #[test]
+    fn buff_stacking_increments_and_caps() {
+        use game_core::combat::status::{ActiveBuff, BuffModifiers};
+
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 10,
+            name: "Poke".to_string(),
+            base_damage: 5.0,
+            damage_type: DamageType::Physical,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
+        });
+        let mut pipeline = make_pipeline(reg);
+
+        let entity = EntityId(1);
+        pipeline.state.spawn_entity(entity, EntityKind::Player, TickId(0), 100.0);
+        pipeline.run_tick(&[]);
+
+        let idx = pipeline.state.entities.lookup(entity).unwrap();
+
+        // Apply a buff with max_stacks = 3.
+        let buff = ActiveBuff {
+            buff_id: 400,
+            source: EntityId(99),
+            target: entity,
+            stacks: 1,
+            max_stacks: 3,
+            expires_at: Some(TickId(10)),
+            modifiers: BuffModifiers {
+                damage_out_pct: Some(0.1),
+                ..Default::default()
+            },
+        };
+
+        // First application: 1 stack.
+        let s = pipeline.state.status.apply_or_stack_buff(idx, buff.clone());
+        assert_eq!(s, 1);
+        assert_eq!(pipeline.state.status.get_buffs(idx).len(), 1);
+
+        // Second application: 2 stacks, one entry.
+        let buff2 = ActiveBuff { expires_at: Some(TickId(20)), ..buff.clone() };
+        let s = pipeline.state.status.apply_or_stack_buff(idx, buff2);
+        assert_eq!(s, 2);
+        assert_eq!(pipeline.state.status.get_buffs(idx).len(), 1);
+        assert_eq!(pipeline.state.status.get_buffs(idx)[0].stacks, 2);
+        assert_eq!(pipeline.state.status.get_buffs(idx)[0].expires_at, Some(TickId(20))); // refreshed
+
+        // Third: 3 stacks (at cap).
+        let buff3 = ActiveBuff { expires_at: Some(TickId(30)), ..buff.clone() };
+        let s = pipeline.state.status.apply_or_stack_buff(idx, buff3);
+        assert_eq!(s, 3);
+
+        // Fourth: still 3 (capped), but duration refreshed.
+        let buff4 = ActiveBuff { expires_at: Some(TickId(40)), ..buff.clone() };
+        let s = pipeline.state.status.apply_or_stack_buff(idx, buff4);
+        assert_eq!(s, 3);
+        assert_eq!(pipeline.state.status.get_buffs(idx).len(), 1);
+        assert_eq!(pipeline.state.status.get_buffs(idx)[0].expires_at, Some(TickId(40)));
+    }
+
+    /// Overlapping iframe windows stack: the first StanceEnd does not
+    /// clobber a second ability's iframe.
+    #[test]
+    fn dodge_stacks_overlap_survives_first_end() {
+        let reg = setup_ability_registry();
+        let mut pipeline = make_pipeline(reg);
+
+        let entity = EntityId(1);
+        pipeline.state.spawn_entity(entity, EntityKind::Player, TickId(0), 100.0);
+        pipeline.run_tick(&[]); // warm-up
+
+        let idx = pipeline.state.entities.lookup(entity).unwrap();
+
+        // Simulate two overlapping StanceBegin(dodge=true)
+        let t = &mut pipeline.state.combat.tactical[idx.as_usize()];
+        assert!(!t.is_dodging());
+
+        t.dodge_stacks = t.dodge_stacks.saturating_add(1); // ability A
+        assert!(t.is_dodging());
+
+        t.dodge_stacks = t.dodge_stacks.saturating_add(1); // ability B
+        assert_eq!(t.dodge_stacks, 2);
+
+        // Ability A ends — should still be dodging
+        t.dodge_stacks = t.dodge_stacks.saturating_sub(1);
+        assert!(t.is_dodging());
+        assert_eq!(t.dodge_stacks, 1);
+
+        // Ability B ends — now dodging stops
+        t.dodge_stacks = t.dodge_stacks.saturating_sub(1);
+        assert!(!t.is_dodging());
+        assert_eq!(t.dodge_stacks, 0);
+    }
+
+    /// ArcMovement timeline action sets arc_state and roots the caster.
+    #[test]
+    fn arc_movement_sets_state_and_roots() {
+
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 90,
+            name: "Vault".to_string(),
+            base_damage: 0.0,
+            damage_type: DamageType::Physical,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 0.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
+        });
+        reg.register_timeline(AbilityTimeline {
+            ability_id: 90,
+            actions: vec![
+                ScheduledAbilityAction {
+                    tick_offset: 0,
+                    action: AbilityAction::ArcMovement { speed: 8.0, lift: 6.0, gravity: 20.0 },
+                },
+                ScheduledAbilityAction {
+                    tick_offset: 0,
+                    action: AbilityAction::CooldownStart { duration_ticks: 40 },
+                },
+                ScheduledAbilityAction {
+                    tick_offset: 20,
+                    action: AbilityAction::StanceEnd,
+                },
+            ],
+        });
+        let mut pipeline = make_pipeline(reg);
+
+        let caster = EntityId(1);
+        pipeline.state.spawn_entity(caster, EntityKind::Player, TickId(0), 100.0);
+
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(
+                caster,
+                rapier3d::math::Vector::new(0.0, 5.0, 0.0),
+                0.5, 0.3, 1.0,
+                collision_groups::player_body_groups(),
+            );
+        }
+
+        // Tick 0: warm-up.
+        pipeline.run_tick(&[]);
+
+        // Tick 1: cast vault.
+        let cast = PlayerIntent {
+            entity_id: caster,
+            sequence_id: 1,
+            target_tick: TickId(1),
+            client_observed_tick: 0,
+            action: IntentAction::UseAbility(game_schema::UseAbilityData {
+                ability_id: 90,
+                target: game_schema::AbilityTarget::None,
+            }),
+        };
+        pipeline.run_tick(&[cast]);
+
+        let idx = pipeline.state.entities.lookup(caster).unwrap();
+        let t = &pipeline.state.combat.tactical[idx.as_usize()];
+
+        // Arc should be active (may have already been consumed by drive_arc_movement
+        // on the launch tick — but rooted should still be set if arc is still going,
+        // or cleared if it already landed). Since ArcMovement fires in Phase 3 which
+        // is AFTER Phase 2, the arc_state is set but drive_arc_movement hasn't run
+        // yet on this tick. We verify after the full tick, where Phase 2 of the NEXT
+        // tick would be the first to drive it. But run_tick runs Phases 1-10, and
+        // Phase 2 runs before Phase 3. So on tick 1, Phase 2 runs first (no arc yet),
+        // then Phase 3 sets arc_state. It persists until next tick's Phase 2.
+        assert!(t.rooted, "Caster should be rooted after ArcMovement");
+        assert!(t.arc_state.is_some(), "arc_state should be set after ArcMovement");
+        let arc = t.arc_state.unwrap();
+        // Facing defaults to +Z (no rotation set), so velocity.z = speed, velocity.x ≈ 0.
+        assert!(arc.velocity.z > 0.0, "Arc should move forward (+Z)");
+        assert!((arc.velocity.y - 6.0).abs() < 0.01, "Lift should be 6.0");
+        assert!((arc.gravity - 20.0).abs() < 0.01, "Gravity should be 20.0");
+    }
+
+    /// Arc movement integrates gravity and lands when grounded with negative Y velocity.
+    #[test]
+    fn arc_movement_integrates_and_lands() {
+        use game_core::combat::tactical::ArcState;
+
+        let reg = setup_ability_registry();
+        let mut pipeline = make_pipeline(reg);
+
+        let entity = EntityId(1);
+        pipeline.state.spawn_entity(entity, EntityKind::Player, TickId(0), 100.0);
+
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(
+                entity,
+                rapier3d::math::Vector::new(0.0, 5.0, 0.0),
+                0.5, 0.3, 1.0,
+                collision_groups::player_body_groups(),
+            );
+        }
+
+        // Tick 0: warm-up to activate entity.
+        pipeline.run_tick(&[]);
+
+        let idx = pipeline.state.entities.lookup(entity).unwrap();
+
+        // Manually set an arc with lift=6, gravity=20, speed=8 in +Z.
+        // At dt=0.05, vel.y drops by 1.0 per tick. After 6 ticks vel.y reaches 0,
+        // after 7 ticks vel.y is negative. With spawn_character_body, the mock
+        // always returns grounded=true, but PhysicsWorld's character controller
+        // returns grounded based on actual ground contact. Since the capsule is
+        // at y=5 with no ground plane, it won't be grounded until it falls.
+        // For this test, we directly test drive_arc_movement with a set arc_state.
+        let t = &mut pipeline.state.combat.tactical[idx.as_usize()];
+        t.arc_state = Some(ArcState {
+            velocity: Vec3f { x: 0.0, y: 3.0, z: 8.0 },
+            gravity: 20.0,
+        });
+        t.rooted = true;
+
+        // Run one tick — Phase 2 will call drive_arc_movement.
+        // vel.y starts at 3.0, gravity subtracts 20*0.05=1.0 → vel.y = 2.0 after first tick.
+        // Still positive, so not landing yet (even if character controller says grounded).
+        pipeline.run_tick(&[]);
+        let t = &pipeline.state.combat.tactical[idx.as_usize()];
+        // After 1 tick: vel.y was 3.0 - 1.0 = 2.0 (still rising)
+        // Arc may or may not have landed depending on grounded — but vel.y > 0 so no landing.
+        assert!(t.arc_state.is_some(), "Arc should still be active (vel.y > 0)");
+
+        // After 3 more ticks, vel.y = 2.0 - 1.0 - 1.0 - 1.0 = -1.0 (falling).
+        // With the real character controller and no ground, grounded may be false.
+        // Let's run ticks and check.
+        pipeline.run_tick(&[]);
+        pipeline.run_tick(&[]);
+        pipeline.run_tick(&[]);
+
+        let t = &pipeline.state.combat.tactical[idx.as_usize()];
+        // After 4 ticks total: vel.y started at 3.0, each tick subtracts 1.0.
+        // vel.y: 3.0 → 2.0 → 1.0 → 0.0 → -1.0
+        // On the 4th drive_arc_movement, vel.y becomes -1.0 (<=0).
+        // If Rapier says grounded=true (capsule resting on default ground), arc ends.
+        // If not grounded (floating in space), arc continues.
+        // With no ground geometry, the character controller likely returns grounded=false
+        // for a floating capsule, so arc continues. That's correct behavior.
+
+        // Verify gravity integration happened: if arc is still active, check velocity.
+        if let Some(arc) = &t.arc_state {
+            assert!(arc.velocity.y < 0.0, "Gravity should have pulled vel.y negative");
+        }
+        // If arc ended (grounded=true from Rapier), rooted should be cleared.
+        if t.arc_state.is_none() {
+            assert!(!t.rooted, "Landing should clear rooted flag");
+        }
+    }
+
+    /// StanceEnd clears arc_state and unroots.
+    #[test]
+    fn stance_end_clears_arc_state() {
+        use game_core::combat::tactical::ArcState;
+
+        let reg = setup_ability_registry();
+        let mut pipeline = make_pipeline(reg);
+
+        let entity = EntityId(1);
+        pipeline.state.spawn_entity(entity, EntityKind::Player, TickId(0), 100.0);
+        pipeline.run_tick(&[]);
+
+        let idx = pipeline.state.entities.lookup(entity).unwrap();
+        let t = &mut pipeline.state.combat.tactical[idx.as_usize()];
+        t.arc_state = Some(ArcState {
+            velocity: Vec3f { x: 0.0, y: 5.0, z: 5.0 },
+            gravity: 10.0,
+        });
+        t.rooted = true;
+
+        // Simulate StanceEnd — directly call the action handler.
+        let exec_id = AbilityExecutionId(999);
+        pipeline.execute_ability_action(entity, 1, exec_id, &AbilityAction::StanceEnd);
+
+        let t = &pipeline.state.combat.tactical[idx.as_usize()];
+        assert!(t.arc_state.is_none(), "StanceEnd should clear arc_state");
+        assert!(!t.rooted, "StanceEnd should clear rooted");
+    }
+
+    // ── Cover mechanic tests ──────────────────────────────────────────────────
+
+    /// When a blocking ally stands between attacker and target (within 4 units,
+    /// in the blocker's rear cone), the target takes 30% less damage.
+    #[test]
+    fn cover_reduces_damage_for_ally_behind_blocker() {
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 10,
+            name: "Slash".to_string(),
+            base_damage: 100.0,
+            damage_type: DamageType::Physical,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
+        });
+        let mut pipeline = make_pipeline(reg);
+
+        let attacker = EntityId(1);
+        let blocker  = EntityId(2);
+        let target   = EntityId(3);
+
+        // Attacker at z=0, blocker at z=3 (between attacker and target), target at z=5.
+        // Blocker faces +Z (default identity quat), so "behind" the blocker is -Z
+        // direction. Wait — blocker must face *toward* the attacker for blocking.
+        // Default identity rotation = facing +Z.
+        //
+        // Layout: attacker at z=6, blocker at z=3 facing +Z (toward attacker), target at z=0 (behind blocker).
+        pipeline.spawn_entity_from_snapshot(
+            attacker, EntityKind::Player, TickId(0), 100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 6.0 },
+        );
+        pipeline.spawn_entity_from_snapshot(
+            blocker, EntityKind::Player, TickId(0), 100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 3.0 },
+        );
+        pipeline.spawn_entity_from_snapshot(
+            target, EntityKind::Player, TickId(0), 100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+        );
+
+        // Warm-up tick: entities go Active.
+        pipeline.run_tick(&[]);
+        assert!(pipeline.state.is_active(attacker));
+        assert!(pipeline.state.is_active(blocker));
+        assert!(pipeline.state.is_active(target));
+
+        // Remove NPC AI entries (players don't have them, but just in case).
+        for id in [attacker, blocker, target] {
+            if let Some(idx) = pipeline.state.entities.lookup(id) {
+                pipeline.state.ai.npc_ai.remove(idx);
+            }
+        }
+
+        // Set blocker to blocking stance (facing +Z by default = toward attacker at z=6).
+        let blocker_idx = pipeline.state.entities.lookup(blocker).unwrap();
+        pipeline.state.combat.tactical[blocker_idx.as_usize()].blocking = true;
+        pipeline.state.combat.tactical[blocker_idx.as_usize()].block_start_tick = None;
+
+        // Apply damage to target.
+        let target_idx = pipeline.state.entities.lookup(target).unwrap();
+        pipeline.apply_hit_damage(attacker, target, target_idx, 10, false, None);
+
+        // Target should take 100 * 0.7 = 70 damage (30% reduction from cover).
+        let hp = pipeline.state.hp_of(target).unwrap();
+        assert!(
+            (hp - 30.0).abs() < 0.01,
+            "Cover should reduce 100 damage to 70, leaving 30 hp; got {}",
+            hp,
+        );
+
+        // Verify Covered event was emitted.
+        let covered = pipeline.pending_events.iter().any(|e| {
+            matches!(&e.payload, EventPayload::Covered { blocker: b, .. } if *b == blocker)
+        });
+        assert!(covered, "Covered event must be emitted with the blocker's id");
+    }
+
+    /// Cover does NOT apply when the target is NOT in the blocker's rear cone
+    /// (e.g. target is in front of the blocker, same side as the attacker).
+    #[test]
+    fn cover_does_not_apply_outside_rear_cone() {
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 10,
+            name: "Slash".to_string(),
+            base_damage: 100.0,
+            damage_type: DamageType::Physical,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
+        });
+        let mut pipeline = make_pipeline(reg);
+
+        let attacker = EntityId(1);
+        let blocker  = EntityId(2);
+        let target   = EntityId(3);
+
+        // Target is in FRONT of blocker (same side as attacker), so no cover.
+        // Blocker at z=3 facing +Z, attacker at z=6, target at z=5 (in front of blocker).
+        pipeline.spawn_entity_from_snapshot(
+            attacker, EntityKind::Player, TickId(0), 100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 6.0 },
+        );
+        pipeline.spawn_entity_from_snapshot(
+            blocker, EntityKind::Player, TickId(0), 100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 3.0 },
+        );
+        pipeline.spawn_entity_from_snapshot(
+            target, EntityKind::Player, TickId(0), 100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 5.0 },
+        );
+
+        pipeline.run_tick(&[]);
+
+        for id in [attacker, blocker, target] {
+            if let Some(idx) = pipeline.state.entities.lookup(id) {
+                pipeline.state.ai.npc_ai.remove(idx);
+            }
+        }
+
+        let blocker_idx = pipeline.state.entities.lookup(blocker).unwrap();
+        pipeline.state.combat.tactical[blocker_idx.as_usize()].blocking = true;
+        pipeline.state.combat.tactical[blocker_idx.as_usize()].block_start_tick = None;
+
+        let target_idx = pipeline.state.entities.lookup(target).unwrap();
+        pipeline.apply_hit_damage(attacker, target, target_idx, 10, false, None);
+
+        // Full 100 damage — no cover since target is not behind blocker.
+        let hp = pipeline.state.hp_of(target).unwrap();
+        assert!(
+            (hp - 0.0).abs() < 0.01,
+            "No cover: target should take full 100 damage (0 hp); got {}",
+            hp,
+        );
+    }
+
+    /// Cover does NOT apply for True damage.
+    #[test]
+    fn cover_does_not_apply_for_true_damage() {
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 10,
+            name: "Burn".to_string(),
+            base_damage: 50.0,
+            damage_type: DamageType::True,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
+        });
+        let mut pipeline = make_pipeline(reg);
+
+        let attacker = EntityId(1);
+        let blocker  = EntityId(2);
+        let target   = EntityId(3);
+
+        // Same layout as the working cover test.
+        pipeline.spawn_entity_from_snapshot(
+            attacker, EntityKind::Player, TickId(0), 100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 6.0 },
+        );
+        pipeline.spawn_entity_from_snapshot(
+            blocker, EntityKind::Player, TickId(0), 100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 3.0 },
+        );
+        pipeline.spawn_entity_from_snapshot(
+            target, EntityKind::Player, TickId(0), 100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+        );
+
+        pipeline.run_tick(&[]);
+
+        for id in [attacker, blocker, target] {
+            if let Some(idx) = pipeline.state.entities.lookup(id) {
+                pipeline.state.ai.npc_ai.remove(idx);
+            }
+        }
+
+        let blocker_idx = pipeline.state.entities.lookup(blocker).unwrap();
+        pipeline.state.combat.tactical[blocker_idx.as_usize()].blocking = true;
+        pipeline.state.combat.tactical[blocker_idx.as_usize()].block_start_tick = None;
+
+        let target_idx = pipeline.state.entities.lookup(target).unwrap();
+        pipeline.apply_hit_damage(attacker, target, target_idx, 10, false, None);
+
+        // True damage bypasses cover → full 50 damage.
+        let hp = pipeline.state.hp_of(target).unwrap();
+        assert!(
+            (hp - 50.0).abs() < 0.01,
+            "True damage should bypass cover (expected 50 hp); got {}",
+            hp,
+        );
+    }
+
+    /// Cover does NOT apply across teams (NPC blocker does not cover a Player).
+    #[test]
+    fn cover_does_not_apply_across_teams() {
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 10,
+            name: "Slash".to_string(),
+            base_damage: 100.0,
+            damage_type: DamageType::Physical,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
+        });
+        let mut pipeline = make_pipeline(reg);
+
+        let attacker = EntityId(1);
+        let blocker  = EntityId(2);
+        let target   = EntityId(3);
+
+        // Blocker is an NPC, target is a Player — different teams, no cover.
+        pipeline.spawn_entity_from_snapshot(
+            attacker, EntityKind::Npc, TickId(0), 100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 6.0 },
+        );
+        pipeline.spawn_entity_from_snapshot(
+            blocker, EntityKind::Npc, TickId(0), 100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 3.0 },
+        );
+        pipeline.spawn_entity_from_snapshot(
+            target, EntityKind::Player, TickId(0), 100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+        );
+
+        pipeline.run_tick(&[]);
+
+        for id in [attacker, blocker, target] {
+            if let Some(idx) = pipeline.state.entities.lookup(id) {
+                pipeline.state.ai.npc_ai.remove(idx);
+            }
+        }
+
+        let blocker_idx = pipeline.state.entities.lookup(blocker).unwrap();
+        pipeline.state.combat.tactical[blocker_idx.as_usize()].blocking = true;
+        pipeline.state.combat.tactical[blocker_idx.as_usize()].block_start_tick = None;
+
+        let target_idx = pipeline.state.entities.lookup(target).unwrap();
+        pipeline.apply_hit_damage(attacker, target, target_idx, 10, false, None);
+
+        // Full 100 damage — blocker is NPC, target is Player → different teams.
+        let hp = pipeline.state.hp_of(target).unwrap();
+        assert!(
+            (hp - 0.0).abs() < 0.01,
+            "Cross-team: target should take full 100 damage (0 hp); got {}",
+            hp,
+        );
+    }
+
+    #[test]
+    fn resolve_charge_tier_basic() {
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 99,
+            name: "Chargey".to_string(),
+            base_damage: 10.0,
+            damage_type: DamageType::Physical,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: Some(vec![
+                game_core::combat::skill::ChargeTierDef { min_ticks: 0,  damage_mult: 1.0 },
+                game_core::combat::skill::ChargeTierDef { min_ticks: 2,  damage_mult: 1.5 },
+                game_core::combat::skill::ChargeTierDef { min_ticks: 4,  damage_mult: 2.0 },
+            ]),
+            damage_interval_ticks: 0,
+        });
+        let pipeline = make_pipeline(reg);
+
+        let cases = vec![(0, 0u8), (1, 0u8), (2, 1u8), (3, 1u8), (4, 2u8), (10, 2u8)];
+        for (elapsed, expect) in cases {
+            let tier = pipeline.resolve_charge_tier(99, elapsed);
+            assert_eq!(tier, expect, "elapsed {} -> tier {} expected {}", elapsed, tier, expect);
+        }
+    }
+
+    #[test]
+    fn charge_auto_release_and_tier_events() {
+        // Small thresholds for fast test.
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 42,
+            name: "ChargedSmash".to_string(),
+            base_damage: 20.0,
+            damage_type: DamageType::Physical,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: Some(vec![
+                game_core::combat::skill::ChargeTierDef { min_ticks: 0, damage_mult: 1.0 },
+                game_core::combat::skill::ChargeTierDef { min_ticks: 2, damage_mult: 1.5 },
+                game_core::combat::skill::ChargeTierDef { min_ticks: 4, damage_mult: 2.0 },
+            ]),
+            damage_interval_ticks: 0,
+
+        });
+        reg.register_timeline(AbilityTimeline {
+            ability_id: 42,
+            actions: vec![
+                ScheduledAbilityAction { tick_offset: 0, action: AbilityAction::SpawnHitbox { shape: SkillShape::Sphere, offset: game_schema::Vec3f { x:0.0, y:0.0, z:0.0 } } },
+                ScheduledAbilityAction { tick_offset: 0, action: AbilityAction::CooldownStart { duration_ticks: 20 } },
+                ScheduledAbilityAction { tick_offset: 1, action: AbilityAction::ApplyDamageFrame },
+                ScheduledAbilityAction { tick_offset: 2, action: AbilityAction::RemoveHitbox },
+            ],
+        });
+
+        let mut pipeline = make_pipeline(reg);
+        let attacker = EntityId(1);
+        let target = EntityId(2);
+        pipeline.state.spawn_entity(attacker, EntityKind::Player, TickId(0), 100.0);
+        pipeline.state.spawn_entity(target, EntityKind::Npc, TickId(0), 100.0);
+        let origin = rapier3d::math::Vector::new(0.0, 5.0, 0.0);
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(attacker, origin, 0.5, 0.3, 1.0, collision_groups::player_body_groups());
+            pw.add_dynamic_capsule(target, origin, 0.5, 0.3, 1.0, collision_groups::npc_body_groups());
+        }
+
+        pipeline.run_tick(&[]); // warm-up
+
+        let intent = PlayerIntent {
+            entity_id: attacker,
+            sequence_id: 1,
+            target_tick: TickId(1),
+            client_observed_tick: 0,
+            action: IntentAction::UseAbility(game_schema::UseAbilityData { ability_id: 42, target: game_schema::AbilityTarget::None }),
+        };
+        let r1 = pipeline.run_tick(&[intent]);
+        assert!(r1.events.iter().any(|e| matches!(&e.payload, EventPayload::ChargeStart { ability_id, .. } if *ability_id == 42)));
+
+        let mut found_tier2 = false;
+        for _ in 2..=6 {
+            let r = pipeline.run_tick(&[]);
+            if r.events.iter().any(|e| matches!(&e.payload, EventPayload::ChargeTierReached { ability_id, tier } if *ability_id == 42 && *tier == 2)) {
+                found_tier2 = true;
+            }
+            if r.events.iter().any(|e| matches!(&e.payload, EventPayload::HitboxSpawned { ability_id } if *ability_id == 42)) {
+                assert!(!pipeline.state.combat.charging.contains_key(&attacker));
+                break;
+            }
+        }
+        assert!(found_tier2, "Tier 2 event should have been emitted before auto-release");
+    }
+
+    #[test]
+    fn damage_scaling_apply_hit_damage() {
+        // Ability with two tiers: base=10, tier1 multiplier=2.0
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 10,
+            name: "Scaler".to_string(),
+            base_damage: 10.0,
+            damage_type: DamageType::Physical,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: Some(vec![
+                game_core::combat::skill::ChargeTierDef { min_ticks: 0, damage_mult: 1.0 },
+                game_core::combat::skill::ChargeTierDef { min_ticks: 2, damage_mult: 2.0 },
+            ]),
+            damage_interval_ticks: 0,
+        });
+        let mut pipeline = make_pipeline(reg);
+
+        let attacker = EntityId(1);
+        let target = EntityId(2);
+        pipeline.state.spawn_entity(attacker, EntityKind::Player, TickId(0), 100.0);
+        pipeline.state.spawn_entity(target, EntityKind::Npc, TickId(0), 100.0);
+        let origin = rapier3d::math::Vector::new(0.0, 5.0, 0.0);
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(attacker, origin, 0.5, 0.3, 1.0, collision_groups::player_body_groups());
+            pw.add_dynamic_capsule(target, origin, 0.5, 0.3, 1.0, collision_groups::npc_body_groups());
+        }
+
+        pipeline.run_tick(&[]);
+
+        // Spawn and arm a hitbox tied to an execution with charge_level = 1
+        let exec_id = AbilityExecutionId(1);
+        let sensor = pipeline.physics.spawn_sensor(
+            attacker,
+            SensorShape::Sphere { radius: 1.0 },
+            Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            ColliderKind::Hitbox(exec_id.0),
+        ).expect("spawn sensor");
+        pipeline.state.combat.hitboxes.spawn_armed(exec_id, attacker, 10, TickId(1), SkillShape::Sphere, Vec3f { x:0.0, y:0.0, z:0.0 }, sensor);
+
+        pipeline.state.combat.executions.insert(AbilityExecutionContext {
+            execution_id: exec_id,
+            ability_id: 10,
+            caster: attacker,
+            started_at: TickId(1),
+            targeting: ResolvedTargeting::SelfCast,
+            origin: Vec3f { x:0.0, y:5.0, z:0.0 },
+            facing: Vec3f { x:0.0, y:0.0, z:1.0 },
+            params: AbilityParams { charge_level: 1, variant: 0 },
+            rewind_ticks: 0,
+        });
+
+        let result = pipeline.run_tick(&[]);
+        // Damage should equal base_damage * 2.0 = 20.0
+        let target_update = result.health_updates.iter().find(|(eid, _, _)| *eid == target).expect("health update");
+        let (_, hp, _) = target_update;
+        assert!((*hp - 80.0).abs() < 0.01, "Expected hp=80 after 20 damage, got {}", hp);
+    }
+
+    /// Helper: register a Projectile ability with immediate spawn + damage frame.
+    fn setup_projectile_registry() -> AbilityRegistry {
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 50,
+            name: "TestProjectile".to_string(),
+            base_damage: 10.0,
+            damage_type: DamageType::Physical,
+            shape: SkillShape::Projectile,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
+        });
+        reg.register_timeline(AbilityTimeline {
+            ability_id: 50,
+            actions: vec![
+                ScheduledAbilityAction { tick_offset: 0, action: AbilityAction::SpawnHitbox {
+                    shape: SkillShape::Projectile,
+                    offset: Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+                }},
+                ScheduledAbilityAction { tick_offset: 0, action: AbilityAction::CooldownStart { duration_ticks: 20 } },
+                ScheduledAbilityAction { tick_offset: 0, action: AbilityAction::ApplyDamageFrame },
+            ],
+        });
+        reg
+    }
+
+    #[test]
+    fn position_targeted_projectile_aims_at_target_point() {
+        let reg = setup_projectile_registry();
+        let mut pipeline = make_pipeline(reg);
+
+        let caster = EntityId(1);
+        pipeline.state.spawn_entity(caster, EntityKind::Player, TickId(0), 100.0);
+
+        // Place caster at origin facing +Z.
+        let pos = rapier3d::math::Vector::new(0.0, 5.0, 0.0);
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(caster, pos, 0.5, 0.3, 1.0, collision_groups::player_body_groups());
+        }
+
+        // Warm-up tick.
+        pipeline.run_tick(&[]);
+
+        // Fire at a position 10 units along +X (perpendicular to default facing).
+        let target_point = Vec3f { x: 10.0, y: 0.0, z: 0.0 };
+        let intent = PlayerIntent {
+            entity_id: caster,
+            sequence_id: 1,
+            target_tick: TickId(1),
+            client_observed_tick: 0,
+            action: IntentAction::UseAbility(game_schema::UseAbilityData {
+                ability_id: 50,
+                target: game_schema::AbilityTarget::Position(target_point),
+            }),
+        };
+        let result = pipeline.run_tick(&[intent]);
+
+        // Verify ProjectileLaunched event was emitted with direction toward target.
+        let launched = result.events.iter().find(|e| {
+            matches!(&e.payload, EventPayload::ProjectileLaunched { ability_id: 50, .. })
+        }).expect("ProjectileLaunched event should be emitted");
+
+        if let EventPayload::ProjectileLaunched { direction, max_range, .. } = &launched.payload {
+            // Direction should be approximately (1, 0, 0) — toward target point.
+            assert!(direction.x > 0.9, "Direction X should point toward target, got {}", direction.x);
+            assert!(direction.z.abs() < 0.2, "Direction Z should be near zero, got {}", direction.z);
+            // Max range should be capped to ~ distance to target point (~10 units),
+            // not the full 30-unit default.
+            assert!(*max_range < 15.0, "Max range should be capped to target distance (~10), got {}", max_range);
+        } else {
+            panic!("Expected ProjectileLaunched payload");
+        }
+    }
+
+    #[test]
+    fn entity_targeted_projectile_aims_at_target_entity() {
+        let reg = setup_projectile_registry();
+        let mut pipeline = make_pipeline(reg);
+
+        let caster = EntityId(1);
+        let target = EntityId(2);
+        pipeline.state.spawn_entity(caster, EntityKind::Player, TickId(0), 100.0);
+        pipeline.state.spawn_entity(target, EntityKind::Npc, TickId(0), 100.0);
+
+        // Place caster at origin, target at (0, 5, 15) — 15 units along +Z.
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(
+                caster,
+                rapier3d::math::Vector::new(0.0, 5.0, 0.0),
+                0.5, 0.3, 1.0,
+                collision_groups::player_body_groups(),
+            );
+            pw.add_dynamic_capsule(
+                target,
+                rapier3d::math::Vector::new(0.0, 5.0, 15.0),
+                0.5, 0.3, 1.0,
+                collision_groups::npc_body_groups(),
+            );
+        }
+
+        // Warm-up tick.
+        pipeline.run_tick(&[]);
+
+        // Neutralize NPC AI to prevent it from acting.
+        if let Some(idx) = pipeline.state.entities.lookup(target) {
+            pipeline.state.ai.npc_ai.remove(idx);
+        }
+
+        // Fire with Entity targeting.
+        let intent = PlayerIntent {
+            entity_id: caster,
+            sequence_id: 1,
+            target_tick: TickId(1),
+            client_observed_tick: 0,
+            action: IntentAction::UseAbility(game_schema::UseAbilityData {
+                ability_id: 50,
+                target: game_schema::AbilityTarget::Entity(target.0),
+            }),
+        };
+        let result = pipeline.run_tick(&[intent]);
+
+        // Verify ProjectileLaunched event with direction toward the target entity.
+        let launched = result.events.iter().find(|e| {
+            matches!(&e.payload, EventPayload::ProjectileLaunched { ability_id: 50, .. })
+        }).expect("ProjectileLaunched event should be emitted");
+
+        if let EventPayload::ProjectileLaunched { direction, max_range, .. } = &launched.payload {
+            // Direction should be approximately (0, 0, 1) — toward target at +Z.
+            assert!(direction.z > 0.9, "Direction Z should point toward target, got {}", direction.z);
+            assert!(direction.x.abs() < 0.2, "Direction X should be near zero, got {}", direction.x);
+            // Entity targeting does NOT cap range — full 30-unit default.
+            assert!((*max_range - 30.0).abs() < 0.01, "Max range should be default 30, got {}", max_range);
+        } else {
+            panic!("Expected ProjectileLaunched payload");
+        }
+    }
+
+    #[test]
+    fn periodic_damage_reapplies_on_interval() {
+        // Ability with damage_interval_ticks = 2: initial hit + re-damage every 2 ticks.
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 60,
+            name: "PoisonPool".to_string(),
+            base_damage: 5.0,
+            damage_type: DamageType::Magical,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 2,
+        });
+        let mut pipeline = make_pipeline(reg);
+
+        let attacker = EntityId(1);
+        let target = EntityId(2);
+        pipeline.state.spawn_entity(attacker, EntityKind::Player, TickId(0), 100.0);
+        pipeline.state.spawn_entity(target, EntityKind::Npc, TickId(0), 100.0);
+
+        let pos = rapier3d::math::Vector::new(0.0, 5.0, 0.0);
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(attacker, pos, 0.5, 0.3, 1.0, collision_groups::player_body_groups());
+            pw.add_dynamic_capsule(target, pos, 0.5, 0.3, 1.0, collision_groups::npc_body_groups());
+        }
+
+        // Tick 0: warm-up.
+        pipeline.run_tick(&[]);
+
+        // Neutralize NPC AI.
+        if let Some(idx) = pipeline.state.entities.lookup(target) {
+            pipeline.state.ai.npc_ai.remove(idx);
+        }
+
+        // Manually insert an armed hitbox with damage_interval_ticks = 2.
+        let exec_id = AbilityExecutionId(1);
+        let sensor = pipeline.physics.spawn_sensor(
+            attacker,
+            SensorShape::Sphere { radius: 1.0 },
+            Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            ColliderKind::Hitbox(exec_id.0),
+        ).expect("spawn sensor");
+        pipeline.state.combat.hitboxes.spawn(
+            exec_id, attacker, 60, TickId(1), SkillShape::Sphere,
+            Vec3f { x: 0.0, y: 0.0, z: 0.0 }, 0, false, 2,
+        );
+        pipeline.state.combat.hitboxes.arm(exec_id, sensor);
+
+        // Tick 1: initial hit from physics contact.
+        let _r1 = pipeline.run_tick(&[]);
+        let hp1 = pipeline.state.hp_of(target).unwrap();
+        assert!((hp1 - 95.0).abs() < 0.01, "Tick 1: expected 95 hp after initial 5 damage, got {}", hp1);
+
+        // Tick 2: no re-damage yet (interval=2, only 1 tick elapsed since last_damage_tick=1).
+        pipeline.run_tick(&[]);
+        let hp2 = pipeline.state.hp_of(target).unwrap();
+        assert!((hp2 - 95.0).abs() < 0.01, "Tick 2: expected 95 hp (no periodic yet), got {}", hp2);
+
+        // Tick 3: periodic damage fires (2 ticks since last_damage_tick=1).
+        pipeline.run_tick(&[]);
+        let hp3 = pipeline.state.hp_of(target).unwrap();
+        assert!((hp3 - 90.0).abs() < 0.01, "Tick 3: expected 90 hp after periodic re-damage, got {}", hp3);
+
+        // Tick 4: no re-damage (only 1 tick since last_damage_tick=3).
+        pipeline.run_tick(&[]);
+        let hp4 = pipeline.state.hp_of(target).unwrap();
+        assert!((hp4 - 90.0).abs() < 0.01, "Tick 4: expected 90 hp (no periodic yet), got {}", hp4);
+
+        // Tick 5: second periodic pulse (2 ticks since last_damage_tick=3).
+        pipeline.run_tick(&[]);
+        let hp5 = pipeline.state.hp_of(target).unwrap();
+        assert!((hp5 - 85.0).abs() < 0.01, "Tick 5: expected 85 hp after second periodic pulse, got {}", hp5);
+    }
+
+    #[test]
+    fn periodic_damage_stops_when_target_leaves() {
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 61,
+            name: "LavaPool".to_string(),
+            base_damage: 10.0,
+            damage_type: DamageType::Magical,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 2,
+        });
+        let mut pipeline = make_pipeline(reg);
+
+        let attacker = EntityId(1);
+        let target = EntityId(2);
+        pipeline.state.spawn_entity(attacker, EntityKind::Player, TickId(0), 100.0);
+        pipeline.state.spawn_entity(target, EntityKind::Npc, TickId(0), 100.0);
+
+        let pos = rapier3d::math::Vector::new(0.0, 5.0, 0.0);
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(attacker, pos, 0.5, 0.3, 1.0, collision_groups::player_body_groups());
+            pw.add_dynamic_capsule(target, pos, 0.5, 0.3, 1.0, collision_groups::npc_body_groups());
+        }
+
+        pipeline.run_tick(&[]); // warm-up
+
+        if let Some(idx) = pipeline.state.entities.lookup(target) {
+            pipeline.state.ai.npc_ai.remove(idx);
+        }
+
+        // Inject armed hitbox.
+        let exec_id = AbilityExecutionId(1);
+        let sensor = pipeline.physics.spawn_sensor(
+            attacker,
+            SensorShape::Sphere { radius: 1.0 },
+            Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            ColliderKind::Hitbox(exec_id.0),
+        ).expect("spawn sensor");
+        pipeline.state.combat.hitboxes.spawn(
+            exec_id, attacker, 61, TickId(1), SkillShape::Sphere,
+            Vec3f { x: 0.0, y: 0.0, z: 0.0 }, 0, false, 2,
+        );
+        pipeline.state.combat.hitboxes.arm(exec_id, sensor);
+
+        // Tick 1: initial hit.
+        pipeline.run_tick(&[]);
+        let hp1 = pipeline.state.hp_of(target).unwrap();
+        assert!((hp1 - 90.0).abs() < 0.01, "Expected 90 hp after initial hit, got {}", hp1);
+
+        // Simulate target leaving: remove from overlapping set.
+        pipeline.state.combat.hitboxes.remove_overlapping(exec_id, target);
+
+        // Tick 2-3: no periodic damage because target left.
+        pipeline.run_tick(&[]);
+        pipeline.run_tick(&[]);
+        let hp3 = pipeline.state.hp_of(target).unwrap();
+        assert!((hp3 - 90.0).abs() < 0.01, "Expected 90 hp (target left zone), got {}", hp3);
+    }
+
+    // ── Combo routing tests ──────────────────────────────────────────
+
+    /// Build a registry with Slash (id=1) that opens a combo window to SlashCombo (id=4).
+    fn setup_combo_registry() -> AbilityRegistry {
+        let mut reg = AbilityRegistry::new();
+        // Slash — base ability
+        reg.register(AbilityData {
+            ability_id: 1,
+            name: "Slash".to_string(),
+            base_damage: 25.0,
+            damage_type: DamageType::Physical,
+            shape: SkillShape::CapsuleSweep,
+            threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
+        });
+        reg.register_timeline(AbilityTimeline {
+            ability_id: 1,
+            actions: vec![
+                ScheduledAbilityAction { tick_offset: 0, action: AbilityAction::SpawnHitbox {
+                    shape: SkillShape::Sphere,
+                    offset: game_schema::Vec3f::ZERO,
+                }},
+                ScheduledAbilityAction { tick_offset: 0, action: AbilityAction::CooldownStart { duration_ticks: 20 } },
+                ScheduledAbilityAction { tick_offset: 1, action: AbilityAction::ApplyDamageFrame },
+                ScheduledAbilityAction { tick_offset: 2, action: AbilityAction::RemoveHitbox },
+                // Open 10-tick combo window → Slash Combo (id=4)
+                ScheduledAbilityAction { tick_offset: 2, action: AbilityAction::OpenFollowUpWindow {
+                    duration_ticks: 10,
+                    next_ability_id: 4,
+                }},
+            ],
+        });
+        // Slash Combo — follow-up ability
+        reg.register(AbilityData {
+            ability_id: 4,
+            name: "Slash Combo".to_string(),
+            base_damage: 35.0,
+            damage_type: DamageType::Physical,
+            shape: SkillShape::CapsuleSweep,
+            threat_multiplier: 1.2,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
+        });
+        reg.register_timeline(AbilityTimeline {
+            ability_id: 4,
+            actions: vec![
+                ScheduledAbilityAction { tick_offset: 0, action: AbilityAction::SpawnHitbox {
+                    shape: SkillShape::Sphere,
+                    offset: game_schema::Vec3f::ZERO,
+                }},
+                ScheduledAbilityAction { tick_offset: 0, action: AbilityAction::CooldownStart { duration_ticks: 20 } },
+                ScheduledAbilityAction { tick_offset: 1, action: AbilityAction::ApplyDamageFrame },
+                ScheduledAbilityAction { tick_offset: 2, action: AbilityAction::RemoveHitbox },
+            ],
+        });
+        reg
+    }
+
+    /// Pressing ability 1 within its combo window redirects the cast to ability 4.
+    #[test]
+    fn combo_window_redirects_to_next_ability() {
+        let reg = setup_combo_registry();
+        let mut pipeline = make_pipeline(reg);
+
+        let caster = EntityId(1);
+        pipeline.state.spawn_entity(caster, EntityKind::Npc, TickId(0), 100.0);
+        let pos = rapier3d::math::Vector::new(0.0, 5.0, 0.0);
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(caster, pos, 0.5, 0.3, 1.0, collision_groups::npc_body_groups());
+        }
+
+        // Tick 0: warm-up — Spawning → Active.
+        pipeline.run_tick(&[]);
+
+        // Cast Slash (ability 1) at tick 1.
+        let ok1 = pipeline.cast_ability(caster, 1, ResolvedTargeting::SelfCast, 0, 0);
+        assert!(ok1, "First Slash cast should succeed");
+
+        // Verify the execution is for ability 1.
+        let exec1: Vec<_> = pipeline.state.combat.executions.active_ids();
+        assert_eq!(pipeline.state.combat.executions.get(exec1[0]).unwrap().ability_id, 1);
+
+        // Tick 1: Phase 3 drains SpawnHitbox + CooldownStart (offset 0).
+        pipeline.run_tick(&[]);
+        // Tick 2: Phase 3 drains ApplyDamageFrame (offset 1).
+        pipeline.run_tick(&[]);
+        // Tick 3: Phase 3 drains RemoveHitbox + OpenFollowUpWindow (offset 2).
+        pipeline.run_tick(&[]);
+
+        // Combo window should now be open for (caster, ability_id=1).
+        assert!(
+            pipeline.state.combat.active_windows.contains_key(&(caster, 1)),
+            "Combo window should be open after OpenFollowUpWindow fires"
+        );
+
+        // The window should point to ability 4.
+        let &(next_id, _expiry) = pipeline.state.combat.active_windows.get(&(caster, 1)).unwrap();
+        assert_eq!(next_id, 4, "Window should redirect to ability 4");
+
+        // Now cast ability 1 again — it should be redirected to ability 4 (Slash Combo).
+        // Note: ability 1 is on cooldown, but the redirect checks cooldown of ability 4.
+        let ok2 = pipeline.cast_ability(caster, 1, ResolvedTargeting::SelfCast, 0, 0);
+        assert!(ok2, "Second press of ability 1 should succeed via combo redirect to 4");
+
+        // Verify the new execution is for ability 4 (not 1).
+        let all_execs: Vec<_> = pipeline.state.combat.executions.active_ids();
+        // Most recently inserted is last.
+        let latest = *all_execs.last().unwrap();
+        let ctx = pipeline.state.combat.executions.get(latest).unwrap();
+        assert_eq!(ctx.ability_id, 4, "Redirected cast should create execution for ability 4");
+
+        // The combo window should be consumed.
+        assert!(
+            !pipeline.state.combat.active_windows.contains_key(&(caster, 1)),
+            "Combo window should be consumed after redirect"
+        );
+    }
+
+    /// After the combo window expires, pressing the same ability should NOT redirect.
+    #[test]
+    fn expired_combo_window_does_not_redirect() {
+        let reg = setup_combo_registry();
+        let mut pipeline = make_pipeline(reg);
+
+        let caster = EntityId(1);
+        pipeline.state.spawn_entity(caster, EntityKind::Npc, TickId(0), 100.0);
+        let pos = rapier3d::math::Vector::new(0.0, 5.0, 0.0);
+        {
+            let pw = pipeline.physics_as::<PhysicsWorld>().unwrap();
+            pw.add_dynamic_capsule(caster, pos, 0.5, 0.3, 1.0, collision_groups::npc_body_groups());
+        }
+
+        // Tick 0: Spawning → Active.
+        pipeline.run_tick(&[]);
+
+        // Cast Slash at tick 1.
+        pipeline.cast_ability(caster, 1, ResolvedTargeting::SelfCast, 0, 0);
+
+        // Ticks 1, 2, 3: Slash timeline plays out.
+        // OpenFollowUpWindow fires at offset 2 → during tick 3 (current_tick=3).
+        // expiry = TickId(3 + 10) = TickId(13).
+        pipeline.run_tick(&[]);
+        pipeline.run_tick(&[]);
+        pipeline.run_tick(&[]);
+        assert!(pipeline.state.combat.active_windows.contains_key(&(caster, 1)));
+
+        // Advance past the combo window expiry (TickId(13)).
+        // Phase 8 drains when exp > current is false → during tick 13.
+        // We're at current_tick=4, need 10 more ticks to process tick 13.
+        for _ in 0..10 {
+            pipeline.run_tick(&[]);
+        }
+
+        // Window should be drained by Phase 8.
+        assert!(
+            !pipeline.state.combat.active_windows.contains_key(&(caster, 1)),
+            "Combo window should be drained after expiry"
+        );
+
+        // Wait for ability 1's cooldown to expire.
+        // CooldownStart fired at tick 1 with duration 20 → ready_at = TickId(21).
+        // We're at current_tick=14, need 8 more ticks to process tick 21.
+        for _ in 0..8 {
+            pipeline.run_tick(&[]);
+        }
+        assert!(!pipeline.is_on_cooldown_pub(caster, 1), "Cooldown should have expired");
+
+        // Now cast ability 1 again — no combo window, should cast ability 1 (not redirect to 4).
+        let ok = pipeline.cast_ability(caster, 1, ResolvedTargeting::SelfCast, 0, 0);
+        assert!(ok, "Cast of ability 1 should succeed after cooldown");
+
+        let all_execs: Vec<_> = pipeline.state.combat.executions.active_ids();
+        let latest = *all_execs.last().unwrap();
+        let ctx = pipeline.state.combat.executions.get(latest).unwrap();
+        assert_eq!(ctx.ability_id, 1, "Without active window, should cast ability 1 (no redirect)");
     }
 }

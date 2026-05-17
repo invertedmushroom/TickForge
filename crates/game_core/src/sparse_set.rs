@@ -55,6 +55,15 @@ impl<T> SparseSet<T> {
         let i = idx.as_usize();
         let dense_idx = self.entity_to_dense.get_mut(i)?.take()?;
 
+        // Validate generation to prevent stale indices from removing a
+        // recycled entity's component.
+        if self.dense_to_entity[dense_idx] != idx {
+            // Restore the mapping we just cleared — it belongs to a
+            // different generation.
+            self.entity_to_dense[i] = Some(dense_idx);
+            return None;
+        }
+
         // Swap-remove from dense arrays to keep them contiguous.
         let value = self.dense.swap_remove(dense_idx);
         self.dense_to_entity.swap_remove(dense_idx);
@@ -69,25 +78,40 @@ impl<T> SparseSet<T> {
     }
 
     /// O(1) immutable lookup by entity index.
+    ///
+    /// Returns `None` if `idx` refers to a stale generation (the slot was
+    /// recycled for a different entity after the caller obtained `idx`).
     #[inline]
     pub fn get(&self, idx: EntityIndex) -> Option<&T> {
         let dense_idx = *self.entity_to_dense.get(idx.as_usize())?.as_ref()?;
+        if self.dense_to_entity[dense_idx] != idx {
+            return None;
+        }
         Some(&self.dense[dense_idx])
     }
 
     /// O(1) mutable lookup by entity index.
+    ///
+    /// Returns `None` if `idx` refers to a stale generation.
     #[inline]
     pub fn get_mut(&mut self, idx: EntityIndex) -> Option<&mut T> {
         let dense_idx = *self.entity_to_dense.get(idx.as_usize())?.as_ref()?;
+        if self.dense_to_entity[dense_idx] != idx {
+            return None;
+        }
         Some(&mut self.dense[dense_idx])
     }
 
     /// Check whether an entity has this component.
+    ///
+    /// Returns `false` for stale-generation indices.
     #[inline]
     pub fn contains(&self, idx: EntityIndex) -> bool {
-        self.entity_to_dense
-            .get(idx.as_usize())
-            .is_some_and(|slot| slot.is_some())
+        if let Some(&Some(dense_idx)) = self.entity_to_dense.get(idx.as_usize()) {
+            self.dense_to_entity[dense_idx] == idx
+        } else {
+            false
+        }
     }
 
     /// Number of entities that carry this component (dense length).
@@ -156,7 +180,7 @@ mod tests {
     use super::*;
 
     fn idx(n: u32) -> EntityIndex {
-        EntityIndex(n)
+        EntityIndex::dangling(n)
     }
 
     #[test]

@@ -12,7 +12,7 @@ use crate::sparse_set::SparseSet;
 use crate::entity::entity_index::EntityIndex;
 use crate::entity::entity_store::EntityStore;
 use crate::physics_backend::CollisionEvent;
-use crate::stats::{StatBlock, StatsStore};
+use crate::stats::{EquipmentModifiers, StatBlock, StatsStore};
 
 // ── Mutation audit (debug/test only) ────────────────────────────────────────
 
@@ -180,7 +180,11 @@ impl MutationAudit {
 pub fn is_ownership_allowed(domain: AuditDomain, subsystem: AuditSubsystem, phase: u8) -> bool {
     match domain {
         AuditDomain::Health => subsystem == AuditSubsystem::Combat && phase == 6,
-        AuditDomain::Threat => subsystem == AuditSubsystem::Combat && phase == 6,
+        AuditDomain::Threat => {
+            (subsystem == AuditSubsystem::Combat && phase == 6)
+                || (subsystem == AuditSubsystem::AiDecisions && phase == 7)
+                || (subsystem == AuditSubsystem::Lifecycle && phase == 8)
+        }
         AuditDomain::Transform => {
             (subsystem == AuditSubsystem::Controller && phase == 2)
                 || (subsystem == AuditSubsystem::AiDecisions && phase == 7)
@@ -196,16 +200,22 @@ pub fn is_ownership_allowed(domain: AuditDomain, subsystem: AuditSubsystem, phas
             (subsystem == AuditSubsystem::AbilityTimeline && phase == 3)
                 || (subsystem == AuditSubsystem::CooldownTracker && phase == 8)
         }
-        AuditDomain::Buff => subsystem == AuditSubsystem::StatusEffects && phase == 8,
+        AuditDomain::Buff => {
+            (subsystem == AuditSubsystem::AbilityTimeline && phase == 3)
+                || (subsystem == AuditSubsystem::Combat && phase == 6)
+                || (subsystem == AuditSubsystem::StatusEffects && phase == 8)
+        }
         AuditDomain::Ai => subsystem == AuditSubsystem::AiDecisions && phase == 7,
         // Window: AbilityTimeline writes in phase 3, CooldownTracker drains in phase 8.
         AuditDomain::Window => {
             (subsystem == AuditSubsystem::AbilityTimeline && phase == 3)
                 || (subsystem == AuditSubsystem::CooldownTracker && phase == 8)
         }
-        // Tactical: AbilityTimeline writes in phase 3, CooldownTracker clears in phase 8.
+        // Tactical: Controller sets blocking in phase 2, AbilityTimeline writes in phase 3,
+        // CooldownTracker clears in phase 8.
         AuditDomain::Tactical => {
-            (subsystem == AuditSubsystem::AbilityTimeline && phase == 3)
+            (subsystem == AuditSubsystem::Controller && phase == 2)
+                || (subsystem == AuditSubsystem::AbilityTimeline && phase == 3)
                 || (subsystem == AuditSubsystem::CooldownTracker && phase == 8)
         }
     }
@@ -233,6 +243,14 @@ impl HealthStore {
         self.hp.push(max_hp);
         self.max_hp.push(max_hp);
         self.last_damage_source.push(None);
+    }
+
+    /// Reset an existing slot for a reused entity.
+    pub fn reset(&mut self, idx: EntityIndex, max_hp: f32) {
+        let i = idx.as_usize();
+        self.hp[i] = max_hp;
+        self.max_hp[i] = max_hp;
+        self.last_damage_source[i] = None;
     }
 
     #[inline]
@@ -290,18 +308,25 @@ pub struct CombatState {
     /// In-flight ability cast instances — one entry per accepted UseAbility cast,
     /// carrying resolved targeting and cast-time spatial snapshot.
     pub executions: AbilityExecutionStore,
-    /// Follow-up eligibility windows: maps (EntityId, ability_id) → expiry tick.
+    /// Follow-up / combo windows: maps `(EntityId, ability_id)` → `(next_ability_id, expiry)`.
     ///
     /// Written by `OpenFollowUpWindow` timeline actions in Phase 3.
-    /// Phase 2 checks this to set `AbilityParams::variant` for combo presses.
-    /// Phase 8 drains entries whose expiry tick ≤ current tick.
-    pub active_windows: HashMap<(EntityId, u32), TickId>,
+    /// Phase 2 checks this map: if the player presses `ability_id` while a window
+    /// is open, the cast is redirected to `next_ability_id` (a separate ability
+    /// with its own timeline and stats).  Phase 8 drains expired entries.
+    pub active_windows: HashMap<(EntityId, u32), (u32, TickId)>,
     /// Per-entity tactical flags for this tick (blocking, dodge).
     ///
     /// Written by `StanceBegin` timeline actions in Phase 3.
     /// Phase 6 checks flags before routing hits through the damage path.
     /// Phase 8 clears all flags so `StanceBegin` must re-assert each tick.
     pub tactical: Vec<TacticalState>,
+    /// In-flight charge states: one entry per entity currently charging a hold-release ability.
+    ///
+    /// Written by Phase 2 when UseAbility targets a chargeable ability.
+    /// Consumed by Phase 2 on ReleaseAbility or auto-release at max tier.
+    /// Cleaned up in `force_remove_entity`.
+    pub charging: HashMap<EntityId, crate::combat::skill::ChargingState>,
 }
 
 /// Buff/debuff status data.
@@ -326,6 +351,11 @@ impl StatusState {
         self.buffs.push(Vec::new());
     }
 
+    /// Clear an existing buff slot for a reused entity.
+    pub fn clear_at(&mut self, idx: EntityIndex) {
+        self.buffs[idx.as_usize()].clear();
+    }
+
     /// Number of buff slots (must equal entity count).
     pub fn len(&self) -> usize {
         self.buffs.len()
@@ -348,6 +378,27 @@ impl StatusState {
     {
         f(&mut self.buffs[idx.as_usize()]);
         self.dirty_entities.insert(idx.as_usize());
+    }
+
+    /// Apply a buff with stacking: if a buff with the same `buff_id` already exists,
+    /// increment stacks (capped at `max_stacks`) and refresh the expiration.
+    /// Otherwise, push a new entry. Returns the resulting stack count.
+    pub fn apply_or_stack_buff(&mut self, idx: EntityIndex, buff: ActiveBuff) -> u32 {
+        let buffs = &mut self.buffs[idx.as_usize()];
+        if let Some(existing) = buffs.iter_mut().find(|b| b.buff_id == buff.buff_id) {
+            if existing.stacks < existing.max_stacks {
+                existing.stacks += 1;
+            }
+            // Refresh duration to the new buff's expiration.
+            existing.expires_at = buff.expires_at;
+            self.dirty_entities.insert(idx.as_usize());
+            existing.stacks
+        } else {
+            let stacks = buff.stacks;
+            buffs.push(buff);
+            self.dirty_entities.insert(idx.as_usize());
+            stacks
+        }
     }
 
     /// Replace an entity's entire buff array, marking dirty.
@@ -376,7 +427,7 @@ impl StatusState {
             if entities.states[i] == EntityState::Removed {
                 continue;
             }
-            let entity_id = entities.id_of(EntityIndex(i as u32));
+            let entity_id = entities.id_of(entities.index_at(i));
             let before = self.buffs[i].len();
             self.buffs[i].retain(|b| {
                 if let Some(expires_at) = b.expires_at
@@ -441,6 +492,7 @@ impl SimState {
                 executions: AbilityExecutionStore::new(),
                 active_windows: HashMap::new(),
                 tactical: Vec::new(),
+                charging: HashMap::new(),
             },
             status: StatusState::new(),
             ai: AiState { npc_ai: SparseSet::new(), home_positions: SparseSet::new() },
@@ -473,23 +525,37 @@ impl SimState {
         tick: TickId,
         max_hp: f32,
     ) -> EntityIndex {
-        let idx = self.entities.spawn(id, kind, tick);
-        // Push component slots in lockstep with the entity store.
-        self.combat.health.push(max_hp);
-        self.status.push_empty();
-        // Mark the new entity's buff slot dirty so the first commit clears any
-        // stale DB rows (e.g. after a worker restart where in-flight buffs were
-        // never committed).
-        self.status.mark_dirty(idx);
-        self.combat.threat_tables.push_slot();
-        self.ai.npc_ai.push_slot();
-        self.ai.home_positions.push_slot();
-        if kind == EntityKind::Npc || kind == EntityKind::Boss {
-            self.combat.threat_tables.insert(idx, ThreatTable::default());
-            self.ai.npc_ai.insert(idx, NpcAiState::Idle);
+        let (idx, reused) = self.entities.spawn(id, kind, tick);
+        if reused {
+            // Overwrite existing component slots at the recycled index.
+            self.combat.health.reset(idx, max_hp);
+            self.status.clear_at(idx);
+            self.status.mark_dirty(idx);
+            // SparseSet slots already exist; insert only for NPC/Boss.
+            if kind == EntityKind::Npc || kind == EntityKind::Boss {
+                self.combat.threat_tables.insert(idx, ThreatTable::default());
+                self.ai.npc_ai.insert(idx, NpcAiState::Idle);
+            }
+            self.combat.tactical[idx.as_usize()] = TacticalState::default();
+            self.stats.set(idx, StatBlock::compute(kind, max_hp, &[], &EquipmentModifiers::default()));
+        } else {
+            // Push new component slots in lockstep with the entity store.
+            self.combat.health.push(max_hp);
+            self.status.push_empty();
+            // Mark the new entity's buff slot dirty so the first commit clears any
+            // stale DB rows (e.g. after a worker restart where in-flight buffs were
+            // never committed).
+            self.status.mark_dirty(idx);
+            self.combat.threat_tables.push_slot();
+            self.ai.npc_ai.push_slot();
+            self.ai.home_positions.push_slot();
+            if kind == EntityKind::Npc || kind == EntityKind::Boss {
+                self.combat.threat_tables.insert(idx, ThreatTable::default());
+                self.ai.npc_ai.insert(idx, NpcAiState::Idle);
+            }
+            self.combat.tactical.push(TacticalState::default());
+            self.stats.push(StatBlock::compute(kind, max_hp, &[], &EquipmentModifiers::default()));
         }
-        self.combat.tactical.push(TacticalState::default());
-        self.stats.push(StatBlock::compute(kind, max_hp, &[]));
         idx
     }
 
@@ -528,7 +594,7 @@ impl SimState {
     pub fn despawn_pending(&self) -> Vec<EntityId> {
         (0..self.entities.len())
             .filter(|&i| self.entities.states[i] == EntityState::DespawnPending)
-            .map(|i| self.entities.id_of(EntityIndex(i as u32)))
+            .map(|i| self.entities.id_of(self.entities.index_at(i)))
             .collect()
     }
 
@@ -539,7 +605,7 @@ impl SimState {
                 self.entities.kinds[i] == kind
                     && self.entities.states[i] == EntityState::Active
             })
-            .map(|i| EntityIndex(i as u32))
+            .map(|i| self.entities.index_at(i))
             .collect()
     }
 
@@ -625,7 +691,7 @@ mod tests {
     fn health_damage_and_healing() {
         let mut store = HealthStore::new();
         store.push(100.0);
-        let idx = EntityIndex(0);
+        let idx = EntityIndex::dangling(0);
 
         assert_eq!(store.apply_damage(idx, 30.0, Some(eid(99))), 30.0);
         assert_eq!(store.hp[0], 70.0);
@@ -647,7 +713,7 @@ mod tests {
     fn damage_rejects_negative_and_non_finite() {
         let mut store = HealthStore::new();
         store.push(100.0);
-        let idx = EntityIndex(0);
+        let idx = EntityIndex::dangling(0);
 
         // Negative damage must not heal
         assert_eq!(store.apply_damage(idx, -50.0, Some(eid(1))), 0.0);
@@ -674,7 +740,7 @@ mod tests {
     fn healing_rejects_negative_and_non_finite() {
         let mut store = HealthStore::new();
         store.push(100.0);
-        let idx = EntityIndex(0);
+        let idx = EntityIndex::dangling(0);
         store.apply_damage(idx, 50.0, None);
         assert_eq!(store.hp[0], 50.0);
 
@@ -750,6 +816,8 @@ mod tests {
         // Verify that every documented ownership triple passes.
         assert!(is_ownership_allowed(AuditDomain::Health, AuditSubsystem::Combat, 6));
         assert!(is_ownership_allowed(AuditDomain::Threat, AuditSubsystem::Combat, 6));
+        assert!(is_ownership_allowed(AuditDomain::Threat, AuditSubsystem::AiDecisions, 7));
+        assert!(is_ownership_allowed(AuditDomain::Threat, AuditSubsystem::Lifecycle, 8));
         assert!(is_ownership_allowed(AuditDomain::Transform, AuditSubsystem::Controller, 2));
         assert!(is_ownership_allowed(AuditDomain::Transform, AuditSubsystem::AiDecisions, 7));
         assert!(is_ownership_allowed(AuditDomain::Lifecycle, AuditSubsystem::Lifecycle, 8));
@@ -760,6 +828,7 @@ mod tests {
         assert!(is_ownership_allowed(AuditDomain::Cooldown, AuditSubsystem::CooldownTracker, 8));
         assert!(is_ownership_allowed(AuditDomain::Buff, AuditSubsystem::StatusEffects, 8));
         assert!(is_ownership_allowed(AuditDomain::Ai, AuditSubsystem::AiDecisions, 7));
+        assert!(is_ownership_allowed(AuditDomain::Tactical, AuditSubsystem::Controller, 2));
     }
 
     #[test]

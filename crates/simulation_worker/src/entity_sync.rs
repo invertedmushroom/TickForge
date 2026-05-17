@@ -243,11 +243,19 @@ mod tests {
         fn spawn_sensor(&mut self, _id: EntityId, _shape: SensorShape, _offset: Vec3f, _kind: ColliderKind) -> Option<u64> {
             Some(999)
         }
+        fn spawn_world_sensor(&mut self, _position: Vec3f, _shape: SensorShape, _kind: ColliderKind, _owner: EntityId) -> u64 { 0 }
+        fn set_sensor_position(&mut self, _handle: u64, _position: Vec3f) -> bool { false }
         fn remove_sensor(&mut self, _handle: u64) {}
         fn spawn_character_body(&mut self, id: EntityId, pos: Vec3f, _kind: EntityKind) -> bool {
             self.transforms.insert(id, pos);
             true
         }
+        fn move_character(&mut self, id: EntityId, desired: Vec3f) -> Option<MoveResult> {
+            let p = self.transforms.get_mut(&id)?;
+            *p = Vec3f { x: p.x + desired.x, y: p.y + desired.y, z: p.z + desired.z };
+            Some(MoveResult { position: *p, grounded: true })
+        }
+        fn raycast(&self, _origin: Vec3f, _direction: Vec3f, _max_distance: f32) -> Option<RayHit> { None }
     }
 
     fn test_runner() -> SimulationRunner {
@@ -256,6 +264,7 @@ mod tests {
             Box::new(MockPhysics::new()),
             0.05,
             AbilityRegistry::new(),
+            game_core::combat::status::BuffRegistry::new(),
         )
     }
 

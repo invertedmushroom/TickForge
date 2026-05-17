@@ -36,6 +36,11 @@ pub enum IntentAction {
     FaceTo(MoveDir),
     /// Interact with a world object (entity_id as u64).
     Interact(u64),
+    /// Hold block stance this tick.
+    Block,
+    /// Release a charging ability. Sent when the player releases the hold key.
+    /// The server resolves the achieved charge tier from elapsed ticks.
+    ReleaseAbility(u32),
 }
 
 /// Target specification for abilities.

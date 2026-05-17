@@ -12,6 +12,8 @@
 //! call remain in the coordinator — TickDriver is SDK-free and always
 //! testable.
 
+use std::time::Instant;
+
 use log::{debug, info, warn};
 
 use crate::commit_authority::{CanProcessResult, CommitAuthority};
@@ -92,7 +94,10 @@ impl TickDriver {
         }
 
         // ── Run pipeline ────────────────────────────────────────────
-        let result = pipeline.run_tick(intents);
+        let tick_start = Instant::now();
+        let mut result = pipeline.run_tick(intents);
+        result.summary.tick_duration_us = tick_start.elapsed().as_micros() as u64;
+        result.summary.commit_retries = commit.retry_count();
 
         // ── Mark in-flight ──────────────────────────────────────────
         commit.mark_in_flight(canonical_tick);
@@ -112,9 +117,10 @@ impl TickDriver {
             || summary.intents_processed > 0
         {
             info!(
-                "tick={tick} intents={} contacts={} damage={} deaths={} despawns={} entities={} hitboxes={}",
+                "tick={tick} intents={} contacts={} damage={} deaths={} despawns={} entities={} hitboxes={} actions={} tick_us={} retries={}",
                 summary.intents_processed, summary.contacts, summary.damage_events,
                 summary.deaths, summary.despawns, summary.active_entities, summary.active_hitboxes,
+                summary.scheduled_actions_len, summary.tick_duration_us, summary.commit_retries,
             );
         }
     }
@@ -140,6 +146,11 @@ mod tests {
             damage_type: game_schema::DamageType::Physical,
             shape: SkillShape::CapsuleSweep,
             threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
         });
         reg.register_timeline(AbilityTimeline {
             ability_id: 1,
@@ -190,11 +201,21 @@ mod tests {
             fn spawn_sensor(&mut self, _id: EntityId, _shape: SensorShape, _offset: game_protocol::types::Vec3f, _kind: ColliderKind) -> Option<u64> {
                 Some(1)
             }
+            fn spawn_world_sensor(&mut self, _position: game_protocol::types::Vec3f, _shape: SensorShape, _kind: ColliderKind, _owner: EntityId) -> u64 { 0 }
+            fn set_sensor_position(&mut self, _handle: u64, _position: game_protocol::types::Vec3f) -> bool { false }
             fn remove_sensor(&mut self, _handle: u64) {}
             fn spawn_character_body(&mut self, id: EntityId, pos: game_protocol::types::Vec3f, _kind: game_schema::EntityKind) -> bool {
                 self.transforms.insert(id, Transform::at_position(pos.x, pos.y, pos.z));
                 true
             }
+            fn move_character(&mut self, id: EntityId, desired: game_protocol::types::Vec3f) -> Option<MoveResult> {
+                let t = self.transforms.get_mut(&id)?;
+                t.position.x += desired.x;
+                t.position.y += desired.y;
+                t.position.z += desired.z;
+                Some(MoveResult { position: t.position, grounded: true })
+            }
+            fn raycast(&self, _origin: game_protocol::types::Vec3f, _direction: game_protocol::types::Vec3f, _max_distance: f32) -> Option<RayHit> { None }
         }
 
         TickPipeline::new(
@@ -202,6 +223,7 @@ mod tests {
             Box::new(MockPhysics { transforms: HashMap::new() }),
             0.05,
             test_registry(),
+            game_core::combat::status::BuffRegistry::new(),
         )
     }
 

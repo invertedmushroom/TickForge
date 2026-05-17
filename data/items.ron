@@ -1,0 +1,78 @@
+// Item definitions for Jump.
+// Loaded at coordinator startup via load_items().
+// Edit this file to tune equipment stats without recompiling.
+//
+// Field reference:
+//   item_id      — must be unique; matches player_equipment.item_id
+//   name         — display name
+//   modifiers    — flat stat bonuses applied additively to base stats
+//     max_hp         — flat HP bonus
+//     attack_power   — flat attack power bonus
+//     speed          — flat movement speed bonus (units/second)
+//     damage_out     — flat outgoing damage multiplier bonus (+0.1 = +10%)
+//     damage_in      — flat incoming damage multiplier bonus (-0.05 = −5% taken)
+//     cooldown_reduce — flat cooldown reduction bonus (0.1 = 10%)
+(
+    items: [
+        (
+            item_id: 1,
+            name: "Rusty Sword",
+            modifiers: (
+                max_hp: 0.0,
+                attack_power: 0.2,
+                speed: 0.0,
+                damage_out: 0.0,
+                damage_in: 0.0,
+                cooldown_reduce: 0.0,
+            ),
+        ),
+        (
+            item_id: 2,
+            name: "Leather Vest",
+            modifiers: (
+                max_hp: 20.0,
+                attack_power: 0.0,
+                speed: 0.0,
+                damage_out: 0.0,
+                damage_in: -0.05,
+                cooldown_reduce: 0.0,
+            ),
+        ),
+        (
+            item_id: 3,
+            name: "Iron Shield",
+            modifiers: (
+                max_hp: 10.0,
+                attack_power: 0.0,
+                speed: -0.3,
+                damage_out: 0.0,
+                damage_in: -0.10,
+                cooldown_reduce: 0.0,
+            ),
+        ),
+        (
+            item_id: 4,
+            name: "Swift Boots",
+            modifiers: (
+                max_hp: 0.0,
+                attack_power: 0.0,
+                speed: 0.8,
+                damage_out: 0.0,
+                damage_in: 0.0,
+                cooldown_reduce: 0.0,
+            ),
+        ),
+        (
+            item_id: 5,
+            name: "Flame Ring",
+            modifiers: (
+                max_hp: 0.0,
+                attack_power: 0.0,
+                speed: 0.0,
+                damage_out: 0.10,
+                damage_in: 0.0,
+                cooldown_reduce: 0.0,
+            ),
+        ),
+    ],
+)

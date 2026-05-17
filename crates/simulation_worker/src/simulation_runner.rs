@@ -19,7 +19,7 @@ use game_protocol::tick::TickId;
 use game_protocol::types::Vec3f;
 use game_schema::EntityKind;
 
-use crate::commit_authority::CommitAuthority;
+use crate::commit_authority::{CommitAuthority, FailureAction};
 use crate::tick_driver::{TickDriver, TickSkipped};
 use crate::tick_pipeline::{TickPipeline, TickResult};
 
@@ -46,9 +46,10 @@ impl SimulationRunner {
         physics: Box<dyn PhysicsBackend>,
         dt: f32,
         abilities: AbilityRegistry,
+        buff_registry: game_core::combat::status::BuffRegistry,
     ) -> Self {
         Self {
-            pipeline: TickPipeline::new(start_tick, physics, dt, abilities),
+            pipeline: TickPipeline::new(start_tick, physics, dt, abilities, buff_registry),
             commit: CommitAuthority::new(),
             tick_driver: TickDriver::new(),
             pending_stat_recalcs: HashSet::new(),
@@ -99,8 +100,11 @@ impl SimulationRunner {
     }
 
     /// Record a failed commit (does not advance cursor).
-    pub fn acknowledge_failure(&mut self, tick: u64, reason: &str) {
-        self.commit.acknowledge_failure(tick, reason);
+    ///
+    /// Returns `Retry` if the commit should be re-sent, or `Exhausted`
+    /// if retries are spent and backpressure should take over.
+    pub fn acknowledge_failure(&mut self, tick: u64, reason: &str) -> FailureAction {
+        self.commit.acknowledge_failure(tick, reason)
     }
 
     // ── Equipment bridge ────────────────────────────────────────
@@ -111,6 +115,13 @@ impl SimulationRunner {
     /// row change (insert, update, or delete). The recalculation is
     /// applied at the start of the next `run_tick` call, before Phase 1.
     pub fn queue_stat_recalc(&mut self, entity_id: EntityId) {
+        self.pending_stat_recalcs.insert(entity_id);
+    }
+
+    /// Update the aggregated equipment modifiers for an entity and
+    /// mark its stats dirty for recalculation.
+    pub fn update_equipment(&mut self, entity_id: EntityId, modifiers: game_core::stats::EquipmentModifiers) {
+        self.pipeline.set_equipment_modifiers(entity_id, modifiers);
         self.pending_stat_recalcs.insert(entity_id);
     }
 
@@ -171,6 +182,7 @@ impl SimulationRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commit_authority::FailureAction;
     use std::collections::HashMap;
     use game_core::combat::skill::{
         AbilityAction, AbilityData, AbilityRegistry, AbilityTimeline,
@@ -188,6 +200,11 @@ mod tests {
             damage_type: game_schema::DamageType::Physical,
             shape: SkillShape::CapsuleSweep,
             threat_multiplier: 1.0,
+            on_hit_buffs: vec![],
+            knockback_force: 0.0,
+            allow_reentry: false,
+            charge_tiers: None,
+            damage_interval_ticks: 0,
         });
         reg.register_timeline(AbilityTimeline {
             ability_id: 1,
@@ -232,11 +249,21 @@ mod tests {
         fn spawn_sensor(&mut self, _id: EntityId, _shape: SensorShape, _offset: Vec3f, _kind: ColliderKind) -> Option<u64> {
             Some(1)
         }
+        fn spawn_world_sensor(&mut self, _position: Vec3f, _shape: SensorShape, _kind: ColliderKind, _owner: EntityId) -> u64 { 0 }
+        fn set_sensor_position(&mut self, _handle: u64, _position: Vec3f) -> bool { false }
         fn remove_sensor(&mut self, _handle: u64) {}
         fn spawn_character_body(&mut self, id: EntityId, pos: Vec3f, _kind: EntityKind) -> bool {
             self.transforms.insert(id, Transform::at_position(pos.x, pos.y, pos.z));
             true
         }
+        fn move_character(&mut self, id: EntityId, desired: Vec3f) -> Option<MoveResult> {
+            let t = self.transforms.get_mut(&id)?;
+            t.position.x += desired.x;
+            t.position.y += desired.y;
+            t.position.z += desired.z;
+            Some(MoveResult { position: t.position, grounded: true })
+        }
+        fn raycast(&self, _origin: Vec3f, _direction: Vec3f, _max_distance: f32) -> Option<RayHit> { None }
     }
 
     fn make_runner() -> SimulationRunner {
@@ -245,6 +272,7 @@ mod tests {
             Box::new(MockPhysics { transforms: HashMap::new() }),
             0.05,
             test_registry(),
+            game_core::combat::status::BuffRegistry::new(),
         )
     }
 
@@ -326,15 +354,19 @@ mod tests {
     }
 
     #[test]
-    fn acknowledge_failure_does_not_advance_cursor() {
+    fn acknowledge_failure_keeps_pending_for_retry() {
         let mut runner = make_runner();
         let _ = runner.run_tick(1, &[]);
 
-        runner.acknowledge_failure(1, "reducer rejected");
+        let action = runner.acknowledge_failure(1, "reducer rejected");
+        assert_eq!(action, FailureAction::Retry);
 
-        // Cursor was not advanced — tick 1 should be retried
-        // (not AlreadyProcessed).
-        // After failure, pending is cleared so next tick can proceed.
+        // Pending is kept set — next tick is blocked until retry succeeds.
+        let result = runner.run_tick(2, &[]);
+        assert!(matches!(result, Err(TickSkipped::CommitPending(1))));
+
+        // Retry succeeds — unblocks pipeline.
+        runner.acknowledge_success(1);
         let result = runner.run_tick(2, &[]);
         assert!(result.is_ok());
     }

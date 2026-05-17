@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use game_protocol::entity_id::EntityId;
 use game_protocol::tick::TickId;
 use serde::{Deserialize, Serialize};
@@ -40,6 +42,48 @@ pub struct BuffModifiers {
     pub speed_pct: Option<f32>,
     /// AI behavior override. Phase 7 checks this before running standard AI decisions.
     pub ai_override: Option<AiOverride>,
+    /// Root: prevents all movement. Checked in Phase 2 (player) and Phase 7 (NPC).
+    pub root: Option<bool>,
+}
+
+/// Data-only buff definition for ability timelines and on-hit effects.
+///
+/// Contains everything needed to create an `ActiveBuff` except the runtime
+/// source/target entities, which are filled in by the pipeline at application time.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BuffTemplate {
+    pub buff_id: u32,
+    #[serde(default)]
+    pub name: String,
+    /// Duration in ticks. `None` = permanent until explicitly removed.
+    pub duration_ticks: Option<u32>,
+    pub max_stacks: u32,
+    #[serde(default)]
+    pub modifiers: BuffModifiers,
+}
+
+/// Registry of all known buff templates, keyed by buff_id.
+///
+/// Loaded from `data/buffs.ron` at startup. Abilities reference buffs by ID
+/// (`on_hit_buffs: Vec<u32>`, `ApplyBuff { buff_id }`) and the pipeline looks
+/// up the full template here at application time.
+#[derive(Clone, Debug, Default)]
+pub struct BuffRegistry {
+    buffs: HashMap<u32, BuffTemplate>,
+}
+
+impl BuffRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&mut self, template: BuffTemplate) {
+        self.buffs.insert(template.buff_id, template);
+    }
+
+    pub fn get(&self, buff_id: u32) -> Option<&BuffTemplate> {
+        self.buffs.get(&buff_id)
+    }
 }
 
 /// Active buff/debuff on an entity.
@@ -55,6 +99,26 @@ pub struct ActiveBuff {
     /// Structured per-phase modifier fields. Default = no modifiers (passive buff).
     #[serde(default)]
     pub modifiers: BuffModifiers,
+}
+
+impl ActiveBuff {
+    /// Create an `ActiveBuff` from a template, filling in runtime context.
+    pub fn from_template(
+        template: &BuffTemplate,
+        source: EntityId,
+        target: EntityId,
+        current_tick: TickId,
+    ) -> Self {
+        Self {
+            buff_id: template.buff_id,
+            source,
+            target,
+            stacks: 1,
+            max_stacks: template.max_stacks,
+            expires_at: template.duration_ticks.map(|d| TickId(current_tick.0 + d as u64)),
+            modifiers: template.modifiers,
+        }
+    }
 }
 
 /// Aggro entry for a single source on a single NPC.

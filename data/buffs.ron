@@ -1,0 +1,44 @@
+(
+    buffs: [
+        // Self-buff: +25% outgoing damage for 2 seconds (40 ticks @ 20 Hz).
+        (
+            buff_id: 200,
+            name: "PowerUp",
+            duration_ticks: Some(40),
+            max_stacks: 1,
+            modifiers: (
+                damage_out_pct: Some(0.25),
+            ),
+        ),
+        // On-hit debuff: −50% movement speed for 3 seconds (60 ticks).
+        (
+            buff_id: 300,
+            name: "Chill",
+            duration_ticks: Some(60),
+            max_stacks: 1,
+            modifiers: (
+                speed_pct: Some(-0.5),
+            ),
+        ),
+        // On-hit debuff: root for 1 second (20 ticks).
+        (
+            buff_id: 301,
+            name: "Snare",
+            duration_ticks: Some(20),
+            max_stacks: 1,
+            modifiers: (
+                root: Some(true),
+            ),
+        ),
+        // Defensive self-buff: −20% incoming damage for 2.5 seconds (50 ticks).
+        (
+            buff_id: 100,
+            name: "IronSkin",
+            duration_ticks: Some(50),
+            max_stacks: 1,
+            modifiers: (
+                damage_in_pct: Some(-0.2),
+            ),
+        ),
+    ],
+)

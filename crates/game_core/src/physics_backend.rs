@@ -98,6 +98,17 @@ pub trait PhysicsBackend: Send {
     /// Returns an opaque handle for later removal. Returns None if the entity has no body.
     fn spawn_sensor(&mut self, entity_id: EntityId, shape: SensorShape, offset: Vec3f, kind: ColliderKind) -> Option<u64>;
 
+    /// Spawn a sensor collider at a fixed world position, not attached to any entity body.
+    ///
+    /// Used for projectiles and ground-targeted abilities whose collision region moves
+    /// independently of any entity. `owner` is the caster entity for damage attribution
+    /// in collision events. Returns an opaque handle for positioning and removal.
+    fn spawn_world_sensor(&mut self, position: Vec3f, shape: SensorShape, kind: ColliderKind, owner: EntityId) -> u64;
+
+    /// Update the world-space position of a sensor created by `spawn_world_sensor`.
+    /// No-op and returns false if the handle is unknown.
+    fn set_sensor_position(&mut self, handle: u64, position: Vec3f) -> bool;
+
     /// Remove a sensor collider previously created by spawn_sensor. No-op if handle unknown.
     fn remove_sensor(&mut self, handle: u64);
 
@@ -110,4 +121,42 @@ pub trait PhysicsBackend: Send {
     /// Used by the coordinator to create physics bodies for entities arriving via DB subscription.
     /// Returns true if the body was created; false if the entity already has a body.
     fn spawn_character_body(&mut self, entity_id: EntityId, position: Vec3f, kind: EntityKind) -> bool;
+
+    /// Move a kinematic character body by `desired_translation`, sliding along obstacles.
+    ///
+    /// Uses a character controller to resolve collisions against static geometry
+    /// (walls, floors, obstacles).  Returns the corrected world-space position
+    /// and whether the character is touching the ground after the move.
+    fn move_character(&mut self, entity_id: EntityId, desired_translation: Vec3f) -> Option<MoveResult>;
+
+    /// Cast a ray from `origin` along `direction` up to `max_distance`.
+    ///
+    /// Returns the first hit (closest by time-of-impact). Layer filtering is
+    /// backend-specific; the `solid` flag controls whether the ray stops at
+    /// the boundary of solid shapes (true) or can penetrate them (false).
+    fn raycast(&self, origin: Vec3f, direction: Vec3f, max_distance: f32) -> Option<RayHit>;
+}
+
+/// Result of a `move_character` call.
+#[derive(Clone, Copy, Debug)]
+pub struct MoveResult {
+    /// Corrected world-space position after contact resolution.
+    pub position: Vec3f,
+    /// True if the character is touching the ground after the move.
+    pub grounded: bool,
+}
+
+/// Result of a `raycast` call.
+#[derive(Clone, Copy, Debug)]
+pub struct RayHit {
+    /// World-space position of the hit point: `origin + direction * toi`.
+    pub point: Vec3f,
+    /// Surface normal at the hit point.
+    pub normal: Vec3f,
+    /// Time-of-impact (distance along the ray direction).
+    pub toi: f32,
+    /// Entity that owns the hit collider.
+    pub entity: EntityId,
+    /// What kind of collider was hit.
+    pub kind: ColliderKind,
 }

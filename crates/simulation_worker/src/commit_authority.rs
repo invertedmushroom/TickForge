@@ -12,7 +12,24 @@
 //! - No tick is processed while another is in-flight (`can_process_tick`
 //!   returns `CommitPending` when `pending_commit_tick.is_some()`).
 
-use log::{debug, error};
+use std::time::Instant;
+
+use log::{debug, error, info, warn};
+
+/// Maximum number of retry attempts before giving up on a failed commit.
+///
+/// After exhaustion, `pending_commit_tick` is cleared and server-side
+/// backpressure stalls the pipeline naturally.
+const MAX_COMMIT_RETRIES: u32 = 3;
+
+/// What the caller should do after a commit failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureAction {
+    /// Re-send the same payload — pending remains set, pipeline blocked.
+    Retry,
+    /// Retries exhausted — pending cleared, pipeline unblocked, backpressure engages.
+    Exhausted,
+}
 
 /// Result of checking whether a tick can be processed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +50,8 @@ pub enum CanProcessResult {
 pub struct CommitAuthority {
     last_processed_tick: u64,
     pending_commit_tick: Option<u64>,
+    retry_count: u32,
+    commit_sent_at: Option<Instant>,
 }
 
 impl Default for CommitAuthority {
@@ -47,6 +66,8 @@ impl CommitAuthority {
         Self {
             last_processed_tick: 0,
             pending_commit_tick: None,
+            retry_count: 0,
+            commit_sent_at: None,
         }
     }
 
@@ -87,25 +108,47 @@ impl CommitAuthority {
             self.pending_commit_tick.unwrap_or(0),
         );
         self.pending_commit_tick = Some(tick);
+        self.commit_sent_at = Some(Instant::now());
     }
 
     /// Acknowledge a successful commit — advance the cursor and clear pending.
     pub fn acknowledge_success(&mut self, tick: u64) {
+        if let Some(sent_at) = self.commit_sent_at.take() {
+            let latency_us = sent_at.elapsed().as_micros();
+            info!("tick={tick} commit_latency_us={latency_us}");
+        }
         self.last_processed_tick = tick;
         self.pending_commit_tick = None;
+        self.retry_count = 0;
         debug!("tick={tick} commit acknowledged");
     }
 
-    /// Acknowledge a failed commit — clear pending but do *not* advance the cursor.
+    /// Acknowledge a failed commit and decide whether to retry.
     ///
-    /// Backpressure will engage on the server side because `last_committed_tick`
-    /// never advanced.
-    pub fn acknowledge_failure(&mut self, tick: u64, reason: &str) {
-        self.pending_commit_tick = None;
-        error!(
-            "tick={tick} commit failed: {reason} — \
-             last_processed_tick not advanced; backpressure will engage"
-        );
+    /// - `Retry`: `pending_commit_tick` stays set (blocking new ticks),
+    ///    retry counter incremented.  Caller should buffer the payload
+    ///    and re-send on the next opportunity.
+    /// - `Exhausted`: retries exceeded `MAX_COMMIT_RETRIES`, pending
+    ///    cleared, retry counter reset.  Server-side backpressure will
+    ///    stall `tick_trigger` because `last_committed_tick` never advanced.
+    pub fn acknowledge_failure(&mut self, tick: u64, reason: &str) -> FailureAction {
+        self.retry_count += 1;
+        if self.retry_count <= MAX_COMMIT_RETRIES {
+            // Keep pending set — blocks new ticks until retry succeeds.
+            warn!(
+                "tick={tick} commit failed (attempt {}/{}): {reason}",
+                self.retry_count, MAX_COMMIT_RETRIES
+            );
+            FailureAction::Retry
+        } else {
+            self.pending_commit_tick = None;
+            self.retry_count = 0;
+            error!(
+                "tick={tick} commit failed after {MAX_COMMIT_RETRIES} retries: {reason} — \
+                 giving up; backpressure will engage"
+            );
+            FailureAction::Exhausted
+        }
     }
 
     /// The last tick whose commit was acknowledged by the server.
@@ -116,6 +159,11 @@ impl CommitAuthority {
     /// The tick currently awaiting commit acknowledgement, if any.
     pub fn pending_tick(&self) -> Option<u64> {
         self.pending_commit_tick
+    }
+
+    /// Current retry attempt count (0 = no failure yet).
+    pub fn retry_count(&self) -> u32 {
+        self.retry_count
     }
 }
 
@@ -158,19 +206,62 @@ mod tests {
     }
 
     #[test]
-    fn failure_does_not_advance_cursor() {
+    fn failure_keeps_pending_for_retry() {
         let mut ca = CommitAuthority::new();
         ca.seed(10);
 
         assert_eq!(ca.can_process_tick(11), CanProcessResult::Proceed);
         ca.mark_in_flight(11);
-        ca.acknowledge_failure(11, "reducer rejected");
+        let action = ca.acknowledge_failure(11, "reducer rejected");
 
-        // Cursor stays at 10 — the failed tick can be re-attempted if needed.
+        // First failure → retry: cursor stays, pending stays set, pipeline blocked.
+        assert_eq!(action, FailureAction::Retry);
         assert_eq!(ca.last_processed_tick(), 10);
+        assert_eq!(ca.pending_tick(), Some(11));
+        assert_eq!(ca.retry_count(), 1);
+        assert_eq!(ca.can_process_tick(12), CanProcessResult::CommitPending(11));
+    }
+
+    #[test]
+    fn exhausted_retries_clear_pending() {
+        let mut ca = CommitAuthority::new();
+        ca.seed(10);
+
+        ca.mark_in_flight(11);
+
+        // Fail MAX_COMMIT_RETRIES times → all return Retry.
+        for i in 1..=MAX_COMMIT_RETRIES {
+            let action = ca.acknowledge_failure(11, "transient error");
+            assert_eq!(action, FailureAction::Retry);
+            assert_eq!(ca.retry_count(), i);
+            assert_eq!(ca.pending_tick(), Some(11));
+        }
+
+        // One more failure → Exhausted, pending cleared.
+        let action = ca.acknowledge_failure(11, "final failure");
+        assert_eq!(action, FailureAction::Exhausted);
         assert_eq!(ca.pending_tick(), None);
-        // Next tick can proceed (server backpressure will stop tick_trigger independently).
+        assert_eq!(ca.retry_count(), 0);
+        assert_eq!(ca.last_processed_tick(), 10);
+        // Pipeline unblocked — server backpressure will stall independently.
         assert_eq!(ca.can_process_tick(12), CanProcessResult::Proceed);
+    }
+
+    #[test]
+    fn success_after_failure_resets_retry_count() {
+        let mut ca = CommitAuthority::new();
+        ca.seed(10);
+
+        ca.mark_in_flight(11);
+        let action = ca.acknowledge_failure(11, "transient");
+        assert_eq!(action, FailureAction::Retry);
+        assert_eq!(ca.retry_count(), 1);
+
+        // Retry succeeds.
+        ca.acknowledge_success(11);
+        assert_eq!(ca.retry_count(), 0);
+        assert_eq!(ca.last_processed_tick(), 11);
+        assert_eq!(ca.pending_tick(), None);
     }
 
     #[test]
@@ -196,15 +287,17 @@ mod tests {
     }
 
     #[test]
-    fn send_failure_clears_pending() {
+    fn send_failure_triggers_retry() {
         let mut ca = CommitAuthority::new();
         ca.seed(10);
 
         ca.mark_in_flight(11);
         // Simulate send_result Err — coordinator calls acknowledge_failure.
-        ca.acknowledge_failure(11, "send failed");
+        let action = ca.acknowledge_failure(11, "send failed");
 
-        assert_eq!(ca.pending_tick(), None);
+        // Send failure is retryable — pending stays set.
+        assert_eq!(action, FailureAction::Retry);
+        assert_eq!(ca.pending_tick(), Some(11));
         assert_eq!(ca.last_processed_tick(), 10);
     }
 }

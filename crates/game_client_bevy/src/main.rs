@@ -4,7 +4,19 @@ mod spacetime;
 mod sync;
 #[cfg(feature = "connected")]
 mod input;
+#[cfg(feature = "connected")]
+mod combat_log;
+#[cfg(feature = "connected")]
+mod vfx;
+#[cfg(feature = "connected")]
+mod inspector;
+#[cfg(feature = "connected")]
+mod admin;
+#[cfg(feature = "connected")]
+mod inventory;
+mod ability_bar;
 mod camera;
+mod diagnostics;
 mod hud;
 
 use bevy::prelude::*;
@@ -23,12 +35,19 @@ fn main() {
     app.add_systems(Startup, setup_scene);
     app.add_plugins(camera::CameraPlugin);
     app.add_plugins(hud::HudPlugin);
+    app.add_plugins(diagnostics::DiagnosticsPlugin);
+    app.add_plugins(ability_bar::AbilityBarPlugin);
 
     #[cfg(feature = "connected")]
     {
         app.add_plugins(spacetime::SpacetimePlugin);
         app.add_plugins(sync::SyncPlugin);
         app.add_plugins(input::InputPlugin);
+        app.add_plugins(combat_log::CombatLogPlugin);
+        app.add_plugins(vfx::VfxPlugin);
+        app.add_plugins(inspector::InspectorPlugin);
+        app.add_plugins(admin::AdminPlugin);
+        app.add_plugins(inventory::InventoryPlugin);
     }
 
     app.run();

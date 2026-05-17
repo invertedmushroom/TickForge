@@ -151,7 +151,7 @@ pub fn hitbox_sensor_shape(shape: SkillShape) -> SensorShape {
         SkillShape::Sphere       => SensorShape::Sphere { radius: 2.0 },
         SkillShape::Cone         => SensorShape::Capsule { half_height: 1.5, radius: 1.0 },
         SkillShape::CapsuleSweep => SensorShape::Capsule { half_height: 1.0, radius: 0.75 },
-        SkillShape::Projectile   => SensorShape::Sphere { radius: 0.3 },
+        SkillShape::Projectile   => SensorShape::Sphere { radius: 0.5 },
         SkillShape::LineSweep    => SensorShape::Capsule { half_height: 3.0, radius: 0.5 },
         SkillShape::HazardZone   => SensorShape::Sphere { radius: 5.0 },
     }
@@ -188,6 +188,61 @@ pub fn shapes_intersect(
             parry_intersect(&iso_hitbox, &shape, &iso_hurtbox, &hurtbox).unwrap_or(false)
         }
     }
+}
+
+/// Swept shape intersection test for projectiles.
+///
+/// Checks the entire path of the projectile from `prev_pos` to `curr_pos`
+/// against a stationary hurtbox. This prevents fast projectiles from tunneling
+/// through targets between ticks.
+///
+/// Uses Parry's `cast_shapes` with the projectile's displacement as its
+/// linear velocity over t=0..1. The hurtbox is treated as stationary.
+pub fn swept_shapes_intersect(
+    hitbox_shape: SensorShape,
+    prev_pos: Vec3f,
+    curr_pos: Vec3f,
+    hurtbox_world_pos: Vec3f,
+) -> bool {
+    use rapier3d::parry::query::{cast_shapes, ShapeCastOptions};
+    use rapier3d::parry::math::{Pose3, Vector};
+    use rapier3d::parry::shape::{Ball, Capsule};
+
+    let iso_hitbox = Pose3::translation(prev_pos.x, prev_pos.y, prev_pos.z);
+    let iso_hurtbox = Pose3::translation(hurtbox_world_pos.x, hurtbox_world_pos.y, hurtbox_world_pos.z);
+
+    // Displacement over this tick = velocity for t ∈ [0, 1].
+    let vel = Vector::new(
+        curr_pos.x - prev_pos.x,
+        curr_pos.y - prev_pos.y,
+        curr_pos.z - prev_pos.z,
+    );
+    let zero_vel = Vector::ZERO;
+    let options = ShapeCastOptions::with_max_time_of_impact(1.0);
+
+    let hurtbox = Capsule::new_y(HURTBOX_HALF_HEIGHT, HURTBOX_RADIUS);
+
+    let toi_result = match hitbox_shape {
+        SensorShape::Sphere { radius } => {
+            let shape = Ball::new(radius);
+            cast_shapes(
+                &iso_hitbox, vel, &shape,
+                &iso_hurtbox, zero_vel, &hurtbox,
+                options,
+            )
+        }
+        SensorShape::Capsule { half_height, radius } => {
+            let shape = Capsule::new_y(half_height, radius);
+            cast_shapes(
+                &iso_hitbox, vel, &shape,
+                &iso_hurtbox, zero_vel, &hurtbox,
+                options,
+            )
+        }
+    };
+    // cast_shapes returns Ok(Some(hit)) if shapes come into contact during t ∈ [0, max_toi].
+    // PenetratingOrWithinTargetDist status means already overlapping at t=0.
+    matches!(toi_result, Ok(Some(_)))
 }
 
 /// Compute the world position of a hitbox sensor, applying the facing-rotated
@@ -340,5 +395,79 @@ mod tests {
         );
         assert!((pos.x - 2.0).abs() < 0.1, "x={}", pos.x);
         assert!((pos.z).abs() < 0.1, "z={}", pos.z);
+    }
+
+    // ── Swept projectile intersection tests ──────────────────────────
+
+    #[test]
+    fn swept_detects_overlap_at_final_position() {
+        // Projectile moves from (0,0,0) to (1,0,0). Target at (1,0,0).
+        // Should hit — target is at the final position.
+        let shape = SensorShape::Sphere { radius: 0.5 };
+        assert!(swept_shapes_intersect(
+            shape,
+            Vec3f::new(0.0, 0.0, 0.0),
+            Vec3f::new(1.0, 0.0, 0.0),
+            Vec3f::new(1.0, 0.0, 0.0),
+        ));
+    }
+
+    #[test]
+    fn swept_detects_tunnel_through() {
+        // Projectile moves from (0,0,0) to (10,0,0), speed = 10 units/tick.
+        // Target at (5,0,0). Point-in-time at (0,0,0) and (10,0,0) would miss,
+        // but swept catches the passage through (5,0,0).
+        let shape = SensorShape::Sphere { radius: 0.5 };
+        assert!(swept_shapes_intersect(
+            shape,
+            Vec3f::new(0.0, 0.0, 0.0),
+            Vec3f::new(10.0, 0.0, 0.0),
+            Vec3f::new(5.0, 0.0, 0.0),
+        ));
+    }
+
+    #[test]
+    fn swept_misses_when_target_far_away() {
+        // Projectile moves from (0,0,0) to (1,0,0). Target at (0,0,10).
+        // Completely perpendicular — no hit.
+        let shape = SensorShape::Sphere { radius: 0.5 };
+        assert!(!swept_shapes_intersect(
+            shape,
+            Vec3f::new(0.0, 0.0, 0.0),
+            Vec3f::new(1.0, 0.0, 0.0),
+            Vec3f::new(0.0, 0.0, 10.0),
+        ));
+    }
+
+    #[test]
+    fn swept_detects_overlap_at_start() {
+        // Projectile starts on top of target — already overlapping at t=0.
+        let shape = SensorShape::Sphere { radius: 0.5 };
+        assert!(swept_shapes_intersect(
+            shape,
+            Vec3f::new(5.0, 0.0, 0.0),
+            Vec3f::new(6.0, 0.0, 0.0),
+            Vec3f::new(5.0, 0.0, 0.0),
+        ));
+    }
+
+    #[test]
+    fn swept_catches_fast_projectile_that_point_test_misses() {
+        // Fast projectile: 5 units/tick. Target hurtbox at (3,0,0).
+        // Hurtbox capsule has radius 0.3 + projectile sphere radius 0.5 = 0.8 combined.
+        // Point-in-time at prev (0,0,0): distance 3.0 > 0.8 → miss.
+        // Point-in-time at curr (5,0,0): distance 2.0 > 0.8 → miss.
+        // Swept: catches passage at ~t=0.6 (x≈3.0) → hit.
+        let shape = SensorShape::Sphere { radius: 0.5 };
+        // Confirm point-in-time would miss at both endpoints:
+        assert!(!shapes_intersect(shape, Vec3f::new(0.0, 0.0, 0.0), Vec3f::new(3.0, 0.0, 0.0)));
+        assert!(!shapes_intersect(shape, Vec3f::new(5.0, 0.0, 0.0), Vec3f::new(3.0, 0.0, 0.0)));
+        // Swept catches it:
+        assert!(swept_shapes_intersect(
+            shape,
+            Vec3f::new(0.0, 0.0, 0.0),
+            Vec3f::new(5.0, 0.0, 0.0),
+            Vec3f::new(3.0, 0.0, 0.0),
+        ));
     }
 }

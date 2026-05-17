@@ -90,11 +90,29 @@ pub struct CommitBuffAppliedData {
 /// Combat event kind — mirrors `CombatEventKind` from `server_module`.
 #[derive(Clone, Debug)]
 pub enum CommitCombatEventKind {
+    CastStart { ability_id: u32, cast_duration_ticks: u32 },
+    ChargeStart { ability_id: u32, max_ticks: u32 },
+    ChargeTierReached { ability_id: u32, tier: u8 },
+    BlockStart,
+    BlockEnd,
     Damage(CommitDamageData),
     SkillHit(u32),
     BuffApplied(CommitBuffAppliedData),
     BuffExpired(u32),
     EntityDied(Option<u64>),
+    Dodged(u32),
+    Blocked { ability_id: u32, damage_taken: f32, perfect: bool },
+    Covered { blocker: u64, ability_id: u32, damage_taken: f32 },
+    LockOnWarning { target: u64, impact_tick: u64 },
+    ProjectileLaunched {
+        execution_id: u64,
+        ability_id: u32,
+        origin_x: f32, origin_y: f32, origin_z: f32,
+        direction_x: f32, direction_y: f32, direction_z: f32,
+        speed: f32,
+        max_range: f32,
+    },
+    ProjectileRemoved { execution_id: u64 },
 }
 
 /// A single combat event ready for commit.
@@ -132,6 +150,14 @@ pub struct CommitBuff {
     pub source_entity: u64,
     pub stacks: u32,
     pub expires_at_tick: Option<u64>,
+    // Modifier fields (flat)
+    pub mod_damage_out_pct: Option<f32>,
+    pub mod_damage_in_pct: Option<f32>,
+    pub mod_cooldown_reduce_pct: Option<f32>,
+    pub mod_speed_pct: Option<f32>,
+    pub mod_ai_override_kind: Option<u8>,
+    pub mod_ai_override_target: Option<u64>,
+    pub mod_root: Option<bool>,
 }
 
 /// One threat entry for persistence. Mirrors the `threat_entry` DB table.
@@ -247,12 +273,28 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
         .buff_updates
         .iter()
         .flat_map(|(eid, buffs)| {
-            buffs.iter().map(move |b| CommitBuff {
-                entity_id: eid.0,
-                buff_id: b.buff_id,
-                source_entity: b.source.0,
-                stacks: b.stacks,
-                expires_at_tick: b.expires_at.map(|t| t.0),
+            buffs.iter().map(move |b| {
+                use game_core::combat::status::AiOverride;
+                let (ai_kind, ai_target) = match b.modifiers.ai_override {
+                    None => (None, None),
+                    Some(AiOverride::ForceFlee) => (Some(0u8), None),
+                    Some(AiOverride::ForceIdle) => (Some(1u8), None),
+                    Some(AiOverride::ForceFocus { target }) => (Some(2u8), Some(target.0)),
+                };
+                CommitBuff {
+                    entity_id: eid.0,
+                    buff_id: b.buff_id,
+                    source_entity: b.source.0,
+                    stacks: b.stacks,
+                    expires_at_tick: b.expires_at.map(|t| t.0),
+                    mod_damage_out_pct: b.modifiers.damage_out_pct,
+                    mod_damage_in_pct: b.modifiers.damage_in_pct,
+                    mod_cooldown_reduce_pct: b.modifiers.cooldown_reduce_pct,
+                    mod_speed_pct: b.modifiers.speed_pct,
+                    mod_ai_override_kind: ai_kind,
+                    mod_ai_override_target: ai_target,
+                    mod_root: b.modifiers.root,
+                }
             })
         })
         .collect();
@@ -407,6 +449,49 @@ fn classify_events(events: &[SimEvent]) -> (Vec<CommitCombatEvent>, Vec<CommitWo
                     event_kind: CommitCombatEventKind::EntityDied(killer.map(|k| k.0)),
                 });
             }
+            EventPayload::Dodged { source, ability_id } => {
+                combat_events.push(CommitCombatEvent {
+                    source_entity: source.0,
+                    target_entity: e.entity_id.0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CommitCombatEventKind::Dodged(*ability_id),
+                });
+            }
+            EventPayload::Blocked { source, ability_id, damage_taken, perfect } => {
+                combat_events.push(CommitCombatEvent {
+                    source_entity: source.0,
+                    target_entity: e.entity_id.0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CommitCombatEventKind::Blocked {
+                        ability_id: *ability_id,
+                        damage_taken: *damage_taken,
+                        perfect: *perfect,
+                    },
+                });
+            }
+            EventPayload::Covered { blocker, ability_id, damage_taken } => {
+                combat_events.push(CommitCombatEvent {
+                    source_entity: blocker.0,
+                    target_entity: e.entity_id.0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CommitCombatEventKind::Covered {
+                        blocker: blocker.0,
+                        ability_id: *ability_id,
+                        damage_taken: *damage_taken,
+                    },
+                });
+            }
+            EventPayload::LockOnWarning { source, target, impact_tick } => {
+                combat_events.push(CommitCombatEvent {
+                    source_entity: source.0,
+                    target_entity: target.0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CommitCombatEventKind::LockOnWarning {
+                        target: target.0,
+                        impact_tick: *impact_tick,
+                    },
+                });
+            }
             EventPayload::EntityDespawned => {
                 world_events.push(CommitWorldEvent {
                     entity_id: e.entity_id.0,
@@ -428,6 +513,55 @@ fn classify_events(events: &[SimEvent]) -> (Vec<CommitCombatEvent>, Vec<CommitWo
                     event_kind: CommitWorldEventKind::InteractTriggered(target.0),
                 });
             }
+            EventPayload::CastStart { ability_id, cast_duration_ticks } => {
+                combat_events.push(CommitCombatEvent {
+                    source_entity: e.entity_id.0,
+                    target_entity: 0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CommitCombatEventKind::CastStart {
+                        ability_id: *ability_id,
+                        cast_duration_ticks: *cast_duration_ticks,
+                    },
+                });
+            }
+            EventPayload::ChargeStart { ability_id, max_ticks } => {
+                combat_events.push(CommitCombatEvent {
+                    source_entity: e.entity_id.0,
+                    target_entity: 0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CommitCombatEventKind::ChargeStart {
+                        ability_id: *ability_id,
+                        max_ticks: *max_ticks,
+                    },
+                });
+            }
+            EventPayload::ChargeTierReached { ability_id, tier } => {
+                combat_events.push(CommitCombatEvent {
+                    source_entity: e.entity_id.0,
+                    target_entity: 0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CommitCombatEventKind::ChargeTierReached {
+                        ability_id: *ability_id,
+                        tier: *tier,
+                    },
+                });
+            }
+            EventPayload::BlockStart => {
+                combat_events.push(CommitCombatEvent {
+                    source_entity: e.entity_id.0,
+                    target_entity: 0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CommitCombatEventKind::BlockStart,
+                });
+            }
+            EventPayload::BlockEnd => {
+                combat_events.push(CommitCombatEvent {
+                    source_entity: e.entity_id.0,
+                    target_entity: 0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CommitCombatEventKind::BlockEnd,
+                });
+            }
             // Internal pipeline events — not committed to DB.
             EventPayload::EntitySpawned
             | EventPayload::HitboxSpawned { .. }
@@ -435,6 +569,33 @@ fn classify_events(events: &[SimEvent]) -> (Vec<CommitCombatEvent>, Vec<CommitWo
             | EventPayload::HitboxRemoved { .. }
             | EventPayload::CooldownReady { .. }
             | EventPayload::TickBoundary => {}
+            EventPayload::ProjectileLaunched {
+                execution_id, ability_id, origin, direction, speed, max_range,
+            } => {
+                combat_events.push(CommitCombatEvent {
+                    source_entity: e.entity_id.0,
+                    target_entity: 0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CommitCombatEventKind::ProjectileLaunched {
+                        execution_id: *execution_id,
+                        ability_id: *ability_id,
+                        origin_x: origin.x, origin_y: origin.y, origin_z: origin.z,
+                        direction_x: direction.x, direction_y: direction.y, direction_z: direction.z,
+                        speed: *speed,
+                        max_range: *max_range,
+                    },
+                });
+            }
+            EventPayload::ProjectileRemoved { execution_id } => {
+                combat_events.push(CommitCombatEvent {
+                    source_entity: e.entity_id.0,
+                    target_entity: 0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CommitCombatEventKind::ProjectileRemoved {
+                        execution_id: *execution_id,
+                    },
+                });
+            }
         }
     }
 

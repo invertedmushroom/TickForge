@@ -11,14 +11,24 @@ pub struct SyncPlugin;
 impl Plugin for SyncPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<EntityMap>();
-        app.add_systems(Update, (detect_local_player, sync_entities, sync_health).chain());
+        app.add_systems(Update, (
+            detect_local_player,
+            sync_entities,
+            sync_health,
+            sync_health_bars,
+            sync_target_lock_indicator,
+            sync_npc_state_color,
+        ).chain());
     }
 }
 
+/// Interpolation speed (units per second). Higher = snappier.
+const INTERP_SPEED: f32 = 12.0;
+
 /// Maps SpacetimeDB entity_id → Bevy Entity.
 #[derive(Resource, Default)]
-struct EntityMap {
-    map: HashMap<u64, bevy::ecs::entity::Entity>,
+pub struct EntityMap {
+    pub map: HashMap<u64, bevy::ecs::entity::Entity>,
 }
 
 /// Tag linking a Bevy entity to its SpacetimeDB entity_id.
@@ -41,10 +51,16 @@ struct EntityMeshes {
     player_mesh: Handle<Mesh>,
     npc_mesh: Handle<Mesh>,
     boss_mesh: Handle<Mesh>,
+    projectile_mesh: Handle<Mesh>,
+    hazard_mesh: Handle<Mesh>,
     player_mat: Handle<StandardMaterial>,
     npc_mat: Handle<StandardMaterial>,
     boss_mat: Handle<StandardMaterial>,
     local_player_mat: Handle<StandardMaterial>,
+    npc_combat_mat: Handle<StandardMaterial>,
+    npc_flee_mat: Handle<StandardMaterial>,
+    projectile_mat: Handle<StandardMaterial>,
+    hazard_mat: Handle<StandardMaterial>,
 }
 
 impl FromWorld for EntityMeshes {
@@ -53,6 +69,8 @@ impl FromWorld for EntityMeshes {
         let player_mesh = meshes.add(Capsule3d::new(0.3, 1.0));
         let npc_mesh = meshes.add(Capsule3d::new(0.3, 1.0));
         let boss_mesh = meshes.add(Capsule3d::new(0.5, 1.5));
+        let projectile_mesh = meshes.add(Sphere::new(0.15));
+        let hazard_mesh = meshes.add(Cylinder::new(0.4, 0.1));
 
         let mut materials = world.resource_mut::<Assets<StandardMaterial>>();
         let player_mat = materials.add(StandardMaterial {
@@ -71,23 +89,52 @@ impl FromWorld for EntityMeshes {
             base_color: Color::srgb(0.1, 1.0, 0.3),
             ..default()
         });
+        let npc_combat_mat = materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.6, 0.1),
+            ..default()
+        });
+        let npc_flee_mat = materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 1.0, 0.3),
+            ..default()
+        });
+        let projectile_mat = materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.9, 0.2),
+            emissive: LinearRgba::new(2.0, 1.8, 0.0, 1.0),
+            ..default()
+        });
+        let hazard_mat = materials.add(StandardMaterial {
+            base_color: Color::srgba(1.0, 0.2, 0.0, 0.7),
+            emissive: LinearRgba::new(1.5, 0.3, 0.0, 1.0),
+            alpha_mode: AlphaMode::Blend,
+            ..default()
+        });
 
         EntityMeshes {
             player_mesh,
             npc_mesh,
             boss_mesh,
+            projectile_mesh,
+            hazard_mesh,
             player_mat,
             npc_mat,
             boss_mat,
             local_player_mat,
+            npc_combat_mat,
+            npc_flee_mat,
+            projectile_mat,
+            hazard_mat,
         }
     }
 }
 
 /// Detect which entity belongs to the local player (by checking entity table for our identity).
+/// When detected, retroactively add LocalPlayer + green material to the already-spawned Bevy entity.
 fn detect_local_player(
     stdb: Option<Res<StdbConnection>>,
     mut local_player: ResMut<LocalPlayerEntity>,
+    entity_map: Res<EntityMap>,
+    entity_meshes: Option<Res<EntityMeshes>>,
+    mut commands: Commands,
 ) {
     let Some(stdb) = stdb else { return };
     if local_player.entity_id.is_some() {
@@ -103,6 +150,17 @@ fn detect_local_player(
         if entity.owner_identity.as_ref() == Some(&our_identity) {
             log::info!("Local player entity detected: {}", entity.entity_id);
             local_player.entity_id = Some(entity.entity_id);
+
+            // Retroactively tag the Bevy entity if it was already spawned.
+            if let Some(&bevy_entity) = entity_map.map.get(&entity.entity_id) {
+                log::info!("Retroactively adding LocalPlayer to Bevy entity");
+                commands.entity(bevy_entity).insert(LocalPlayer);
+                if let Some(meshes) = entity_meshes {
+                    commands.entity(bevy_entity).insert(
+                        MeshMaterial3d(meshes.local_player_mat.clone()),
+                    );
+                }
+            }
             return;
         }
     }
@@ -116,6 +174,7 @@ fn sync_entities(
     mut commands: Commands,
     mut query: Query<&mut Transform, With<ServerEntity>>,
     entity_meshes: Option<Res<EntityMeshes>>,
+    time: Res<Time>,
 ) {
     let Some(stdb) = stdb else { return };
 
@@ -130,10 +189,16 @@ fn sync_entities(
     let mut live_ids: bevy::utils::HashSet<u64> = bevy::utils::HashSet::new();
 
     for row in stdb.conn.db.nearby_transforms().iter() {
+        // Skip entities in terminal states (death cleanup may lag one frame).
+        let entity_row = stdb.conn.db.entity().entity_id().find(&row.entity_id);
+        if entity_row.as_ref().is_some_and(|e| matches!(e.state, EntityState::DespawnPending | EntityState::Removed)) {
+            continue;
+        }
+
         live_ids.insert(row.entity_id);
 
         // Look up entity kind from entity table.
-        let kind = stdb.conn.db.entity().entity_id().find(&row.entity_id)
+        let kind = entity_row
             .map(|e| e.kind)
             .unwrap_or(EntityKind::Player);
 
@@ -143,9 +208,10 @@ fn sync_entities(
         if let Some(&bevy_entity) = entity_map.map.get(&row.entity_id) {
             // Update existing Bevy entity.
             if let Ok(mut tf) = query.get_mut(bevy_entity) {
-                // Smooth interpolation toward server position.
-                tf.translation = tf.translation.lerp(server_pos, 0.3);
-                tf.rotation = tf.rotation.slerp(server_rot, 0.3);
+                // Frame-rate independent interpolation toward server position.
+                let t = (INTERP_SPEED * time.delta_secs()).min(1.0);
+                tf.translation = tf.translation.lerp(server_pos, t);
+                tf.rotation = tf.rotation.slerp(server_rot, t);
             }
         } else {
             // Spawn new Bevy entity for this server entity.
@@ -155,7 +221,8 @@ fn sync_entities(
                 EntityKind::Player => (meshes.player_mesh.clone(), meshes.player_mat.clone()),
                 EntityKind::Npc => (meshes.npc_mesh.clone(), meshes.npc_mat.clone()),
                 EntityKind::Boss => (meshes.boss_mesh.clone(), meshes.boss_mat.clone()),
-                _ => (meshes.npc_mesh.clone(), meshes.npc_mat.clone()),
+                EntityKind::Projectile => (meshes.projectile_mesh.clone(), meshes.projectile_mat.clone()),
+                EntityKind::Hazard => (meshes.hazard_mesh.clone(), meshes.hazard_mat.clone()),
             };
 
             let mut entity_cmd = commands.spawn((
@@ -182,7 +249,7 @@ fn sync_entities(
         .collect();
     for id in stale {
         if let Some(bevy_entity) = entity_map.map.remove(&id) {
-            commands.entity(bevy_entity).despawn();
+            commands.entity(bevy_entity).despawn_recursive();
         }
     }
 }
@@ -202,5 +269,154 @@ fn sync_health(
                 hp.max_hp = row.max_hp;
             }
         }
+    }
+}
+
+// ── Health bars ──────────────────────────────────────────────────────
+
+/// Tag for the health bar background (child of a 3D entity).
+#[derive(Component)]
+struct HealthBarBg;
+
+/// Tag for the health bar fill (child of health bar background).
+#[derive(Component)]
+struct HealthBarFill {
+    parent_server_entity: u64,
+}
+
+/// Spawn / update floating health bars above entities.
+fn sync_health_bars(
+    mut commands: Commands,
+    server_q: Query<(bevy::ecs::entity::Entity, &ServerEntity, &Health, Option<&Children>)>,
+    mut fill_q: Query<(&HealthBarFill, &mut Node, &mut BackgroundColor)>,
+    bg_q: Query<&HealthBarBg>,
+) {
+    for (bevy_entity, se, hp, children) in server_q.iter() {
+        // Check if this entity already has a health bar child.
+        let has_bar = children.map_or(false, |ch| ch.iter().any(|c| bg_q.get(*c).is_ok()));
+
+        if !has_bar && hp.max_hp > 0.0 {
+            // Spawn health bar UI as child of 3D entity.
+            commands.entity(bevy_entity).with_children(|parent| {
+                parent.spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        width: Val::Px(60.0),
+                        height: Val::Px(6.0),
+                        left: Val::Px(-30.0),
+                        top: Val::Px(-80.0),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.2, 0.2, 0.2, 0.7)),
+                    HealthBarBg,
+                )).with_children(|bar_parent| {
+                    bar_parent.spawn((
+                        Node {
+                            width: Val::Percent(100.0),
+                            height: Val::Percent(100.0),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.1, 0.9, 0.1)),
+                        HealthBarFill {
+                            parent_server_entity: se.entity_id,
+                        },
+                    ));
+                });
+            });
+        }
+
+        // Update existing health bar fill width.
+        for (fill, mut node, mut bg) in fill_q.iter_mut() {
+            if fill.parent_server_entity == se.entity_id && hp.max_hp > 0.0 {
+                let frac = (hp.hp / hp.max_hp).clamp(0.0, 1.0);
+                node.width = Val::Percent(frac * 100.0);
+                // Color: green > yellow > red.
+                let color = if frac > 0.5 {
+                    Color::srgb(0.1, 0.9, 0.1)
+                } else if frac > 0.25 {
+                    Color::srgb(0.9, 0.9, 0.1)
+                } else {
+                    Color::srgb(0.9, 0.1, 0.1)
+                };
+                *bg = BackgroundColor(color);
+            }
+        }
+    }
+}
+
+// ── Target lock indicator ────────────────────────────────────────────
+
+/// Visual ring mesh spawned at the feet of the target-locked entity.
+#[derive(Component)]
+pub struct TargetLockRing;
+
+fn sync_target_lock_indicator(
+    mut commands: Commands,
+    lock: Option<Res<crate::input::TargetLockState>>,
+    entity_map: Res<EntityMap>,
+    existing_rings: Query<bevy::ecs::entity::Entity, With<TargetLockRing>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let target = lock.and_then(|l| l.target_entity);
+
+    // Despawn old rings.
+    for ring in existing_rings.iter() {
+        commands.entity(ring).despawn();
+    }
+
+    // Spawn ring under the locked target.
+    let Some(target_id) = target else { return };
+    let Some(&bevy_entity) = entity_map.map.get(&target_id) else { return };
+
+    let ring_mesh = meshes.add(Torus::new(0.35, 0.5));
+    let ring_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(1.0, 0.3, 0.3, 0.6),
+        emissive: LinearRgba::new(2.0, 0.4, 0.0, 1.0),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        ..default()
+    });
+
+    commands.entity(bevy_entity).with_children(|parent| {
+        parent.spawn((
+            Mesh3d(ring_mesh),
+            MeshMaterial3d(ring_mat),
+            Transform::from_xyz(0.0, -0.4, 0.0),
+            TargetLockRing,
+        ));
+    });
+}
+
+// ── NPC AI state color ──────────────────────────────────────────────
+
+/// Tint NPC capsules based on their AI state from the npc_state table.
+fn sync_npc_state_color(
+    stdb: Option<Res<StdbConnection>>,
+    entity_map: Res<EntityMap>,
+    entity_meshes: Option<Res<EntityMeshes>>,
+    _server_q: Query<(&ServerEntity, &MeshMaterial3d<StandardMaterial>)>,
+    mut commands: Commands,
+    entity_table: Query<&ServerEntity>,
+) {
+    let Some(stdb) = stdb else { return };
+    let Some(meshes) = entity_meshes else { return };
+
+    for npc in stdb.conn.db.npc_state().iter() {
+        let Some(&bevy_entity) = entity_map.map.get(&npc.entity_id) else { continue };
+
+        // Only recolor NPC/Boss entities — skip players.
+        let Ok(se) = entity_table.get(bevy_entity) else { continue };
+        let entity_row = stdb.conn.db.entity().entity_id().find(&se.entity_id);
+        let is_npc = entity_row.as_ref().is_some_and(|e| matches!(e.kind, EntityKind::Npc | EntityKind::Boss));
+        if !is_npc { continue; }
+
+        let mat = match npc.ai_state {
+            NpcAiState::Combat => meshes.npc_combat_mat.clone(),
+            NpcAiState::Flee => meshes.npc_flee_mat.clone(),
+            _ => meshes.npc_mat.clone(),
+        };
+
+        commands.entity(bevy_entity).insert(MeshMaterial3d(mat));
     }
 }
