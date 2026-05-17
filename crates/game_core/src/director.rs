@@ -186,9 +186,9 @@ impl DirectorState {
 
             if rt.def.trigger.evaluate(player_count, current_tick, world_phases) {
                 let scaling = ScalingFactor::from_player_count(player_count);
-                let (rx, rz, _layer) = rt.def.region;
-                let center_x = (rx as f32 + 0.5) * REGION_CELL_SIZE;
-                let center_z = (rz as f32 + 0.5) * REGION_CELL_SIZE;
+            let (rx, rz, layer) = rt.def.region;
+            let center_x = (rx as f32 + 0.5) * REGION_CELL_SIZE;
+            let center_z = (rz as f32 + 0.5) * REGION_CELL_SIZE;
 
                 for directive in &rt.def.spawns {
                     // Scale spawn count by region density.
@@ -202,7 +202,7 @@ impl DirectorState {
                                 y: directive.offset[1],
                                 z: center_z + directive.offset[2],
                             },
-                            layer: 0,
+                            layer,
                         });
                     }
                 }

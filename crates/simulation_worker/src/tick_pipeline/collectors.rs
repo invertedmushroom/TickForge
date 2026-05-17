@@ -37,7 +37,7 @@ impl TickPipeline {
     pub(super) fn collect_health_updates(&self) -> Vec<(EntityId, f32, f32)> {
         let damaged: HashSet<EntityId> = self.pending_events.iter()
             .filter_map(|e| match &e.payload {
-                EventPayload::Damage { .. } | EventPayload::FallDamage { .. } => Some(e.entity_id),
+                EventPayload::Damage { .. } | EventPayload::FallDamage { .. } | EventPayload::Healed { .. } => Some(e.entity_id),
                 _ => None,
             })
             .collect();
@@ -103,10 +103,19 @@ impl TickPipeline {
         let mut out = Vec::new();
         for &(eid, ref tf) in transforms {
             let pos = &tf.position;
+            let layer = self.layer_of(eid);
             let new_cell = match self.entity_regions.get(&eid) {
-                Some(current) => RegionCell::from_position_with_hysteresis(pos, current),
-                // Entity not tracked yet (expected on first tick after spawn).
-                None => RegionCell::from_position(pos),
+                Some(current) if current.layer == layer => {
+                    RegionCell::from_position_with_hysteresis(pos, current)
+                }
+                Some(current) => {
+                    // Layer changed — carry it through so the region update
+                    // propagates to entity_region even if XZ didn't move.
+                    let mut cell = RegionCell::from_position_with_hysteresis(pos, current);
+                    cell.layer = layer;
+                    cell
+                }
+                None => RegionCell::from_position_on_layer(pos, layer),
             };
             let changed = self.entity_regions.get(&eid) != Some(&new_cell);
             if changed {

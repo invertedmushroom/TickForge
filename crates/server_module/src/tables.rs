@@ -22,6 +22,9 @@ pub struct ModuleConfig {
     /// Next dynamic instance layer to allocate. Layers 0–99 are reserved;
     /// dynamic instances start at 100 and increment.
     pub next_instance_layer: u32,
+    /// Monotonically increasing counter tracking the latest sim_tick row inserted.
+    /// Eliminates the O(N) `sim_tick().iter().max_by_key()` scan in tick_trigger.
+    pub next_tick_id: u64,
 }
 // ── Simulation Clock ────────────────────────────────────────────────
 // Per spec: tick number must be committed through the database.
@@ -70,6 +73,19 @@ pub struct EntityTeam {
     #[primary_key]
     pub entity_id: u64,
     pub team_id: u32,
+}
+
+// ── Layer Assignment ────────────────────────────────────────────────
+// Public projection of entity_region.layer so the simulation worker can
+// subscribe and track layer changes without exposing the private
+// entity_region table (which contains spatial data used for stealth/AOI).
+// Written alongside entity_region inserts/updates that change layer.
+
+#[table(accessor = entity_layer, public)]
+pub struct EntityLayer {
+    #[primary_key]
+    pub entity_id: u64,
+    pub layer: u32,
 }
 
 // ── Stealth ─────────────────────────────────────────────────────────
@@ -152,6 +168,11 @@ pub struct ClientSequence {
 // ── Buffs ───────────────────────────────────────────────────────────
 // Single writer: combat system.
 
+/// Persisted buff state — only per-instance runtime fields.
+///
+/// Static template data (modifiers, buff_kind, max_stacks, etc.) is
+/// reconstructed from `BuffRegistry::get(buff_id)` at rehydration time.
+/// This keeps the commit payload small: ~10 columns instead of ~25.
 #[table(accessor = active_buff, public)]
 pub struct ActiveBuff {
     #[primary_key]
@@ -163,19 +184,16 @@ pub struct ActiveBuff {
     pub source_entity: u64,
     pub stacks: u32,
     pub expires_at_tick: Option<u64>,
-    // ── Modifier fields (flat columns) ──
-    pub mod_damage_out_pct: Option<f32>,
-    pub mod_damage_in_pct: Option<f32>,
-    pub mod_cooldown_reduce_pct: Option<f32>,
-    pub mod_speed_pct: Option<f32>,
     /// AI override kind: 0=ForceFlee, 1=ForceIdle, 2=ForceFocus. None = no override.
+    /// Persisted because ForceFocus carries a per-instance target entity.
     pub mod_ai_override_kind: Option<u8>,
     /// Target entity for ForceFocus override. Only meaningful when ai_override_kind == 2.
     pub mod_ai_override_target: Option<u64>,
-    /// Root: prevents movement when `Some(true)`.
-    pub mod_root: Option<bool>,
-    /// Stealth: hides entity from enemy teams in the nearby_transforms view.
+    /// Stealth flag — persisted so the reducer can derive `stealthed_entity` rows
+    /// without needing the buff registry.
     pub mod_stealth: Option<bool>,
+    /// Tick when DoT damage was last applied. Per-instance runtime state.
+    pub last_dot_tick: Option<u64>,
 }
 
 // ── NPC State ───────────────────────────────────────────────────────
@@ -240,6 +258,11 @@ pub struct DamageData {
 }
 
 #[derive(SpacetimeType, Clone, Debug)]
+pub struct HealedData {
+    pub amount: f32,
+}
+
+#[derive(SpacetimeType, Clone, Debug)]
 pub struct BuffAppliedData {
     pub buff_id: u32,
     pub duration_ticks: u32,
@@ -271,6 +294,7 @@ pub enum CombatEventKind {
     BlockStart,
     BlockEnd,
     Damage(DamageData),
+    Healed(HealedData),
     SkillHit(u32),
     BuffApplied(BuffAppliedData),
     BuffExpired(u32),

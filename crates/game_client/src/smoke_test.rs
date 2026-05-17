@@ -775,7 +775,6 @@ fn run_stealth_tests(conn: &DbConnection, r: &mut TestResults) {
     let bo = Arc::clone(&buff_ok);
     let _ = conn.reducers().debug_apply_buff_then(
         npc_eid, 700, 1, 200, // long duration so it doesn't expire during test
-        None, None, None, None,
         Some(true), // mod_stealth
         move |_ctx, result| {
             if let Ok(Ok(())) = result { bo.store(true, Ordering::SeqCst); }

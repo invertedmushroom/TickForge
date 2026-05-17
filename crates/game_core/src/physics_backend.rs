@@ -3,6 +3,7 @@ use std::any::Any;
 use game_protocol::entity_id::EntityId;
 use game_protocol::types::{Quatf, Transform, Vec3f};
 use game_schema::EntityKind;
+use game_schema::LayerCollisionPolicy;
 
 /// What role a collider plays on an entity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -159,12 +160,28 @@ pub trait PhysicsBackend: Send {
     /// Used for lock-on tagging validation and ground-target placement.
     fn line_of_sight(&self, from: Vec3f, to: Vec3f) -> bool;
 
+    /// Layer-aware line-of-sight: only environment colliders on `layer` (or the
+    /// shared ground plane) can occlude the ray.
+    ///
+    /// Default: delegates to `line_of_sight` (ignores layer).
+    fn line_of_sight_on_layer(&self, from: Vec3f, to: Vec3f, _layer: u32) -> bool {
+        self.line_of_sight(from, to)
+    }
+
     /// Cast from `from` toward `to` through environment-only geometry and return
     /// the safe teleport destination. If no wall is hit, returns `to` unchanged.
     /// If a wall is hit, returns the contact point pulled back 0.3 units toward `from`
     /// so the traveller stops flush against the wall without overlapping it.
     /// Used by `TeleportForward` and `TeleportBehindTarget` to prevent going through walls.
     fn cast_to_wall(&self, from: Vec3f, to: Vec3f) -> Vec3f;
+
+    /// Layer-aware cast-to-wall: only environment colliders on `layer` (or the
+    /// shared ground plane) can block the cast.
+    ///
+    /// Default: delegates to `cast_to_wall` (ignores layer).
+    fn cast_to_wall_on_layer(&self, from: Vec3f, to: Vec3f, _layer: u32) -> Vec3f {
+        self.cast_to_wall(from, to)
+    }
 
     /// Teleport an entity's physics body to `position` immediately.
     ///
@@ -223,6 +240,44 @@ pub trait PhysicsBackend: Send {
     ///
     /// Default: no-op (no pool to drain).
     fn drain_pool(&mut self, _max_idle: usize) {}
+
+    // ── Layer metadata ──────────────────────────────────────────
+
+    /// Set the visibility/isolation layer for an entity in the physics runtime.
+    ///
+    /// Used by scene-query predicates to filter colliders so entities on
+    /// different layers never interact physically. Called on spawn and when
+    /// an entity changes layer (instance join/leave).
+    ///
+    /// Default: no-op.
+    fn set_entity_layer(&mut self, _entity_id: EntityId, _layer: u32) {}
+
+    /// Set the team for an entity in the physics runtime.
+    /// Get the visibility/isolation layer for an entity.
+    ///
+    /// Returns 0 (open world) if the entity is unknown or layer was never set.
+    fn entity_layer(&self, _entity_id: EntityId) -> u32 { 0 }
+
+    /// Register a collision policy for a layer.
+    ///
+    /// Called when a dungeon instance is created; the policy is looked up by
+    /// scene-query predicates to decide whether specific entity kinds can
+    /// interact physically (e.g. player-vs-player collision).
+    ///
+    /// Default: no-op.
+    fn set_layer_policy(&mut self, _layer: u32, _policy: LayerCollisionPolicy) {}
+
+    /// Get the collision policy for a layer.
+    ///
+    /// Returns `LayerCollisionPolicy::default()` for unknown layers.
+    fn layer_policy(&self, _layer: u32) -> LayerCollisionPolicy {
+        LayerCollisionPolicy::default()
+    }
+
+    /// Remove the collision policy for a layer (instance teardown).
+    ///
+    /// Default: no-op.
+    fn remove_layer_policy(&mut self, _layer: u32) {}
 }
 
 /// Abstract shape for environment colliders (walls, floors, pillars).

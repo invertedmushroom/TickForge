@@ -1,4 +1,24 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+/// Per-layer collision policy controlling which entity interactions are
+/// permitted. Stored on dungeon templates, copied into `Instance` rows,
+/// and cached by the physics runtime for scene-query predicates.
+///
+/// Defaults: no player-vs-player physical collision.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "spacetimedb", derive(spacetimedb::SpacetimeType))]
+pub struct LayerCollisionPolicy {
+    /// Whether player character bodies physically collide with each other
+    /// (KCC movement, raycasts, etc.). `false` for open-world PvE,
+    /// `true` for PvP arenas and dungeons.
+    pub player_collides_player: bool,
+}
+
+impl Default for LayerCollisionPolicy {
+    fn default() -> Self {
+        Self { player_collides_player: false }
+    }
+}
 
 /// On-disk serialization format for `data/dungeons.ron`.
 #[derive(Clone, Debug, Deserialize)]
@@ -25,6 +45,10 @@ pub struct DungeonTemplate {
     pub geometry: Vec<GeometryDef>,
     pub interactables: Vec<InteractableDef>,
     pub spawn_point: [f32; 3],
+    /// Per-layer collision rules for instances of this template.
+    /// Defaults to `LayerCollisionPolicy::default()` when omitted in RON.
+    #[serde(default)]
+    pub collision_policy: LayerCollisionPolicy,
 }
 
 /// A piece of static environment geometry (wall, floor, pillar).

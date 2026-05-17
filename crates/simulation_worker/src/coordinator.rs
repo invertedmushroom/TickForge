@@ -21,7 +21,7 @@ use crate::physics::rapier_world::PhysicsWorld;
 use crate::simulation_runner::SimulationRunner;
 use game_core::combat::skill::{
     AbilityAction, AbilityData, AbilityFile, AbilityRegistry, AbilityTimeline, ScheduledAbilityAction,
-    SkillShape,
+    SkillShape, TargetFilter,
 };
 use game_core::combat::status::BuffRegistry;
 use game_protocol::entity_id::EntityId;
@@ -317,6 +317,29 @@ pub fn run(config: CoordinatorConfig) {
         // exits for a clean supervisor reseed.
         send_commit(&ctx.reducers, pkg, Arc::clone(&state_for_tick));
 
+        // ── Catch-up loop ───────────────────────────────────────────────
+        // When backlogged, process additional ticks immediately instead of
+        // waiting for the next SDK callback (which would keep the gap
+        // constant forever).  Each iteration re-acquires the lock, runs
+        // one tick, drops the lock, and sends the commit.
+        loop {
+            let pkg = {
+                let mut guard = match state_for_tick.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if !guard.sim.can_catch_up(canonical_tick) {
+                    break;
+                }
+                let result = match guard.sim.run_tick(canonical_tick, &[]) {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                commit_builder::build(result, vec![])
+            };
+            send_commit(&ctx.reducers, pkg, Arc::clone(&state_for_tick));
+        }
+
         // Periodically prune old combat/world event rows so the event tables don't
         // grow unbounded. Keep a 2-second window (40 ticks at 20 Hz) so clients
         // that are slightly behind still receive events before they are deleted.
@@ -370,44 +393,39 @@ pub fn run(config: CoordinatorConfig) {
                 game_protocol::types::Vec3f { x: 0.0, y: 1.0, z: 0.0 }
             });
 
-        // Read runtime state from the SDK cache for restart continuity.
-        let buffs: Vec<game_core::combat::status::ActiveBuff> = ctx.db
+        let layer = ctx.db
+            .entity_layer()
+            .entity_id()
+            .find(&new_entity.entity_id)
+            .map(|r| r.layer)
+            .unwrap_or(0);
+
+        // Read per-instance buff state from the SDK cache.
+        // Template data (modifiers, buff_kind, max_stacks) is reconstructed
+        // from the BuffRegistry after acquiring the lock.
+        struct BuffRow {
+            buff_id: u32,
+            source_entity: u64,
+            entity_id: u64,
+            stacks: u32,
+            expires_at_tick: Option<u64>,
+            ai_override_kind: Option<u8>,
+            ai_override_target: Option<u64>,
+            last_dot_tick: Option<u64>,
+        }
+        let buff_rows: Vec<BuffRow> = ctx.db
             .active_buff()
             .iter()
             .filter(|b| b.entity_id == new_entity.entity_id)
-            .map(|b| {
-                use game_core::combat::status::{AiOverride, BuffModifiers};
-                let ai_override = match b.mod_ai_override_kind {
-                    Some(0) => Some(AiOverride::ForceFlee),
-                    Some(1) => Some(AiOverride::ForceIdle),
-                    Some(2) => Some(AiOverride::ForceFocus {
-                        target: EntityId(b.mod_ai_override_target.unwrap_or(0)),
-                    }),
-                    _ => None,
-                };
-                game_core::combat::status::ActiveBuff {
-                    buff_id: b.buff_id,
-                    source: EntityId(b.source_entity),
-                    target: EntityId(b.entity_id),
-                    buff_kind: Default::default(),
-                    stacks: b.stacks,
-                    // max_stacks is static registry data not stored in the DB.
-                    // Use u32::MAX as an explicit "uncapped" sentinel — the correct
-                    // value is restored next time this buff is applied from combat.
-                    max_stacks: u32::MAX,
-                    expires_at: b.expires_at_tick.map(game_protocol::tick::TickId),
-                    modifiers: BuffModifiers {
-                        damage_out_pct: b.mod_damage_out_pct,
-                        damage_in_pct: b.mod_damage_in_pct,
-                        cooldown_reduce_pct: b.mod_cooldown_reduce_pct,
-                        speed_pct: b.mod_speed_pct,
-                        ai_override,
-                        root: b.mod_root,
-                        stealth: b.mod_stealth,
-                        ..Default::default()
-                    },
-                    last_dot_tick: None,
-                }
+            .map(|b| BuffRow {
+                buff_id: b.buff_id,
+                source_entity: b.source_entity,
+                entity_id: b.entity_id,
+                stacks: b.stacks,
+                expires_at_tick: b.expires_at_tick,
+                ai_override_kind: b.mod_ai_override_kind,
+                ai_override_target: b.mod_ai_override_target,
+                last_dot_tick: b.last_dot_tick,
             })
             .collect();
 
@@ -443,6 +461,41 @@ pub fn run(config: CoordinatorConfig) {
                 poisoned.into_inner()
             }
         };
+
+        // Reconstruct full ActiveBuff from per-instance DB fields + registry template.
+        let buffs: Vec<game_core::combat::status::ActiveBuff> = buff_rows
+            .into_iter()
+            .filter_map(|b| {
+                use game_core::combat::status::AiOverride;
+                let ai_override = match b.ai_override_kind {
+                    Some(0) => Some(AiOverride::ForceFlee),
+                    Some(1) => Some(AiOverride::ForceIdle),
+                    Some(2) => Some(AiOverride::ForceFocus {
+                        target: EntityId(b.ai_override_target.unwrap_or(0)),
+                    }),
+                    _ => None,
+                };
+                if let Some(template) = guard.sim.buff_registry().get(b.buff_id) {
+                    let mut modifiers = template.modifiers;
+                    modifiers.ai_override = ai_override;
+                    Some(game_core::combat::status::ActiveBuff {
+                        buff_id: b.buff_id,
+                        source: EntityId(b.source_entity),
+                        target: EntityId(b.entity_id),
+                        buff_kind: template.buff_kind,
+                        stacks: b.stacks,
+                        max_stacks: template.max_stacks,
+                        expires_at: b.expires_at_tick.map(game_protocol::tick::TickId),
+                        modifiers,
+                        last_dot_tick: b.last_dot_tick.map(game_protocol::tick::TickId),
+                    })
+                } else {
+                    warn!("Buff {} not found in registry during rehydration — skipping", b.buff_id);
+                    None
+                }
+            })
+            .collect();
+
         EntitySync::sync_insert(
             &mut guard.sim,
             eid,
@@ -451,6 +504,7 @@ pub fn run(config: CoordinatorConfig) {
             tick,
             max_hp,
             pos,
+            layer,
             crate::entity_sync::RuntimeSnapshot {
                 buffs,
                 npc_state,
@@ -523,6 +577,16 @@ pub fn run(config: CoordinatorConfig) {
                         z: 0.0,
                     });
 
+                // Read the entity's layer from the DB — respawn_player sets this
+                // to the death layer (which may be a dungeon instance, not 0).
+                let layer = ctx
+                    .db
+                    .entity_layer()
+                    .entity_id()
+                    .find(&new_entity.entity_id)
+                    .map(|r| r.layer)
+                    .unwrap_or(0);
+
                 let snapshot = crate::entity_sync::RuntimeSnapshot::default();
 
                 // Reacquire lock only for the sync_insert mutation.
@@ -541,8 +605,12 @@ pub fn run(config: CoordinatorConfig) {
                     tick,
                     max_hp,
                     pos,
+                    layer,
                     snapshot,
                 );
+                // Re-apply equipment modifiers — force_remove_entities cleared
+                // them, but the DB rows still exist.
+                recompute_equipment(&ctx.db, &mut guard, eid);
                 info!(
                     "Entity {} respawned via sync_insert after on_update Respawn signal",
                     eid.0
@@ -608,6 +676,9 @@ pub fn run(config: CoordinatorConfig) {
                 "Instance {} (template={}): spawned {} environment colliders on layer {}",
                 inst.instance_id, inst.template_id, template.geometry.len(), layer
             );
+            // Register per-layer collision policy so physics queries respect
+            // instance-specific rules (e.g. player-vs-player collision).
+            guard.sim.physics_mut().set_layer_policy(layer, template.collision_policy);
         } else {
             warn!(
                 "Instance {} references unknown template '{}' — no geometry spawned",
@@ -631,10 +702,92 @@ pub fn run(config: CoordinatorConfig) {
             Err(poisoned) => poisoned.into_inner(),
         };
         guard.sim.physics_mut().remove_environment_colliders_by_layer(new_inst.layer);
+        guard.sim.physics_mut().remove_layer_policy(new_inst.layer);
         info!(
             "Instance {} expired: removed environment colliders from layer {}",
             new_inst.instance_id, new_inst.layer
         );
+    });
+
+    // ── Entity layer bridge ──────────────────────────────────────────
+    // Mirror entity_layer rows (public projection of entity_region.layer)
+    // into the sim's dense layer cache so physics and combat use the
+    // correct layer for every entity (players, NPCs, props, bosses).
+
+    let state_for_layer_insert = Arc::clone(&state);
+    conn.db.entity_layer().on_insert(move |ctx, row| {
+        if matches!(ctx.event, spacetimedb_sdk::Event::SubscribeApplied) {
+            return; // Handled in on_applied bulk seed.
+        }
+        let eid = EntityId(row.entity_id);
+        let mut guard = match state_for_layer_insert.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.sim.set_entity_layer(eid, row.layer);
+        info!("entity_layer.on_insert: entity {} → layer {}", row.entity_id, row.layer);
+    });
+
+    let state_for_layer_update = Arc::clone(&state);
+    conn.db.entity_layer().on_update(move |_ctx, _old, row| {
+        let eid = EntityId(row.entity_id);
+        let mut guard = match state_for_layer_update.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.sim.set_entity_layer(eid, row.layer);
+        info!("entity_layer.on_update: entity {} → layer {}", row.entity_id, row.layer);
+    });
+
+    let state_for_layer_delete = Arc::clone(&state);
+    conn.db.entity_layer().on_delete(move |_ctx, row| {
+        let eid = EntityId(row.entity_id);
+        let mut guard = match state_for_layer_delete.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.sim.set_entity_layer(eid, 0);
+        //info!("entity_layer.on_delete: entity {} → layer 0", row.entity_id);
+    });
+
+    // ── Entity team bridge ──────────────────────────────────────────
+    // Mirror entity_team rows into the sim's dense team cache so
+    // apply_hit_damage can filter friendly/hostile targets in O(1).
+
+    let state_for_team_insert = Arc::clone(&state);
+    conn.db.entity_team().on_insert(move |ctx, row| {
+        if matches!(ctx.event, spacetimedb_sdk::Event::SubscribeApplied) {
+            return; // Handled in on_applied bulk seed below.
+        }
+        let eid = EntityId(row.entity_id);
+        let mut guard = match state_for_team_insert.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.sim.set_entity_team(eid, row.team_id);
+        info!("entity_team.on_insert: entity {} → team {}", row.entity_id, row.team_id);
+    });
+
+    let state_for_team_update = Arc::clone(&state);
+    conn.db.entity_team().on_update(move |_ctx, _old, row| {
+        let eid = EntityId(row.entity_id);
+        let mut guard = match state_for_team_update.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.sim.set_entity_team(eid, row.team_id);
+        info!("entity_team.on_update: entity {} → team {}", row.entity_id, row.team_id);
+    });
+
+    let state_for_team_delete = Arc::clone(&state);
+    conn.db.entity_team().on_delete(move |_ctx, row| {
+        let eid = EntityId(row.entity_id);
+        let mut guard = match state_for_team_delete.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.sim.set_entity_team(eid, 0);
+        info!("entity_team.on_delete: entity {} → team 0", row.entity_id);
     });
 
     // ── Equipment bridge ────────────────────────────────────────────
@@ -667,9 +820,14 @@ pub fn run(config: CoordinatorConfig) {
         guard.sim.set_interactable(EntityId(row.entity_id), info);
     });
 
-    // TODO: add on_delete callback to remove stale entries from
-    // sim.pipeline.state.interactables when interactable_config rows
-    // are deleted at runtime (e.g. instance teardown).
+    let state_for_interact_delete = Arc::clone(&state);
+    conn.db.interactable_config().on_delete(move |_ctx, row| {
+        let mut guard = match state_for_interact_delete.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.sim.remove_interactable(EntityId(row.entity_id));
+    });
 
     // ── World Phase projection ──────────────────────────────────────
     // Project world_phase rows into the pipeline's world_phases map so
@@ -818,6 +976,32 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
                     }
                 };
                 guard.sim.seed(max_tick);
+
+                // Recompute equipment modifiers for every entity that has
+                // equipment rows.  The per-row on_insert callback skips
+                // SubscribeApplied events, so this is the only path that
+                // restores equipment state after a worker restart.
+                let equipped_entities: std::collections::BTreeSet<_> = ctx
+                    .db
+                    .player_equipment()
+                    .iter()
+                    .map(|row| EntityId(row.owner_entity))
+                    .collect();
+                for eid in equipped_entities {
+                    recompute_equipment(&ctx.db, &mut guard, eid);
+                }
+
+                // Seed entity layers from entity_layer rows (public
+                // projection of entity_region.layer). Covers all entities
+                // — players, dungeon NPCs, props, bosses.
+                for row in ctx.db.entity_layer().iter() {
+                    guard.sim.set_entity_layer(EntityId(row.entity_id), row.layer);
+                }
+
+                // Seed entity teams from entity_team rows.
+                for row in ctx.db.entity_team().iter() {
+                    guard.sim.set_entity_team(EntityId(row.entity_id), row.team_id);
+                }
             }
             info!(
                 "Subscription applied — {} sim_tick rows, {} intent rows, {} entity rows; seeding last_processed_tick={} pipeline_start_tick={}",
@@ -847,6 +1031,8 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
             "SELECT * FROM world_phase",
             "SELECT * FROM npc_goal",
             "SELECT * FROM npc_config",
+            "SELECT * FROM entity_team",
+            "SELECT * FROM entity_layer",
         ]);
 }
 
@@ -924,6 +1110,7 @@ fn build_ability_registry() -> AbilityRegistry {
         cast_facing_policy: game_core::combat::skill::CastFacingPolicy::FaceAimDirection,
         lock_on_timeout_ticks: None,
         max_rewind_ticks: None,
+        target_filter: TargetFilter::Hostile,
     });
     reg.register_timeline(AbilityTimeline {
         ability_id: 1,
@@ -1481,6 +1668,9 @@ fn wire_combat_event(e: &CommitCombatEvent) -> CombatEventInput {
                     source: *source,
                 })
             }
+            CommitCombatEventKind::Healed { amount } => CombatEventKind::Healed(HealedData {
+                amount: *amount,
+            }),
         },
     }
 }
@@ -1538,14 +1728,10 @@ fn wire_buff_updates(pkg: &CommitPackage) -> Vec<BuffUpdate> {
             source_entity: b.source_entity,
             stacks: b.stacks,
             expires_at_tick: b.expires_at_tick,
-            mod_damage_out_pct: b.mod_damage_out_pct,
-            mod_damage_in_pct: b.mod_damage_in_pct,
-            mod_cooldown_reduce_pct: b.mod_cooldown_reduce_pct,
-            mod_speed_pct: b.mod_speed_pct,
             mod_ai_override_kind: b.mod_ai_override_kind,
             mod_ai_override_target: b.mod_ai_override_target,
-            mod_root: b.mod_root,
             mod_stealth: b.mod_stealth,
+            last_dot_tick: b.last_dot_tick,
         })
         .collect()
 }

@@ -101,6 +101,7 @@ impl EntitySync {
         tick: TickId,
         max_hp: f32,
         position: Vec3f,
+        layer: u32,
         snapshot: RuntimeSnapshot,
     ) -> SyncInsertResult {
         // Guard: never spawn entities that have already passed their useful lifecycle.
@@ -123,7 +124,7 @@ impl EntitySync {
             return SyncInsertResult::SkippedDuplicate;
         }
 
-        sim.spawn_entity_from_snapshot(id, kind, tick, max_hp, position);
+        sim.spawn_entity_from_snapshot(id, kind, tick, max_hp, position, layer);
 
         let RuntimeSnapshot {
             buffs,
@@ -321,6 +322,7 @@ mod tests {
         let result = EntitySync::sync_insert(
             &mut sim, id, EntityKind::Player, EntityState::Spawning,
             TickId(1), 100.0, Vec3f { x: 1.0, y: 2.0, z: 3.0 },
+            0,
             Default::default(),
         );
         assert_eq!(result, SyncInsertResult::Spawned);
@@ -334,6 +336,7 @@ mod tests {
         let result = EntitySync::sync_insert(
             &mut sim, id, EntityKind::Npc, EntityState::Removed,
             TickId(1), 50.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            0,
             Default::default(),
         );
         assert_eq!(result, SyncInsertResult::SkippedTerminal);
@@ -347,6 +350,7 @@ mod tests {
         let result = EntitySync::sync_insert(
             &mut sim, id, EntityKind::Npc, EntityState::DespawnPending,
             TickId(1), 50.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            0,
             Default::default(),
         );
         assert_eq!(result, SyncInsertResult::SkippedTerminal);
@@ -360,6 +364,7 @@ mod tests {
         let first = EntitySync::sync_insert(
             &mut sim, id, EntityKind::Player, EntityState::Spawning,
             TickId(1), 100.0, Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+            0,
             Default::default(),
         );
         assert_eq!(first, SyncInsertResult::Spawned);
@@ -367,6 +372,7 @@ mod tests {
         let second = EntitySync::sync_insert(
             &mut sim, id, EntityKind::Player, EntityState::Active,
             TickId(2), 100.0, Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+            0,
             Default::default(),
         );
         assert_eq!(second, SyncInsertResult::SkippedDuplicate);
@@ -385,6 +391,7 @@ mod tests {
             TickId(1),
             80.0,
             Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            0,
             RuntimeSnapshot {
                 npc_state: Some((NpcAiState::Combat, Some(target))),
                 ..Default::default()
@@ -409,6 +416,7 @@ mod tests {
         EntitySync::sync_insert(
             &mut sim, id, EntityKind::Npc, EntityState::Spawning,
             TickId(1), 80.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            0,
             Default::default(),
         );
         // Activate the entity so is_active() returns true.
@@ -428,6 +436,7 @@ mod tests {
         EntitySync::sync_insert(
             &mut sim, id, EntityKind::Npc, EntityState::Spawning,
             TickId(1), 60.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            0,
             Default::default(),
         );
         assert!(sim.contains(id));
@@ -456,6 +465,7 @@ mod tests {
         EntitySync::sync_insert(
             &mut sim, id, EntityKind::Player, EntityState::Spawning,
             TickId(1), 100.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            0,
             Default::default(),
         );
         let result = EntitySync::sync_update(
@@ -473,6 +483,7 @@ mod tests {
         EntitySync::sync_insert(
             &mut sim, id, EntityKind::Player, EntityState::Spawning,
             TickId(1), 100.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            0,
             Default::default(),
         );
         let result = EntitySync::sync_delete(&mut sim, id);
@@ -486,5 +497,77 @@ mod tests {
         let id = EntityId(900);
         let result = EntitySync::sync_delete(&mut sim, id);
         assert_eq!(result, SyncDeleteResult::Noop);
+    }
+
+    // ── Respawn layer preservation ──────────────────────────────
+
+    #[test]
+    fn respawn_on_instance_layer_preserves_layer() {
+        // Validates Finding 2: when a player dies in a dungeon instance
+        // (layer 100) and respawns, the coordinator must pass the death
+        // layer to sync_insert — not hard-code 0.
+        let mut sim = test_runner();
+        let id = EntityId(1000);
+        let instance_layer = 100u32;
+
+        // 1. Spawn on instance layer.
+        let r = EntitySync::sync_insert(
+            &mut sim, id, EntityKind::Player, EntityState::Spawning,
+            TickId(1), 1000.0, Vec3f { x: 10.0, y: 0.0, z: 20.0 },
+            instance_layer,
+            Default::default(),
+        );
+        assert_eq!(r, SyncInsertResult::Spawned);
+        assert_eq!(sim.entity_layer(id), instance_layer);
+
+        // 2. Simulate death → force-remove (mirrors what commit_tick_results does).
+        sim.force_remove_entity(id);
+        assert!(!sim.contains(id));
+
+        // 3. sync_update detects Removed→Spawning transition → returns Respawn.
+        let update_result = EntitySync::sync_update(
+            &mut sim, id, EntityState::Removed, EntityState::Spawning,
+        );
+        assert_eq!(update_result, SyncUpdateResult::Respawn);
+
+        // 4. Coordinator re-inserts with the correct layer (this is the fix).
+        let r2 = EntitySync::sync_insert(
+            &mut sim, id, EntityKind::Player, EntityState::Spawning,
+            TickId(5), 1000.0, Vec3f { x: 10.0, y: 0.0, z: 20.0 },
+            instance_layer,   // Correct: reads from entity_layer DB row
+            Default::default(),
+        );
+        assert_eq!(r2, SyncInsertResult::Spawned);
+        assert_eq!(sim.entity_layer(id), instance_layer,
+            "Respawned entity must retain the instance layer, not reset to 0");
+    }
+
+    #[test]
+    fn respawn_on_layer_zero_works() {
+        // Complementary test: respawn on open world (layer 0) still works.
+        let mut sim = test_runner();
+        let id = EntityId(1001);
+
+        EntitySync::sync_insert(
+            &mut sim, id, EntityKind::Player, EntityState::Spawning,
+            TickId(1), 1000.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            0,
+            Default::default(),
+        );
+        sim.force_remove_entity(id);
+
+        let update_result = EntitySync::sync_update(
+            &mut sim, id, EntityState::Removed, EntityState::Spawning,
+        );
+        assert_eq!(update_result, SyncUpdateResult::Respawn);
+
+        let r2 = EntitySync::sync_insert(
+            &mut sim, id, EntityKind::Player, EntityState::Spawning,
+            TickId(5), 1000.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            0,
+            Default::default(),
+        );
+        assert_eq!(r2, SyncInsertResult::Spawned);
+        assert_eq!(sim.entity_layer(id), 0);
     }
 }

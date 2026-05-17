@@ -14,6 +14,10 @@ mod inspector;
 mod admin;
 #[cfg(feature = "connected")]
 mod inventory;
+#[cfg(feature = "connected")]
+mod instance_panel;
+#[cfg(feature = "connected")]
+mod dungeon_geometry;
 mod ability_bar;
 mod ability_visuals;
 mod camera;
@@ -49,6 +53,8 @@ fn main() {
         app.add_plugins(inspector::InspectorPlugin);
         app.add_plugins(admin::AdminPlugin);
         app.add_plugins(inventory::InventoryPlugin);
+        app.add_plugins(instance_panel::InstancePanelPlugin);
+        app.add_plugins(dungeon_geometry::DungeonGeometryPlugin);
     }
 
     app.run();

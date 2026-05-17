@@ -74,6 +74,21 @@ pub enum CastFacingPolicy {
     FaceResolvedTarget,
 }
 
+/// Which entities a hitbox is allowed to affect based on team membership.
+///
+/// Checked in `apply_hit_damage` after layer isolation passes.
+/// Team 0 (unassigned) is treated as hostile to everyone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TargetFilter {
+    /// Damages/affects only entities on a different team (or team 0).
+    #[default]
+    Hostile,
+    /// Heals/buffs only entities on the same team (team must match and be non-zero).
+    Friendly,
+    /// Affects all entities regardless of team (e.g. environmental hazards).
+    All,
+}
+
 /// Runtime parameters for a single ability cast.
 ///
 /// Created in Phase 2 alongside `AbilityExecutionContext` so that a single
@@ -411,6 +426,10 @@ pub struct AbilityData {
     /// (e.g. melee AoE). Higher values extend it for precise skill-shots (capped by global).
     #[serde(default)]
     pub max_rewind_ticks: Option<u32>,
+    /// Which entities this ability's hitbox is allowed to affect.
+    /// `Hostile` (default) = only enemies. `Friendly` = only allies. `All` = everything.
+    #[serde(default)]
+    pub target_filter: TargetFilter,
 }
 
 /// Registry of all known abilities, keyed by ability_id.

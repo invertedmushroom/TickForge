@@ -183,6 +183,7 @@ pub fn is_ownership_allowed(domain: AuditDomain, subsystem: AuditSubsystem, phas
         AuditDomain::Health => {
             (subsystem == AuditSubsystem::Combat && phase == 6)
                 || (subsystem == AuditSubsystem::StatusEffects && phase == 8)
+                || (subsystem == AuditSubsystem::Controller && phase == 2)
         }
         AuditDomain::Threat => {
             (subsystem == AuditSubsystem::Combat && phase == 6)
@@ -617,6 +618,8 @@ impl SimState {
         debug_assert_eq!(self.ai.npc_ability_ids.sparse_len(), n, "npc_ability_ids desync");
         debug_assert_eq!(self.ai.npc_passive.sparse_len(), n, "npc_passive desync");
         debug_assert_eq!(self.ai.npc_no_chase.sparse_len(), n, "npc_no_chase desync");
+        debug_assert_eq!(self.ai.npc_leash_radius.sparse_len(), n, "npc_leash_radius desync");
+        debug_assert_eq!(self.ai.npc_aggro_radius.sparse_len(), n, "npc_aggro_radius desync");
         debug_assert_eq!(self.combat.loadouts.sparse_len(), n, "loadouts desync");
         debug_assert_eq!(self.stats.len(), n, "stats desync");
     }
@@ -635,7 +638,16 @@ impl SimState {
             self.combat.health.reset(idx, max_hp);
             self.status.clear_at(idx);
             self.status.mark_dirty(idx);
-            // SparseSet slots already exist; insert only for NPC/Boss.
+            // Unconditionally clear all sparse components from previous occupant.
+            self.combat.threat_tables.remove(idx);
+            self.ai.npc_ai.remove(idx);
+            self.ai.home_positions.remove(idx);
+            self.ai.npc_ability_ids.remove(idx);
+            self.ai.npc_passive.remove(idx);
+            self.ai.npc_no_chase.remove(idx);
+            self.ai.npc_leash_radius.remove(idx);
+            self.ai.npc_aggro_radius.remove(idx);
+            // Re-insert defaults for NPC/Boss.
             if kind == EntityKind::Npc || kind == EntityKind::Boss {
                 self.combat.threat_tables.insert(idx, ThreatTable::default());
                 self.ai.npc_ai.insert(idx, NpcAiState::Idle);
@@ -709,6 +721,8 @@ impl SimState {
             self.ai.npc_ability_ids.remove(idx);
             self.ai.npc_passive.remove(idx);
             self.ai.npc_no_chase.remove(idx);
+            self.ai.npc_leash_radius.remove(idx);
+            self.ai.npc_aggro_radius.remove(idx);
             // Clean up interactable info (switches, gates, chests).
             self.interactables.remove(&id);
             true
@@ -979,9 +993,9 @@ mod tests {
 
     #[test]
     fn health_ownership_rejects_non_combat_writer() {
-        // Health may only be written by Combat in phase 6.
+        // Health may only be written by Combat/6, StatusEffects/8, or Controller/2 (fall damage).
         assert!(!is_ownership_allowed(AuditDomain::Health, AuditSubsystem::Lifecycle, 8));
-        assert!(!is_ownership_allowed(AuditDomain::Health, AuditSubsystem::Controller, 2));
+        assert!( is_ownership_allowed(AuditDomain::Health, AuditSubsystem::Controller, 2));
         assert!(!is_ownership_allowed(AuditDomain::Health, AuditSubsystem::Combat, 3));
         assert!(!is_ownership_allowed(AuditDomain::Health, AuditSubsystem::AiDecisions, 7));
     }

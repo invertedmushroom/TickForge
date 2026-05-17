@@ -13,6 +13,7 @@ pub fn init(ctx: &ReducerContext) {
         admin: ctx.sender(),
         last_committed_tick: 0,
         next_instance_layer: 100,
+        next_tick_id: 0,
     });
 
     // Seed tick 0
@@ -67,6 +68,10 @@ pub fn client_connected(ctx: &ReducerContext) {
                                 region_z: er.region_z,
                                 layer: instance.layer,
                             });
+                            ctx.db.entity_layer().entity_id().update(EntityLayer {
+                                entity_id: seq.entity_id,
+                                layer: instance.layer,
+                            });
                         }
                         log::info!(
                             "Instance reconnect: entity {} restored to instance {} (layer {})",
@@ -119,17 +124,19 @@ const RESPAWN_DELAY_TICKS: u64 = 100;
 /// Party invite expiry in microseconds (60 seconds).
 const INVITE_EXPIRE_MICROS: i64 = 60_000_000;
 
+/// Prune sim_tick every N ticks to amortize scan + delete + view re-eval cost.
+const PRUNE_INTERVAL: u64 = 20;
+
 #[reducer]
 pub fn tick_trigger(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String> {
     if ctx.sender() != ctx.identity() {
         return Err("tick_trigger may only be invoked by the scheduler".into());
     }
 
-    // Read current max tick from sim_tick.
-    let mut current_max = ctx.db.sim_tick().iter()
-        .max_by_key(|t| t.tick_id)
-        .ok_or("No tick found")?
-        .tick_id;
+    // Read the counter from module_config (O(1) indexed lookup).
+    let mut cfg = ctx.db.module_config().key().find(0)
+        .ok_or("module_config missing")?;
+    let mut current_max = cfg.next_tick_id;
 
     // Backpressure guard: skip inserting a new tick if the simulation worker
     // has not committed recent ticks. This prevents sim_tick from accumulating
@@ -140,12 +147,8 @@ pub fn tick_trigger(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(),
     // schema migration that zero-initialises the field, or a fresh server with no
     // worker yet — we let ticks flow freely.  The sim_tick table is already bounded
     // by the SIM_TICK_RETAIN pruning below, so unbounded growth is not a concern.
-    let last_committed = ctx.db.module_config().key().find(0)
-        .map(|c| c.last_committed_tick)
-        .unwrap_or(0);
-
-    if last_committed > 0 {
-        let backlog = current_max.saturating_sub(last_committed);
+    if cfg.last_committed_tick > 0 {
+        let backlog = current_max.saturating_sub(cfg.last_committed_tick);
         if backlog > BACKLOG_LIMIT {
             // Self-healing: the worker that created these sim_tick rows crashed
             // before committing results. Delete the orphaned rows and reset
@@ -154,22 +157,24 @@ pub fn tick_trigger(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(),
             // commit will bootstrap the sequence via the cold-start bypass in
             // commit_tick_results.
             let to_delete: Vec<u64> = ctx.db.sim_tick().iter()
-                .filter(|t| t.tick_id > last_committed)
+                .filter(|t| t.tick_id > cfg.last_committed_tick)
                 .map(|t| t.tick_id)
                 .collect();
             let count = to_delete.len();
             for id in to_delete {
                 ctx.db.sim_tick().tick_id().delete(&id);
             }
-            if let Some(mut cfg) = ctx.db.module_config().key().find(0) {
-                cfg.last_committed_tick = 0;
-                ctx.db.module_config().key().update(cfg);
-            }
-            current_max = last_committed;
+            current_max = cfg.last_committed_tick;
+            cfg.last_committed_tick = 0;
+            cfg.next_tick_id = current_max;
+            ctx.db.module_config().key().update(cfg);
             log::warn!(
-                "tick_trigger: cleaned {count} orphaned sim_tick rows (last_committed was {last_committed}) — entering cold-start recovery"
+                "tick_trigger: cleaned {count} orphaned sim_tick rows (last_committed was {}) — entering cold-start recovery",
+                current_max
             );
-            // Fall through to insert the next tick normally.
+            // Re-read cfg after update for the insert below.
+            cfg = ctx.db.module_config().key().find(0)
+                .ok_or("module_config missing after recovery")?;
         }
     }
 
@@ -180,10 +185,13 @@ pub fn tick_trigger(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(),
         timestamp_us: ctx.timestamp.to_micros_since_unix_epoch(),
     });
 
+    // Update the counter so the next invocation skips the O(N) scan.
+    cfg.next_tick_id = next_tick_id;
+    ctx.db.module_config().key().update(cfg);
+
     // Prune old sim_tick rows to cap table size.
-    // Keeps the last SIM_TICK_RETAIN rows so a restarting coordinator can still
-    // seed last_processed_tick = MAX(sim_tick) without loading the full history.
-    if next_tick_id > SIM_TICK_RETAIN {
+    // Batched every PRUNE_INTERVAL ticks to amortize scan + delete + view re-eval.
+    if next_tick_id > SIM_TICK_RETAIN && next_tick_id % PRUNE_INTERVAL == 0 {
         let cutoff = next_tick_id - SIM_TICK_RETAIN;
         let to_delete: Vec<u64> = ctx.db.sim_tick()
             .iter()
@@ -354,9 +362,8 @@ pub fn submit_intent(
     }
 
     // Intents are always scheduled for the next simulation tick.
-    let current_tick = ctx.db.sim_tick().iter()
-        .max_by_key(|t| t.tick_id)
-        .map(|t| t.tick_id)
+    let current_tick = ctx.db.module_config().key().find(0)
+        .map(|c| c.next_tick_id)
         .unwrap_or(0);
     let target_tick = current_tick + 1;
 
@@ -385,9 +392,8 @@ pub fn spawn_player(ctx: &ReducerContext) -> Result<(), String> {
         return Err("Player already spawned".into());
     }
 
-    let current_tick = ctx.db.sim_tick().iter()
-        .max_by_key(|t| t.tick_id)
-        .map(|t| t.tick_id)
+    let current_tick = ctx.db.module_config().key().find(0)
+        .map(|c| c.next_tick_id)
         .unwrap_or(0);
 
     let entity = ctx.db.entity().insert(Entity {
@@ -422,6 +428,11 @@ pub fn spawn_player(ctx: &ReducerContext) -> Result<(), String> {
         layer: 0,
     });
 
+    ctx.db.entity_layer().insert(EntityLayer {
+        entity_id: eid,
+        layer: 0,
+    });
+
     ctx.db.client_sequence().insert(ClientSequence {
         client_identity: caller,
         last_processed_sequence: 0,
@@ -446,9 +457,8 @@ fn spawn_npc_internal(
     max_hp: f32,
     config: Option<NpcConfig>,
 ) -> u64 {
-    let current_tick = ctx.db.sim_tick().iter()
-        .max_by_key(|t| t.tick_id)
-        .map(|t| t.tick_id)
+    let current_tick = ctx.db.module_config().key().find(0)
+        .map(|c| c.next_tick_id)
         .unwrap_or(0);
 
     let entity = ctx.db.entity().insert(Entity {
@@ -479,6 +489,11 @@ fn spawn_npc_internal(
         entity_id: eid,
         region_x: (pos_x / 50.0).floor() as i32,
         region_z: (pos_z / 50.0).floor() as i32,
+        layer: 0,
+    });
+
+    ctx.db.entity_layer().insert(EntityLayer {
+        entity_id: eid,
         layer: 0,
     });
 
@@ -553,6 +568,33 @@ pub fn commit_tick_results(
     // Accept only trusted worker identities (or module identity in internal calls).
     if !is_trusted_caller(ctx) {
         return Err("commit_tick_results may only be invoked by a trusted worker".into());
+    }
+
+    // ── Tick sequence guard (read-only, BEFORE any mutations) ─────────
+    // Reject duplicates and gaps before touching any table.  The cursor
+    // advance itself is deferred to the end so that if any mutation in the
+    // middle fails the cursor stays unchanged.
+    let cfg = ctx.db.module_config().key().find(0);
+    if let Some(ref c) = cfg {
+        if c.last_committed_tick != 0 {
+            if tick_id <= c.last_committed_tick {
+                // Duplicate / replay — return Ok so the worker ack succeeds,
+                // but skip all mutations below.
+                log::warn!(
+                    "commit_tick_results: tick_id={} already committed (last={}), skipping entire reducer",
+                    tick_id, c.last_committed_tick
+                );
+                return Ok(());
+            }
+            let expected = c.last_committed_tick + 1;
+            if tick_id != expected {
+                // Gap detected — reject so the worker sees a reducer error and retries.
+                return Err(format!(
+                    "commit_tick_results: tick_id={} skips expected {} — gap rejected",
+                    tick_id, expected
+                ));
+            }
+        }
     }
 
     // Apply transform updates
@@ -659,6 +701,7 @@ pub fn commit_tick_results(
             if u.new_state == EntityState::Removed {
                 ctx.db.entity_transform().entity_id().delete(&u.entity_id);
                 ctx.db.entity_region().entity_id().delete(&u.entity_id);
+                ctx.db.entity_layer().entity_id().delete(&u.entity_id);
                 ctx.db.entity_health().entity_id().delete(&u.entity_id);
                 ctx.db.npc_state().entity_id().delete(&u.entity_id);
                 ctx.db.npc_config().entity_id().delete(&u.entity_id);
@@ -685,7 +728,12 @@ pub fn commit_tick_results(
         }
     }
 
-    // Apply region updates
+    // Apply region updates.
+    // The sim worker mirrors the DB-authoritative layer via the
+    // entity_layer.on_update → set_entity_layer → entity_regions[eid].layer
+    // bridge, so r.layer is already the correct value.  Previously this loop
+    // did a per-entity entity_region().find() to preserve the DB layer, which
+    // added O(N) indexed reads on every heavy tick.
     for r in region_updates {
         ctx.db.entity_region().entity_id().update(EntityRegion {
             entity_id: r.entity_id,
@@ -713,14 +761,10 @@ pub fn commit_tick_results(
                 source_entity: b.source_entity,
                 stacks: b.stacks,
                 expires_at_tick: b.expires_at_tick,
-                mod_damage_out_pct: b.mod_damage_out_pct,
-                mod_damage_in_pct: b.mod_damage_in_pct,
-                mod_cooldown_reduce_pct: b.mod_cooldown_reduce_pct,
-                mod_speed_pct: b.mod_speed_pct,
                 mod_ai_override_kind: b.mod_ai_override_kind,
                 mod_ai_override_target: b.mod_ai_override_target,
-                mod_root: b.mod_root,
                 mod_stealth: b.mod_stealth,
+                last_dot_tick: b.last_dot_tick,
             });
         }
 
@@ -803,6 +847,11 @@ pub fn commit_tick_results(
             region_z: (s.pos_z / 50.0).floor() as i32,
             layer: s.layer,
         });
+
+        ctx.db.entity_layer().insert(EntityLayer {
+            entity_id: eid,
+            layer: s.layer,
+        });
     }
 
     // Apply interactable state changes (switch toggled, chest opened, etc.)
@@ -820,38 +869,12 @@ pub fn commit_tick_results(
         }
     }
 
-    // Advance the last_committed_tick cursor used by tick_trigger's backpressure guard.
-    // Strict sequence enforcement: the worker must commit ticks exactly in order.
-    // If a tick was lost or skipped, the worker should have retried or crashed;
-    // accepting a gap here would silently drop DB effects for the missing tick.
-    //
-    // Cold-start rule: when last_committed_tick == 0, no worker has committed yet
-    // (or the module was freshly deployed). Accept any tick_id to bootstrap the
-    // sequence. This mirrors tick_trigger's cold-start bypass of backpressure.
+    // ── Advance last_committed_tick cursor (after all mutations) ────────
+    // Deferred to the end so the guard at the top is read-only and any
+    // mid-reducer failure leaves the cursor unchanged.
     if let Some(mut cfg) = ctx.db.module_config().key().find(0) {
-        if cfg.last_committed_tick == 0 {
-            // Cold start — accept whatever tick the worker sends to bootstrap.
-            cfg.last_committed_tick = tick_id;
-            ctx.db.module_config().key().update(cfg);
-        } else {
-            let expected = cfg.last_committed_tick + 1;
-            if tick_id == expected {
-                cfg.last_committed_tick = tick_id;
-                ctx.db.module_config().key().update(cfg);
-            } else if tick_id <= cfg.last_committed_tick {
-                // Duplicate / replay — harmless, ignore.
-                log::warn!(
-                    "commit_tick_results: tick_id={} already committed (last={}), ignoring cursor advance",
-                    tick_id, cfg.last_committed_tick
-                );
-            } else {
-                // Gap detected — reject so the worker sees a reducer error and retries.
-                return Err(format!(
-                    "commit_tick_results: tick_id={} skips expected {} — gap rejected",
-                    tick_id, expected
-                ));
-            }
-        }
+        cfg.last_committed_tick = tick_id;
+        ctx.db.module_config().key().update(cfg);
     }
 
     Ok(())
@@ -914,14 +937,10 @@ pub struct BuffUpdate {
     pub source_entity: u64,
     pub stacks: u32,
     pub expires_at_tick: Option<u64>,
-    pub mod_damage_out_pct: Option<f32>,
-    pub mod_damage_in_pct: Option<f32>,
-    pub mod_cooldown_reduce_pct: Option<f32>,
-    pub mod_speed_pct: Option<f32>,
     pub mod_ai_override_kind: Option<u8>,
     pub mod_ai_override_target: Option<u64>,
-    pub mod_root: Option<bool>,
     pub mod_stealth: Option<bool>,
+    pub last_dot_tick: Option<u64>,
 }
 
 #[derive(spacetimedb::SpacetimeType, Clone, Debug)]
@@ -1263,9 +1282,8 @@ pub fn respawn_player(ctx: &ReducerContext) -> Result<(), String> {
         return Err(format!("Entity is {:?} — not dead", entity.state));
     }
 
-    let current_tick = ctx.db.sim_tick().iter()
-        .max_by_key(|t| t.tick_id)
-        .map(|t| t.tick_id)
+    let current_tick = ctx.db.module_config().key().find(0)
+        .map(|c| c.next_tick_id)
         .unwrap_or(0);
 
     // Check respawn timer via death_state (created by commit_tick_results).
@@ -1291,41 +1309,53 @@ pub fn respawn_player(ctx: &ReducerContext) -> Result<(), String> {
         owner_identity: entity.owner_identity,
     });
 
-    // Re-create companion rows (deleted on Removed transition).
-    if ctx.db.entity_transform().entity_id().find(&entity_id).is_none() {
-        ctx.db.entity_transform().insert(EntityTransform {
-            entity_id,
-            pos_x: respawn_pos.0, pos_y: respawn_pos.1, pos_z: respawn_pos.2,
-            rot_x: 0.0, rot_y: 0.0, rot_z: 0.0, rot_w: 1.0,
-            vel_x: 0.0, vel_y: 0.0, vel_z: 0.0,
-            angvel_x: 0.0, angvel_y: 0.0, angvel_z: 0.0,
-            last_tick: current_tick,
-        });
+    // Upsert companion rows: on DespawnPending the old rows still exist
+    // (they're only deleted on Removed), so insert-if-missing would keep
+    // the corpse position / stale region.  Unconditional upsert is correct.
+    let transform_row = EntityTransform {
+        entity_id,
+        pos_x: respawn_pos.0, pos_y: respawn_pos.1, pos_z: respawn_pos.2,
+        rot_x: 0.0, rot_y: 0.0, rot_z: 0.0, rot_w: 1.0,
+        vel_x: 0.0, vel_y: 0.0, vel_z: 0.0,
+        angvel_x: 0.0, angvel_y: 0.0, angvel_z: 0.0,
+        last_tick: current_tick,
+    };
+    if ctx.db.entity_transform().entity_id().find(&entity_id).is_some() {
+        ctx.db.entity_transform().entity_id().update(transform_row);
+    } else {
+        ctx.db.entity_transform().insert(transform_row);
     }
 
-    if ctx.db.entity_health().entity_id().find(&entity_id).is_none() {
-        ctx.db.entity_health().insert(EntityHealth {
-            entity_id,
-            hp: 1000.0,
-            max_hp: 1000.0,
-        });
+    let health_row = EntityHealth {
+        entity_id,
+        hp: 1000.0,
+        max_hp: 1000.0,
+    };
+    if ctx.db.entity_health().entity_id().find(&entity_id).is_some() {
+        ctx.db.entity_health().entity_id().update(health_row);
     } else {
-        ctx.db.entity_health().entity_id().update(EntityHealth {
-            entity_id,
-            hp: 1000.0,
-            max_hp: 1000.0,
-        });
+        ctx.db.entity_health().insert(health_row);
     }
 
     let region_x = (respawn_pos.0 / 50.0).floor() as i32;
     let region_z = (respawn_pos.2 / 50.0).floor() as i32;
-    if ctx.db.entity_region().entity_id().find(&entity_id).is_none() {
-        ctx.db.entity_region().insert(EntityRegion {
-            entity_id,
-            region_x,
-            region_z,
-            layer,
-        });
+    let region_row = EntityRegion {
+        entity_id,
+        region_x,
+        region_z,
+        layer,
+    };
+    if ctx.db.entity_region().entity_id().find(&entity_id).is_some() {
+        ctx.db.entity_region().entity_id().update(region_row);
+    } else {
+        ctx.db.entity_region().insert(region_row);
+    }
+
+    let layer_row = EntityLayer { entity_id, layer };
+    if ctx.db.entity_layer().entity_id().find(&entity_id).is_some() {
+        ctx.db.entity_layer().entity_id().update(layer_row);
+    } else {
+        ctx.db.entity_layer().insert(layer_row);
     }
 
     // Clean up death state.
@@ -1779,6 +1809,11 @@ pub fn create_instance(
             layer,
         });
 
+        ctx.db.entity_layer().insert(EntityLayer {
+            entity_id: eid,
+            layer,
+        });
+
         // BossSpawn entities get NpcConfig so the worker treats them as AI-driven.
         if let game_schema::dungeon::InteractKindDef::BossSpawn { npc_name } = &def.kind {
             ctx.db.npc_config().insert(NpcConfig {
@@ -1870,6 +1905,10 @@ pub fn join_instance(ctx: &ReducerContext, instance_id: u64) -> Result<(), Strin
             layer: instance.layer,
         });
     }
+    ctx.db.entity_layer().entity_id().update(EntityLayer {
+        entity_id,
+        layer: instance.layer,
+    });
 
     log::info!(
         "Instance join: entity {} joined instance {} (layer {})",
@@ -1901,6 +1940,10 @@ pub fn leave_instance(ctx: &ReducerContext) -> Result<(), String> {
             layer: 0,
         });
     }
+    ctx.db.entity_layer().entity_id().update(EntityLayer {
+        entity_id,
+        layer: 0,
+    });
 
     log::info!("Instance leave: entity {} returned to open world", entity_id);
     Ok(())
@@ -1957,6 +2000,10 @@ pub fn expire_instances(ctx: &ReducerContext) -> Result<(), String> {
                     layer: 0,
                 });
             }
+            ctx.db.entity_layer().entity_id().update(EntityLayer {
+                entity_id: *eid,
+                layer: 0,
+            });
         }
 
         // Mark instance expired.
@@ -2021,6 +2068,10 @@ pub fn expire_instances(ctx: &ReducerContext) -> Result<(), String> {
                 layer: 0,
             });
         }
+        ctx.db.entity_layer().entity_id().update(EntityLayer {
+            entity_id: *eid,
+            layer: 0,
+        });
         log::info!("Instance: stale member {} removed (disconnect grace expired)", eid);
     }
 
@@ -2078,10 +2129,6 @@ mod debug_reducers {
         buff_id: u32,
         stacks: u32,
         duration_ticks: u32,
-        mod_damage_out_pct: Option<f32>,
-        mod_damage_in_pct: Option<f32>,
-        mod_speed_pct: Option<f32>,
-        mod_root: Option<bool>,
         mod_stealth: Option<bool>,
     ) -> Result<(), String> {
         if !is_module_admin(ctx) && !is_debug_caller(ctx) {
@@ -2109,14 +2156,10 @@ mod debug_reducers {
             source_entity: entity_id, // self-applied
             stacks,
             expires_at_tick,
-            mod_damage_out_pct,
-            mod_damage_in_pct,
-            mod_cooldown_reduce_pct: None,
-            mod_speed_pct,
             mod_ai_override_kind: None,
             mod_ai_override_target: None,
-            mod_root,
             mod_stealth,
+            last_dot_tick: None,
         });
 
         // Derive stealthed_entity so the view filter works immediately.
@@ -2245,6 +2288,7 @@ mod debug_reducers {
         // Clean companion rows.
         ctx.db.entity_transform().entity_id().delete(&entity_id);
         ctx.db.entity_region().entity_id().delete(&entity_id);
+        ctx.db.entity_layer().entity_id().delete(&entity_id);
         ctx.db.entity_health().entity_id().delete(&entity_id);
         ctx.db.player_intent().entity_id().delete(&entity_id);
         ctx.db.npc_state().entity_id().delete(&entity_id);
@@ -2566,6 +2610,11 @@ mod debug_reducers {
             layer: 0,
         });
 
+        ctx.db.entity_layer().insert(EntityLayer {
+            entity_id: eid,
+            layer: 0,
+        });
+
         log::info!("debug_spawn_prop: entity_id={eid} pos=({pos_x},{pos_y},{pos_z})");
         Ok(())
     }
@@ -2588,6 +2637,10 @@ mod debug_reducers {
             entity_id,
             region_x: er.region_x,
             region_z: er.region_z,
+            layer,
+        });
+        ctx.db.entity_layer().entity_id().update(EntityLayer {
+            entity_id,
             layer,
         });
         log::info!("debug_set_layer: entity={entity_id} layer={layer}");
@@ -2625,19 +2678,21 @@ mod debug_reducers {
 
     /// Join an instance without the party membership requirement.
     /// Identical to `join_instance` but skips the party check, allowing
-    /// solo testing of dungeon flows from the CLI.
+    /// solo testing of dungeon flows from the CLI.  Takes an explicit
+    /// `entity_id` so admin/CLI callers (who have no registered player)
+    /// can move any entity into an instance.
     #[reducer]
     pub fn debug_join_instance(
         ctx: &ReducerContext,
+        entity_id: u64,
         instance_id: u64,
     ) -> Result<(), String> {
         if !is_module_admin(ctx) && !is_debug_caller(ctx) {
             return Err("debug_join_instance: admin only".into());
         }
-        let caller = ctx.sender();
-        let seq = ctx.db.client_sequence().client_identity().find(&caller)
-            .ok_or("Not registered")?;
-        let entity_id = seq.entity_id;
+        // Validate entity exists.
+        ctx.db.entity().entity_id().find(&entity_id)
+            .ok_or_else(|| format!("Entity {entity_id} not found"))?;
 
         let instance = ctx.db.instance().instance_id().find(&instance_id)
             .ok_or("Instance not found")?;
@@ -2668,10 +2723,60 @@ mod debug_reducers {
                 layer: instance.layer,
             });
         }
+        ctx.db.entity_layer().entity_id().update(EntityLayer {
+            entity_id,
+            layer: instance.layer,
+        });
 
         log::info!(
             "debug_join_instance: entity {} joined instance {} (layer {}) — party check skipped",
             entity_id, instance_id, instance.layer
+        );
+        Ok(())
+    }
+
+    /// Create a test instance using `test_dungeon_01` and immediately join
+    /// the given entity into it.  Takes an explicit `entity_id` so
+    /// admin/CLI callers can operate without a registered player.
+    #[reducer]
+    pub fn debug_create_instance(ctx: &ReducerContext, entity_id: u64) -> Result<(), String> {
+        if !is_module_admin(ctx) && !is_debug_caller(ctx) {
+            return Err("debug_create_instance: admin only".into());
+        }
+        // Delegate to the real create_instance reducer logic.
+        create_instance(ctx, "test_dungeon_01".into(), 4)?;
+
+        // Find the instance we just created (highest ID with our template).
+        let inst = ctx.db.instance().iter()
+            .filter(|i| i.template_id == "test_dungeon_01")
+            .max_by_key(|i| i.instance_id)
+            .ok_or("Instance not found after creation")?;
+
+        // Auto-join the entity.
+        debug_join_instance(ctx, entity_id, inst.instance_id)?;
+        log::info!("debug_create_instance: created + joined instance {} (layer {})", inst.instance_id, inst.layer);
+        Ok(())
+    }
+
+    /// Increment the "kills" zone counter for testing world_clock transitions.
+    /// Admin-callable shorthand — `increment_zone_counter` is trusted-worker-only
+    /// so the client cannot call it directly.
+    #[reducer]
+    pub fn debug_add_zone_kill(
+        ctx: &ReducerContext,
+        layer: u32,
+        region_x: i32,
+        region_z: i32,
+        count: u32,
+    ) -> Result<(), String> {
+        if !is_module_admin(ctx) && !is_debug_caller(ctx) {
+            return Err("debug_add_zone_kill: admin only".into());
+        }
+        for _ in 0..count.min(100) {
+            increment_zone_counter(ctx, layer, region_x, region_z, "kills".into(), 1.0)?;
+        }
+        log::info!(
+            "debug_add_zone_kill: layer={layer} region=({region_x},{region_z}) +{count} kills"
         );
         Ok(())
     }

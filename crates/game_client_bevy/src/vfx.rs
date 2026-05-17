@@ -348,18 +348,21 @@ fn spawn_damage_numbers(
 
         let Some(world_pos) = pos else { continue };
 
-        let color = if ev.is_self {
-            Color::srgb(1.0, 0.2, 0.2)
+        let (color, label) = if ev.amount < 0.0 {
+            // Heal — show green with "+" prefix.
+            (Color::srgb(0.2, 1.0, 0.3), format!("+{:.0}", ev.amount.abs()))
+        } else if ev.is_self {
+            (Color::srgb(1.0, 0.2, 0.2), format!("{:.0}", ev.amount))
         } else if ev.is_crit {
-            Color::srgb(1.0, 0.8, 0.0)
+            (Color::srgb(1.0, 0.8, 0.0), format!("{:.0}", ev.amount))
         } else {
-            Color::srgb(1.0, 1.0, 1.0)
+            (Color::srgb(1.0, 1.0, 1.0), format!("{:.0}", ev.amount))
         };
 
         let font_size = if ev.is_crit { 28.0 } else { 22.0 };
 
         commands.spawn((
-            Text::new(format!("{:.0}", ev.amount)),
+            Text::new(label),
             TextFont { font_size, ..default() },
             TextColor(color),
             Node {

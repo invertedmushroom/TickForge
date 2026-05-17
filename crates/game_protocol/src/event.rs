@@ -140,6 +140,12 @@ pub enum EventPayload {
         impact_speed: f32,
     },
 
+    /// Entity was healed (e.g. NPC evade arrival full-heal).
+    Healed {
+        amount: f32,
+        source: EntityId,
+    },
+
     /// Entity left the ground by jumping. Clients use this to trigger jump
     /// animations and sound. Paired with landing detection on the client side
     /// (arc cleared on `drive_arc_movement` grounded detection).

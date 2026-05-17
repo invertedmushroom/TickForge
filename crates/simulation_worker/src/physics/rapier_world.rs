@@ -15,6 +15,105 @@ use game_core::physics_backend::{
 };
 use super::collision_groups;
 
+// ── Collider user_data encoding ─────────────────────────────────────────
+//
+// Rapier's `Collider::user_data: u128` is stamped on every collider so that
+// scene-query predicates and contact resolution can read entity metadata
+// without any HashMap lookups.
+//
+// Layout (little-endian order inside the u128):
+//   bits  0..31  — layer_id        (u32)  dungeon/instance isolation
+//   bits 32..47  — (unused)        (16 bits) available for future flags
+//   bits 48..50  — collider_kind   (3 bits)  Body=0, Hurtbox=1, Hitbox=2, BlockCone=3
+//   bits 51..63  — flags           (13 bits) future: phased, stealthed, etc.
+//   bits 64..95  — entity_id.0     (u32)  owning entity (0 = environment)
+//   bits 96..127 — reserved        (u32)  expansion
+//
+// Team membership is tracked in the dense `entity_team_cache` (full u32),
+// not in user_data.  A 1-bit stealth flag can be added to the flags field
+// when that feature is implemented.
+//
+// Layer semantics:
+//   layer 0 = shared world geometry (ground plane, open-world props).
+//             Visible to ALL layers.
+//   layer N (N>0) = dungeon-instance geometry. Only visible to entities
+//                   whose own colliders are stamped with the same layer.
+//
+// Predicate: `col_layer == 0 || col_layer == caller_layer`
+//
+// ColliderKind discriminant:
+//   Body and Hurtbox (discriminant 0, 1) are fully decoded from user_data.
+//   Hitbox and BlockCone (discriminant 2, 3) carry payload data that doesn't
+//   fit in user_data — for those, `collider_kinds` HashMap is the fallback.
+
+const UD_KIND_SHIFT: u32 = 48;
+const UD_KIND_MASK: u128 = 0x7; // 3 bits
+const UD_ENTITY_SHIFT: u32 = 64;
+const UD_ENTITY_MASK: u128 = 0xFFFF_FFFF; // 32 bits
+const UD_KIND_BODY: u128 = 0;
+const UD_KIND_HURTBOX: u128 = 1;
+const UD_KIND_HITBOX: u128 = 2;
+const UD_KIND_BLOCKCONE: u128 = 3;
+
+/// Extract the layer from a collider's user_data.
+#[inline(always)]
+fn ud_layer(user_data: u128) -> u32 {
+    user_data as u32
+}
+
+/// Encode a layer into user_data (preserving upper bits).
+#[inline(always)]
+fn ud_set_layer(user_data: u128, layer: u32) -> u128 {
+    (user_data & !0xFFFF_FFFFu128) | layer as u128
+}
+
+/// Extract the owning EntityId from user_data. Returns `None` for environment
+/// colliders (entity_id.0 == 0).
+#[inline(always)]
+fn ud_entity_id(user_data: u128) -> Option<EntityId> {
+    let raw = ((user_data >> UD_ENTITY_SHIFT) & UD_ENTITY_MASK) as u64;
+    if raw == 0 { None } else { Some(EntityId(raw)) }
+}
+
+/// Encode an EntityId into user_data (preserving other fields).
+#[inline(always)]
+fn ud_set_entity_id(user_data: u128, entity_id: EntityId) -> u128 {
+    let cleared = user_data & !(UD_ENTITY_MASK << UD_ENTITY_SHIFT);
+    cleared | ((entity_id.0 as u128) << UD_ENTITY_SHIFT)
+}
+
+/// Extract the ColliderKind discriminant from user_data.
+/// Returns the full `ColliderKind` for Body/Hurtbox. For Hitbox/BlockCone
+/// returns `None` (caller must fall back to the `collider_kinds` HashMap).
+#[inline(always)]
+fn ud_collider_kind(user_data: u128) -> Option<ColliderKind> {
+    match (user_data >> UD_KIND_SHIFT) & UD_KIND_MASK {
+        UD_KIND_BODY => Some(ColliderKind::Body),
+        UD_KIND_HURTBOX => Some(ColliderKind::Hurtbox),
+        // Hitbox/BlockCone carry payload not in user_data — fallback required.
+        _ => None,
+    }
+}
+
+/// Encode a ColliderKind discriminant into user_data (preserving other fields).
+#[inline(always)]
+fn ud_set_kind(user_data: u128, kind: &ColliderKind) -> u128 {
+    let disc = match kind {
+        ColliderKind::Body => UD_KIND_BODY,
+        ColliderKind::Hurtbox => UD_KIND_HURTBOX,
+        ColliderKind::Hitbox(_) => UD_KIND_HITBOX,
+        ColliderKind::BlockCone(_) => UD_KIND_BLOCKCONE,
+    };
+    let cleared = user_data & !(UD_KIND_MASK << UD_KIND_SHIFT);
+    cleared | (disc << UD_KIND_SHIFT)
+}
+
+/// Stamp entity_id + collider_kind into user_data in a single call.
+#[inline(always)]
+fn ud_stamp(user_data: u128, entity_id: EntityId, kind: &ColliderKind) -> u128 {
+    ud_set_entity_id(ud_set_kind(user_data, kind), entity_id)
+}
+
 /// Wraps the full Rapier physics simulation state.
 ///
 /// This is the long-lived physics world owned by the simulation worker.
@@ -50,7 +149,6 @@ pub struct PhysicsWorld {
 
     // Entity ↔ Rapier handle mapping
     entity_to_body: HashMap<EntityId, RigidBodyHandle>,
-    body_to_entity: HashMap<RigidBodyHandle, EntityId>,
 
     // Collider metadata — tracks the role of every collider
     collider_kinds: HashMap<ColliderHandle, ColliderKind>,
@@ -68,6 +166,14 @@ pub struct PhysicsWorld {
     // Keyed by EntityKind so NPC bodies are reused for NPCs, etc.
     // All character kinds currently share identical capsule geometry (0.5, 0.3).
     disabled_pool: Vec<(RigidBodyHandle, EntityKind)>,
+
+    // Per-entity visibility layer — cached from authoritative entity_regions.
+    // Used by scene-query predicates to filter cross-layer interactions.
+    entity_layers: HashMap<EntityId, u32>,
+
+    // Per-layer collision policies — controls entity-kind interaction rules.
+    // Keyed by layer. Layer 0 (open world) uses default when absent.
+    layer_policies: HashMap<u32, game_schema::LayerCollisionPolicy>,
 }
 
 /// Result of a raycast query.
@@ -106,7 +212,6 @@ impl PhysicsWorld {
             contact_force_send,
             contact_force_recv,
             entity_to_body: HashMap::new(),
-            body_to_entity: HashMap::new(),
             collider_kinds: HashMap::new(),
             sensor_handle_counter: 0,
             sensor_handles: HashMap::new(),
@@ -115,6 +220,8 @@ impl PhysicsWorld {
             env_collider_handles: HashMap::new(),
             env_colliders_by_layer: HashMap::new(),
             disabled_pool: Vec::new(),
+            entity_layers: HashMap::new(),
+            layer_policies: HashMap::new(),
         };
 
         // Default ground plane — every world has a floor.
@@ -180,19 +287,28 @@ impl PhysicsWorld {
     }
 
     /// Resolve a collider handle to its parent entity ID.
+    /// Primary path: extract from user_data (O(1) bit shift, no HashMap).
+    /// Returns `None` for environment colliders (entity_id == 0 in user_data).
     fn entity_for_collider(&self, collider_handle: ColliderHandle) -> Option<EntityId> {
         let collider = self.colliders.get(collider_handle)?;
-        if let Some(body_handle) = collider.parent() {
-            return self.body_to_entity.get(&body_handle).copied();
+        if let Some(eid) = ud_entity_id(collider.user_data) {
+            return Some(eid);
         }
-        // Parentless (world-space) sensor — look up via world_sensor_owners.
+        // Parentless sensors without user_data stamp (legacy fallback).
         self.world_sensor_owners.get(&collider_handle).copied()
     }
 
     /// Resolve a collider handle to its `ColliderKind`.
-    /// Defaults to `Body` for colliders that were never registered
-    /// (e.g. environment / legacy bodies).
+    /// Primary path: extract discriminant from user_data (O(1) bit shift).
+    /// For Hitbox/BlockCone (which carry payload), falls back to `collider_kinds` HashMap.
+    /// Defaults to `Body` for environment colliders or unregistered colliders.
     fn kind_for_collider(&self, handle: ColliderHandle) -> ColliderKind {
+        if let Some(collider) = self.colliders.get(handle) {
+            if let Some(kind) = ud_collider_kind(collider.user_data) {
+                return kind;
+            }
+        }
+        // Hitbox/BlockCone or unstamped — full lookup.
         self.collider_kinds
             .get(&handle)
             .copied()
@@ -260,6 +376,7 @@ impl PhysicsWorld {
             .restitution(0.3)
             .collision_groups(groups)
             .active_events(ActiveEvents::COLLISION_EVENTS)
+            .user_data(ud_stamp(0, entity_id, &ColliderKind::Body))
             .build();
         let ch = self.colliders
             .insert_with_parent(collider, body_handle, &mut self.bodies);
@@ -270,13 +387,13 @@ impl PhysicsWorld {
             .sensor(true)
             .collision_groups(collision_groups::skill_hurtbox_groups())
             .active_events(ActiveEvents::COLLISION_EVENTS)
+            .user_data(ud_stamp(0, entity_id, &ColliderKind::Hurtbox))
             .build();
         let hch = self.colliders
             .insert_with_parent(hurtbox, body_handle, &mut self.bodies);
         self.collider_kinds.insert(hch, ColliderKind::Hurtbox);
 
         self.entity_to_body.insert(entity_id, body_handle);
-        self.body_to_entity.insert(body_handle, entity_id);
 
         entity_id
     }
@@ -303,6 +420,7 @@ impl PhysicsWorld {
             .density(density)
             .collision_groups(groups)
             .active_events(ActiveEvents::COLLISION_EVENTS)
+            .user_data(ud_stamp(0, entity_id, &ColliderKind::Body))
             .build();
         let ch = self.colliders
             .insert_with_parent(collider, body_handle, &mut self.bodies);
@@ -313,13 +431,13 @@ impl PhysicsWorld {
             .sensor(true)
             .collision_groups(collision_groups::skill_hurtbox_groups())
             .active_events(ActiveEvents::COLLISION_EVENTS)
+            .user_data(ud_stamp(0, entity_id, &ColliderKind::Hurtbox))
             .build();
         let hch = self.colliders
             .insert_with_parent(hurtbox, body_handle, &mut self.bodies);
         self.collider_kinds.insert(hch, ColliderKind::Hurtbox);
 
         self.entity_to_body.insert(entity_id, body_handle);
-        self.body_to_entity.insert(body_handle, entity_id);
 
         entity_id
     }
@@ -353,6 +471,7 @@ impl PhysicsWorld {
             .collision_groups(groups)
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .active_collision_types(active_types)
+            .user_data(ud_stamp(0, entity_id, &ColliderKind::Body))
             .build();
         let ch = self.colliders
             .insert_with_parent(collider, body_handle, &mut self.bodies);
@@ -365,13 +484,13 @@ impl PhysicsWorld {
             .collision_groups(collision_groups::skill_hurtbox_groups())
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .active_collision_types(active_types)
+            .user_data(ud_stamp(0, entity_id, &ColliderKind::Hurtbox))
             .build();
         let hch = self.colliders
             .insert_with_parent(hurtbox, body_handle, &mut self.bodies);
         self.collider_kinds.insert(hch, ColliderKind::Hurtbox);
 
         self.entity_to_body.insert(entity_id, body_handle);
-        self.body_to_entity.insert(body_handle, entity_id);
 
         entity_id
     }
@@ -395,12 +514,15 @@ impl PhysicsWorld {
         let active_types = ActiveCollisionTypes::default()
             | ActiveCollisionTypes::KINEMATIC_KINEMATIC
             | ActiveCollisionTypes::KINEMATIC_FIXED;
+        let layer = self.entity_layer(entity_id);
+        let base = ud_set_layer(0, layer);
         let collider = ColliderBuilder::new(shape)
             .position(offset)
             .sensor(true)
             .collision_groups(groups)
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .active_collision_types(active_types)
+            .user_data(ud_stamp(base, entity_id, &kind))
             .build();
         let handle = self.colliders
             .insert_with_parent(collider, body_handle, &mut self.bodies);
@@ -420,7 +542,7 @@ impl PhysicsWorld {
     /// Remove an entity and its physics body/colliders from the world.
     pub fn remove_entity(&mut self, entity_id: EntityId) -> bool {
         if let Some(body_handle) = self.entity_to_body.remove(&entity_id) {
-            self.body_to_entity.remove(&body_handle);
+            self.entity_layers.remove(&entity_id);
             // Clean up collider metadata for all colliders attached to this body.
             // Use body.colliders() for O(attached) instead of scanning all colliders.
             let attached: Vec<ColliderHandle> = self.bodies.get(body_handle)
@@ -464,7 +586,7 @@ impl PhysicsWorld {
     /// Returns `true` if the entity was found and pooled.
     pub fn disable_entity(&mut self, entity_id: EntityId, kind: EntityKind) -> bool {
         if let Some(body_handle) = self.entity_to_body.remove(&entity_id) {
-            self.body_to_entity.remove(&body_handle);
+            self.entity_layers.remove(&entity_id);
 
             // Clean up sensor and collider-kind metadata exactly as remove_entity does,
             // but keep the body+colliders alive in Rapier.
@@ -543,18 +665,19 @@ impl PhysicsWorld {
                 if let Some(collider) = self.colliders.get_mut(ch) {
                     collider.set_enabled(true);
                     // First collider = Body, second = Hurtbox (per add_kinematic_capsule layout).
+                    let ck = if i == 0 { ColliderKind::Body } else { ColliderKind::Hurtbox };
                     if i == 0 {
                         collider.set_collision_groups(groups);
-                        self.collider_kinds.insert(ch, ColliderKind::Body);
                     } else {
                         collider.set_collision_groups(collision_groups::skill_hurtbox_groups());
-                        self.collider_kinds.insert(ch, ColliderKind::Hurtbox);
                     }
+                    // Re-stamp user_data with new entity_id + kind (clears stale bits).
+                    collider.user_data = ud_stamp(collider.user_data, entity_id, &ck);
+                    self.collider_kinds.insert(ch, ck);
                 }
             }
 
             self.entity_to_body.insert(entity_id, body_handle);
-            self.body_to_entity.insert(body_handle, entity_id);
             true
         } else {
             // Pool empty for this kind — create fresh.
@@ -707,10 +830,6 @@ impl PhysicsWorld {
         self.disabled_pool.len()
     }
 
-    pub fn entity_for_body(&self, handle: RigidBodyHandle) -> Option<EntityId> {
-        self.body_to_entity.get(&handle).copied()
-    }
-
     pub fn body_handle_for_entity(&self, entity_id: EntityId) -> Option<RigidBodyHandle> {
         self.entity_to_body.get(&entity_id).copied()
     }
@@ -847,12 +966,15 @@ impl PhysicsBackend for PhysicsWorld {
         let active_types = ActiveCollisionTypes::default()
             | ActiveCollisionTypes::KINEMATIC_KINEMATIC
             | ActiveCollisionTypes::KINEMATIC_FIXED;
+        let layer = self.entity_layer(owner);
+        let base = ud_set_layer(0, layer);
         let collider = ColliderBuilder::new(rapier_shape)
             .translation(Vector::new(position.x, position.y, position.z))
             .sensor(true)
             .collision_groups(groups)
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .active_collision_types(active_types)
+            .user_data(ud_stamp(base, owner, &kind))
             .build();
         // Insert without a parent body — collider is free-standing in world space.
         let col_handle = self.colliders.insert(collider);
@@ -969,12 +1091,12 @@ impl PhysicsBackend for PhysicsWorld {
                     | ActiveCollisionTypes::DYNAMIC_KINEMATIC
                     | ActiveCollisionTypes::DYNAMIC_FIXED,
             )
+            .user_data(ud_stamp(0, entity_id, &ColliderKind::Body))
             .build();
         let ch = self.colliders.insert_with_parent(collider, body_handle, &mut self.bodies);
         self.collider_kinds.insert(ch, ColliderKind::Body);
 
         self.entity_to_body.insert(entity_id, body_handle);
-        self.body_to_entity.insert(body_handle, entity_id);
         true
     }
 
@@ -985,6 +1107,7 @@ impl PhysicsBackend for PhysicsWorld {
     ) -> Option<MoveResult> {
         let handle = *self.entity_to_body.get(&entity_id)?;
         let desired_vec = Vector::new(desired_translation.x, desired_translation.y, desired_translation.z);
+        let caller_layer = self.entity_layers.get(&entity_id).copied().unwrap_or(0);
 
         // Extract position and collider handle up front so the subsequent block
         // can borrow self freely without conflicting with these short-lived borrows.
@@ -1008,9 +1131,17 @@ impl PhysicsBackend for PhysicsWorld {
             // geometry so characters never collide with other character capsules during
             // movement.  This prevents capsule stacking, landing-on-heads after launch CC,
             // and getting wedged between overlapping capsules.
+            //
+            // Layer predicate: only collide with same-layer or shared (layer 0) colliders.
+            // Reads the layer from collider.user_data — zero HashMap lookups.
+            let layer_pred = move |_ch: ColliderHandle, collider: &Collider| -> bool {
+                let col_layer = ud_layer(collider.user_data);
+                col_layer == 0 || col_layer == caller_layer
+            };
             let filter = QueryFilter::default()
                 .exclude_rigid_body(handle)
-                .groups(collision_groups::kcc_movement_groups());
+                .groups(collision_groups::kcc_movement_groups())
+                .predicate(&layer_pred);
             let queries = self.broad_phase.as_query_pipeline(
                 self.narrow_phase.query_dispatcher(),
                 &self.bodies,
@@ -1106,7 +1237,17 @@ impl PhysicsBackend for PhysicsWorld {
         max_distance: f32,
         ignore_entity: Option<EntityId>,
     ) -> Option<RayHit> {
-        let mut filter = QueryFilter::new().groups(collision_groups::targeting_ray_groups());
+        // Determine the caller's layer from ignore_entity (the caster).
+        let caller_layer = ignore_entity
+            .and_then(|eid| self.entity_layers.get(&eid).copied())
+            .unwrap_or(0);
+        let layer_pred = move |_ch: ColliderHandle, collider: &Collider| -> bool {
+            let col_layer = ud_layer(collider.user_data);
+            col_layer == 0 || col_layer == caller_layer
+        };
+        let mut filter = QueryFilter::new()
+            .groups(collision_groups::targeting_ray_groups())
+            .predicate(&layer_pred);
         if let Some(entity_id) = ignore_entity
             && let Some(&body_handle) = self.entity_to_body.get(&entity_id)
         {
@@ -1255,6 +1396,10 @@ impl PhysicsBackend for PhysicsWorld {
             rapier_shape,
             Vector::new(position.x, position.y, position.z),
         );
+        // Stamp layer into collider user_data for zero-cost predicate reads.
+        if let Some(col) = self.colliders.get_mut(col_handle) {
+            col.user_data = ud_set_layer(col.user_data, layer);
+        }
         let opaque = self.env_collider_counter;
         self.env_collider_counter += 1;
         self.env_collider_handles.insert(opaque, col_handle);
@@ -1308,6 +1453,115 @@ impl PhysicsBackend for PhysicsWorld {
 
     fn drain_pool(&mut self, max_idle: usize) {
         PhysicsWorld::drain_pool(self, max_idle);
+    }
+
+    fn line_of_sight_on_layer(
+        &self,
+        from: game_protocol::types::Vec3f,
+        to: game_protocol::types::Vec3f,
+        layer: u32,
+    ) -> bool {
+        let dx = to.x - from.x;
+        let dy = to.y - from.y;
+        let dz = to.z - from.z;
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        if dist < 1e-6 {
+            return true;
+        }
+        let inv = 1.0 / dist;
+        let dir = Vector::new(dx * inv, dy * inv, dz * inv);
+        let origin = Vector::new(from.x, from.y, from.z);
+        let ray = Ray::new(origin, dir);
+        let layer_pred = move |_ch: ColliderHandle, collider: &Collider| -> bool {
+            let col_layer = ud_layer(collider.user_data);
+            col_layer == 0 || col_layer == layer
+        };
+        let env_filter = QueryFilter::new()
+            .groups(collision_groups::kcc_movement_groups())
+            .predicate(&layer_pred);
+        let query = self.broad_phase.as_query_pipeline(
+            self.narrow_phase.query_dispatcher(),
+            &self.bodies,
+            &self.colliders,
+            env_filter,
+        );
+        match query.cast_ray_and_get_normal(&ray, dist, true) {
+            None => true,
+            Some((_, hit)) => hit.time_of_impact >= dist - 0.25,
+        }
+    }
+
+    fn cast_to_wall_on_layer(
+        &self,
+        from: game_protocol::types::Vec3f,
+        to: game_protocol::types::Vec3f,
+        layer: u32,
+    ) -> game_protocol::types::Vec3f {
+        let dx = to.x - from.x;
+        let dy = to.y - from.y;
+        let dz = to.z - from.z;
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        if dist < 1e-6 {
+            return to;
+        }
+        let inv = 1.0 / dist;
+        let dir = Vector::new(dx * inv, dy * inv, dz * inv);
+        let origin = Vector::new(from.x, from.y, from.z);
+        let ray = Ray::new(origin, dir);
+        let layer_pred = move |_ch: ColliderHandle, collider: &Collider| -> bool {
+            let col_layer = ud_layer(collider.user_data);
+            col_layer == 0 || col_layer == layer
+        };
+        let env_filter = QueryFilter::new()
+            .groups(collision_groups::kcc_movement_groups())
+            .predicate(&layer_pred);
+        let query = self.broad_phase.as_query_pipeline(
+            self.narrow_phase.query_dispatcher(),
+            &self.bodies,
+            &self.colliders,
+            env_filter,
+        );
+        if let Some((_, hit)) = query.cast_ray_and_get_normal(&ray, dist, true) {
+            let safe_dist = (hit.time_of_impact - 0.3_f32).max(0.0);
+            game_protocol::types::Vec3f::new(
+                from.x + dir.x * safe_dist,
+                from.y + dir.y * safe_dist,
+                from.z + dir.z * safe_dist,
+            )
+        } else {
+            to
+        }
+    }
+
+    fn set_entity_layer(&mut self, entity_id: EntityId, layer: u32) {
+        self.entity_layers.insert(entity_id, layer);
+        // Stamp layer into user_data of all colliders attached to this entity's body.
+        if let Some(&body_handle) = self.entity_to_body.get(&entity_id) {
+            if let Some(body) = self.bodies.get(body_handle) {
+                let collider_handles: Vec<_> = body.colliders().to_vec();
+                for ch in collider_handles {
+                    if let Some(col) = self.colliders.get_mut(ch) {
+                        col.user_data = ud_set_layer(col.user_data, layer);
+                    }
+                }
+            }
+        }
+    }
+
+    fn entity_layer(&self, entity_id: EntityId) -> u32 {
+        self.entity_layers.get(&entity_id).copied().unwrap_or(0)
+    }
+
+    fn set_layer_policy(&mut self, layer: u32, policy: game_schema::LayerCollisionPolicy) {
+        self.layer_policies.insert(layer, policy);
+    }
+
+    fn layer_policy(&self, layer: u32) -> game_schema::LayerCollisionPolicy {
+        self.layer_policies.get(&layer).copied().unwrap_or_default()
+    }
+
+    fn remove_layer_policy(&mut self, layer: u32) {
+        self.layer_policies.remove(&layer);
     }
 }
 
@@ -1559,5 +1813,80 @@ mod tests {
 
         // Non-existent entity returns false.
         assert!(!world.set_collider_enabled(EntityId(999), false));
+    }
+
+    // ── user_data bit-packing round-trip tests ──────────────────────
+
+    #[test]
+    fn ud_layer_round_trip() {
+        let ud = ud_set_layer(0, 42);
+        assert_eq!(ud_layer(ud), 42);
+
+        let ud = ud_set_layer(0, u32::MAX);
+        assert_eq!(ud_layer(ud), u32::MAX);
+
+        let ud = ud_set_layer(0, 0);
+        assert_eq!(ud_layer(ud), 0);
+    }
+
+    #[test]
+    fn ud_entity_id_round_trip() {
+        let ud = ud_set_entity_id(0, EntityId(123));
+        assert_eq!(ud_entity_id(ud), Some(EntityId(123)));
+
+        // Entity 0 → None (environment collider).
+        assert_eq!(ud_entity_id(0), None);
+
+        let ud = ud_set_entity_id(0, EntityId(0xFFFF_FFFF));
+        assert_eq!(ud_entity_id(ud), Some(EntityId(0xFFFF_FFFF)));
+    }
+
+    #[test]
+    fn ud_collider_kind_round_trip() {
+        let ud = ud_set_kind(0, &ColliderKind::Body);
+        assert_eq!(ud_collider_kind(ud), Some(ColliderKind::Body));
+
+        let ud = ud_set_kind(0, &ColliderKind::Hurtbox);
+        assert_eq!(ud_collider_kind(ud), Some(ColliderKind::Hurtbox));
+
+        // Hitbox and BlockCone return None (HashMap fallback).
+        let ud = ud_set_kind(0, &ColliderKind::Hitbox(99));
+        assert_eq!(ud_collider_kind(ud), None);
+
+        let ud = ud_set_kind(0, &ColliderKind::BlockCone(5));
+        assert_eq!(ud_collider_kind(ud), None);
+    }
+
+    #[test]
+    fn ud_stamp_encodes_entity_and_kind() {
+        let ud = ud_stamp(0, EntityId(42), &ColliderKind::Hurtbox);
+        assert_eq!(ud_entity_id(ud), Some(EntityId(42)));
+        assert_eq!(ud_collider_kind(ud), Some(ColliderKind::Hurtbox));
+    }
+
+    #[test]
+    fn ud_fields_do_not_overlap() {
+        // Set all fields on the same u128 and verify each survives.
+        let mut ud: u128 = 0;
+        ud = ud_set_layer(ud, 100);
+        ud = ud_set_kind(ud, &ColliderKind::Hurtbox);
+        ud = ud_set_entity_id(ud, EntityId(9999));
+
+        assert_eq!(ud_layer(ud), 100, "layer corrupted");
+        assert_eq!(ud_collider_kind(ud), Some(ColliderKind::Hurtbox), "kind corrupted");
+        assert_eq!(ud_entity_id(ud), Some(EntityId(9999)), "entity_id corrupted");
+    }
+
+    #[test]
+    fn ud_set_layer_preserves_other_fields() {
+        let mut ud: u128 = 0;
+        ud = ud_set_entity_id(ud, EntityId(42));
+        ud = ud_set_kind(ud, &ColliderKind::Body);
+
+        // Now change only the layer.
+        ud = ud_set_layer(ud, 777);
+        assert_eq!(ud_layer(ud), 777);
+        assert_eq!(ud_entity_id(ud), Some(EntityId(42)), "entity_id clobbered by set_layer");
+        assert_eq!(ud_collider_kind(ud), Some(ColliderKind::Body), "kind clobbered by set_layer");
     }
 }

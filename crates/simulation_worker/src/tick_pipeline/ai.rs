@@ -96,11 +96,14 @@ impl TickPipeline {
                             let aggro = self.state.ai.npc_aggro_radius.get(*idx).copied().unwrap_or(0.0);
                             if aggro > 0.0 {
                                 let npc_id = self.state.entities.id_of(*idx);
+                                let npc_layer = self.layer_of_idx(*idx);
                                 if let Some(npc_t) = self.physics.get_transform(npc_id) {
                                     let npc_pos = npc_t.position;
                                     let aggro_sq = aggro * aggro;
                                     for &p_idx in &players {
                                         let p_id = self.state.entities.id_of(p_idx);
+                                        // Layer isolation: NPCs only aggro players on the same layer.
+                                        if self.layer_of_idx(p_idx) != npc_layer { continue; }
                                         if let Some(p_t) = self.physics.get_transform(p_id) {
                                             let dx = p_t.position.x - npc_pos.x;
                                             let dz = p_t.position.z - npc_pos.z;
@@ -202,8 +205,21 @@ impl TickPipeline {
             let current_state = self.state.ai.npc_ai.get(*idx).copied().unwrap();
             match current_state {
                 NpcAiState::Combat => {
+                    // Sanitize threat table: remove entries for entities on a different layer.
+                    let npc_id = self.state.entities.id_of(*idx);
+                    let npc_layer = self.layer_of_idx(*idx);
+                    if let Some(table) = self.state.combat.threat_tables.get_mut(*idx) {
+                        let entities = &self.state.entities;
+                        let cache = &self.entity_layer_cache;
+                        table.entries.retain(|e| {
+                            entities.lookup(e.source).map_or(false, |src_idx| {
+                                let slot = src_idx.as_usize();
+                                let src_layer = if slot < cache.len() { cache[slot] } else { 0 };
+                                src_layer == npc_layer
+                            })
+                        });
+                    }
                     if let Some(target_id) = self.state.combat.threat_tables.get(*idx).and_then(|t| t.top_threat()) {
-                        let npc_id = self.state.entities.id_of(*idx);
                         let no_chase = self.state.ai.npc_no_chase.get(*idx).copied() == Some(true);
                         if !no_chase {
                             self.npc_move_toward(npc_id, *idx, target_id, self.dt);
@@ -229,8 +245,13 @@ impl TickPipeline {
                 NpcAiState::Flee => {
                     if let Some(threat_source) = self.state.combat.threat_tables.get(*idx).and_then(|t| t.top_threat()) {
                         let npc_id = self.state.entities.id_of(*idx);
-                        self.npc_move_away(npc_id, *idx, threat_source, self.dt);
-                        audit!(self.state, Transform, AiDecisions, 7, Some(npc_id), "flee");
+                        let npc_layer = self.layer_of_idx(*idx);
+                        if self.layer_of(threat_source) != npc_layer {
+                            // Threat source is on a different layer; skip flee movement.
+                        } else {
+                            self.npc_move_away(npc_id, *idx, threat_source, self.dt);
+                            audit!(self.state, Transform, AiDecisions, 7, Some(npc_id), "flee");
+                        }
                     }
                 }
                 NpcAiState::Patrol => {
@@ -258,7 +279,16 @@ impl TickPipeline {
                                     table.entries.clear();
                                 }
                                 let max_hp = self.state.combat.health.max_hp[idx.as_usize()];
-                                self.state.combat.health.hp[idx.as_usize()] = max_hp;
+                                let current_hp = self.state.combat.health.hp[idx.as_usize()];
+                                if current_hp < max_hp {
+                                    let healed = self.state.combat.health.apply_healing(*idx, max_hp - current_hp);
+                                    if healed > 0.0 {
+                                        self.emit_event(npc_id, EventPayload::Healed {
+                                            amount: healed,
+                                            source: npc_id,
+                                        });
+                                    }
+                                }
                                 if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) { *ai = NpcAiState::Idle; }
                                 audit!(self.state, Ai, AiDecisions, 7, Some(npc_id), "evade_home");
                             }

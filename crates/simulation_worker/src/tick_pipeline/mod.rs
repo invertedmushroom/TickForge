@@ -9,7 +9,8 @@ pub(super) use game_core::physics_backend::{ColliderKind, PhysicsBackend, Sensor
 pub(super) use game_core::combat::skill::{
     AbilityAction, AbilityParams, AbilityTimeline, AbilityRegistry,
     AbilityExecutionContext, AbilityExecutionId, CastFacingPolicy, ChargingState,
-    ResolvedTargeting, ScheduledAction, ScheduledActionType, SkillShape, TargetingMode,
+    ResolvedTargeting, ScheduledAction, ScheduledActionType, SkillShape, TargetFilter,
+    TargetingMode,
 };
 pub(super) use game_core::director::{DirectorSpawn, DirectorState};
 pub(super) use game_core::entity::entity_index::EntityIndex;
@@ -55,6 +56,15 @@ impl RegionCell {
             region_x: (pos.x / CELL_SIZE).floor() as i32,
             region_z: (pos.z / CELL_SIZE).floor() as i32,
             layer: 0,
+        }
+    }
+
+    /// Compute the grid cell for a world position on a specific visibility layer.
+    pub fn from_position_on_layer(pos: &Vec3f, layer: u32) -> Self {
+        Self {
+            region_x: (pos.x / CELL_SIZE).floor() as i32,
+            region_z: (pos.z / CELL_SIZE).floor() as i32,
+            layer,
         }
     }
 
@@ -232,6 +242,14 @@ pub struct TickPipeline {
     /// Seeded at spawn (from initial position → cell), updated each tick when
     /// a transition is emitted. Entries are removed in `force_remove_entity`.
     pub(super) entity_regions: HashMap<EntityId, RegionCell>,
+    /// Dense layer cache indexed by entity slot (EntityIndex.as_usize()).
+    /// Mirrors `entity_regions[id].layer` for O(1) access in hot paths.
+    /// Updated in `spawn_entity_from_snapshot` and `set_entity_layer`.
+    pub(super) entity_layer_cache: Vec<u32>,
+    /// Dense team cache indexed by entity slot (EntityIndex.as_usize()).
+    /// Mirrors the `entity_team` DB table for O(1) access in combat checks.
+    /// Updated in `set_entity_team`; 0 = unassigned/no team.
+    pub(super) entity_team_cache: Vec<u32>,
     /// Last transform snapshot sent to the commit reducer per entity.
     ///
     /// Used to emit transform deltas instead of a full-world snapshot every tick.
@@ -390,7 +408,14 @@ impl TickPipeline {
         }
 
         // 6) Drop region tracking and dirty-tracking for each removed entity.
+        //    Also zero out dense cache slots so stale layer/team values are never
+        //    inherited when the slot is recycled by a future spawn.
         for id in &removed_set {
+            if let Some(idx) = self.state.entities.lookup(*id) {
+                let slot = idx.as_usize();
+                if slot < self.entity_layer_cache.len() { self.entity_layer_cache[slot] = 0; }
+                if slot < self.entity_team_cache.len() { self.entity_team_cache[slot] = 0; }
+            }
             self.entity_regions.remove(id);
             self.last_committed_transforms.remove(id);
             self.npc_state_prev.remove(id);
@@ -398,13 +423,17 @@ impl TickPipeline {
             self.weapon_swap_cooldowns.remove(id);
         }
 
-        // 6b) Cancel any active lock-on sessions owned by removed entities.
+        // 6b) Cancel any active lock-on sessions owned by removed entities,
+        //     and scrub removed targets from other sessions' tagged lists.
         for &id in &removed_set {
             if let Some(session) = self.active_lock_on_sessions.remove(&id) {
                 for target in &session.tagged {
                     self.emit_event(id, EventPayload::LockOnCanceled { source: id, target: *target });
                 }
             }
+        }
+        for session in self.active_lock_on_sessions.values_mut() {
+            session.tagged.retain(|t| !removed_set.contains(t));
         }
 
         // 7) Remove entities from SimState and physics world.
@@ -450,6 +479,8 @@ impl TickPipeline {
             next_scheduled_id: 0,
             summary: TickSummary::default(),
             entity_regions: HashMap::new(),
+            entity_layer_cache: Vec::new(),
+            entity_team_cache: Vec::new(),
             last_committed_transforms: HashMap::new(),
             transform_history: TransformHistory::new(),
             director: DirectorState::new(),
@@ -518,6 +549,47 @@ impl TickPipeline {
         game_core::region::RepulsionRules::for_region(region_type)
     }
 
+    /// Returns the visibility layer for an entity, defaulting to 0 (open world).
+    /// Uses the dense layer cache for O(1) access when an EntityIndex is available.
+    pub(super) fn layer_of(&self, entity: EntityId) -> u32 {
+        if let Some(idx) = self.state.entities.lookup(entity) {
+            let slot = idx.as_usize();
+            if slot < self.entity_layer_cache.len() {
+                return self.entity_layer_cache[slot];
+            }
+        }
+        // Fallback to HashMap for entities not yet in the cache.
+        self.entity_regions.get(&entity).map_or(0, |c| c.layer)
+    }
+
+    /// O(1) layer lookup by dense index — preferred in tight loops where the
+    /// EntityIndex is already known.
+    #[inline(always)]
+    pub(super) fn layer_of_idx(&self, idx: EntityIndex) -> u32 {
+        let slot = idx.as_usize();
+        if slot < self.entity_layer_cache.len() {
+            self.entity_layer_cache[slot]
+        } else {
+            0
+        }
+    }
+
+    /// Check whether two entities share the same visibility layer.
+    pub(super) fn same_layer(&self, a: EntityId, b: EntityId) -> bool {
+        self.layer_of(a) == self.layer_of(b)
+    }
+
+    /// O(1) team lookup by dense index — used in combat target filtering.
+    #[inline(always)]
+    pub(super) fn team_of_idx(&self, idx: EntityIndex) -> u32 {
+        let slot = idx.as_usize();
+        if slot < self.entity_team_cache.len() {
+            self.entity_team_cache[slot]
+        } else {
+            0
+        }
+    }
+
     /// Ingest an entity from a DB snapshot row into the simulation.
     ///
     /// Registers the entity in SimState and creates the appropriate physics body
@@ -530,6 +602,7 @@ impl TickPipeline {
         tick: TickId,
         max_hp: f32,
         position: Vec3f,
+        layer: u32,
     ) {
         // Idempotency guard — the coordinator's on_insert callback already checks
         // contains() before calling here, but this defence-in-depth prevents a double-
@@ -539,6 +612,22 @@ impl TickPipeline {
             return;
         }
         self.state.spawn_entity(id, kind, tick, max_hp);
+
+        // Grow or set the dense layer cache.
+        if let Some(idx) = self.state.entities.lookup(id) {
+            let slot = idx.as_usize();
+            if slot >= self.entity_layer_cache.len() {
+                self.entity_layer_cache.resize(slot + 1, 0);
+            }
+            self.entity_layer_cache[slot] = layer;
+            // Grow team cache in parallel and reset to 0 (unassigned) so slot
+            // reuse never inherits the previous occupant's team.
+            if slot >= self.entity_team_cache.len() {
+                self.entity_team_cache.resize(slot + 1, 0);
+            }
+            self.entity_team_cache[slot] = 0;
+        }
+
         match kind {
             EntityKind::Player | EntityKind::Npc | EntityKind::Boss => {
                 self.physics.reuse_or_spawn_character(id, position, kind);
@@ -557,10 +646,12 @@ impl TickPipeline {
                 self.state.ai.home_positions.insert(idx, position);
             }
 
-        // NOTE: entity_regions is NOT seeded here. collect_region_updates() will
-        // discover the entity on its first tick (via the `None` branch) and emit
-        // an initial region update, which guarantees the DB receives the correct
-        // cell computed from the actual spawn position.
+        // Seed the entity's region so collect_region_updates uses the correct
+        // visibility layer from the first tick onward.
+        self.entity_regions.insert(id, RegionCell::from_position_on_layer(&position, layer));
+        // Mirror the layer into the physics runtime so scene-query predicates
+        // can filter cross-layer interactions.
+        self.physics.set_entity_layer(id, layer);
     }
 
     /// Seed runtime state from DB rows recovered on worker restart.

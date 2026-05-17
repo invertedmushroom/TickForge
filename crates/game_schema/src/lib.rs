@@ -18,6 +18,7 @@ pub mod cc;
 pub use types::Vec3f;
 pub use entity::{EntityKind, EntityState, NpcAiState};
 pub use damage::DamageType;
+pub use dungeon::LayerCollisionPolicy;
 pub use equipment::EquipmentSlot;
 pub use intent::{AbilityTarget, BlockData, IntentAction, MoveDir, UseAbilityData};
 pub use cc::CCEffect;

@@ -243,6 +243,7 @@ impl TickPipeline {
                 self.state.entities.is_active(idx) && self.state.combat.health.is_dead(idx)
             })
             .collect();
+        let mut dot_newly_despawned = Vec::new();
         for idx in dot_dead {
             let id = self.state.entities.id_of(idx);
             self.state.entities.mark_despawn(idx);
@@ -255,18 +256,18 @@ impl TickPipeline {
                         .and_then(|t| t.top_threat())
                 });
             self.emit_event(id, EventPayload::EntityDied { killer });
+            dot_newly_despawned.push(id);
         }
-        // Clean up DoT-killed DespawnPending entities.
-        // DoT deaths are typically few, but still use batch path for consistency.
-        let dot_despawning = self.state.despawn_pending();
-        for &id in &dot_despawning {
+        // Remove only the entities that DoT actually killed this tick,
+        // not leftovers from the capped first sweep.
+        for &id in &dot_newly_despawned {
             self.summary.despawns += 1;
             self.emit_event(id, EventPayload::EntityDespawned);
             audit!(self.state, Lifecycle, Lifecycle, 8, Some(id), "dot_remove");
             state_updates.push((id, EntityState::Removed));
         }
-        let dot_count = dot_despawning.len();
-        self.force_remove_entities(&dot_despawning);
+        let dot_count = dot_newly_despawned.len();
+        self.force_remove_entities(&dot_newly_despawned);
 
         // Decay threat tables multiplicatively — all values scale by factor each tick.
         // Multiplicative decay prevents runaway target switching when entries are near-equal,

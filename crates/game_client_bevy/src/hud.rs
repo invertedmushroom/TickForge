@@ -175,6 +175,12 @@ fn update_hud(
     crosshair: Option<Res<crate::input::CrosshairAim>>,
     #[cfg(feature = "connected")]
     lock_on: Option<Res<crate::input::LockOnSession>>,
+    #[cfg(feature = "connected")]
+    stdb: Option<Res<crate::spacetime::StdbConnection>>,
+    #[cfg(feature = "connected")]
+    local_player: Option<Res<crate::spacetime::LocalPlayerEntity>>,
+    #[cfg(feature = "connected")]
+    tick_counter: Option<Res<crate::spacetime::TickCounter>>,
 ) {
     let Ok(mut text) = hud_q.get_single_mut() else { return };
 
@@ -240,15 +246,55 @@ fn update_hud(
                 Some(h) => format!("HP: {:.0}/{:.0}", h.hp, h.max_hp),
                 None => "HP: --/--".to_string(),
             };
+
+            let entity_id = local_player.as_ref().and_then(|lp| lp.entity_id).unwrap_or(0);
+
+            // Layer from my_region view.
+            let layer_line = {
+                use game_client::module_bindings::*;
+                use spacetimedb_sdk::Table;
+                let layer = stdb.as_ref()
+                    .and_then(|s| s.conn.db.my_region().iter()
+                        .find(|r| r.entity_id == entity_id)
+                        .map(|r| r.layer));
+                match layer {
+                    Some(0) => "Layer: 0 (open world)".to_string(),
+                    Some(l) => format!("Layer: {l} (instance)"),
+                    None => "Layer: --".to_string(),
+                }
+            };
+
+            // Respawn countdown from death_state.
+            let respawn_line = {
+                use game_client::module_bindings::*;
+                let current_tick = tick_counter.as_ref().map(|tc| tc.last_tick).unwrap_or(0);
+                stdb.as_ref()
+                    .and_then(|s| s.conn.db.death_state().entity_id().find(&entity_id))
+                    .and_then(|ds| {
+                        if ds.respawn_at_tick > current_tick {
+                            let remaining_ticks = ds.respawn_at_tick - current_tick;
+                            let secs = remaining_ticks / 20; // 20 Hz
+                            Some(format!("Respawn in {}s (R)", secs))
+                        } else {
+                            Some("Respawn ready (R)".to_string())
+                        }
+                    })
+            };
+
             let mut hud = format!(
-                "Jump Client\nPos: ({:.1}, {:.1}, {:.1})\nFacing: ({:.2}, {:.2}) yaw {:.0}°\n{}\n{}\n{}\n{}",
+                "Jump Client\nPos: ({:.1}, {:.1}, {:.1})\nFacing: ({:.2}, {:.2}) yaw {:.0}°\n{}\n{}\n{}\n{}\n{}",
                 tf.translation.x, tf.translation.y, tf.translation.z,
                 forward.x, forward.z, facing_yaw_deg,
                 hp_line,
+                layer_line,
                 ack_line,
                 lock_line,
                 aim_line,
             );
+            if let Some(respawn) = respawn_line {
+                hud.push('\n');
+                hud.push_str(&respawn);
+            }
             if !lock_on_line.is_empty() {
                 hud.push('\n');
                 hud.push_str(&lock_on_line);

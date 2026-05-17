@@ -95,6 +95,9 @@ pub enum CommitCombatEventKind {
     BlockStart,
     BlockEnd,
     Damage(CommitDamageData),
+    Healed {
+        amount: f32,
+    },
     SkillHit(u32),
     BuffApplied(CommitBuffAppliedData),
     BuffExpired(u32),
@@ -223,7 +226,8 @@ pub struct CommitWorldEvent {
     pub event_kind: CommitWorldEventKind,
 }
 
-/// One buff instance for persistence. Mirrors the `active_buff` DB table.
+/// Per-instance buff state for persistence. Only runtime-varying fields;
+/// static template data is reconstructed from `BuffRegistry` at rehydration.
 #[derive(Clone, Debug)]
 pub struct CommitBuff {
     pub entity_id: u64,
@@ -231,15 +235,10 @@ pub struct CommitBuff {
     pub source_entity: u64,
     pub stacks: u32,
     pub expires_at_tick: Option<u64>,
-    // Modifier fields (flat)
-    pub mod_damage_out_pct: Option<f32>,
-    pub mod_damage_in_pct: Option<f32>,
-    pub mod_cooldown_reduce_pct: Option<f32>,
-    pub mod_speed_pct: Option<f32>,
     pub mod_ai_override_kind: Option<u8>,
     pub mod_ai_override_target: Option<u64>,
-    pub mod_root: Option<bool>,
     pub mod_stealth: Option<bool>,
+    pub last_dot_tick: Option<u64>,
 }
 
 /// NPC AI state for persistence. Mirrors the `npc_state` DB table.
@@ -368,14 +367,10 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
                     source_entity: b.source.0,
                     stacks: b.stacks,
                     expires_at_tick: b.expires_at.map(|t| t.0),
-                    mod_damage_out_pct: b.modifiers.damage_out_pct,
-                    mod_damage_in_pct: b.modifiers.damage_in_pct,
-                    mod_cooldown_reduce_pct: b.modifiers.cooldown_reduce_pct,
-                    mod_speed_pct: b.modifiers.speed_pct,
                     mod_ai_override_kind: ai_kind,
                     mod_ai_override_target: ai_target,
-                    mod_root: b.modifiers.root,
                     mod_stealth: b.modifiers.stealth,
+                    last_dot_tick: b.last_dot_tick.map(|t| t.0),
                 }
             })
         })
@@ -652,6 +647,14 @@ fn classify_events(events: &[SimEvent]) -> (Vec<CommitCombatEvent>, Vec<CommitWo
                         amount: *damage,
                         damage_type: DamageType::Physical,
                     }),
+                });
+            }
+            EventPayload::Healed { amount, source } => {
+                combat_events.push(CommitCombatEvent {
+                    source_entity: source.0,
+                    target_entity: e.entity_id.0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CommitCombatEventKind::Healed { amount: *amount },
                 });
             }
             EventPayload::LockOnSessionStarted { source, ability_id } => {

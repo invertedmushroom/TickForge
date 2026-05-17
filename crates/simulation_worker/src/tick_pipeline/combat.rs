@@ -135,10 +135,40 @@ impl TickPipeline {
         compensated: bool,
         exec_id: Option<AbilityExecutionId>,
     ) {
+        // Layer isolation: reject cross-layer damage at the central choke point.
+        if !self.same_layer(attacker, target) {
+            return;
+        }
+
         let ability = match self.abilities.get(ability_id) {
             Some(a) => a,
             None => return,
         };
+
+        // Team-based target filter: skip if the ability cannot affect this target.
+        match ability.target_filter {
+            TargetFilter::All => {} // no restriction
+            TargetFilter::Hostile => {
+                let attacker_team = self.state.entities.lookup(attacker)
+                    .map(|idx| self.team_of_idx(idx))
+                    .unwrap_or(0);
+                let target_team = self.team_of_idx(target_idx);
+                // Same non-zero team → friendly, reject.
+                if attacker_team != 0 && target_team != 0 && attacker_team == target_team {
+                    return;
+                }
+            }
+            TargetFilter::Friendly => {
+                let attacker_team = self.state.entities.lookup(attacker)
+                    .map(|idx| self.team_of_idx(idx))
+                    .unwrap_or(0);
+                let target_team = self.team_of_idx(target_idx);
+                // Must share a non-zero team.
+                if attacker_team == 0 || target_team == 0 || attacker_team != target_team {
+                    return;
+                }
+            }
+        }
 
         // Resolve charge-tier damage multiplier from execution context.
         let charge_mult: f32 = exec_id
@@ -268,7 +298,6 @@ impl TickPipeline {
         const COVER_FACTOR: f32 = 0.7;          // 30% damage reduction
         let (cover_factor, cover_source) = if !is_true_damage && block_factor >= 1.0 {
             // Only check cover if the target isn't already self-blocking.
-            let target_kind = self.state.entities.kinds[target_idx.as_usize()];
             if let (Some(tp), Some(ap)) = (
                 self.physics.get_transform(target),
                 self.physics.get_transform(attacker),
@@ -277,14 +306,12 @@ impl TickPipeline {
                 let mut best_blocker: Option<EntityId> = None;
                 for &(i, blocker_id) in &self.cover_blockers {
                     if blocker_id == target || blocker_id == attacker { continue; }
-                    // Same-team check: blocker and target must be the same entity kind category.
-                    // Players cover players; NPCs/Bosses cover NPCs/Bosses.
-                    let blocker_kind = self.state.entities.kinds[i];
-                    let same_team = matches!(
-                        (blocker_kind, target_kind),
-                        (EntityKind::Player, EntityKind::Player)
-                        | (EntityKind::Npc | EntityKind::Boss, EntityKind::Npc | EntityKind::Boss)
-                    );
+                    // Same-team check: blocker and target must share a non-zero team.
+                    // Team 0 (unassigned) never covers anyone.
+                    let blocker_idx = self.state.entities.index_at(i);
+                    let blocker_team = self.team_of_idx(blocker_idx);
+                    let target_team = self.team_of_idx(target_idx);
+                    let same_team = blocker_team != 0 && blocker_team == target_team;
                     if !same_team { continue; }
                     let Some(bp) = self.physics.get_transform(blocker_id) else { continue };
                     // Distance: target must be within COVER_RADIUS of blocker.
@@ -423,7 +450,7 @@ impl TickPipeline {
         // mitigation against true damage). Stability and DR still apply.
         // `facing_attacker` is already false when is_true_damage (see above),
         // so this falls out naturally — stated here for clarity.
-        let cc_blocked = tactical.blocking && facing_attacker;
+        let cc_blocked = is_blocking && facing_attacker;
         let has_stability_cc = stun_ticks > 0 || knockdown_ticks > 0
             || launch_lift > 0.0 || pull_force > 0.0
             || knockback_force > 0.0
@@ -872,6 +899,11 @@ impl TickPipeline {
                 continue;
             }
 
+            // Layer isolation: hitboxes only affect entities on the same layer.
+            if !self.same_layer(attacker, target) {
+                continue;
+            }
+
             // Track overlapping for periodic damage (HazardZone).
             self.state.combat.hitboxes.add_overlapping(exec_id, target);
 
@@ -962,6 +994,10 @@ impl TickPipeline {
                 if target == attacker {
                     continue;
                 }
+                // Layer isolation: skip targets on a different layer.
+                if !self.same_layer(attacker, target) {
+                    continue;
+                }
 
                 self.state.combat.hitboxes.add_overlapping(exec_id, target);
 
@@ -985,6 +1021,9 @@ impl TickPipeline {
         for (exec_id, attacker, ability_id, targets) in due {
             for target in targets {
                 if target == attacker {
+                    continue;
+                }
+                if !self.same_layer(attacker, target) {
                     continue;
                 }
                 let target_idx = match self.state.entities.lookup(target) {
@@ -1042,6 +1081,9 @@ impl TickPipeline {
                 let target_id = self.state.entities.id_of(target_idx);
 
                 if target_id == attacker {
+                    continue;
+                }
+                if !self.same_layer(attacker, target_id) {
                     continue;
                 }
                 if self.state.combat.hitboxes.has_hit(exec_id, target_id) {
@@ -1148,6 +1190,9 @@ impl TickPipeline {
             for (target_id, historical_pos) in candidates {
                 // Skip self-hits.
                 if target_id == attacker {
+                    continue;
+                }
+                if !self.same_layer(attacker, target_id) {
                     continue;
                 }
 

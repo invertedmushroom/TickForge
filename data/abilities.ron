@@ -24,6 +24,7 @@
 //   cast_facing_policy           — PreserveBody (default) | FaceAimDirection | FaceResolvedTarget
 //   projectile_speed             — units per tick; None = default 1.0 (20 units/sec at 20 Hz)
 //   max_range                    — max range in units; None = default 30.0
+//   target_filter                — Hostile (default) | Friendly | All — team-based hit filtering
 //
 // Timeline actions (tick_offset is relative to cast tick):
 //   SpawnHitbox(shape, offset)             — logical hitbox; no Rapier sensor until ApplyDamageFrame
@@ -217,6 +218,7 @@
             threat_multiplier: 0.0,
             targeting_mode: DirectionTarget,
             cast_facing_policy: PreserveBody,
+            target_filter: Friendly,
         ),
         (
             ability_id: 61,

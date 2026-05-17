@@ -112,7 +112,8 @@ impl TickPipeline {
                     let max_range = self.ability_prop(ability_id, |ad| ad.max_range, None)
                         .unwrap_or(game_core::physics_constants::DEFAULT_ABILITY_MAX_RANGE);
                     let range_sq = max_range * max_range;
-                    // Validate each target: active, in 3-D range, and clear LoS.
+                    let caster_layer = self.layer_of(entity);
+                    // Validate each target: active, in 3-D range, same layer, and clear LoS.
                     let mut valid: Vec<(EntityId, EntityIndex)> = Vec::new();
                     let mut invalid: Vec<EntityId> = Vec::new();
                     for &target in &targets {
@@ -124,7 +125,8 @@ impl TickPipeline {
                             let dy = p.y - caster_pos.y;
                             let dz = p.z - caster_pos.z;
                             dx*dx + dy*dy + dz*dz <= range_sq
-                                && self.physics.line_of_sight(caster_pos, p)
+                                && self.layer_of(target) == caster_layer
+                                && self.physics.line_of_sight_on_layer(caster_pos, p, caster_layer)
                         });
                         if ok {
                             if let Some(idx) = self.state.entities.lookup(target) {
@@ -631,7 +633,8 @@ impl TickPipeline {
                     y: target_t.position.y,
                     z: target_t.position.z - target_forward.z * distance,
                 };
-                let destination = self.physics.cast_to_wall(caster_pos, raw_dest);
+                let caster_layer = self.layer_of(entity);
+                let destination = self.physics.cast_to_wall_on_layer(caster_pos, raw_dest, caster_layer);
                 if self.physics.teleport_entity(entity, destination) {
                     self.emit_event(entity, EventPayload::Teleported {
                         entity,
@@ -651,7 +654,8 @@ impl TickPipeline {
                     y: caster_pos.y,
                     z: caster_pos.z + facing.z * distance,
                 };
-                let destination = self.physics.cast_to_wall(caster_pos, raw_dest);
+                let caster_layer = self.layer_of(entity);
+                let destination = self.physics.cast_to_wall_on_layer(caster_pos, raw_dest, caster_layer);
                 if self.physics.teleport_entity(entity, destination) {
                     self.emit_event(entity, EventPayload::Teleported {
                         entity,

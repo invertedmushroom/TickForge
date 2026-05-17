@@ -227,6 +227,7 @@ impl TickPipeline {
                         if let Some(idx) = self.state.entities.lookup(entity_id) {
                             let actual_damage = self.state.combat.health.apply_damage(idx, damage, None);
                             if actual_damage > 0.0 {
+                                audit!(self.state, Health, Controller, 2, Some(entity_id), "fall_damage");
                                 self.emit_event(entity_id, EventPayload::FallDamage {
                                     damage: actual_damage,
                                     impact_speed,
@@ -406,6 +407,7 @@ impl TickPipeline {
             kind: EntityKind,
             x: f32,
             z: f32,
+            layer: u32,
             rules: game_core::region::RepulsionRules,
         }
 
@@ -421,7 +423,8 @@ impl TickPipeline {
                 let id = self.state.entities.id_of(idx);
                 let t = self.physics.get_transform(id)?;
                 let rules = self.repulsion_rules_for(id);
-                Some(CharInfo { entity_id: id, kind, x: t.position.x, z: t.position.z, rules })
+                let layer = self.layer_of(id);
+                Some(CharInfo { entity_id: id, kind, x: t.position.x, z: t.position.z, layer, rules })
             })
             .collect();
 
@@ -447,6 +450,11 @@ impl TickPipeline {
             let dz = chars[i].z - chars[j].z;
             let dist_sq = dx * dx + dz * dz;
             if dist_sq >= push_threshold_sq || dist_sq < 1e-8 {
+                return;
+            }
+
+            // Layer isolation: no repulsion between entities on different layers.
+            if chars[i].layer != chars[j].layer {
                 return;
             }
 
@@ -656,6 +664,8 @@ impl TickPipeline {
     fn handle_interact(&mut self, entity_id: EntityId, target_id_raw: u64) {
         use game_core::sim_state::{SimInteractKind, SimInteractState};
         let target = EntityId(target_id_raw);
+        // Layer isolation: can only interact with entities on the same layer.
+        if !self.same_layer(entity_id, target) { return; }
         if let (Some(actor_t), Some(target_t)) = (
             self.physics.get_transform(entity_id),
             self.physics.get_transform(target),
@@ -825,6 +835,9 @@ impl TickPipeline {
                 if target == entity_id {
                     return;
                 }
+                if !self.same_layer(entity_id, target) {
+                    return;
+                }
                 let Some(target_idx) = self.state.entities.lookup(target) else { return; };
                 if !self.state.entities.is_active(target_idx) {
                     return;
@@ -841,7 +854,7 @@ impl TickPipeline {
                 if dx * dx + dy * dy + dz * dz > max_range * max_range {
                     return;
                 }
-                if !self.physics.line_of_sight(caster_t.position, target_t.position) {
+                if !self.physics.line_of_sight_on_layer(caster_t.position, target_t.position, self.layer_of(entity_id)) {
                     return;
                 }
                 ResolvedTargeting::Entity { target }
@@ -861,7 +874,7 @@ impl TickPipeline {
                 if dx * dx + dz * dz > max_range * max_range {
                     return; // out of range on ground plane
                 }
-                if !self.physics.line_of_sight(caster_pos, point) {
+                if !self.physics.line_of_sight_on_layer(caster_pos, point, self.layer_of(entity_id)) {
                     return; // blocked by environment
                 }
                 ResolvedTargeting::Position { point }
@@ -904,6 +917,9 @@ impl TickPipeline {
                     game_schema::AbilityTarget::Entity(id) => {
                         // Tab-lock path: validate target is within max_range.
                         let target = EntityId(*id);
+                        if !self.same_layer(entity_id, target) {
+                            return;
+                        }
                         if let Some(t) = self.physics.get_transform(target) {
                             let dx = t.position.x - caster_pos.x;
                             let dz = t.position.z - caster_pos.z;
@@ -1076,9 +1092,12 @@ impl TickPipeline {
         };
 
         let mut best: Option<(EntityId, f32)> = None; // (entity, dist_sq)
+        let caster_layer = self.layer_of(caster);
 
         for (eid, transform) in self.physics.get_all_transforms() {
             if eid == caster { continue; }
+            // Layer isolation: aim-assist only considers entities on the same layer.
+            if self.layer_of(eid) != caster_layer { continue; }
             let dx = transform.position.x - caster_pos.x;
             let dy = transform.position.y - caster_pos.y;
             let dz = transform.position.z - caster_pos.z;
@@ -1145,6 +1164,9 @@ impl TickPipeline {
     /// validation failure (no session, already tagged, out of range, no LoS, max reached).
     fn handle_tag_target(&mut self, caster: EntityId, target_id_raw: u64) {
         let target = EntityId(target_id_raw);
+        if !self.same_layer(caster, target) {
+            return;
+        }
         // Extract session metadata without holding a borrow on the session.
         let (ability_id, is_full, already_tagged) = if let Some(session) = self.active_lock_on_sessions.get(&caster) {
             let is_full = session.tagged.len() >= session.max_targets as usize;
@@ -1165,7 +1187,7 @@ impl TickPipeline {
         let dz = target_pos.z - caster_pos.z;
         if dx * dx + dy * dy + dz * dz > max_range * max_range { return; }
         // Environment line-of-sight check.
-        if !self.physics.line_of_sight(caster_pos, target_pos) { return; }
+        if !self.physics.line_of_sight_on_layer(caster_pos, target_pos, self.layer_of(caster)) { return; }
         // All checks passed — record the tag.
         if let Some(session) = self.active_lock_on_sessions.get_mut(&caster) {
             session.tagged.push(target);

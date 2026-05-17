@@ -131,6 +131,16 @@ fn poll_combat_events(
             });
         }
 
+        // Emit floating heal number (green, negative convention).
+        if let CombatEventKind::Healed(ref h) = ev.event_kind {
+            damage_events.send(crate::vfx::DamageNumberEvent {
+                target_entity_id: ev.target_entity,
+                amount: -h.amount,
+                is_crit: false,
+                is_self: is_us_target,
+            });
+        }
+
         // Emit death notification for VFX (death marker + "YOU DIED" screen).
         if matches!(&ev.event_kind, CombatEventKind::EntityDied(_)) {
             death_events.send(crate::vfx::DeathNotification {
@@ -331,6 +341,14 @@ fn format_combat_event(
                 game_client::module_bindings::DamageType::True => "True",
             };
             (format!("{src} hit {tgt} for {:.0} {damage_type}", d.amount), color)
+        }
+        CombatEventKind::Healed(h) => {
+            let color = if is_us_target {
+                Color::srgb(0.2, 1.0, 0.3) // green — we were healed
+            } else {
+                Color::srgb(0.5, 0.9, 0.5)
+            };
+            (format!("{src} healed {tgt} for {:.0}", h.amount), color)
         }
         CombatEventKind::SkillHit(_) => {
             // Suppressed — redundant with Damage line and CastStart.
