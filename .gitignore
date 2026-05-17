@@ -1,0 +1,7 @@
+/target/
+/.worker_token
+/.client_token
+/.client_token_*
+/.client_token_left
+/.client_token_right
+*.log
