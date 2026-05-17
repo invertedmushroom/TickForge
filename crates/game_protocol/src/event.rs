@@ -297,4 +297,20 @@ pub enum EventPayload {
         from: crate::types::Vec3f,
         to: crate::types::Vec3f,
     },
+
+    // ── Volume events ──────────────────────────────────
+    /// An entity entered a gameplay volume (trigger zone, puzzle pad,
+    /// water, arena). Emitted on the tick the entity first overlaps the
+    /// volume's sensor.
+    VolumeEnter {
+        volume_id: u64,
+        entity: EntityId,
+    },
+    /// An entity left a gameplay volume. Emitted on the tick its overlap
+    /// is no longer reported by the physics backend, including when the
+    /// volume itself despawns.
+    VolumeExit {
+        volume_id: u64,
+        entity: EntityId,
+    },
 }

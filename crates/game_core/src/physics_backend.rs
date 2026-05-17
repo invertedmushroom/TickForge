@@ -16,6 +16,12 @@ pub enum ColliderKind {
     Hitbox(u64),
     /// Directional block region. Carries a block id.
     BlockCone(u32),
+    /// Generic gameplay volume — trigger zone, puzzle pad, water, arena,
+    /// cleanse pool. Carries the `VolumeId.0` so the worker can route
+    /// occupant updates back to the [`crate::volume::VolumeStore`]. Volumes
+    /// never deal damage; the volume system reads `sensor_intersections`
+    /// directly each tick instead of relying on contact events.
+    Volume(u64),
 }
 
 /// Abstract shape for a sensor collider (hitbox, trigger zone).

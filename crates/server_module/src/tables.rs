@@ -93,6 +93,27 @@ pub struct EntityLayer {
     pub layer: u32,
 }
 
+// ── Encounter Add Membership ────────────────────────────────────────
+// Ties a scripted encounter add (spawned by `Effect::SpawnAdds`) to its
+// owning boss and the tags assigned at spawn time. Worker subscribes to
+// rebuild in-memory `add_to_boss` and `entity_tags` so encounter rules
+// like `OnEntityDied { tag }` can fire deterministically in production.
+// See `docs/contracts/spawn_add_membership_contract.md`.
+//
+// Primary writer: `commit_tick_results` reducer (insert at spawn time).
+// Cleanup writer: `commit_tick_results` reducer when the add or its boss
+// is removed; instance teardown also cascades.
+
+#[table(accessor = encounter_add, public, index(accessor = by_boss, btree(columns = [boss_entity])))]
+pub struct EncounterAdd {
+    #[primary_key]
+    pub add_entity: u64,
+    pub boss_entity: u64,
+    pub tags: Vec<String>,
+    pub archetype: String,
+    pub spawned_at_tick: u64,
+}
+
 // ── Stealth ─────────────────────────────────────────────────────────
 // Tracks which entities are currently stealthed and their team.
 // Private — enemies must not be able to query this table directly.
@@ -233,6 +254,8 @@ pub struct NpcState {
 pub struct NpcConfig {
     #[primary_key]
     pub entity_id: u64,
+    /// Encounter rules key used by worker boss registration. None => fallback behavior.
+    pub encounter_name: Option<String>,
     /// Training dummy — never enters combat, ignores threat.
     pub passive: bool,
     /// Fights back but does not chase (stationary turret).

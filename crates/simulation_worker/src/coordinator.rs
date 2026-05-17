@@ -98,6 +98,7 @@ fn send_commit(reducers: &RemoteReducers, pkg: CommitPackage, state: Arc<Mutex<C
     let buff_cleared_entity_ids = pkg.buff_cleared_entity_ids.clone();
     let npc_state_updates = wire_npc_state_updates(&pkg);
     let director_spawns = wire_director_spawns(&pkg);
+    let encounter_memberships = wire_encounter_memberships(&pkg);
     let interactable_updates = wire_interactable_updates(&pkg);
     let death_state_inserts = wire_death_state_inserts(&pkg);
     let sim_log_entries = wire_sim_log_entries(&pkg);
@@ -119,6 +120,7 @@ fn send_commit(reducers: &RemoteReducers, pkg: CommitPackage, state: Arc<Mutex<C
         buff_cleared_entity_ids,
         npc_state_updates,
         director_spawns,
+        encounter_memberships,
         interactable_updates,
         death_state_inserts,
         sim_log_entries,
@@ -323,7 +325,14 @@ pub fn run(config: CoordinatorConfig) {
     }
 
     let state = Arc::new(Mutex::new(CoordinatorState {
-        sim: SimulationRunner::new(TickId(0), Box::new(physics), tick_dt, abilities, buffs, crate::lag_compensation::MAX_REWIND_TICKS),
+        sim: SimulationRunner::new(
+            TickId(0),
+            Box::new(physics),
+            tick_dt,
+            abilities,
+            buffs,
+            crate::lag_compensation::MAX_REWIND_TICKS,
+        ),
         items,
         dungeons,
         encounters,
@@ -564,24 +573,39 @@ pub fn run(config: CoordinatorConfig) {
             .find(&new_entity.entity_id)
             .map(|n| (convert_npc_ai_state(n.ai_state), n.target_entity.map(EntityId)));
 
-        let npc_config: Option<crate::entity_sync::NpcSpawnConfig> = ctx.db
+        let npc_config_row = ctx
+            .db
             .npc_config()
             .entity_id()
-            .find(&new_entity.entity_id)
-            .map(|c| {
-                let mut ability_ids: Vec<u32> = Vec::new();
-                if let Some(id) = c.ability_id_1 { ability_ids.push(id); }
-                if let Some(id) = c.ability_id_2 { ability_ids.push(id); }
-                if let Some(id) = c.ability_id_3 { ability_ids.push(id); }
-                if let Some(id) = c.ability_id_4 { ability_ids.push(id); }
-                crate::entity_sync::NpcSpawnConfig {
-                    passive: c.passive,
-                    no_chase: c.no_chase,
-                    ability_ids,
-                    leash_radius: c.leash_radius,
-                    aggro_radius: c.aggro_radius,
-                }
-            });
+            .find(&new_entity.entity_id);
+
+        let configured_encounter_key = npc_config_row
+            .as_ref()
+            .and_then(|c| c.encounter_name.clone())
+            .filter(|key| !key.is_empty());
+
+        let npc_config: Option<crate::entity_sync::NpcSpawnConfig> = npc_config_row.map(|c| {
+            let mut ability_ids: Vec<u32> = Vec::new();
+            if let Some(id) = c.ability_id_1 {
+                ability_ids.push(id);
+            }
+            if let Some(id) = c.ability_id_2 {
+                ability_ids.push(id);
+            }
+            if let Some(id) = c.ability_id_3 {
+                ability_ids.push(id);
+            }
+            if let Some(id) = c.ability_id_4 {
+                ability_ids.push(id);
+            }
+            crate::entity_sync::NpcSpawnConfig {
+                passive: c.passive,
+                no_chase: c.no_chase,
+                ability_ids,
+                leash_radius: c.leash_radius,
+                aggro_radius: c.aggro_radius,
+            }
+        });
 
         let mut guard = match state_for_entity.lock() {
             Ok(g) => g,
@@ -657,10 +681,38 @@ pub fn run(config: CoordinatorConfig) {
         // Register encounter rules for Boss entities so the pipeline can
         // evaluate phase transitions each tick.
         if kind == game_schema::EntityKind::Boss {
-            if let Some(rules) = guard.encounters.rules_for("default") {
-                let enc_state = game_core::encounter::EncounterState::new(eid, rules.clone(), tick);
+            let configured_key = configured_encounter_key.as_deref();
+            if let Some((resolved_key, rules, fell_back)) =
+                resolve_boss_encounter_rules(&guard.encounters, configured_key)
+            {
+                if fell_back {
+                    if let Some(missing_key) = configured_key {
+                        warn!(
+                            "Encounter key '{}' missing for boss entity {} — falling back to 'default'",
+                            missing_key,
+                            eid.0,
+                        );
+                    }
+                }
+
+                let enc_state = game_core::encounter::EncounterState::new(eid, rules, tick);
                 guard.sim.register_encounter(eid, enc_state);
-                info!("Registered encounter rules for boss entity {}", eid.0);
+                info!(
+                    "Registered encounter rules '{}' for boss entity {}",
+                    resolved_key,
+                    eid.0,
+                );
+            } else if let Some(missing_key) = configured_key {
+                warn!(
+                    "Encounter key '{}' missing for boss entity {} and 'default' encounter is missing",
+                    missing_key,
+                    eid.0,
+                );
+            } else {
+                warn!(
+                    "No encounter rules registered for boss entity {} because 'default' encounter is missing",
+                    eid.0,
+                );
             }
         }
     });
@@ -780,7 +832,7 @@ pub fn run(config: CoordinatorConfig) {
     let state_for_instance_insert = Arc::clone(&state);
     conn.db.instance().on_insert(move |ctx, inst| {
         // Skip initial subscription snapshot — existing instances are already
-        // running (or expired). Only react to live inserts.
+        // handled by on_applied. Only react to live inserts here.
         if matches!(ctx.event, spacetimedb_sdk::Event::SubscribeApplied) {
             return;
         }
@@ -793,98 +845,7 @@ pub fn run(config: CoordinatorConfig) {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(template) = guard.dungeons.get(&inst.template_id) {
-            let template = template.clone();
-            let layer = inst.layer;
-            materialize_layer(
-                guard.sim.physics_mut(),
-                layer,
-                &template.geometry,
-                template.terrain_set.as_deref(),
-                template.collision_policy,
-            );
-            info!(
-                "Instance {} (template={}): materialised {} environment collider(s) on layer {} (terrain_set={:?})",
-                inst.instance_id,
-                inst.template_id,
-                template.geometry.len(),
-                layer,
-                template.terrain_set,
-            );
-            // Register terrain binding for this instance layer + enqueue
-            // every chunk currently cached for the matching set. Drain
-            // happens at the next tick boundary (§4.8b Phase 5).
-            //
-            // Note: register_binding picks up an existing set_id if any
-            // sibling layer already resolved this name; the explicit
-            // resolve_set call below is still needed for the
-            // first-binder case (no sibling has resolved yet) and is a
-            // no-op when a sibling already did.
-            if let Some(set_name) = template.terrain_set.as_deref() {
-                guard.terrain.register_binding(layer, set_name.to_string());
-                if let Some(set_row) = ctx.db.terrain_set().name().find(&set_name.to_string()) {
-                    let newly = guard.terrain.resolve_set(set_name, set_row.terrain_set_id);
-                    let chunks: Vec<_> = ctx
-                        .db
-                        .terrain_chunk()
-                        .iter()
-                        .filter(|c| c.terrain_set_id == set_row.terrain_set_id)
-                        .collect();
-                    let chunk_count = chunks.len();
-                    for c in chunks {
-                        guard.terrain.enqueue(TerrainEdit::Insert {
-                            terrain_set_id: c.terrain_set_id,
-                            row_id: c.row_id,
-                            vertices: c.vertices,
-                            indices: c.indices,
-                        });
-                    }
-                    info!(
-                        "Instance {}: terrain_set '{}' resolved to id {} ({} new layer(s) bound, \
-                         {} chunk(s) queued)",
-                        inst.instance_id,
-                        set_name,
-                        set_row.terrain_set_id,
-                        newly.len(),
-                        chunk_count,
-                    );
-                } else {
-                    info!(
-                        "Instance {}: terrain_set '{}' not yet observed — chunks will arrive via \
-                         live terrain_set/terrain_chunk callbacks",
-                        inst.instance_id, set_name,
-                    );
-                }
-            }
-
-            // Register any dungeon-scoped spawn rules for this template
-            // against the instance's layer.  Rules are cleared when the
-            // instance expires (see `on_update` Expired handler below).
-            let dungeon_events: Vec<game_core::director::DynamicEvent> = guard
-                .spawn_rules
-                .for_dungeon(&inst.template_id)
-                .filter_map(|rule| {
-                    // Dungeon-scoped rules use the instance-normalised zone
-                    // key (layer, 0, 0) — see `rule_to_dynamic_event`.
-                    game_core::spawn_rules::rule_to_dynamic_event(rule, 0, 0, layer)
-                })
-                .collect();
-            let dungeon_event_count = dungeon_events.len();
-            for ev in dungeon_events {
-                let _ = guard.sim.register_director_event(ev);
-            }
-            if dungeon_event_count > 0 {
-                info!(
-                    "Instance {} (template={}): registered {} director event(s) on layer {}",
-                    inst.instance_id, inst.template_id, dungeon_event_count, layer
-                );
-            }
-        } else {
-            warn!(
-                "Instance {} references unknown template '{}' — no geometry spawned",
-                inst.instance_id, inst.template_id
-            );
-        }
+        materialize_active_instance(&mut guard, &ctx.db, inst, "live insert");
     });
 
     // On instance update → Expired: remove environment colliders for that layer.
@@ -1134,11 +1095,7 @@ pub fn run(config: CoordinatorConfig) {
         // would otherwise be lost. Once terrain_set resolves, that
         // callback queues a fresh batch from the cache (which includes
         // this row), keeping behaviour correct.
-        if guard
-            .terrain
-            .layers_for_set(row.terrain_set_id)
-            .is_empty()
-        {
+        if guard.terrain.layers_for_set(row.terrain_set_id).is_empty() {
             return;
         }
         guard.terrain.enqueue(TerrainEdit::Insert {
@@ -1155,11 +1112,7 @@ pub fn run(config: CoordinatorConfig) {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if guard
-            .terrain
-            .layers_for_set(row.terrain_set_id)
-            .is_empty()
-        {
+        if guard.terrain.layers_for_set(row.terrain_set_id).is_empty() {
             return;
         }
         guard.terrain.enqueue(TerrainEdit::Update {
@@ -1176,9 +1129,47 @@ pub fn run(config: CoordinatorConfig) {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.terrain.enqueue(TerrainEdit::Delete {
-            row_id: row.row_id,
-        });
+        guard
+            .terrain
+            .enqueue(TerrainEdit::Delete { row_id: row.row_id });
+    });
+
+    // ── Encounter Add Membership projection ─────────────────────────
+    // Mirror encounter_add rows into the pipeline's add_to_boss/entity_tags
+    // maps so encounter rules like `OnEntityDied { tag }` fire in production.
+    // See `docs/contracts/spawn_add_membership_contract.md`.
+    //
+    // Replay ordering note: this fires independently of `entity.on_insert`.
+    // `register_encounter_add_with_tags` only writes the two HashMaps and
+    // does not consult any entity slot table, so out-of-order arrival is
+    // safe.
+
+    let state_for_add_insert = Arc::clone(&state);
+    conn.db.encounter_add().on_insert(move |_ctx, row| {
+        let mut guard = match state_for_add_insert.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.sim.register_encounter_add_with_tags(
+            EntityId(row.add_entity),
+            EntityId(row.boss_entity),
+            &row.tags,
+        );
+    });
+
+    // Symmetric on_delete: clear mirrored worker state when the reducer
+    // cascade-deletes membership rows (especially via `by_boss()` on boss
+    // death, where the add entity may briefly outlive its membership row).
+    // See `docs/contracts/spawn_add_membership_contract.md`.
+    let state_for_add_delete = Arc::clone(&state);
+    conn.db.encounter_add().on_delete(move |_ctx, row| {
+        let mut guard = match state_for_add_delete.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
+            .sim
+            .unregister_encounter_add(EntityId(row.add_entity));
     });
 
     // ── World Phase projection ──────────────────────────────────────
@@ -1398,6 +1389,32 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
                 info!(
                     "Registered {registered} open-world director event(s) from spawn_rules.ron",
                 );
+
+                // Seed Active/Pending instance geometry after a worker restart.
+                // `instance.on_insert` skips SubscribeApplied rows, so without
+                // this path the DB can contain live instance entities/layers
+                // while Rapier has no dungeon floor or walls for that layer.
+                let active_instances: Vec<_> = ctx
+                    .db
+                    .instance()
+                    .iter()
+                    .filter(|inst| {
+                        inst.state == crate::module_bindings::InstanceState::Active
+                            || inst.state == crate::module_bindings::InstanceState::Pending
+                    })
+                    .collect();
+                let mut materialized_instances = 0usize;
+                for inst in active_instances {
+                    if materialize_active_instance(&mut guard, &ctx.db, &inst, "subscription seed")
+                    {
+                        materialized_instances += 1;
+                    }
+                }
+                if materialized_instances > 0 {
+                    info!(
+                        "Materialised {materialized_instances} active instance layer(s) from subscription snapshot",
+                    );
+                }
             }
             info!(
                 "Subscription applied — {} sim_tick rows, {} intent rows, {} entity rows; seeding last_processed_tick={} pipeline_start_tick={}",
@@ -1430,6 +1447,7 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
             "SELECT * FROM npc_config",
             "SELECT * FROM entity_team",
             "SELECT * FROM entity_layer",
+            "SELECT * FROM encounter_add",
             // Terrain: full snapshot once at SubscribeApplied, then per-row
             // deltas via on_insert/on_update/on_delete. A single chunk edit
             // costs one row delta + one TriMesh rebuild — not a reload.
@@ -1438,6 +1456,113 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
             "SELECT * FROM terrain_set",
             "SELECT * FROM terrain_chunk",
         ]);
+}
+
+fn materialize_active_instance(
+    guard: &mut CoordinatorState,
+    db: &RemoteTables,
+    inst: &Instance,
+    source: &str,
+) -> bool {
+    let Some(template) = guard.dungeons.get(&inst.template_id).cloned() else {
+        warn!(
+            "Instance {} references unknown template '{}' during {} — no geometry spawned",
+            inst.instance_id, inst.template_id, source
+        );
+        return false;
+    };
+
+    let layer = inst.layer;
+    materialize_layer(
+        guard.sim.physics_mut(),
+        layer,
+        &template.geometry,
+        template.terrain_set.as_deref(),
+        template.collision_policy,
+    );
+    info!(
+        "Instance {} (template={}): materialised {} environment collider(s) on layer {} (terrain_set={:?}, source={})",
+        inst.instance_id,
+        inst.template_id,
+        template.geometry.len(),
+        layer,
+        template.terrain_set,
+        source,
+    );
+
+    // Register terrain binding for this instance layer + enqueue every
+    // currently cached chunk for the matching set. Drain happens at the
+    // next tick boundary (§4.8b Phase 5).
+    //
+    // `register_binding` picks up an existing set_id if any sibling layer
+    // already resolved this name; the explicit resolve below handles the
+    // first-binder case and is a no-op for already-resolved siblings.
+    if let Some(set_name) = template.terrain_set.as_deref() {
+        guard.terrain.register_binding(layer, set_name.to_string());
+        if let Some(set_row) = db.terrain_set().name().find(&set_name.to_string()) {
+            let newly = guard.terrain.resolve_set(set_name, set_row.terrain_set_id);
+            let chunks: Vec<_> = db
+                .terrain_chunk()
+                .iter()
+                .filter(|c| c.terrain_set_id == set_row.terrain_set_id)
+                .collect();
+            let chunk_count = chunks.len();
+            for c in chunks {
+                guard.terrain.enqueue(TerrainEdit::Insert {
+                    terrain_set_id: c.terrain_set_id,
+                    row_id: c.row_id,
+                    vertices: c.vertices,
+                    indices: c.indices,
+                });
+            }
+            info!(
+                "Instance {}: terrain_set '{}' resolved to id {} ({} new layer(s) bound, {} chunk(s) queued)",
+                inst.instance_id,
+                set_name,
+                set_row.terrain_set_id,
+                newly.len(),
+                chunk_count,
+            );
+        } else {
+            info!(
+                "Instance {}: terrain_set '{}' not yet observed — chunks will arrive via live terrain_set/terrain_chunk callbacks",
+                inst.instance_id, set_name,
+            );
+        }
+    }
+
+    // Re-materialization is idempotent for geometry; make director
+    // registrations idempotent too so a subscription reseed cannot double-fire
+    // dungeon-scoped spawn rules on the same layer.
+    let cleared = guard.sim.clear_director_for_layer(layer);
+    if cleared > 0 {
+        info!(
+            "Instance {} (template={}): cleared {} stale director event(s) on layer {} before registering rules",
+            inst.instance_id, inst.template_id, cleared, layer,
+        );
+    }
+
+    let dungeon_events: Vec<game_core::director::DynamicEvent> = guard
+        .spawn_rules
+        .for_dungeon(&inst.template_id)
+        .filter_map(|rule| {
+            // Dungeon-scoped rules use the instance-normalised zone key
+            // (layer, 0, 0) — see `rule_to_dynamic_event`.
+            game_core::spawn_rules::rule_to_dynamic_event(rule, 0, 0, layer)
+        })
+        .collect();
+    let dungeon_event_count = dungeon_events.len();
+    for ev in dungeon_events {
+        let _ = guard.sim.register_director_event(ev);
+    }
+    if dungeon_event_count > 0 {
+        info!(
+            "Instance {} (template={}): registered {} director event(s) on layer {}",
+            inst.instance_id, inst.template_id, dungeon_event_count, layer
+        );
+    }
+
+    true
 }
 
 // ── Ability registry ───────────────────────────────────────────
@@ -2008,7 +2133,7 @@ fn load_encounters() -> game_core::encounter::EncounterRegistry {
             let count = file.encounters.len();
             let mut reg = EncounterRegistry::new();
             for def in file.encounters {
-                reg.register(def.boss_name, def.rules);
+                reg.register(def.name, def.rules);
             }
             info!("Loaded {count} encounter definition(s) from {PATH}");
             reg
@@ -2018,6 +2143,24 @@ fn load_encounters() -> game_core::encounter::EncounterRegistry {
             EncounterRegistry::new()
         }
     }
+}
+
+fn resolve_boss_encounter_rules(
+    encounters: &game_core::encounter::EncounterRegistry,
+    configured_key: Option<&str>,
+) -> Option<(String, Vec<game_core::encounter::Rule>, bool)> {
+    if let Some(key) = configured_key.filter(|k| !k.is_empty()) {
+        if let Some(rules) = encounters.rules_for(key) {
+            return Some((key.to_string(), rules, false));
+        }
+        return encounters
+            .rules_for("default")
+            .map(|rules| ("default".to_string(), rules, true));
+    }
+
+    encounters
+        .rules_for("default")
+        .map(|rules| ("default".to_string(), rules, false))
 }
 
 // ── Spawn-rules registry ────────────────────────────────────────
@@ -2539,6 +2682,18 @@ fn wire_director_spawns(pkg: &CommitPackage) -> Vec<DirectorSpawnInput> {
         .collect()
 }
 
+fn wire_encounter_memberships(pkg: &CommitPackage) -> Vec<EncounterAddMembershipInput> {
+    pkg.encounter_memberships
+        .iter()
+        .map(|m| EncounterAddMembershipInput {
+            spawn_index: m.spawn_index,
+            boss_entity: m.boss_entity,
+            archetype: m.archetype.clone(),
+            tags: m.tags.clone(),
+        })
+        .collect()
+}
+
 fn convert_entity_kind_to_wire(
     kind: game_schema::EntityKind,
 ) -> crate::module_bindings::EntityKind {
@@ -2918,8 +3073,7 @@ mod tests {
     fn shipped_layers_ron_parses() {
         use game_schema::dungeon::WorldLayersFile;
         let src = include_str!("../../../data/layers.ron");
-        let file: WorldLayersFile =
-            ron::from_str(src).expect("data/layers.ron must be valid RON");
+        let file: WorldLayersFile = ron::from_str(src).expect("data/layers.ron must be valid RON");
         assert!(
             !file.layers.is_empty(),
             "shipped layers.ron should declare at least one static layer"
@@ -2933,5 +3087,60 @@ mod tests {
             );
             assert!(!l.name.is_empty(), "layer name must not be empty");
         }
+    }
+
+    fn one_rule(phase: game_core::encounter::BossPhase) -> Vec<game_core::encounter::EncounterRule> {
+        vec![game_core::encounter::EncounterRule {
+            trigger: game_core::encounter::EncounterTrigger::OnHpBelowOnce { percent: 0.5 },
+            action: game_core::encounter::EncounterAction::ChangePhase { phase },
+            fired: false,
+        }]
+    }
+
+    #[test]
+    fn resolve_boss_encounter_rules_prefers_configured_key() {
+        let mut reg = game_core::encounter::EncounterRegistry::new();
+        reg.register("default".to_string(), one_rule(game_core::encounter::BossPhase::Phase2));
+        reg.register(
+            "state_enter_demo".to_string(),
+            one_rule(game_core::encounter::BossPhase::Phase3),
+        );
+
+        let (key, rules, fell_back) =
+            resolve_boss_encounter_rules(&reg, Some("state_enter_demo")).expect("rules");
+        assert_eq!(key, "state_enter_demo");
+        assert!(!fell_back);
+        assert_eq!(rules.len(), 1);
+    }
+
+    #[test]
+    fn resolve_boss_encounter_rules_falls_back_to_default() {
+        let mut reg = game_core::encounter::EncounterRegistry::new();
+        reg.register("default".to_string(), one_rule(game_core::encounter::BossPhase::Phase2));
+
+        let (key, rules, fell_back) =
+            resolve_boss_encounter_rules(&reg, Some("missing_key")).expect("fallback rules");
+        assert_eq!(key, "default");
+        assert!(fell_back);
+        assert_eq!(rules.len(), 1);
+    }
+
+    #[test]
+    fn resolve_boss_encounter_rules_uses_default_when_unconfigured() {
+        let mut reg = game_core::encounter::EncounterRegistry::new();
+        reg.register("default".to_string(), one_rule(game_core::encounter::BossPhase::Phase2));
+
+        let (key, rules, fell_back) =
+            resolve_boss_encounter_rules(&reg, None).expect("default rules");
+        assert_eq!(key, "default");
+        assert!(!fell_back);
+        assert_eq!(rules.len(), 1);
+    }
+
+    #[test]
+    fn resolve_boss_encounter_rules_none_when_no_matches() {
+        let reg = game_core::encounter::EncounterRegistry::new();
+        assert!(resolve_boss_encounter_rules(&reg, Some("missing_key")).is_none());
+        assert!(resolve_boss_encounter_rules(&reg, None).is_none());
     }
 }

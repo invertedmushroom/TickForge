@@ -294,6 +294,7 @@ impl TickPipeline {
                         .and_then(|t| t.top_threat())
                 });
             self.emit_event(id, EventPayload::EntityDied { killer });
+            self.forward_death_to_encounter(id);
             self.push_death_zone_counter(id, idx);
             self.push_player_death_state(id, idx, killer);
         }
@@ -491,6 +492,7 @@ impl TickPipeline {
                         .and_then(|t| t.top_threat())
                 });
             self.emit_event(id, EventPayload::EntityDied { killer });
+            self.forward_death_to_encounter(id);
             self.push_death_zone_counter(id, idx);
             self.push_player_death_state(id, idx, killer);
             dot_newly_despawned.push(id);

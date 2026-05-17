@@ -21,13 +21,17 @@ pub(super) use log::warn;
 pub(super) use std::collections::{HashMap, HashSet};
 
 mod ai;
+mod archetype;
 mod collectors;
 mod combat;
 mod controller;
 mod finalization;
 mod skill_dispatch;
+mod volumes;
 #[cfg(test)]
 mod tests;
+
+pub(super) use archetype::NpcArchetypeRegistry;
 
 // ── Region / AOI constants ──────────────────────────────────────────
 
@@ -207,6 +211,10 @@ pub struct TickResult {
     /// Entities spawned by the world director this tick.
     /// Coordinator marshals these into DB insert calls so the entities are persisted.
     pub director_spawns: Vec<DirectorSpawn>,
+    /// Encounter-add membership entries, one per encounter-spawned add.
+    /// `spawn_index` references the corresponding slot in `director_spawns`.
+    /// See `docs/contracts/spawn_add_membership_contract.md`.
+    pub encounter_memberships: Vec<game_core::director::PendingAddMembership>,
     /// Interactable state changes this tick (entity_id, new SimInteractState).
     pub interactable_updates: Vec<(EntityId, game_core::sim_state::SimInteractState)>,
     /// Boss phase transitions from the encounter executor (boss_entity_id, phase, tick).
@@ -313,6 +321,24 @@ pub struct TickPipeline {
     /// Active boss encounters — keyed by boss entity ID.
     /// Phase 7.5 evaluates encounter rules after director spawns.
     pub(crate) encounters: HashMap<EntityId, game_core::encounter::EncounterState>,
+    /// Mechanic factory registry — resolves `EncounterOutput::StartMechanic`
+    /// names to runtime instances. Pre-populated with built-ins; extended at
+    /// startup via `set_mechanic_registry`.
+    pub(crate) mechanics: game_core::encounter::MechanicRegistry,
+    /// NPC archetype registry — resolves `EncounterOutput::SpawnAdds`
+    /// archetype names to spawn profiles for the director.
+    pub(crate) npc_archetypes: NpcArchetypeRegistry,
+    /// Per-encounter (boss-keyed) gameplay volumes. Each `VolumeStore` owns
+    /// its world sensors; entries are dropped when the owning boss is
+    /// removed via `force_remove_entity`. Volume edge events accumulated
+    /// during `phase_volume_sync` are drained per-boss into the encounter
+    /// rule evaluator the same tick.
+    pub(crate) volumes: HashMap<EntityId, game_core::volume::VolumeStore>,
+    /// Volume edge events queued by the latest occupant sync, keyed by
+    /// owning boss. Drained by `volumes_take_rule_events` before encounter
+    /// rule evaluation. Each pair = (volume, list of (entity, is_enter)).
+    pub(super) pending_volume_events:
+        HashMap<EntityId, Vec<game_core::encounter::VolumeRuleEvent>>,
     /// Entities whose cached `StatBlock` needs recalculation.
     /// Populated by: (a) equipment changes (via `mark_stats_dirty`),
     /// (b) buff changes (copied from `StatusState::dirty_entities` at Phase 10).
@@ -364,6 +390,15 @@ pub struct TickPipeline {
     /// Authoritative `death_state` rows produced by Phase 8b for player deaths.
     /// Drained into `TickResult.death_state_inserts` at commit assembly time.
     pub(super) pending_death_state_inserts: Vec<DeathStateInsertEntry>,
+    /// Opt-in tag classification per entity for encounter `OnEntityDied`
+    /// triggers. Bosses, scripted adds, or arbitrary entities can be
+    /// tagged at spawn time. Looked up during the encounter event
+    /// fan-out phase. Cleared per entity on force_remove_entities.
+    pub(crate) entity_tags: HashMap<EntityId, Vec<String>>,
+    /// Reverse map: scripted add entity → owning boss entity. Populated
+    /// when `apply_spawn_adds` resolves the spawn and forwarded into the
+    /// owning encounter's bus on death. Cleared on force_remove_entities.
+    pub(crate) add_to_boss: HashMap<EntityId, EntityId>,
 }
 
 impl TickPipeline {
@@ -489,6 +524,13 @@ impl TickPipeline {
             self.npc_state_prev.remove(id);
             self.equipment_modifiers.remove(id);
             self.weapon_swap_cooldowns.remove(id);
+            self.entity_tags.remove(id);
+            self.add_to_boss.remove(id);
+        }
+
+        // 6a) Drop any encounter-owned volumes for removed bosses.
+        for id in &removed_set {
+            self.drop_volumes_for_boss(*id);
         }
 
         // 6b) Clean up lock-on sessions. Self-removal and target scrubbing.
@@ -578,6 +620,10 @@ impl TickPipeline {
             world_phases: HashMap::new(),
             npc_goals: HashMap::new(),
             encounters: HashMap::new(),
+            mechanics: game_core::encounter::MechanicRegistry::with_builtins(),
+            npc_archetypes: NpcArchetypeRegistry::with_builtins(),
+            volumes: HashMap::new(),
+            pending_volume_events: HashMap::new(),
             stats_dirty: HashSet::new(),
             equipment_modifiers: HashMap::new(),
             npc_state_prev: HashMap::new(),
@@ -590,6 +636,8 @@ impl TickPipeline {
             pending_heals: Vec::new(),
             pending_zone_counter_deltas: Vec::new(),
             pending_death_state_inserts: Vec::new(),
+            entity_tags: HashMap::new(),
+            add_to_boss: HashMap::new(),
         }
     }
 
@@ -620,6 +668,117 @@ impl TickPipeline {
     #[doc(hidden)]
     pub fn encounters(&self) -> &HashMap<EntityId, game_core::encounter::EncounterState> {
         &self.encounters
+    }
+
+    /// Read-only access to gameplay volumes for assertions.
+    #[doc(hidden)]
+    pub fn __test_volumes(&self) -> &HashMap<EntityId, game_core::volume::VolumeStore> {
+        &self.volumes
+    }
+
+    /// Replace the mechanic factory registry (e.g., to register custom
+    /// mechanics at startup before any encounter rules execute).
+    pub fn set_mechanic_registry(
+        &mut self,
+        registry: game_core::encounter::MechanicRegistry,
+    ) {
+        self.mechanics = registry;
+    }
+
+    /// Replace the NPC archetype registry used to resolve
+    /// `EncounterOutput::SpawnAdds` archetype names.
+    pub fn set_npc_archetype_registry(&mut self, registry: NpcArchetypeRegistry) {
+        self.npc_archetypes = registry;
+    }
+
+    /// Attach an opt-in classification tag to an entity. Looked up during the
+    /// encounter event fan-out phase to drive `OnEntityDied { tag }` triggers.
+    /// Idempotent — repeated calls with the same tag are no-ops.
+    pub fn set_entity_tag(&mut self, entity: EntityId, tag: impl Into<String>) {
+        let tag = tag.into();
+        let entry = self.entity_tags.entry(entity).or_default();
+        if !entry.iter().any(|t| t == &tag) {
+            entry.push(tag);
+        }
+    }
+
+    /// Read-only access to entity tags for tests/assertions.
+    #[doc(hidden)]
+    pub fn entity_tags(&self, entity: EntityId) -> Option<&[String]> {
+        self.entity_tags.get(&entity).map(|v| v.as_slice())
+    }
+
+    /// Register `add_entity` as a scripted add belonging to `boss_entity`'s
+    /// encounter. Death of the add will fan out into the boss's encounter
+    /// bus as `EncounterEvent::EntityDied`. Optionally tags the add with
+    /// `tag` for `OnEntityDied { tag }` matching.
+    ///
+    /// Per `docs/contracts/dungeon_layer_propagation_contract.md` rule #4,
+    /// cross-layer registrations are rejected with a warning: the maps
+    /// remain unchanged and the spawn proceeds without encounter
+    /// membership. Existing teardown removes the orphan add.
+    pub fn register_encounter_add(
+        &mut self,
+        add_entity: EntityId,
+        boss_entity: EntityId,
+        tag: Option<&str>,
+    ) {
+        let add_layer = self.layer_of(add_entity);
+        let boss_layer = self.layer_of(boss_entity);
+        if add_layer != boss_layer {
+            warn!(
+                "register_encounter_add: layer mismatch (add {:?} layer {} vs boss {:?} layer {}); dropping registration",
+                add_entity, add_layer, boss_entity, boss_layer
+            );
+            return;
+        }
+        self.add_to_boss.insert(add_entity, boss_entity);
+        if let Some(t) = tag {
+            self.set_entity_tag(add_entity, t.to_string());
+        }
+    }
+
+    /// Multi-tag variant used by the production `encounter_add.on_insert`
+    /// subscription path. Each tag is applied via `set_entity_tag`.
+    /// See `docs/contracts/spawn_add_membership_contract.md`.
+    ///
+    /// Layer-match enforcement for Spec C rule #4 lives in the
+    /// `commit_tick_results` reducer, where both layers are visible
+    /// inside the same transaction. This function does **not** consult
+    /// `layer_of`: under SDK subscription replay the `entity_layer` row
+    /// for either side may not yet have been projected, and a guard
+    /// here would silently warn-drop legitimate registrations with no
+    /// fixup path. Only the two `HashMap`s are written, so out-of-order
+    /// arrival vs. `entity.on_insert` / `entity_layer.on_insert` is
+    /// safe.
+    pub fn register_encounter_add_with_tags(
+        &mut self,
+        add_entity: EntityId,
+        boss_entity: EntityId,
+        tags: &[String],
+    ) {
+        self.add_to_boss.insert(add_entity, boss_entity);
+        for t in tags {
+            self.set_entity_tag(add_entity, t.clone());
+        }
+    }
+
+    /// Symmetric counterpart of `register_encounter_add_with_tags`, driven
+    /// by the `encounter_add.on_delete` subscription callback.
+    ///
+    /// The reducer cascade-deletes `encounter_add` rows in two cases (see
+    /// `docs/contracts/spawn_add_membership_contract.md`): by `add_entity`
+    /// when the add itself is removed, and by `by_boss()` when the boss is
+    /// removed. The first case is already covered by `force_remove_entities`
+    /// clearing `add_to_boss` / `entity_tags` on worker-side entity removal;
+    /// the second case can leave add entities briefly outliving their
+    /// membership rows, so this method ensures the worker mirror is also
+    /// cleared along the boss-death cascade. Idempotent: `HashMap::remove`
+    /// on a missing key is a no-op, so ordering vs. `force_remove_entities`
+    /// doesn't matter.
+    pub fn unregister_encounter_add(&mut self, add_entity: EntityId) {
+        self.add_to_boss.remove(&add_entity);
+        self.entity_tags.remove(&add_entity);
     }
 
     /// Direct access to the world_phase projection map for test setup
@@ -1419,10 +1578,27 @@ impl TickPipeline {
         self.phase_ai_decisions();
 
         // Phase 7.5: World orchestration — director evaluates triggers and spawns
-        let director_spawns = self.phase_world_orchestration();
+        let mut director_spawns = self.phase_world_orchestration();
+
+        // Phase 7.5a: Volume occupant sync — refresh per-volume occupant lists
+        // from the physics backend, emit VolumeEnter/VolumeExit events, and
+        // queue VolumeRuleEvent edges for encounter rule evaluation.
+        self.phase_volume_sync();
 
         // Phase 7.5b: Encounter execution — evaluate boss encounter rules
-        let encounter_outputs = self.phase_encounter_execution();
+        let (encounter_outputs, encounter_spawns, mut encounter_memberships) =
+            self.phase_encounter_execution();
+        // Memberships' spawn_index values are local to encounter_spawns;
+        // shift them by the current director_spawns length so they index
+        // into the final concatenated vector after `extend`.
+        let spawn_offset = director_spawns.len() as u32;
+        if spawn_offset > 0 {
+            for m in &mut encounter_memberships {
+                m.spawn_index = m.spawn_index.saturating_add(spawn_offset);
+            }
+        }
+        director_spawns.extend(encounter_spawns);
+        // `encounter_memberships` is moved into TickResult below.
         let mut boss_phase_updates = Vec::new();
         let mut zone_counter_deltas = Vec::new();
         for output in encounter_outputs {
@@ -1442,6 +1618,16 @@ impl TickPipeline {
                     delta,
                 } => {
                     zone_counter_deltas.push((layer, region_x, region_z, counter_name, delta));
+                }
+                game_core::encounter::EncounterOutput::CastSkill { .. }
+                | game_core::encounter::EncounterOutput::ReplaceAbilityList { .. }
+                | game_core::encounter::EncounterOutput::StartMechanic { .. }
+                | game_core::encounter::EncounterOutput::StopMechanic { .. }
+                | game_core::encounter::EncounterOutput::SpawnAdds { .. }
+                | game_core::encounter::EncounterOutput::Telegraph { .. }
+                | game_core::encounter::EncounterOutput::SpawnVolume { .. }
+                | game_core::encounter::EncounterOutput::DespawnVolume { .. } => {
+                    // Runtime encounter actions are applied inside phase_encounter_execution.
                 }
             }
         }
@@ -1550,6 +1736,7 @@ impl TickPipeline {
             npc_state_updates,
             region_updates,
             director_spawns,
+            encounter_memberships,
             interactable_updates: std::mem::take(&mut self.pending_interactable_updates),
             boss_phase_updates,
             zone_counter_deltas,
@@ -1596,6 +1783,49 @@ impl TickPipeline {
             payload,
         });
         self.event_sequence += 1;
+    }
+
+    /// Forward an entity-death event into any encounter that owns the
+    /// dying entity (the boss itself, or a scripted add registered via
+    /// `add_to_boss`). The bus is drained at the start of the *next*
+    /// `EncounterState::evaluate`, so `OnEntityDied` triggers fire on the
+    /// tick following the death.
+    pub(super) fn forward_death_to_encounter(&mut self, entity: EntityId) {
+        let tags = self
+            .entity_tags
+            .get(&entity)
+            .cloned()
+            .unwrap_or_default();
+        // Boss death — encounter is keyed by the boss entity itself.
+        if let Some(enc) = self.encounters.get_mut(&entity) {
+            enc.bus.push(game_core::encounter::EncounterEvent::EntityDied {
+                entity,
+                tags: tags.clone(),
+            });
+            return;
+        }
+        // Add death — owning boss recorded at spawn.
+        if let Some(boss) = self.add_to_boss.get(&entity).copied() {
+            // Spec C rule #7 (belt-and-suspenders): drop cross-layer
+            // death events. Even if `add_to_boss` somehow lists a boss
+            // on a different layer (e.g., a stale row during the Spec A
+            // replay race), the death event is ignored.
+            let add_layer = self.layer_of(entity);
+            let boss_layer = self.layer_of(boss);
+            if add_layer != boss_layer {
+                warn!(
+                    "forward_death_to_encounter: cross-layer drop (add {:?} layer {} vs boss {:?} layer {})",
+                    entity, add_layer, boss, boss_layer
+                );
+                return;
+            }
+            if let Some(enc) = self.encounters.get_mut(&boss) {
+                enc.bus.push(game_core::encounter::EncounterEvent::EntityDied {
+                    entity,
+                    tags,
+                });
+            }
+        }
     }
 }
 

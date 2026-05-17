@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
+#[allow(unused_imports)]
 use log::{debug, error, info, warn};
 
 /// Maximum number of retry attempts before giving up on a failed commit.
@@ -145,9 +146,10 @@ impl CommitAuthority {
             "acknowledge_success({tick}) but front of pipeline is {:?}",
             front.map(|c| c.tick),
         );
+        #[allow(unused_variables)]
         if let Some(commit) = self.in_flight.pop_front() {
             let latency_us = commit.sent_at.elapsed().as_micros();
-            info!("tick={tick} commit_latency_us={latency_us}");
+            //info!("tick={tick} commit_latency_us={latency_us}");
         }
         self.last_processed_tick = tick;
         self.retry_count = 0;

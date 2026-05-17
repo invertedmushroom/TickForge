@@ -303,7 +303,8 @@ impl TickPipeline {
             let current_state = self.state.ai.npc_ai.get(*idx).copied().unwrap();
             match current_state {
                 NpcAiState::Combat => {
-                    // Sanitize threat table: remove entries for entities on a different layer.
+                    // Sanitize threat table: remove entries for entities on a different layer
+                    // or for non-combat entity kinds (Props should never be valid targets).
                     let npc_id = self.state.entities.id_of(*idx);
                     let npc_layer = self.layer_of_idx(*idx);
                     if let Some(table) = self.state.combat.threat_tables.get_mut(*idx) {
@@ -313,7 +314,9 @@ impl TickPipeline {
                             entities.lookup(e.source).map_or(false, |src_idx| {
                                 let slot = src_idx.as_usize();
                                 let src_layer = if slot < cache.len() { cache[slot] } else { 0 };
+                                let src_kind = entities.kinds[slot];
                                 src_layer == npc_layer
+                                    && src_kind != game_core::entity::lifecycle::EntityKind::Prop
                             })
                         });
                     }
@@ -589,40 +592,740 @@ impl TickPipeline {
             .evaluate(&region_player_counts, self.current_tick, &self.world_phases)
     }
 
+    /// Deterministic radial offset for scripted add spawns around the boss.
+    fn encounter_spawn_offset(index: u32) -> Vec3f {
+        if index == 0 {
+            return Vec3f::ZERO;
+        }
+        let angle = (index as f32) * std::f32::consts::FRAC_PI_4;
+        let radius = 2.5;
+        Vec3f {
+            x: angle.cos() * radius,
+            y: 0.0,
+            z: angle.sin() * radius,
+        }
+    }
+
     // ── Phase 7.5b: Encounter execution ─────────────────────────
 
     /// Evaluate encounter rules for all active boss encounters.
     ///
-    /// Checks boss HP thresholds and timers, fires one-shot triggers,
-    /// and returns outputs (phase changes, counter increments) for the
-    /// commit pipeline.
+    /// For each boss encounter:
+    /// 1. Tick active mechanics with `WorkerMechanicCtx`.
+    /// 2. Evaluate rules → `Vec<EncounterOutput>`.
+    /// 3. Forward `ChangeBossPhase` / `IncrementZoneCounter` to the commit
+    ///    pipeline (Tier-2 reducer-owned tables).
+    /// 4. Apply worker-owned effects directly: ability list replacement,
+    ///    spawn-add requests, scripted casts, telegraph log lines, mechanic
+    ///    start/stop.
     pub(super) fn phase_encounter_execution(
         &mut self,
-    ) -> Vec<game_core::encounter::EncounterOutput> {
-        let mut outputs = Vec::new();
+    ) -> (
+        Vec<game_core::encounter::EncounterOutput>,
+        Vec<game_core::director::DirectorSpawn>,
+        Vec<game_core::director::PendingAddMembership>,
+    ) {
+        let mut commit_outputs = Vec::new();
+        let mut encounter_spawns = Vec::new();
+        let mut pending_memberships: Vec<game_core::director::PendingAddMembership> =
+            Vec::new();
 
         // Collect boss entity IDs first to avoid borrow issues.
-        let boss_ids: Vec<EntityId> = self.encounters.keys().copied().collect();
+        let mut boss_ids: Vec<EntityId> = self.encounters.keys().copied().collect();
+        boss_ids.sort_by_key(|id| id.0);
 
         for boss_id in boss_ids {
-            let hp_pct = if let Some(idx) = self.state.entities.lookup(boss_id) {
-                let i = idx.as_usize();
-                let hp = self.state.combat.health.hp[i];
-                let max_hp = self.state.combat.health.max_hp[i];
-                if max_hp > 0.0 { hp / max_hp } else { 0.0 }
-            } else {
+            let Some(boss_idx) = self.state.entities.lookup(boss_id) else {
                 // Boss entity no longer exists — clean up encounter.
                 self.encounters.remove(&boss_id);
+                self.drop_volumes_for_boss(boss_id);
                 continue;
             };
 
-            if let Some(enc) = self.encounters.get_mut(&boss_id) {
-                let enc_outputs = enc.evaluate(hp_pct, self.current_tick);
-                outputs.extend(enc_outputs);
+            let i = boss_idx.as_usize();
+            let hp = self.state.combat.health.hp[i];
+            let max_hp = self.state.combat.health.max_hp[i];
+            let hp_pct = if max_hp > 0.0 { hp / max_hp } else { 0.0 };
+
+            // ── Mechanic tick pass ──────────────────────────────
+            // Active mechanics get a `WorkerMechanicCtx` and may queue
+            // arbitrary `Effect`s via `MechanicCtx::emit_effect`. Those
+            // emissions are funneled through `apply_external_effects` so
+            // they share the rule pipeline.
+            let tick_emissions = {
+                let mut active_mechanics = match self.encounters.get_mut(&boss_id) {
+                    Some(enc) => std::mem::take(&mut enc.active_mechanics),
+                    None => continue,
+                };
+                let emitted = {
+                    let mut ctx = WorkerMechanicCtx::new(self, boss_id);
+                    for mechanic in &mut active_mechanics {
+                        mechanic.tick(&mut ctx);
+                    }
+                    ctx.take_emitted()
+                };
+                // Partition finished mechanics out so we can push
+                // `MechanicEnded` onto the bus (the bus is what feeds the
+                // `OnMechanicEnded` trigger on the next evaluate).
+                let mut finished: Vec<(String, game_core::encounter::MechanicOutcome)> =
+                    Vec::new();
+                let mut live: Vec<Box<dyn game_core::encounter::Mechanic>> =
+                    Vec::with_capacity(active_mechanics.len());
+                for m in active_mechanics.into_iter() {
+                    if m.is_finished() {
+                        let name = m.name().to_string();
+                        if !name.is_empty() {
+                            let outcome = m
+                                .outcome()
+                                .unwrap_or(game_core::encounter::MechanicOutcome::Completed);
+                            finished.push((name, outcome));
+                        }
+                    } else {
+                        live.push(m);
+                    }
+                }
+                if let Some(enc) = self.encounters.get_mut(&boss_id) {
+                    enc.active_mechanics = live;
+                    for (name, outcome) in finished {
+                        enc.bus
+                            .push(game_core::encounter::EncounterEvent::MechanicEnded {
+                                name,
+                                outcome,
+                            });
+                    }
+                }
+                emitted
+            };
+
+            let mut all_outputs: Vec<game_core::encounter::EncounterOutput> = Vec::new();
+            if !tick_emissions.is_empty() {
+                if let Some(enc) = self.encounters.get_mut(&boss_id) {
+                    all_outputs
+                        .extend(enc.apply_external_effects(tick_emissions, self.current_tick));
+                }
+            }
+
+            // ── Rule evaluation ────────────────────────────────
+            // Compute volume inputs before reborrowing encounters.
+            let occupancy_by_tag = self.volumes_occupancy_by_tag(boss_id);
+            let volume_events = self.volumes_take_rule_events(boss_id);
+            let Some(enc) = self.encounters.get_mut(&boss_id) else {
+                continue;
+            };
+            let eval_inputs = game_core::encounter::EncounterEvalInputs {
+                volume_occupancy_by_tag: occupancy_by_tag
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), *v))
+                    .collect(),
+                volume_events: &volume_events,
+            };
+            all_outputs.extend(enc.evaluate(hp_pct, self.current_tick, &eval_inputs));
+
+            // ── Dispatch all outputs (rule + mechanic-emitted) ──
+            self.dispatch_encounter_outputs(
+                boss_id,
+                all_outputs,
+                &mut commit_outputs,
+                &mut encounter_spawns,
+                &mut pending_memberships,
+                0,
+            );
+        }
+
+        (commit_outputs, encounter_spawns, pending_memberships)
+    }
+
+    /// Maximum recursion depth for mechanic-emitted effects that themselves
+    /// produce new outputs (e.g., a mechanic's `start()` emits another
+    /// `StartMechanic`). Bounded to keep authoring mistakes survivable.
+    const MECHANIC_DISPATCH_MAX_DEPTH: u8 = 4;
+
+    /// Single dispatcher for `EncounterOutput`s, regardless of source
+    /// (rules or mechanic emissions). Each variant routes to a focused
+    /// per-variant handler. Mechanic-emitted effects from `start` /
+    /// `on_event` callbacks are gathered and recursively dispatched up to
+    /// `MECHANIC_DISPATCH_MAX_DEPTH`.
+    fn dispatch_encounter_outputs(
+        &mut self,
+        boss_id: EntityId,
+        outputs: Vec<game_core::encounter::EncounterOutput>,
+        commit_outputs: &mut Vec<game_core::encounter::EncounterOutput>,
+        encounter_spawns: &mut Vec<game_core::director::DirectorSpawn>,
+        pending_memberships: &mut Vec<game_core::director::PendingAddMembership>,
+        depth: u8,
+    ) {
+        use game_core::encounter::EncounterOutput as EO;
+
+        if depth > Self::MECHANIC_DISPATCH_MAX_DEPTH {
+            log::warn!(
+                "Encounter: boss {} mechanic emission depth exceeded {} — dropping {} outputs",
+                boss_id.0,
+                Self::MECHANIC_DISPATCH_MAX_DEPTH,
+                outputs.len()
+            );
+            return;
+        }
+
+        // 1) Tier-2 outputs forwarded to the commit pipeline.
+        for output in &outputs {
+            if matches!(
+                output,
+                EO::ChangeBossPhase { .. } | EO::IncrementZoneCounter { .. }
+            ) {
+                commit_outputs.push(output.clone());
             }
         }
 
-        outputs
+        // 2) StartMechanic.
+        let pending_starts: Vec<(String, game_core::encounter::MechanicParams)> = outputs
+            .iter()
+            .filter_map(|o| match o {
+                EO::StartMechanic { name, params, .. } => Some((name.clone(), params.clone())),
+                _ => None,
+            })
+            .collect();
+        if !pending_starts.is_empty() {
+            let start_emissions = self.apply_start_mechanic(boss_id, pending_starts);
+            if !start_emissions.is_empty() {
+                if let Some(enc) = self.encounters.get_mut(&boss_id) {
+                    let nested =
+                        enc.apply_external_effects(start_emissions, self.current_tick);
+                    self.dispatch_encounter_outputs(
+                        boss_id,
+                        nested,
+                        commit_outputs,
+                        encounter_spawns,
+                        pending_memberships,
+                        depth + 1,
+                    );
+                }
+            }
+        }
+
+        // 3) StopMechanic.
+        for output in &outputs {
+            if let EO::StopMechanic { name, .. } = output {
+                let stop_emissions = self.apply_stop_mechanic(boss_id, name);
+                if !stop_emissions.is_empty() {
+                    if let Some(enc) = self.encounters.get_mut(&boss_id) {
+                        let nested =
+                            enc.apply_external_effects(stop_emissions, self.current_tick);
+                        self.dispatch_encounter_outputs(
+                            boss_id,
+                            nested,
+                            commit_outputs,
+                            encounter_spawns,
+                            pending_memberships,
+                            depth + 1,
+                        );
+                    }
+                }
+            }
+        }
+
+        // 4) ReplaceAbilityList.
+        for output in &outputs {
+            if let EO::ReplaceAbilityList {
+                boss_entity_id,
+                ability_ids,
+            } = output
+            {
+                self.apply_replace_ability_list(*boss_entity_id, ability_ids);
+            }
+        }
+
+        // 5) SpawnAdds.
+        for output in &outputs {
+            if let EO::SpawnAdds {
+                boss_entity_id,
+                archetype,
+                count,
+                tags,
+            } = output
+            {
+                self.apply_spawn_adds(
+                    *boss_entity_id,
+                    archetype,
+                    *count,
+                    tags,
+                    encounter_spawns,
+                    pending_memberships,
+                );
+            }
+        }
+
+        // 6) Telegraph.
+        for output in &outputs {
+            if let EO::Telegraph {
+                boss_entity_id,
+                skill_id,
+                target,
+                lead_ticks,
+            } = output
+            {
+                self.apply_telegraph(*boss_entity_id, *skill_id, target.clone(), *lead_ticks);
+            }
+        }
+
+        // 6b) SpawnVolume / DespawnVolume.
+        for output in &outputs {
+            match output {
+                EO::SpawnVolume {
+                    boss_entity_id,
+                    tag,
+                    shape,
+                    anchor,
+                    lifetime_ticks,
+                    entity_filter,
+                } => {
+                    self.apply_spawn_volume(
+                        *boss_entity_id,
+                        tag,
+                        *shape,
+                        anchor,
+                        *lifetime_ticks,
+                        entity_filter.clone(),
+                    );
+                }
+                EO::DespawnVolume {
+                    boss_entity_id,
+                    tag,
+                } => {
+                    self.despawn_volumes_by_tag(*boss_entity_id, tag);
+                    log::info!(
+                        "Encounter: boss {} despawned volumes tag='{}'",
+                        boss_entity_id.0,
+                        tag,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // 7) CastSkill.
+        for output in outputs {
+            if let EO::CastSkill {
+                boss_entity_id,
+                skill_id,
+                target,
+            } = output
+            {
+                self.apply_cast_skill(boss_entity_id, skill_id, target);
+            }
+        }
+    }
+
+    /// Instantiate and start mechanics requested via `StartMechanic`.
+    /// Returns any `Effect`s emitted by their `start()` callbacks so the
+    /// dispatcher can route them through the encounter.
+    fn apply_start_mechanic(
+        &mut self,
+        boss_id: EntityId,
+        pending_starts: Vec<(String, game_core::encounter::MechanicParams)>,
+    ) -> Vec<game_core::encounter::Effect> {
+        let mut started: Vec<Box<dyn game_core::encounter::Mechanic>> = Vec::new();
+        let tick_value = self.current_tick.0;
+        let emissions = {
+            let mut ctx = WorkerMechanicCtx::new(self, boss_id);
+            for (name, params) in pending_starts {
+                match ctx.pipeline.mechanics.instantiate(&name, &params) {
+                    Some(mut mechanic) => {
+                        mechanic.start(&mut ctx);
+                        log::info!(
+                            "Encounter: boss {} started mechanic '{}' at tick {}",
+                            boss_id.0,
+                            name,
+                            tick_value
+                        );
+                        started.push(mechanic);
+                    }
+                    None => {
+                        log::warn!(
+                            "Encounter: boss {} requested unknown mechanic '{}'",
+                            boss_id.0,
+                            name
+                        );
+                    }
+                }
+            }
+            ctx.take_emitted()
+        };
+        if let Some(enc) = self.encounters.get_mut(&boss_id) {
+            enc.active_mechanics.extend(started);
+        }
+        emissions
+    }
+
+    /// Deliver a synthetic `mechanic:<name>:stop` event to active mechanics
+    /// so they can finalize, then prune finished mechanics. Returns any
+    /// `Effect`s emitted during the on_event callback.
+    fn apply_stop_mechanic(
+        &mut self,
+        boss_id: EntityId,
+        name: &str,
+    ) -> Vec<game_core::encounter::Effect> {
+        let event_name = format!("mechanic:{}:stop", name);
+        let mut active_mechanics = match self.encounters.get_mut(&boss_id) {
+            Some(enc) => std::mem::take(&mut enc.active_mechanics),
+            None => return Vec::new(),
+        };
+        let emitted = {
+            let mut ctx = WorkerMechanicCtx::new(self, boss_id);
+            for mechanic in &mut active_mechanics {
+                mechanic.on_event(&mut ctx, &event_name);
+            }
+            ctx.take_emitted()
+        };
+        // Finding #5: StopMechanic must surface a MechanicEnded event so that
+        // `OnMechanicEnded` rules can observe cancellation. We push one event
+        // per dropped mechanic with outcome=Cancelled. Mechanics that finished
+        // naturally during this on_event will instead be reported as Completed
+        // by the natural-completion path; here every drop is treated as a
+        // cancellation since the rule explicitly requested a stop.
+        let (still_active, dropped): (Vec<_>, Vec<_>) =
+            active_mechanics.into_iter().partition(|m| !m.is_finished());
+        if !dropped.is_empty() {
+            if let Some(enc) = self.encounters.get_mut(&boss_id) {
+                for m in &dropped {
+                    enc.bus.push(game_core::encounter::EncounterEvent::MechanicEnded {
+                        name: m.name().to_string(),
+                        outcome: game_core::encounter::MechanicOutcome::Cancelled,
+                    });
+                }
+            }
+        }
+        if let Some(enc) = self.encounters.get_mut(&boss_id) {
+            enc.active_mechanics = still_active;
+        }
+        emitted
+    }
+
+    fn apply_replace_ability_list(
+        &mut self,
+        boss_entity_id: EntityId,
+        ability_ids: &[u32],
+    ) {
+        let Some(idx) = self.state.entities.lookup(boss_entity_id) else {
+            return;
+        };
+        self.state.ai.npc_ability_ids.remove(idx);
+        self.state
+            .ai
+            .npc_ability_ids
+            .insert(idx, ability_ids.to_vec());
+        log::info!(
+            "Encounter: boss {} replaced AI ability list with {} abilities",
+            boss_entity_id.0,
+            ability_ids.len()
+        );
+    }
+
+    fn apply_spawn_adds(
+        &mut self,
+        boss_entity_id: EntityId,
+        archetype: &str,
+        count: u32,
+        tags: &[String],
+        encounter_spawns: &mut Vec<game_core::director::DirectorSpawn>,
+        pending_memberships: &mut Vec<game_core::director::PendingAddMembership>,
+    ) {
+        let Some(profile) = self.npc_archetypes.lookup(archetype).cloned() else {
+            log::warn!(
+                "Encounter: boss {} requested unknown archetype '{}'",
+                boss_entity_id.0,
+                archetype
+            );
+            return;
+        };
+        let Some(transform) = self.physics.get_transform(boss_entity_id) else {
+            log::warn!(
+                "Encounter: boss {} spawn '{}' skipped (missing transform)",
+                boss_entity_id.0,
+                archetype
+            );
+            return;
+        };
+        let Some(idx) = self.state.entities.lookup(boss_entity_id) else {
+            return;
+        };
+
+        let layer = self.layer_of_idx(idx);
+        let spawn_count = count.min(64);
+        if count > spawn_count {
+            log::warn!(
+                "Encounter: boss {} requested {} spawns; capped at {}",
+                boss_entity_id.0,
+                count,
+                spawn_count
+            );
+        }
+
+        // Validate tags against contract caps before queuing memberships.
+        // Per spawn_add_membership_contract.md: ≤ 8 tags, each ≤ 32 bytes.
+        let sanitized_tags: Vec<String> = tags
+            .iter()
+            .filter(|t| {
+                if t.len() > 32 {
+                    log::warn!(
+                        "Encounter: boss {} SpawnAdds tag '{}' exceeds 32 bytes — dropping",
+                        boss_entity_id.0,
+                        t
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .take(8)
+            .cloned()
+            .collect();
+        if tags.len() > sanitized_tags.len() && tags.iter().filter(|t| t.len() <= 32).count() > 8 {
+            log::warn!(
+                "Encounter: boss {} SpawnAdds tags ({}) exceed cap (8) — extras dropped",
+                boss_entity_id.0,
+                tags.len(),
+            );
+        }
+
+        for spawn_idx in 0..spawn_count {
+            let offset = Self::encounter_spawn_offset(spawn_idx);
+            // Local index into the tick's encounter_spawns Vec; the worker
+            // shifts by the existing director_spawns length when packaging
+            // for commit so `spawn_index` ends up referencing the correct
+            // slot in the final `director_spawns` array.
+            let local_index = encounter_spawns.len() as u32;
+            encounter_spawns.push(game_core::director::DirectorSpawn {
+                kind: profile.kind,
+                max_hp: profile.max_hp,
+                position: Vec3f {
+                    x: transform.position.x + offset.x,
+                    y: transform.position.y + offset.y,
+                    z: transform.position.z + offset.z,
+                },
+                layer,
+            });
+            pending_memberships.push(game_core::director::PendingAddMembership {
+                spawn_index: local_index,
+                boss_entity: boss_entity_id,
+                archetype: archetype.to_string(),
+                tags: sanitized_tags.clone(),
+            });
+        }
+
+        log::info!(
+            "Encounter: boss {} queued {} scripted spawns (archetype='{}' → {:?}, tags={:?})",
+            boss_entity_id.0,
+            spawn_count,
+            archetype,
+            profile.kind,
+            sanitized_tags,
+        );
+    }
+
+    fn apply_spawn_volume(
+        &mut self,
+        boss_entity_id: EntityId,
+        tag: &str,
+        shape: game_core::volume::VolumeShape,
+        anchor: &game_core::encounter::VolumeAnchor,
+        lifetime_ticks: Option<u32>,
+        entity_filter: game_core::volume::EntityKindFilter,
+    ) {
+        let Some(position) = self.resolve_volume_anchor(boss_entity_id, anchor) else {
+            log::warn!(
+                "Encounter: boss {} spawn_volume tag='{}' skipped (anchor unresolved: {:?})",
+                boss_entity_id.0,
+                tag,
+                anchor,
+            );
+            return;
+        };
+        let follow_owner = matches!(anchor, game_core::encounter::VolumeAnchor::FollowBoss);
+        let id = self.spawn_volume(
+            boss_entity_id,
+            tag.to_string(),
+            shape,
+            position,
+            lifetime_ticks,
+            entity_filter,
+            follow_owner,
+        );
+        log::info!(
+            "Encounter: boss {} spawned volume id={} tag='{}' lifetime={:?}",
+            boss_entity_id.0,
+            id.0,
+            tag,
+            lifetime_ticks,
+        );
+    }
+
+    fn apply_cast_skill(
+        &mut self,
+        boss_entity_id: EntityId,
+        skill_id: u32,
+        target: game_core::encounter::Target,
+    ) {
+        let Some(idx) = self.state.entities.lookup(boss_entity_id) else {
+            return;
+        };
+
+        if self.is_cc_disabled(idx) || self.is_silenced(idx) {
+            log::debug!(
+                "Encounter: boss {} cast {} blocked by CC/silence",
+                boss_entity_id.0,
+                skill_id
+            );
+            return;
+        }
+
+        let resolved = self.resolve_encounter_target(boss_entity_id, idx, &target);
+        let Some(resolved_target) = resolved else {
+            log::debug!(
+                "Encounter: boss {} cast {} skipped (target {:?} unresolved)",
+                boss_entity_id.0,
+                skill_id,
+                target,
+            );
+            return;
+        };
+
+        let casted = self.cast_ability(
+            boss_entity_id,
+            skill_id,
+            ResolvedTargeting::Entity {
+                target: resolved_target,
+            },
+            0,
+            0,
+        );
+        if !casted {
+            log::warn!(
+                "Encounter: boss {} cast {} rejected (cooldown, missing ability, or invalid cast geometry)",
+                boss_entity_id.0,
+                skill_id
+            );
+        }
+    }
+
+    /// Resolve a telegraph target and emit a `TelegraphWarning` event so
+    /// clients can surface a wind-up warning ahead of the actual cast.
+    fn apply_telegraph(
+        &mut self,
+        boss_entity_id: EntityId,
+        skill_id: u32,
+        target: game_core::encounter::Target,
+        lead_ticks: u32,
+    ) {
+        let Some(idx) = self.state.entities.lookup(boss_entity_id) else {
+            return;
+        };
+        let Some(resolved) = self.resolve_encounter_target(boss_entity_id, idx, &target) else {
+            log::debug!(
+                "Encounter: boss {} telegraph skill {} skipped (target {:?} unresolved)",
+                boss_entity_id.0,
+                skill_id,
+                target,
+            );
+            return;
+        };
+        let impact_tick = self.current_tick.0.saturating_add(lead_ticks as u64);
+        log::info!(
+            "Encounter: boss {} telegraph skill_id={} → target {} impact_tick={} (lead={})",
+            boss_entity_id.0,
+            skill_id,
+            resolved.0,
+            impact_tick,
+            lead_ticks,
+        );
+        self.emit_event(
+            resolved,
+            EventPayload::TelegraphWarning {
+                source: boss_entity_id,
+                target: resolved,
+                impact_tick,
+            },
+        );
+    }
+
+    /// Resolve an encounter `Target` enum to a concrete entity for scripted
+    /// boss casts. Returns `None` when the target cannot be resolved (e.g.,
+    /// `TopThreat` with empty threat table, no players for `RandomPlayer`).
+    fn resolve_encounter_target(
+        &self,
+        boss_id: EntityId,
+        boss_idx: EntityIndex,
+        target: &game_core::encounter::Target,
+    ) -> Option<EntityId> {
+        match target {
+            game_core::encounter::Target::Boss => Some(boss_id),
+            game_core::encounter::Target::TopThreat => self
+                .state
+                .combat
+                .threat_tables
+                .get(boss_idx)
+                .and_then(|table| table.top_threat()),
+            game_core::encounter::Target::RandomPlayer
+            | game_core::encounter::Target::AllPlayers => {
+                // Step 2: pick the first player by EntityId order. `AllPlayers`
+                // currently behaves like a single-target fallback because the
+                // cast pipeline takes one target; multi-target broadcast is a
+                // Step 3 follow-up.
+                //
+                // Layer scoping (Finding #4): only consider players sharing
+                // the boss's layer, so an instanced boss can never accidentally
+                // target an open-world player with a lower EntityId.
+                let boss_layer = self.layer_of_idx(boss_idx);
+                let mut players: Vec<EntityId> = self
+                    .state
+                    .entities
+                    .kinds
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, kind)| {
+                        if *kind == EntityKind::Player {
+                            let player_layer = if slot < self.entity_layer_cache.len() {
+                                self.entity_layer_cache[slot]
+                            } else {
+                                0
+                            };
+                            if player_layer != boss_layer {
+                                return None;
+                            }
+                            self.state.entities.lookup_by_slot(slot)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                players.sort_by_key(|id| id.0);
+                if matches!(target, game_core::encounter::Target::RandomPlayer) {
+                    let seed = self.current_tick.0 ^ boss_id.0;
+                    if players.is_empty() {
+                        None
+                    } else {
+                        let idx = (seed % players.len() as u64) as usize;
+                        Some(players[idx])
+                    }
+                } else {
+                    players.first().copied()
+                }
+            }
+            game_core::encounter::Target::VolumeOccupants { tag } => {
+                // Step 2.5: cast pipeline takes one target; collapse to the
+                // lowest-EntityId occupant across volumes matching `tag`.
+                // Multi-target broadcast follows in Step 3.
+                let store = self.volumes.get(&boss_id)?;
+                let mut occupants: Vec<EntityId> = Vec::new();
+                for v in store.iter_sorted() {
+                    if v.tag == *tag {
+                        occupants.extend(v.occupants.iter().copied());
+                    }
+                }
+                occupants.sort_by_key(|e| e.0);
+                occupants.dedup();
+                occupants.first().copied()
+            }
+        }
     }
 
     /// Get mutable access to the director state for event registration.
@@ -695,5 +1398,54 @@ impl TickPipeline {
             let block = game_core::stats::StatBlock::compute(kind, max_hp, buffs, equip);
             self.state.stats.set(idx, block);
         }
+    }
+}
+
+// ── Mechanic context bridge ────────────────────────────────────
+//
+// Adapter that satisfies `game_core::encounter::MechanicCtx` against the
+// live `TickPipeline`. Constructed per encounter, per phase pass; never
+// stored.
+//
+// Borrow rules: `WorkerMechanicCtx` holds an exclusive `&mut TickPipeline`,
+// so callers must release any prior `&mut self.encounters` borrow before
+// constructing one.
+pub(super) struct WorkerMechanicCtx<'a> {
+    pipeline: &'a mut TickPipeline,
+    boss_id: EntityId,
+    current_tick: TickId,
+    /// Effects queued by mechanics this call. Drained by the caller and
+    /// routed through `EncounterState::apply_external_effects` so they
+    /// share the same code path as rule-emitted effects.
+    pub(super) emitted: Vec<game_core::encounter::Effect>,
+}
+
+impl<'a> WorkerMechanicCtx<'a> {
+    pub(super) fn new(pipeline: &'a mut TickPipeline, boss_id: EntityId) -> Self {
+        let current_tick = pipeline.current_tick;
+        Self {
+            pipeline,
+            boss_id,
+            current_tick,
+            emitted: Vec::new(),
+        }
+    }
+
+    pub(super) fn take_emitted(&mut self) -> Vec<game_core::encounter::Effect> {
+        std::mem::take(&mut self.emitted)
+    }
+}
+
+impl<'a> game_core::encounter::MechanicCtx for WorkerMechanicCtx<'a> {
+    fn current_tick(&self) -> TickId {
+        self.current_tick
+    }
+
+    fn boss_entity_id(&self) -> EntityId {
+        self.boss_id
+    }
+
+    fn emit_effect(&mut self, effect: game_core::encounter::Effect) {
+        self.emitted.push(effect);
     }
 }

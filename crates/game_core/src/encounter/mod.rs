@@ -1,14 +1,33 @@
+//! Boss encounter framework — composable authoring model.
+//!
+//! Each encounter is an `EncounterScript` consisting of [`Rule`]s. A rule is
+//! `(Trigger, Cond, Vec<Effect>, RepeatPolicy)`. Triggers gate _when_ a rule
+//! potentially fires; conditions gate _whether_ it fires; effects are leaf
+//! actions executed in order on the tick the rule fires.
+//!
+//! Step 2 of the encounter rethink keeps composers (`Sequence`/`Parallel`/
+//! `Wait`) and event-driven triggers as **stubs**: the variants exist so RON
+//! authors don't churn when Step 3 lands the event bus, but the stub triggers
+//! never fire and stub effects are no-ops with a warn log.
+//!
+//! Mechanic instantiation is decoupled from rule evaluation: `evaluate()`
+//! returns an [`EncounterOutput::StartMechanic { name, params }`], which the
+//! worker resolves through a [`MechanicRegistry`] (name → factory) and starts
+//! with a live [`MechanicCtx`].
+
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use game_protocol::entity_id::EntityId;
 use game_protocol::tick::TickId;
+use game_protocol::types::Vec3f;
 use serde::{Deserialize, Serialize};
 
-/// Boss encounter framework — three-layer model per spec:
-/// phases (enum), triggers, and actions.
-///
-/// Each boss is a list of EncounterRule { trigger, condition, action }.
-/// Encounter controller owns phase sequencing, one-time flags, and
-/// active mechanics list.
-///
+use crate::volume::{EntityKindFilter, VolumeId, VolumeShape};
+
+// ── Phase identifier ────────────────────────────────────────────
+
 /// Boss phase identifier.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BossPhase {
@@ -32,68 +51,197 @@ impl BossPhase {
     }
 }
 
-/// Trigger conditions for encounter rules.
+// ── Triggers ────────────────────────────────────────────────────
+
+/// Comparison operator used by `Cond` and counter-style `Trigger`s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CmpOp {
+    Lt,
+    Le,
+    Eq,
+    Ne,
+    Ge,
+    Gt,
+}
+
+impl CmpOp {
+    fn cmp_i64(self, lhs: i64, rhs: i64) -> bool {
+        match self {
+            CmpOp::Lt => lhs < rhs,
+            CmpOp::Le => lhs <= rhs,
+            CmpOp::Eq => lhs == rhs,
+            CmpOp::Ne => lhs != rhs,
+            CmpOp::Ge => lhs >= rhs,
+            CmpOp::Gt => lhs > rhs,
+        }
+    }
+
+    fn cmp_f32(self, lhs: f32, rhs: f32) -> bool {
+        match self {
+            CmpOp::Lt => lhs < rhs,
+            CmpOp::Le => lhs <= rhs,
+            CmpOp::Eq => lhs == rhs,
+            CmpOp::Ne => lhs != rhs,
+            CmpOp::Ge => lhs >= rhs,
+            CmpOp::Gt => lhs > rhs,
+        }
+    }
+}
+
+/// What event makes a rule potentially fire.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum EncounterTrigger {
-    /// Fires once when boss HP drops below a percentage.
-    OnHpBelowOnce { percent: f32 },
-    /// Fires once after a timer (in ticks from phase start).
-    OnTimerOnce { ticks: u32 },
-    /// Fires on entering a specific phase.
-    OnStateEnter { phase: BossPhase },
-    /// Fires on a named event.
+pub enum Trigger {
+    /// Fires the first tick after the rule's owning encounter enters `phase`.
+    /// (`Once` semantics with `OnEachPhaseEntry` re-arms it on each entry.)
+    OnEnter { phase: BossPhase },
+    /// Fires when boss HP first drops below `percent`.
+    OnHpBelow { percent: f32 },
+    /// Fires once after `ticks` ticks since current phase began.
+    OnAfter { ticks: u32 },
+    /// Fires every `ticks` ticks. Combine with `RepeatPolicy::EveryNTicks`.
+    OnEvery { ticks: u32 },
+    /// Fires when a `Custom` event with `event_name` was pushed into the
+    /// encounter bus this tick (typically by `MechanicCtx::log_event`
+    /// or `Effect::EmitEncounterEvent`).
     OnEvent { event_name: String },
-}
-
-/// Actions taken when a trigger fires.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum EncounterAction {
-    CastSkill { skill_id: u32 },
-    StartMechanic { mechanic_id: u32 },
-    ChangePhase { phase: BossPhase },
-    SpawnNpc { kind_id: u32, count: u32 },
-}
-
-/// A single encounter rule: trigger → action.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct EncounterRule {
-    pub trigger: EncounterTrigger,
-    pub action: EncounterAction,
-    /// Whether this rule has already fired (for once-only triggers).
-    pub fired: bool,
-}
-
-/// Mechanic trait — each mechanic handles its own lifecycle.
-///
-/// Mechanics use shared primitives (spawn_zone, assign_players,
-/// apply_damage, is_entity_in_zone, schedule_at_tick) instead
-/// of inventing ad hoc behavior.
-pub trait Mechanic: Send {
-    fn start(&mut self, tick: TickId);
-    fn tick(&mut self, tick: TickId);
-    fn on_event(&mut self, event_name: &str);
-    fn is_finished(&self) -> bool;
-}
-
-/// Runtime state for an active boss encounter.
-pub struct EncounterState {
-    pub boss_entity: EntityId,
-    pub phase: BossPhase,
-    pub rules: Vec<EncounterRule>,
-    pub active_mechanics: Vec<Box<dyn Mechanic>>,
-    pub phase_start_tick: TickId,
-}
-
-/// Output actions produced by encounter evaluation.
-#[derive(Clone, Debug)]
-pub enum EncounterOutput {
-    /// Boss phase changed — commit to boss_phase table.
-    ChangeBossPhase {
-        boss_entity_id: EntityId,
-        new_phase: u32,
-        entered_at_tick: u64,
+    /// Fires when an entity classified with `tag` died this tick (boss
+    /// or any add the worker is tracking for this encounter).
+    OnEntityDied { tag: String },
+    /// Counter-on-encounter comparison; fires on the tick the comparison flips
+    /// from false → true.
+    OnCounter {
+        name: String,
+        op: CmpOp,
+        value: i64,
     },
-    /// Increment a zone counter (e.g., on boss kill or phase transition).
+    /// Fires when a mechanic with the matching `name` finished this tick.
+    OnMechanicEnded { name: String },
+    /// An entity entered a volume matching `tag`. Volume events are wired
+    /// in Step 2.5 ahead of the rest of the bus, but they only fire when
+    /// a corresponding volume currently exists.
+    OnVolumeEnter { tag: String },
+    /// An entity exited a volume matching `tag`.
+    OnVolumeExit { tag: String },
+}
+
+// ── Conditions (composable gate) ────────────────────────────────
+
+/// Condition gate evaluated when a rule's trigger has fired.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Cond {
+    /// Always true. Default for rules without an explicit gate.
+    Always,
+    PhaseIs { phase: BossPhase },
+    HpPctCmp { op: CmpOp, value: f32 },
+    CounterCmp { name: String, op: CmpOp, value: i64 },
+    All { conds: Vec<Cond> },
+    Any { conds: Vec<Cond> },
+    Not { cond: Box<Cond> },
+    /// True when at least `count` distinct entities of any kind currently
+    /// overlap any volume tagged `tag` (across all volumes with that tag).
+    OccupancyCmp {
+        tag: String,
+        op: CmpOp,
+        count: i64,
+    },
+}
+
+impl Default for Cond {
+    fn default() -> Self {
+        Cond::Always
+    }
+}
+
+// ── Targets ─────────────────────────────────────────────────────
+
+/// Targeting hint for effects that need an entity.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Target {
+    /// The boss itself.
+    Boss,
+    /// Boss's current top-threat target.
+    TopThreat,
+    /// A pseudo-random player (worker resolves with a deterministic tick seed).
+    /// Step 3 will refine this.
+    RandomPlayer,
+    /// All players in the encounter.
+    AllPlayers,
+    /// All entities currently inside any volume matching `tag`.
+    VolumeOccupants { tag: String },
+}
+
+// ── Mechanic params ─────────────────────────────────────────────
+
+/// Typed bag of named parameters passed to a mechanic factory.
+///
+/// `BTreeMap` keeps deterministic iteration so RON-loaded params produce
+/// reproducible mechanic state across runs and replays.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct MechanicParams {
+    #[serde(default)]
+    pub ints: BTreeMap<String, i64>,
+    #[serde(default)]
+    pub floats: BTreeMap<String, f64>,
+    #[serde(default)]
+    pub strings: BTreeMap<String, String>,
+}
+
+impl MechanicParams {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn int(&self, key: &str) -> Option<i64> {
+        self.ints.get(key).copied()
+    }
+
+    pub fn float(&self, key: &str) -> Option<f64> {
+        self.floats.get(key).copied()
+    }
+
+    pub fn string(&self, key: &str) -> Option<&str> {
+        self.strings.get(key).map(String::as_str)
+    }
+}
+
+// ── Effects (leaves only — composers reserved for Step 3) ───────
+
+/// Leaf actions emitted by rule evaluation.
+///
+/// Composers (`Sequence`/`Parallel`/`Wait`) are deliberately not yet present.
+/// `Vec<Effect>` on `Rule` already provides same-tick sequencing; multi-tick
+/// continuations require per-rule state and are part of Step 3.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Effect {
+    ChangePhase { phase: BossPhase },
+    CastSkill { skill_id: u32, target: Target },
+    ReplaceAbilityList { ability_ids: Vec<u32> },
+    StartMechanic {
+        name: String,
+        #[serde(default)]
+        params: MechanicParams,
+    },
+    StopMechanic { name: String },
+    /// Spawn `count` scripted adds of the named NPC archetype, each
+    /// labelled with `tags` so downstream rules (`OnEntityDied { tag }`,
+    /// `WhenAdds { tag, … }`) can match. See
+    /// `docs/contracts/spawn_add_membership_contract.md`.
+    SpawnAdds {
+        archetype: String,
+        count: u32,
+        #[serde(default)]
+        tags: Vec<String>,
+    },
+    /// Visual telegraph stub — emits log + reserved `EncounterOutput::Telegraph`
+    /// so the worker can wire `TelegraphWarning` events when it's ready.
+    Telegraph {
+        skill_id: u32,
+        target: Target,
+        lead_ticks: u32,
+    },
+    /// Mutate per-encounter counter (in-memory; not committed to DB).
+    IncrementCounter { name: String, delta: i64 },
+    /// Mutate the world `zone_counter` table (committed Tier-2).
     IncrementZoneCounter {
         layer: u32,
         region_x: i32,
@@ -101,118 +249,1054 @@ pub enum EncounterOutput {
         counter_name: String,
         delta: f64,
     },
+    /// Step 3 hook — pushed into the encounter event bus when it lands; for
+    /// now this is just a log line.
+    EmitEncounterEvent { name: String },
+    /// Spawn a gameplay volume. The volume tracks its occupants every tick
+    /// and emits `VolumeEnter`/`VolumeExit` events on the sim event bus.
+    /// `lifetime_ticks = None` keeps the volume alive until an explicit
+    /// `DespawnVolume`.
+    SpawnVolume {
+        tag: String,
+        shape: VolumeShape,
+        /// Where to anchor the volume. `Boss` follows the boss this tick;
+        /// volumes do not auto-track movement — a follow-up `SpawnVolume`
+        /// must replace them if a moving anchor is needed.
+        anchor: VolumeAnchor,
+        lifetime_ticks: Option<u32>,
+        /// Which entities count as occupants. Defaults to `Any`.
+        #[serde(default)]
+        entity_filter: EntityKindFilter,
+    },
+    /// Despawn all volumes matching `tag` for this encounter's boss.
+    DespawnVolume { tag: String },
+    /// Sleep `ticks` ticks before applying the next step in a containing
+    /// `Sequence`. A bare `Wait` outside a `Sequence` is a no-op.
+    Wait { ticks: u32 },
+    /// Apply `steps` in order, with `Wait` parking the remaining tail as a
+    /// continuation that resumes on a future tick. The continuation is
+    /// owned by the encounter and re-entered at the start of `evaluate`.
+    Sequence { steps: Vec<Effect> },
+    /// Apply every `step` this tick, in order. Equivalent to inlining the
+    /// list, but explicit for authoring clarity.
+    Parallel { steps: Vec<Effect> },
+}
+
+/// Where to spawn a volume. Resolved by the worker against the encounter's
+/// boss + sim state.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum VolumeAnchor {
+    /// Anchor at the boss's current position (one-shot at spawn time).
+    Boss,
+    /// Anchor at a fixed world-space position.
+    World { position: [f32; 3] },
+    /// Anchor at the boss + this offset (boss-local, applied at spawn time).
+    BossOffset { offset: [f32; 3] },
+    /// Track the boss every tick. The worker re-resolves the position on
+    /// each `phase_volume_sync` and moves the underlying physics sensor.
+    FollowBoss,
+}
+
+impl VolumeAnchor {
+    pub fn world(x: f32, y: f32, z: f32) -> Self {
+        VolumeAnchor::World {
+            position: [x, y, z],
+        }
+    }
+
+    pub fn world_vec(&self) -> Option<Vec3f> {
+        match self {
+            VolumeAnchor::World { position } => Some(Vec3f {
+                x: position[0],
+                y: position[1],
+                z: position[2],
+            }),
+            _ => None,
+        }
+    }
+}
+
+// ── Repeat policy ───────────────────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum RepeatPolicy {
+    /// Fire once per encounter lifetime.
+    Once,
+    /// Re-arm on every phase entry.
+    OnEachPhaseEntry,
+    /// Periodic with optional cap.
+    EveryNTicks {
+        interval: u32,
+        max_fires: Option<u32>,
+    },
+}
+
+impl Default for RepeatPolicy {
+    fn default() -> Self {
+        RepeatPolicy::Once
+    }
+}
+
+// ── Rule ────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Rule {
+    pub id: String,
+    pub when: Trigger,
+    #[serde(default)]
+    pub cond: Cond,
+    pub effects: Vec<Effect>,
+    #[serde(default)]
+    pub repeat: RepeatPolicy,
+
+    /// Total times this rule has fired across the encounter lifetime.
+    #[serde(skip)]
+    pub fire_count: u32,
+    /// Tick this rule last fired (for `EveryNTicks` cadence).
+    #[serde(skip)]
+    pub last_fire_tick: Option<TickId>,
+    /// HP-threshold latch so `OnHpBelow` only fires once per arming
+    /// (until next phase entry under `OnEachPhaseEntry`).
+    #[serde(skip)]
+    pub hp_threshold_armed: bool,
+    /// Last counter comparison result, used to detect false→true edges
+    /// for `Trigger::OnCounter`.
+    #[serde(skip)]
+    pub counter_was_true: bool,
+}
+
+impl Rule {
+    fn re_arm_on_phase_entry(&mut self) {
+        if matches!(self.repeat, RepeatPolicy::OnEachPhaseEntry) {
+            self.fire_count = 0;
+            self.last_fire_tick = None;
+            self.hp_threshold_armed = true;
+            self.counter_was_true = false;
+        }
+    }
+
+    fn can_fire(&self) -> bool {
+        match &self.repeat {
+            RepeatPolicy::Once | RepeatPolicy::OnEachPhaseEntry => self.fire_count == 0,
+            RepeatPolicy::EveryNTicks { max_fires, .. } => match max_fires {
+                Some(cap) => self.fire_count < *cap,
+                None => true,
+            },
+        }
+    }
+}
+
+// ── Mechanic trait + ctx ────────────────────────────────────────
+
+/// Runtime context passed to mechanics on every lifecycle callback.
+///
+/// Mechanics interact with the live simulation through this surface only.
+/// The single primitive is `emit_effect`, which routes any `Effect` through
+/// the same pipeline rules use. Convenience wrappers (`cast_boss_skill`,
+/// etc.) compose on top. Concrete implementations live in the simulation
+/// worker — `game_core` only sees the trait, keeping the mechanic API
+/// independent of any particular pipeline implementation.
+pub trait MechanicCtx {
+    /// The current simulation tick.
+    fn current_tick(&self) -> TickId;
+
+    /// The boss entity that owns the encounter this mechanic belongs to.
+    fn boss_entity_id(&self) -> EntityId;
+
+    /// Queue an [`Effect`] for the encounter to apply after the current
+    /// mechanic call returns. The effect is processed identically to one
+    /// emitted by a [`Rule`], producing the same [`EncounterOutput`]s and
+    /// state mutations (phase change, counter increment, etc.).
+    fn emit_effect(&mut self, effect: Effect);
+
+    // ── Convenience wrappers (default-implemented over `emit_effect`). ──
+
+    /// Cast a boss skill. Default targets the top-threat entity; mechanics
+    /// that need a specific target should call `emit_effect` with an
+    /// explicit `Target`.
+    fn cast_boss_skill(&mut self, skill_id: u32) -> bool {
+        self.emit_effect(Effect::CastSkill {
+            skill_id,
+            target: Target::TopThreat,
+        });
+        true
+    }
+
+    /// Spawn a gameplay volume.
+    fn spawn_volume(
+        &mut self,
+        tag: String,
+        shape: VolumeShape,
+        anchor: VolumeAnchor,
+        lifetime_ticks: Option<u32>,
+        entity_filter: EntityKindFilter,
+    ) {
+        self.emit_effect(Effect::SpawnVolume {
+            tag,
+            shape,
+            anchor,
+            lifetime_ticks,
+            entity_filter,
+        });
+    }
+
+    /// Despawn all volumes matching `tag` for this encounter.
+    fn despawn_volume(&mut self, tag: String) {
+        self.emit_effect(Effect::DespawnVolume { tag });
+    }
+
+    /// Spawn `count` adds of the named NPC archetype, labelled with
+    /// `tags` for downstream `OnEntityDied { tag }` matching.
+    fn spawn_adds(&mut self, archetype: String, count: u32, tags: Vec<String>) {
+        self.emit_effect(Effect::SpawnAdds {
+            archetype,
+            count,
+            tags,
+        });
+    }
+
+    /// Increment an encounter-scoped counter by `delta`.
+    fn increment_counter(&mut self, name: String, delta: i64) {
+        self.emit_effect(Effect::IncrementCounter { name, delta });
+    }
+
+    /// Switch the boss to a new phase.
+    fn change_phase(&mut self, phase: BossPhase) {
+        self.emit_effect(Effect::ChangePhase { phase });
+    }
+
+    /// Replace the boss AI ability list (composition of available skills).
+    fn replace_ability_list(&mut self, ability_ids: Vec<u32>) {
+        self.emit_effect(Effect::ReplaceAbilityList { ability_ids });
+    }
+
+    /// Telegraph an upcoming cast (Step 3 will wire `TelegraphWarning`).
+    fn telegraph(&mut self, skill_id: u32, target: Target, lead_ticks: u32) {
+        self.emit_effect(Effect::Telegraph {
+            skill_id,
+            target,
+            lead_ticks,
+        });
+    }
+
+    /// Free-form encounter log line (placeholder until the event bus
+    /// lands in Step 3). Defaults to `EmitEncounterEvent`.
+    fn log_event(&mut self, event_name: &str) {
+        self.emit_effect(Effect::EmitEncounterEvent {
+            name: event_name.to_string(),
+        });
+    }
+}
+
+/// Mechanic trait — each mechanic handles its own lifecycle.
+pub trait Mechanic: Send {
+    fn start(&mut self, ctx: &mut dyn MechanicCtx);
+    fn tick(&mut self, ctx: &mut dyn MechanicCtx);
+    fn on_event(&mut self, ctx: &mut dyn MechanicCtx, event_name: &str);
+    fn is_finished(&self) -> bool;
+    /// Name used by the encounter bus when announcing `MechanicEnded`.
+    /// Implementations should return a stable identifier matching the
+    /// `StartMechanic { name }` value used to spawn them.
+    fn name(&self) -> &str {
+        ""
+    }
+    /// Outcome category for `OnMechanicEnded` triggers. Default `None`
+    /// means the bus reports `MechanicOutcome::Completed`.
+    fn outcome(&self) -> Option<MechanicOutcome> {
+        None
+    }
+}
+
+/// Outcome of a finished mechanic, surfaced through `EncounterEvent::MechanicEnded`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MechanicOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Minimal built-in mechanic — auto-finishes one tick after start.
+pub struct MarkerMechanic {
+    name: String,
+    started_at: Option<TickId>,
+    finished: bool,
+}
+
+impl MarkerMechanic {
+    pub fn new(name: String) -> Self {
+        Self {
+            name,
+            started_at: None,
+            finished: false,
+        }
+    }
+}
+
+impl Mechanic for MarkerMechanic {
+    fn start(&mut self, ctx: &mut dyn MechanicCtx) {
+        self.started_at = Some(ctx.current_tick());
+        self.finished = false;
+    }
+
+    fn tick(&mut self, ctx: &mut dyn MechanicCtx) {
+        if let Some(started_at) = self.started_at
+            && ctx.current_tick().0 > started_at.0
+        {
+            self.finished = true;
+        }
+    }
+
+    fn on_event(&mut self, _ctx: &mut dyn MechanicCtx, event_name: &str) {
+        let expected = format!("mechanic:{}:stop", self.name);
+        if event_name == expected {
+            self.finished = true;
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+// ── Mechanic registry ───────────────────────────────────────────
+
+type MechanicFactory = Arc<dyn Fn(&MechanicParams) -> Box<dyn Mechanic> + Send + Sync>;
+
+/// Name → factory registry for built-in mechanics. Loaded at startup and
+/// passed to the tick pipeline. Authors reference mechanics by name in RON.
+pub struct MechanicRegistry {
+    factories: HashMap<String, MechanicFactory>,
+}
+
+impl MechanicRegistry {
+    pub fn new() -> Self {
+        Self {
+            factories: HashMap::new(),
+        }
+    }
+
+    /// Registry pre-populated with built-in mechanics (`marker`).
+    pub fn with_builtins() -> Self {
+        let mut reg = Self::new();
+        reg.register("marker", |_params| {
+            Box::new(MarkerMechanic::new("marker".to_string()))
+        });
+        reg
+    }
+
+    pub fn register<F>(&mut self, name: &str, factory: F)
+    where
+        F: Fn(&MechanicParams) -> Box<dyn Mechanic> + Send + Sync + 'static,
+    {
+        self.factories.insert(name.to_string(), Arc::new(factory));
+    }
+
+    pub fn instantiate(&self, name: &str, params: &MechanicParams) -> Option<Box<dyn Mechanic>> {
+        self.factories.get(name).map(|f| f(params))
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.factories.contains_key(name)
+    }
+
+    pub fn len(&self) -> usize {
+        self.factories.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.factories.is_empty()
+    }
+}
+
+impl Default for MechanicRegistry {
+    fn default() -> Self {
+        Self::with_builtins()
+    }
+}
+
+// ── Outputs ─────────────────────────────────────────────────────
+
+/// Output actions produced by rule evaluation, consumed by the worker.
+#[derive(Clone, Debug)]
+pub enum EncounterOutput {
+    /// Boss phase changed — commit to `boss_phase` table.
+    ChangeBossPhase {
+        boss_entity_id: EntityId,
+        new_phase: u32,
+        entered_at_tick: u64,
+    },
+    /// Increment a world `zone_counter` (Tier-2 commit).
+    IncrementZoneCounter {
+        layer: u32,
+        region_x: i32,
+        region_z: i32,
+        counter_name: String,
+        delta: f64,
+    },
+    /// Worker should run a scripted boss cast at the resolved target.
+    CastSkill {
+        boss_entity_id: EntityId,
+        skill_id: u32,
+        target: Target,
+    },
+    /// Worker should replace the boss's AI ability list.
+    ReplaceAbilityList {
+        boss_entity_id: EntityId,
+        ability_ids: Vec<u32>,
+    },
+    /// Worker should resolve `name` against the `MechanicRegistry`,
+    /// instantiate, `start(ctx)`, and push onto active mechanics.
+    StartMechanic {
+        boss_entity_id: EntityId,
+        name: String,
+        params: MechanicParams,
+    },
+    /// Worker should mark active mechanics named `name` as finished.
+    StopMechanic {
+        boss_entity_id: EntityId,
+        name: String,
+    },
+    /// Worker should resolve `archetype` against `NpcArchetypeRegistry` and
+    /// emit `count` adds via `DirectorSpawn` near the boss. `tags` are
+    /// applied to each add through the `encounter_add` membership
+    /// roundtrip (see contract `spawn_add_membership_contract.md`).
+    SpawnAdds {
+        boss_entity_id: EntityId,
+        archetype: String,
+        count: u32,
+        tags: Vec<String>,
+    },
+    /// Reserved telegraph output — currently log-only; Step 3 will wire it
+    /// to a real `TelegraphWarning` event.
+    Telegraph {
+        boss_entity_id: EntityId,
+        skill_id: u32,
+        target: Target,
+        lead_ticks: u32,
+    },
+    /// Worker should spawn a gameplay volume.
+    SpawnVolume {
+        boss_entity_id: EntityId,
+        tag: String,
+        shape: VolumeShape,
+        anchor: VolumeAnchor,
+        lifetime_ticks: Option<u32>,
+        entity_filter: EntityKindFilter,
+    },
+    /// Worker should despawn all volumes matching `tag` owned by this boss.
+    DespawnVolume {
+        boss_entity_id: EntityId,
+        tag: String,
+    },
+}
+
+// ── EncounterState ──────────────────────────────────────────────
+
+/// Runtime state for an active boss encounter.
+pub struct EncounterState {
+    pub boss_entity: EntityId,
+    pub phase: BossPhase,
+    pub rules: Vec<Rule>,
+    pub active_mechanics: Vec<Box<dyn Mechanic>>,
+    pub phase_start_tick: TickId,
+    /// Per-encounter named counters (e.g., add kills, mechanic completions).
+    pub counters: BTreeMap<String, i64>,
+    /// Tracks the lowest hp-pct seen so HP-threshold rules fire only on the
+    /// downward edge.
+    last_hp_pct: f32,
+    /// Typed event bus drained at the start of each `evaluate`.
+    pub bus: EncounterBus,
+    /// Parked `Sequence` tails waiting for `Wait` ticks to elapse.
+    pending_continuations: Vec<Continuation>,
+    /// Monotonic id stamped on each new `Sequence` for deterministic
+    /// ordering across continuations.
+    next_sequence_id: u64,
 }
 
 impl EncounterState {
-    /// Create a new encounter state from a boss entity and rules.
-    pub fn new(boss_entity: EntityId, rules: Vec<EncounterRule>, start_tick: TickId) -> Self {
-        Self {
+    pub fn new(boss_entity: EntityId, rules: Vec<Rule>, start_tick: TickId) -> Self {
+        let mut state = Self {
             boss_entity,
             phase: BossPhase::Phase1,
             rules,
             active_mechanics: Vec::new(),
             phase_start_tick: start_tick,
+            counters: BTreeMap::new(),
+            last_hp_pct: 1.0,
+            bus: EncounterBus::new(),
+            pending_continuations: Vec::new(),
+            next_sequence_id: 0,
+        };
+        for rule in &mut state.rules {
+            rule.hp_threshold_armed = true;
+        }
+        state
+    }
+
+    /// Tick all active mechanics and prune any that have finished. Pruned
+    /// mechanics push a `MechanicEnded` event into the bus so encounter
+    /// rules can react next evaluate.
+    pub fn tick_mechanics(&mut self, ctx: &mut dyn MechanicCtx) {
+        for mechanic in &mut self.active_mechanics {
+            mechanic.tick(ctx);
+        }
+        let mut i = 0;
+        while i < self.active_mechanics.len() {
+            if self.active_mechanics[i].is_finished() {
+                let m = self.active_mechanics.remove(i);
+                let name = m.name().to_string();
+                let outcome = m.outcome().unwrap_or(MechanicOutcome::Completed);
+                if !name.is_empty() {
+                    self.bus
+                        .push(EncounterEvent::MechanicEnded { name, outcome });
+                }
+            } else {
+                i += 1;
+            }
         }
     }
 
-    /// Evaluate encounter rules against current boss state.
-    ///
-    /// `boss_hp_pct` is the boss's current HP as a fraction of max (0.0–1.0).
-    /// Returns a list of output actions to be processed by the pipeline.
-    pub fn evaluate(&mut self, boss_hp_pct: f32, current_tick: TickId) -> Vec<EncounterOutput> {
+    fn eval_cond(&self, cond: &Cond, hp_pct: f32, inputs: &EncounterEvalInputs<'_>) -> bool {
+        match cond {
+            Cond::Always => true,
+            Cond::PhaseIs { phase } => &self.phase == phase,
+            Cond::HpPctCmp { op, value } => op.cmp_f32(hp_pct, *value),
+            Cond::CounterCmp { name, op, value } => {
+                let n = self.counters.get(name).copied().unwrap_or(0);
+                op.cmp_i64(n, *value)
+            }
+            Cond::All { conds } => conds.iter().all(|c| self.eval_cond(c, hp_pct, inputs)),
+            Cond::Any { conds } => conds.iter().any(|c| self.eval_cond(c, hp_pct, inputs)),
+            Cond::Not { cond } => !self.eval_cond(cond, hp_pct, inputs),
+            Cond::OccupancyCmp { tag, op, count } => {
+                let n = inputs
+                    .volume_occupancy_by_tag
+                    .get(tag.as_str())
+                    .copied()
+                    .unwrap_or(0) as i64;
+                op.cmp_i64(n, *count)
+            }
+        }
+    }
+
+    /// Evaluate all rules for the current tick, returning outputs the worker
+    /// applies. Side-effecting state changes (phase, counters, fired flags)
+    /// happen here; outward-facing effects flow as `EncounterOutput`.
+    pub fn evaluate(
+        &mut self,
+        boss_hp_pct: f32,
+        current_tick: TickId,
+        inputs: &EncounterEvalInputs<'_>,
+    ) -> Vec<EncounterOutput> {
         let mut outputs = Vec::new();
+        let last_hp = self.last_hp_pct;
+        self.last_hp_pct = boss_hp_pct;
+
+        // Drain any matured continuations BEFORE rule eval so their tail
+        // effects observe the same tick as freshly-fired rules.
+        let matured: Vec<Continuation> = {
+            let (mature, pending): (Vec<_>, Vec<_>) = self
+                .pending_continuations
+                .drain(..)
+                .partition(|c| c.resume_tick.0 <= current_tick.0);
+            self.pending_continuations = pending;
+            mature
+        };
+        // Order by sequence_id for determinism (insertion order ties broken
+        // by partition's stable iteration).
+        let mut matured = matured;
+        matured.sort_by_key(|c| c.sequence_id);
+        for cont in matured {
+            for effect in cont.remaining {
+                self.apply_effect(effect, current_tick, &mut outputs);
+            }
+        }
+
+        // Recompute `ticks_in_phase` AFTER continuations: a matured
+        // continuation may have applied `Effect::ChangePhase`, which
+        // resets `phase_start_tick`. Rule triggers like `OnAfter` would
+        // otherwise consult a stale value and fire too early in the new
+        // phase.
         let ticks_in_phase = current_tick.0.saturating_sub(self.phase_start_tick.0) as u32;
 
-        for rule in &mut self.rules {
-            if rule.fired {
+        // Drain typed events for this tick. Triggers consult this snapshot.
+        let bus_events: Vec<EncounterEvent> = self.bus.drain();
+
+        // Snapshot counters so all rules see the same view this tick.
+        let counters_snapshot: BTreeMap<String, i64> = self.counters.clone();
+        // Indices we'll process in input order; collect first to avoid
+        // borrow conflicts when applying effects that mutate `self`.
+        // Each entry carries (rule_index, fire_count) so that triggers
+        // matching multiple events in one tick (e.g. four tagged adds dying
+        // simultaneously under `OnEntityDied`) fire the rule once per match
+        // rather than collapsing to a single boolean. RepeatPolicy gating is
+        // re-applied per occurrence at fire time.
+        let rule_count = self.rules.len();
+        let mut to_fire: Vec<(usize, u32)> = Vec::new();
+
+        for (idx, rule) in self.rules.iter_mut().enumerate() {
+            if !rule.can_fire() {
                 continue;
             }
 
-            let triggered = match &rule.trigger {
-                EncounterTrigger::OnHpBelowOnce { percent } => boss_hp_pct < *percent,
-                EncounterTrigger::OnTimerOnce { ticks } => ticks_in_phase >= *ticks,
-                EncounterTrigger::OnStateEnter { phase } => *phase == self.phase,
-                EncounterTrigger::OnEvent { .. } => false, // Events not wired in V1
+            let (triggered, occurrences) = match &rule.when {
+                Trigger::OnEnter { phase } => {
+                    (&self.phase == phase && rule.fire_count == 0, 1u32)
+                }
+                Trigger::OnHpBelow { percent } => (
+                    rule.hp_threshold_armed && last_hp >= *percent && boss_hp_pct < *percent,
+                    1u32,
+                ),
+                Trigger::OnAfter { ticks } => (ticks_in_phase >= *ticks, 1u32),
+                Trigger::OnEvery { ticks } => {
+                    let fires = match rule.last_fire_tick {
+                        None => ticks_in_phase >= *ticks,
+                        Some(last) => current_tick.0.saturating_sub(last.0) as u32 >= *ticks,
+                    };
+                    (fires, 1u32)
+                }
+                Trigger::OnEvent { event_name } => {
+                    let count = bus_events
+                        .iter()
+                        .filter(|e| {
+                            matches!(e, EncounterEvent::Custom { name } if name == event_name)
+                        })
+                        .count() as u32;
+                    (count > 0, count)
+                }
+                Trigger::OnEntityDied { tag } => {
+                    let count = bus_events
+                        .iter()
+                        .filter(|e| {
+                            matches!(
+                                e,
+                                EncounterEvent::EntityDied { tags, .. } if tags.iter().any(|t| t == tag)
+                            )
+                        })
+                        .count() as u32;
+                    (count > 0, count)
+                }
+                Trigger::OnMechanicEnded { name } => {
+                    let count = bus_events
+                        .iter()
+                        .filter(|e| {
+                            matches!(e, EncounterEvent::MechanicEnded { name: n, .. } if n == name)
+                        })
+                        .count() as u32;
+                    (count > 0, count)
+                }
+                Trigger::OnCounter { name, op, value } => {
+                    let n = counters_snapshot.get(name).copied().unwrap_or(0);
+                    let now_true = op.cmp_i64(n, *value);
+                    let edge = now_true && !rule.counter_was_true;
+                    rule.counter_was_true = now_true;
+                    (edge, 1u32)
+                }
+                Trigger::OnVolumeEnter { tag } => {
+                    let count = inputs
+                        .volume_events
+                        .iter()
+                        .filter(|e| matches!(e, VolumeRuleEvent::Enter { tag: t, .. } if t == tag))
+                        .count() as u32;
+                    (count > 0, count)
+                }
+                Trigger::OnVolumeExit { tag } => {
+                    let count = inputs
+                        .volume_events
+                        .iter()
+                        .filter(|e| matches!(e, VolumeRuleEvent::Exit { tag: t, .. } if t == tag))
+                        .count() as u32;
+                    (count > 0, count)
+                }
             };
 
             if triggered {
-                rule.fired = true;
+                to_fire.push((idx, occurrences.max(1)));
+            }
+        }
 
-                match &rule.action {
-                    EncounterAction::ChangePhase { phase } => {
-                        let old_phase = self.phase.clone();
-                        self.phase = phase.clone();
-                        self.phase_start_tick = current_tick;
-                        outputs.push(EncounterOutput::ChangeBossPhase {
-                            boss_entity_id: self.boss_entity,
-                            new_phase: phase.to_phase_number(),
-                            entered_at_tick: current_tick.0,
-                        });
-                        log::info!(
-                            "Encounter: boss {} phase {:?} → {:?} at tick {}",
-                            self.boss_entity.0,
-                            old_phase,
-                            phase,
-                            current_tick.0
-                        );
-                        // Reset fired state for OnStateEnter rules targeting the NEW phase
-                        // so they can fire on the next evaluate call.
-                    }
-                    EncounterAction::CastSkill { .. }
-                    | EncounterAction::StartMechanic { .. }
-                    | EncounterAction::SpawnNpc { .. } => {
-                        // V1: log only — these actions will be wired in later phases.
-                        log::info!(
-                            "Encounter: boss {} triggered {:?} (not yet wired)",
-                            self.boss_entity.0,
-                            rule.action
-                        );
-                    }
+        for (idx, occurrences) in to_fire {
+            for _ in 0..occurrences {
+                // Re-check can_fire so RepeatPolicy::Once still caps the rule
+                // at a single firing even when multiple matching events
+                // arrived in one tick.
+                if !self.rules[idx].can_fire() {
+                    break;
+                }
+
+                // Re-borrow per-rule to evaluate cond against current `self`.
+                let cond_ok = {
+                    let rule = &self.rules[idx];
+                    self.eval_cond(&rule.cond, boss_hp_pct, inputs)
+                };
+                if !cond_ok {
+                    continue;
+                }
+
+                // Snapshot the rule's effects + bookkeeping.
+                let (effects, rule_id) = {
+                    let rule = &mut self.rules[idx];
+                    rule.fire_count = rule.fire_count.saturating_add(1);
+                    rule.last_fire_tick = Some(current_tick);
+                    rule.hp_threshold_armed = false;
+                    (rule.effects.clone(), rule.id.clone())
+                };
+
+                log::info!(
+                    "Encounter: boss {} rule '{}' fired at tick {} (phase {:?})",
+                    self.boss_entity.0,
+                    rule_id,
+                    current_tick.0,
+                    self.phase,
+                );
+
+                for effect in effects {
+                    self.apply_effect(effect, current_tick, &mut outputs);
                 }
             }
         }
 
+        let _ = rule_count;
         outputs
     }
+
+    /// Apply a sequence of effects emitted from outside the rule system
+    /// (e.g., by a mechanic via `MechanicCtx::emit_effect`). The effects
+    /// are routed through the same handler used by rules, so behavior is
+    /// identical (counter mutations take effect, phase changes re-arm
+    /// rules, outputs queue for the worker to consume).
+    pub fn apply_external_effects(
+        &mut self,
+        effects: Vec<Effect>,
+        current_tick: TickId,
+    ) -> Vec<EncounterOutput> {
+        let mut outputs = Vec::new();
+        for effect in effects {
+            self.apply_effect(effect, current_tick, &mut outputs);
+        }
+        outputs
+    }
+
+    fn apply_effect(
+        &mut self,
+        effect: Effect,
+        current_tick: TickId,
+        outputs: &mut Vec<EncounterOutput>,
+    ) {
+        match effect {
+            Effect::ChangePhase { phase } => {
+                let old_phase = self.phase.clone();
+                self.phase = phase.clone();
+                self.phase_start_tick = current_tick;
+                for rule in &mut self.rules {
+                    rule.re_arm_on_phase_entry();
+                }
+                outputs.push(EncounterOutput::ChangeBossPhase {
+                    boss_entity_id: self.boss_entity,
+                    new_phase: phase.to_phase_number(),
+                    entered_at_tick: current_tick.0,
+                });
+                log::info!(
+                    "Encounter: boss {} phase {:?} → {:?} at tick {}",
+                    self.boss_entity.0,
+                    old_phase,
+                    phase,
+                    current_tick.0
+                );
+            }
+            Effect::CastSkill { skill_id, target } => {
+                outputs.push(EncounterOutput::CastSkill {
+                    boss_entity_id: self.boss_entity,
+                    skill_id,
+                    target,
+                });
+            }
+            Effect::ReplaceAbilityList { ability_ids } => {
+                outputs.push(EncounterOutput::ReplaceAbilityList {
+                    boss_entity_id: self.boss_entity,
+                    ability_ids,
+                });
+            }
+            Effect::StartMechanic { name, params } => {
+                outputs.push(EncounterOutput::StartMechanic {
+                    boss_entity_id: self.boss_entity,
+                    name,
+                    params,
+                });
+            }
+            Effect::StopMechanic { name } => {
+                outputs.push(EncounterOutput::StopMechanic {
+                    boss_entity_id: self.boss_entity,
+                    name,
+                });
+            }
+            Effect::SpawnAdds {
+                archetype,
+                count,
+                tags,
+            } => {
+                outputs.push(EncounterOutput::SpawnAdds {
+                    boss_entity_id: self.boss_entity,
+                    archetype,
+                    count,
+                    tags,
+                });
+            }
+            Effect::Telegraph {
+                skill_id,
+                target,
+                lead_ticks,
+            } => {
+                outputs.push(EncounterOutput::Telegraph {
+                    boss_entity_id: self.boss_entity,
+                    skill_id,
+                    target,
+                    lead_ticks,
+                });
+            }
+            Effect::IncrementCounter { name, delta } => {
+                let entry = self.counters.entry(name.clone()).or_insert(0);
+                *entry = entry.saturating_add(delta);
+                log::debug!(
+                    "Encounter: boss {} counter '{}' += {} (now {})",
+                    self.boss_entity.0,
+                    name,
+                    delta,
+                    *entry,
+                );
+            }
+            Effect::IncrementZoneCounter {
+                layer,
+                region_x,
+                region_z,
+                counter_name,
+                delta,
+            } => {
+                outputs.push(EncounterOutput::IncrementZoneCounter {
+                    layer,
+                    region_x,
+                    region_z,
+                    counter_name,
+                    delta,
+                });
+            }
+            Effect::EmitEncounterEvent { name } => {
+                log::info!(
+                    "Encounter: boss {} emit event '{}' at tick {}",
+                    self.boss_entity.0,
+                    name,
+                    current_tick.0,
+                );
+                self.bus.push(EncounterEvent::Custom { name });
+            }
+            Effect::SpawnVolume {
+                tag,
+                shape,
+                anchor,
+                lifetime_ticks,
+                entity_filter,
+            } => {
+                outputs.push(EncounterOutput::SpawnVolume {
+                    boss_entity_id: self.boss_entity,
+                    tag,
+                    shape,
+                    anchor,
+                    lifetime_ticks,
+                    entity_filter,
+                });
+            }
+            Effect::DespawnVolume { tag } => {
+                outputs.push(EncounterOutput::DespawnVolume {
+                    boss_entity_id: self.boss_entity,
+                    tag,
+                });
+            }
+            Effect::Wait { .. } => {
+                // Bare `Wait` outside a `Sequence` is a no-op; only the
+                // `Sequence` arm consumes wait semantics to park its tail.
+            }
+            Effect::Sequence { steps } => {
+                self.apply_sequence(steps, current_tick, outputs);
+            }
+            Effect::Parallel { steps } => {
+                for step in steps {
+                    self.apply_effect(step, current_tick, outputs);
+                }
+            }
+        }
+    }
+
+    /// Apply `steps` in order, parking the tail at the first `Wait` as a
+    /// pending continuation. Steps before any `Wait` apply this tick.
+    fn apply_sequence(
+        &mut self,
+        steps: Vec<Effect>,
+        current_tick: TickId,
+        outputs: &mut Vec<EncounterOutput>,
+    ) {
+        let mut iter = steps.into_iter();
+        while let Some(step) = iter.next() {
+            match step {
+                Effect::Wait { ticks } => {
+                    let remaining: Vec<Effect> = iter.collect();
+                    if remaining.is_empty() {
+                        return;
+                    }
+                    if self.pending_continuations.len() >= MAX_PENDING_CONTINUATIONS {
+                        log::warn!(
+                            "Encounter: boss {} dropped Sequence tail (continuation cap {} reached)",
+                            self.boss_entity.0,
+                            MAX_PENDING_CONTINUATIONS,
+                        );
+                        return;
+                    }
+                    let resume_tick = TickId(current_tick.0.saturating_add(ticks as u64));
+                    let sequence_id = self.next_sequence_id;
+                    self.next_sequence_id = self.next_sequence_id.saturating_add(1);
+                    self.pending_continuations.push(Continuation {
+                        sequence_id,
+                        resume_tick,
+                        remaining,
+                    });
+                    return;
+                }
+                other => self.apply_effect(other, current_tick, outputs),
+            }
+        }
+    }
 }
+
+/// Per-tick inputs threaded into `EncounterState::evaluate` for things the
+/// encounter doesn't own (volume occupancy, edge events). Borrowed for the
+/// duration of one evaluate call.
+#[derive(Default)]
+pub struct EncounterEvalInputs<'a> {
+    /// Map of `volume.tag` → number of distinct entities currently inside
+    /// any volume with that tag (summed across volumes — duplicates if the
+    /// same entity is in two volumes with the same tag are counted twice).
+    pub volume_occupancy_by_tag: HashMap<&'a str, u32>,
+    /// Volume edge events emitted on the previous occupant-sync step. The
+    /// worker drains these into the encounter for one evaluate, then clears.
+    pub volume_events: &'a [VolumeRuleEvent],
+}
+
+impl<'a> EncounterEvalInputs<'a> {
+    pub fn empty() -> Self {
+        EncounterEvalInputs {
+            volume_occupancy_by_tag: HashMap::new(),
+            volume_events: &[],
+        }
+    }
+}
+
+/// Volume edge events visible to encounter rules this tick.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VolumeRuleEvent {
+    Enter { tag: String, entity: EntityId, volume_id: VolumeId },
+    Exit { tag: String, entity: EntityId, volume_id: VolumeId },
+}
+
+/// Typed events visible to `OnEvent`/`OnEntityDied`/`OnMechanicEnded`
+/// triggers. The worker pushes events into the bus during its event
+/// fan-out phase; the encounter drains the bus at the start of each
+/// `evaluate` call so triggers see one tick worth of events.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EncounterEvent {
+    /// An entity died this tick. `tags` carries any opt-in classification
+    /// strings the worker attached to the entity (e.g. add archetype name).
+    EntityDied { entity: EntityId, tags: Vec<String> },
+    /// An entity took damage this tick. Reserved for richer triggers.
+    EntityDamaged { source: EntityId, target: EntityId, amount: f32 },
+    /// A mechanic finished and was pruned this tick.
+    MechanicEnded { name: String, outcome: MechanicOutcome },
+    /// A custom named event raised via `MechanicCtx::log_event` /
+    /// `Effect::EmitEncounterEvent`.
+    Custom { name: String },
+    /// Mirrors `VolumeRuleEvent::Enter` for trigger uniformity.
+    VolumeEnter { tag: String, entity: EntityId, volume_id: VolumeId },
+    /// Mirrors `VolumeRuleEvent::Exit` for trigger uniformity.
+    VolumeExit { tag: String, entity: EntityId, volume_id: VolumeId },
+}
+
+/// Single-tick FIFO of encounter events. Owned by `EncounterState` and
+/// drained at the start of each `evaluate`.
+#[derive(Clone, Debug, Default)]
+pub struct EncounterBus {
+    events: Vec<EncounterEvent>,
+}
+
+impl EncounterBus {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn push(&mut self, event: EncounterEvent) {
+        self.events.push(event);
+    }
+    pub fn drain(&mut self) -> Vec<EncounterEvent> {
+        std::mem::take(&mut self.events)
+    }
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
+
+/// Maximum number of pending continuations a single encounter may queue.
+/// Bounds memory and protects against runaway `Sequence`/`Wait` chains.
+pub const MAX_PENDING_CONTINUATIONS: usize = 32;
+
+/// Parked tail of a `Sequence` waiting for a `Wait` to elapse before its
+/// remaining steps fire. Owned by `EncounterState`.
+#[derive(Clone, Debug)]
+struct Continuation {
+    sequence_id: u64,
+    resume_tick: TickId,
+    remaining: Vec<Effect>,
+}
+
+// ── Files / registry ────────────────────────────────────────────
 
 /// On-disk format for encounter definitions.
 #[derive(Clone, Debug, Deserialize)]
 pub struct EncounterFile {
-    pub encounters: Vec<EncounterDef>,
+    pub encounters: Vec<EncounterScript>,
 }
 
-/// A single encounter definition keyed by boss_name.
+/// One named encounter script.
 #[derive(Clone, Debug, Deserialize)]
-pub struct EncounterDef {
-    pub boss_name: String,
-    pub rules: Vec<EncounterRule>,
+pub struct EncounterScript {
+    pub name: String,
+    pub rules: Vec<Rule>,
 }
 
-/// Registry of encounter definitions keyed by boss name.
+/// Registry of encounter scripts keyed by name.
 pub struct EncounterRegistry {
-    defs: std::collections::HashMap<String, Vec<EncounterRule>>,
+    defs: HashMap<String, Vec<Rule>>,
 }
 
 impl EncounterRegistry {
     pub fn new() -> Self {
         Self {
-            defs: std::collections::HashMap::new(),
+            defs: HashMap::new(),
         }
     }
 
-    pub fn register(&mut self, boss_name: String, rules: Vec<EncounterRule>) {
-        self.defs.insert(boss_name, rules);
+    pub fn register(&mut self, name: String, rules: Vec<Rule>) {
+        self.defs.insert(name, rules);
     }
 
-    pub fn get(&self, boss_name: &str) -> Option<&Vec<EncounterRule>> {
-        self.defs.get(boss_name)
+    pub fn get(&self, name: &str) -> Option<&Vec<Rule>> {
+        self.defs.get(name)
     }
 
-    /// Lookup encounter rules by boss name, returning a clone suitable for
-    /// creating a new `EncounterState`.
-    pub fn rules_for(&self, boss_name: &str) -> Option<Vec<EncounterRule>> {
-        self.defs.get(boss_name).cloned()
+    pub fn rules_for(&self, name: &str) -> Option<Vec<Rule>> {
+        self.defs.get(name).cloned()
     }
 
     pub fn len(&self) -> usize {
@@ -224,27 +1308,50 @@ impl EncounterRegistry {
     }
 }
 
+impl Default for EncounterRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn rule(id: &str, when: Trigger, effects: Vec<Effect>, repeat: RepeatPolicy) -> Rule {
+        Rule {
+            id: id.to_string(),
+            when,
+            cond: Cond::Always,
+            effects,
+            repeat,
+            fire_count: 0,
+            last_fire_tick: None,
+            hp_threshold_armed: true,
+            counter_was_true: false,
+        }
+    }
+
     #[test]
-    fn hp_threshold_fires_once() {
-        let rules = vec![EncounterRule {
-            trigger: EncounterTrigger::OnHpBelowOnce { percent: 0.5 },
-            action: EncounterAction::ChangePhase {
+    fn hp_threshold_fires_on_downward_edge_once() {
+        let rules = vec![rule(
+            "p2",
+            Trigger::OnHpBelow { percent: 0.5 },
+            vec![Effect::ChangePhase {
                 phase: BossPhase::Phase2,
-            },
-            fired: false,
-        }];
+            }],
+            RepeatPolicy::Once,
+        )];
         let mut enc = EncounterState::new(EntityId(1), rules, TickId(0));
 
-        // Above threshold — no output.
-        let out = enc.evaluate(0.6, TickId(10));
+        // First tick at full HP arms threshold; no fire.
+        let out = enc.evaluate(0.9, TickId(1), &EncounterEvalInputs::empty());
         assert!(out.is_empty());
 
-        // Below threshold — fires.
-        let out = enc.evaluate(0.4, TickId(20));
+        // Drop below 50% → fires.
+        let out = enc.evaluate(0.4, TickId(2), &EncounterEvalInputs::empty());
         assert_eq!(out.len(), 1);
         assert!(matches!(
             &out[0],
@@ -252,34 +1359,267 @@ mod tests {
         ));
         assert_eq!(enc.phase, BossPhase::Phase2);
 
-        // Already fired — does not fire again.
-        let out = enc.evaluate(0.3, TickId(30));
+        // Already fired — does not re-fire.
+        let out = enc.evaluate(0.3, TickId(3), &EncounterEvalInputs::empty());
+        assert!(out.is_empty());
+
+        // Even bouncing back above and below: Once means once.
+        let out = enc.evaluate(0.6, TickId(4), &EncounterEvalInputs::empty());
+        assert!(out.is_empty());
+        let out = enc.evaluate(0.2, TickId(5), &EncounterEvalInputs::empty());
         assert!(out.is_empty());
     }
 
     #[test]
-    fn timer_trigger() {
-        let rules = vec![EncounterRule {
-            trigger: EncounterTrigger::OnTimerOnce { ticks: 100 },
-            action: EncounterAction::ChangePhase {
+    fn timer_after_phase_start() {
+        let rules = vec![rule(
+            "enrage",
+            Trigger::OnAfter { ticks: 100 },
+            vec![Effect::ChangePhase {
                 phase: BossPhase::Enrage,
-            },
-            fired: false,
-        }];
+            }],
+            RepeatPolicy::Once,
+        )];
         let mut enc = EncounterState::new(EntityId(2), rules, TickId(50));
 
-        let out = enc.evaluate(1.0, TickId(140));
+        let out = enc.evaluate(1.0, TickId(149), &EncounterEvalInputs::empty());
         assert!(out.is_empty());
-
-        let out = enc.evaluate(1.0, TickId(150));
+        let out = enc.evaluate(1.0, TickId(150), &EncounterEvalInputs::empty());
         assert_eq!(out.len(), 1);
     }
 
     #[test]
-    fn encounter_def_ron_roundtrip() {
-        let ron_str = r#"(encounters: [(boss_name: "Golem", rules: [(trigger: OnHpBelowOnce(percent: 0.5), action: ChangePhase(phase: Phase2), fired: false)])])"#;
-        let file: EncounterFile = ron::from_str(ron_str).expect("valid RON");
-        assert_eq!(file.encounters.len(), 1);
-        assert_eq!(file.encounters[0].boss_name, "Golem");
+    fn cond_phase_gates_effect() {
+        let rules = vec![Rule {
+            cond: Cond::PhaseIs {
+                phase: BossPhase::Phase2,
+            },
+            ..rule(
+                "phase2_only_cast",
+                Trigger::OnAfter { ticks: 0 },
+                vec![Effect::CastSkill {
+                    skill_id: 24,
+                    target: Target::TopThreat,
+                }],
+                RepeatPolicy::Once,
+            )
+        }];
+        let mut enc = EncounterState::new(EntityId(3), rules, TickId(0));
+        // Phase1 — gate fails.
+        let out = enc.evaluate(1.0, TickId(0), &EncounterEvalInputs::empty());
+        assert!(out.is_empty());
+        // Manually advance to Phase2 and re-evaluate.
+        enc.phase = BossPhase::Phase2;
+        let out = enc.evaluate(1.0, TickId(1), &EncounterEvalInputs::empty());
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], EncounterOutput::CastSkill { .. }));
+    }
+
+    #[test]
+    fn counter_increment_and_trigger_edge() {
+        let rules = vec![
+            rule(
+                "tick0_inc",
+                Trigger::OnAfter { ticks: 0 },
+                vec![Effect::IncrementCounter {
+                    name: "kills".to_string(),
+                    delta: 4,
+                }],
+                RepeatPolicy::Once,
+            ),
+            rule(
+                "phase_at_4",
+                Trigger::OnCounter {
+                    name: "kills".to_string(),
+                    op: CmpOp::Ge,
+                    value: 4,
+                },
+                vec![Effect::ChangePhase {
+                    phase: BossPhase::Phase2,
+                }],
+                RepeatPolicy::Once,
+            ),
+        ];
+        let mut enc = EncounterState::new(EntityId(4), rules, TickId(0));
+
+        let out = enc.evaluate(1.0, TickId(0), &EncounterEvalInputs::empty());
+        // tick0_inc fires (no commit output for IncrementCounter), kills→4.
+        // counter rule's snapshot at start-of-tick saw kills=0 so it does
+        // NOT fire on this tick.
+        assert!(out.is_empty());
+        assert_eq!(enc.counters.get("kills").copied(), Some(4));
+
+        let out = enc.evaluate(1.0, TickId(1), &EncounterEvalInputs::empty());
+        assert!(out
+            .iter()
+            .any(|o| matches!(o, EncounterOutput::ChangeBossPhase { new_phase: 2, .. })));
+    }
+
+    #[test]
+    fn every_n_ticks_with_max_fires() {
+        let rules = vec![rule(
+            "tick",
+            Trigger::OnEvery { ticks: 5 },
+            vec![Effect::EmitEncounterEvent {
+                name: "tick".to_string(),
+            }],
+            RepeatPolicy::EveryNTicks {
+                interval: 5,
+                max_fires: Some(2),
+            },
+        )];
+        let mut enc = EncounterState::new(EntityId(5), rules, TickId(0));
+
+        // Tick 5 → fires (ticks_in_phase ≥ 5, never fired).
+        let out = enc.evaluate(1.0, TickId(5), &EncounterEvalInputs::empty());
+        assert!(!out.is_empty() == false || enc.rules[0].fire_count == 1);
+        // Tick 9 → still <5 since last fire (5).
+        let _ = enc.evaluate(1.0, TickId(9), &EncounterEvalInputs::empty());
+        // Tick 10 → 5 ticks since last fire → 2nd fire (cap).
+        let _ = enc.evaluate(1.0, TickId(10), &EncounterEvalInputs::empty());
+        // Tick 15 → cap reached, no more.
+        let _ = enc.evaluate(1.0, TickId(15), &EncounterEvalInputs::empty());
+
+        assert_eq!(enc.rules[0].fire_count, 2);
+    }
+
+    #[test]
+    fn parses_shipped_encounters_ron() {
+        let file: EncounterFile = ron::from_str(include_str!("../../../../data/encounters.ron"))
+            .expect("shipped encounters.ron should parse");
+        assert!(file.encounters.iter().any(|def| def.name == "default"));
+        let all_rules: Vec<&Rule> = file.encounters.iter().flat_map(|d| &d.rules).collect();
+        assert!(all_rules
+            .iter()
+            .any(|r| matches!(r.when, Trigger::OnHpBelow { .. })));
+        assert!(all_rules.iter().any(|r| {
+            r.effects
+                .iter()
+                .any(|e| matches!(e, Effect::ChangePhase { .. }))
+        }));
+        assert!(all_rules.iter().any(|r| {
+            r.effects
+                .iter()
+                .any(|e| matches!(e, Effect::CastSkill { .. }))
+        }));
+        assert!(all_rules.iter().any(|r| {
+            r.effects
+                .iter()
+                .any(|e| matches!(e, Effect::SpawnAdds { .. }))
+        }));
+    }
+
+    #[test]
+    fn mechanic_registry_builtins_have_marker() {
+        let reg = MechanicRegistry::with_builtins();
+        assert!(reg.contains("marker"));
+        let m = reg
+            .instantiate("marker", &MechanicParams::empty())
+            .expect("marker instantiates");
+        let _ = m;
+    }
+
+    /// Test-only `MechanicCtx` impl for unit testing without a pipeline.
+    struct FakeMechanicCtx {
+        tick: TickId,
+        boss: EntityId,
+        emitted: Vec<Effect>,
+    }
+
+    impl FakeMechanicCtx {
+        fn new(tick: TickId, boss: EntityId) -> Self {
+            Self {
+                tick,
+                boss,
+                emitted: Vec::new(),
+            }
+        }
+    }
+
+    impl MechanicCtx for FakeMechanicCtx {
+        fn current_tick(&self) -> TickId {
+            self.tick
+        }
+        fn boss_entity_id(&self) -> EntityId {
+            self.boss
+        }
+        fn emit_effect(&mut self, effect: Effect) {
+            self.emitted.push(effect);
+        }
+    }
+
+    #[test]
+    fn marker_mechanic_via_factory_starts_and_expires() {
+        let reg = MechanicRegistry::with_builtins();
+        let mut ctx = FakeMechanicCtx::new(TickId(0), EntityId(99));
+        let mut m = reg
+            .instantiate("marker", &MechanicParams::empty())
+            .expect("marker registered");
+        m.start(&mut ctx);
+        assert!(!m.is_finished());
+        ctx.tick = TickId(1);
+        m.tick(&mut ctx);
+        assert!(m.is_finished());
+    }
+
+    #[test]
+    fn start_mechanic_emits_request_output_only() {
+        let rules = vec![rule(
+            "spawn_marker",
+            Trigger::OnAfter { ticks: 0 },
+            vec![Effect::StartMechanic {
+                name: "marker".to_string(),
+                params: MechanicParams::empty(),
+            }],
+            RepeatPolicy::Once,
+        )];
+        let mut enc = EncounterState::new(EntityId(7), rules, TickId(0));
+        let out = enc.evaluate(1.0, TickId(0), &EncounterEvalInputs::empty());
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            &out[0],
+            EncounterOutput::StartMechanic { name, .. } if name == "marker"
+        ));
+        assert!(
+            enc.active_mechanics.is_empty(),
+            "evaluate() must not instantiate mechanics — worker handles via factory"
+        );
+    }
+
+    #[test]
+    fn mechanic_ctx_emit_effect_round_trips_through_apply_external_effects() {
+        // A mechanic accumulates effects via `emit_effect`; the encounter
+        // routes them through `apply_external_effects` and produces the
+        // same `EncounterOutput`s a rule would.
+        let mut ctx = FakeMechanicCtx::new(TickId(0), EntityId(7));
+        ctx.spawn_volume(
+            "arena".to_string(),
+            VolumeShape::Sphere { radius: 5.0 },
+            VolumeAnchor::Boss,
+            None,
+            crate::volume::EntityKindFilter::Any,
+        );
+        ctx.cast_boss_skill(42);
+        ctx.change_phase(BossPhase::Phase2);
+
+        assert_eq!(ctx.emitted.len(), 3);
+
+        let mut enc = EncounterState::new(EntityId(7), Vec::new(), TickId(0));
+        let outs = enc.apply_external_effects(ctx.emitted, TickId(1));
+
+        assert!(matches!(
+            outs[0],
+            EncounterOutput::SpawnVolume { ref tag, .. } if tag == "arena"
+        ));
+        assert!(matches!(
+            outs[1],
+            EncounterOutput::CastSkill { skill_id: 42, .. }
+        ));
+        assert!(matches!(
+            outs[2],
+            EncounterOutput::ChangeBossPhase { new_phase: 2, .. }
+        ));
+        // ChangePhase is also reflected on the state.
+        assert_eq!(enc.phase, BossPhase::Phase2);
     }
 }

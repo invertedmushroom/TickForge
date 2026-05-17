@@ -64,8 +64,8 @@
                 (local_id: 1, kind: Gate, position: (0.0, 1.5, -10.0), linked_to: None, required_buff: None, required_item: None, interact_range: None),
                 // Switch that opens the gate
                 (local_id: 2, kind: Switch, position: (5.0, 1.0, -8.0), linked_to: Some(1), required_buff: None, required_item: None, interact_range: Some(3.0)),
-                // Boss spawn behind the gate
-                (local_id: 3, kind: BossSpawn(npc_name: "TrainingDummy"), position: (0.0, 1.0, -15.0), linked_to: None, required_buff: None, required_item: None, interact_range: None),
+                // Boss spawn on player side of the gate for unobstructed combat testing
+                (local_id: 3, kind: BossSpawn(npc_name: "TrainingDummy", encounter_name: Some("runtime_actions_demo")), position: (0.0, 1.0, -5.0), linked_to: None, required_buff: None, required_item: None, interact_range: None),
             ],
         ),
     ],

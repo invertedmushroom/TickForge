@@ -57,6 +57,7 @@ const UD_KIND_BODY: u128 = 0;
 const UD_KIND_HURTBOX: u128 = 1;
 const UD_KIND_HITBOX: u128 = 2;
 const UD_KIND_BLOCKCONE: u128 = 3;
+const UD_KIND_VOLUME: u128 = 4;
 
 /// Extract the layer from a collider's user_data.
 #[inline(always)]
@@ -106,6 +107,7 @@ fn ud_set_kind(user_data: u128, kind: &ColliderKind) -> u128 {
         ColliderKind::Hurtbox => UD_KIND_HURTBOX,
         ColliderKind::Hitbox(_) => UD_KIND_HITBOX,
         ColliderKind::BlockCone(_) => UD_KIND_BLOCKCONE,
+        ColliderKind::Volume(_) => UD_KIND_VOLUME,
     };
     let cleared = user_data & !(UD_KIND_MASK << UD_KIND_SHIFT);
     cleared | (disc << UD_KIND_SHIFT)

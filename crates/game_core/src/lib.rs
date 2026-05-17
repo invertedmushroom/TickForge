@@ -11,3 +11,4 @@ pub mod sim_state;
 pub mod sparse_set;
 pub mod spawn_rules;
 pub mod stats;
+pub mod volume;

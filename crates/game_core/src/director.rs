@@ -131,6 +131,20 @@ pub struct DirectorSpawn {
     pub layer: u32,
 }
 
+/// Encounter membership entry paired with a `DirectorSpawn` produced by an
+/// encounter rule's `SpawnAdds` effect. The commit reducer reads this to
+/// insert an `encounter_add` row tying the new entity to its owning boss
+/// and tags. See `docs/contracts/spawn_add_membership_contract.md`.
+#[derive(Clone, Debug)]
+pub struct PendingAddMembership {
+    /// Index into the same tick's `director_spawns` vector. The reducer
+    /// rejects packages where this is out of range.
+    pub spawn_index: u32,
+    pub boss_entity: EntityId,
+    pub archetype: String,
+    pub tags: Vec<String>,
+}
+
 /// World director state — owns event definitions and per-region player counts.
 #[derive(Debug)]
 pub struct DirectorState {

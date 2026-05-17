@@ -130,7 +130,7 @@ mod tests {
                 interactables: [
                     (local_id: 1, kind: Gate, position: (0.0, 1.5, -5.0), linked_to: None, required_buff: None, required_item: None, interact_range: None),
                     (local_id: 2, kind: Switch, position: (3.0, 1.0, -3.0), linked_to: Some(1), required_buff: None, required_item: None, interact_range: Some(3.0)),
-                    (local_id: 3, kind: BossSpawn(npc_name: "Golem"), position: (0.0, 1.0, -8.0), linked_to: None, required_buff: None, required_item: None, interact_range: None),
+                    (local_id: 3, kind: BossSpawn(npc_name: "Golem", encounter_name: Some("state_enter_demo")), position: (0.0, 1.0, -8.0), linked_to: None, required_buff: None, required_item: None, interact_range: None),
                     (local_id: 4, kind: NpcSpawn(npc_name: "Guard"), position: (2.0, 1.0, 0.0), linked_to: None, required_buff: None, required_item: None, interact_range: None),
                     (local_id: 5, kind: Chest, position: (-2.0, 0.5, -9.0), linked_to: None, required_buff: Some(42), required_item: Some(100), interact_range: Some(2.0)),
                 ],
@@ -195,7 +195,13 @@ mod tests {
         assert_eq!(ints[1].linked_to, Some(1)); // linked to gate
 
         match &ints[2].kind {
-            InteractKindDef::BossSpawn { npc_name } => assert_eq!(npc_name, "Golem"),
+            InteractKindDef::BossSpawn {
+                npc_name,
+                encounter_name,
+            } => {
+                assert_eq!(npc_name, "Golem");
+                assert_eq!(encounter_name.as_deref(), Some("state_enter_demo"));
+            }
             other => panic!("expected BossSpawn, got {other:?}"),
         }
 
@@ -239,6 +245,38 @@ mod tests {
         for t in &file.templates {
             assert!(!t.template_id.is_empty(), "template_id must not be empty");
             assert!(t.max_players > 0, "max_players must be positive");
+        }
+    }
+
+    #[test]
+    fn parse_boss_spawn_without_encounter_name_defaults_none() {
+        const LEGACY: &str = r#"(
+            templates: [
+                (
+                    template_id: "legacy",
+                    name: "Legacy",
+                    max_players: 1,
+                    spawn_points: [(0.0, 1.0, 0.0)],
+                    geometry: [
+                        (shape: Cuboid(half_x: 1.0, half_y: 1.0, half_z: 1.0), position: (0.0, 0.0, 0.0)),
+                    ],
+                    interactables: [
+                        (local_id: 1, kind: BossSpawn(npc_name: "LegacyBoss"), position: (0.0, 1.0, 0.0), linked_to: None, required_buff: None, required_item: None, interact_range: None),
+                    ],
+                ),
+            ],
+        )"#;
+
+        let file: DungeonFile = ron::from_str(LEGACY).expect("legacy BossSpawn syntax should parse");
+        match &file.templates[0].interactables[0].kind {
+            InteractKindDef::BossSpawn {
+                npc_name,
+                encounter_name,
+            } => {
+                assert_eq!(npc_name, "LegacyBoss");
+                assert!(encounter_name.is_none());
+            }
+            other => panic!("expected BossSpawn, got {other:?}"),
         }
     }
 

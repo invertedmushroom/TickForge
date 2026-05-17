@@ -1,12 +1,274 @@
+// Encounter scripts (Step 2 + Step 3 shape).
+//
+// Each encounter is referenced by `name` from a Boss spawn's `encounter_name`
+// (see data/dungeons.ron). Rules are `(id, when, cond, effects, repeat)`.
+//
+// Step 3 surface (now wired):
+//   - Triggers: OnEvent / OnEntityDied / OnMechanicEnded fan in via the
+//     EncounterBus drained at the start of each evaluate().
+//   - Effects: Sequence { steps: [...] } parks its tail at the first Wait;
+//     Parallel { steps: [...] } applies in order this tick. Wait outside a
+//     Sequence is a no-op.
+//   - VolumeAnchor::FollowBoss tracks the boss every tick.
+//   - Effect::Telegraph emits a real EventPayload::TelegraphWarning event.
+//
+// Built-in mechanic names: "marker" (placeholder; auto-finishes one tick
+// after start).
+//
+// Built-in archetype names (data/spawn_rules.ron-adjacent worker registry):
+//   "trash" / "elite" — see crates/simulation_worker/src/tick_pipeline/archetype.rs
 (
     encounters: [
+        // Default rules for any Boss whose `encounter_name` is unset or
+        // unresolved.
         (
-            boss_name: "default",
+            name: "default",
             rules: [
                 (
-                    trigger: OnHpBelowOnce(percent: 0.5),
-                    action: ChangePhase(phase: Phase2),
-                    fired: false,
+                    id: "phase2_at_50",
+                    when: OnHpBelow(percent: 0.5),
+                    cond: Always,
+                    effects: [ChangePhase(phase: Phase2)],
+                    repeat: Once,
+                ),
+                (
+                    id: "enrage_at_20",
+                    when: OnHpBelow(percent: 0.2),
+                    cond: Always,
+                    effects: [ChangePhase(phase: Enrage)],
+                    repeat: Once,
+                ),
+                (
+                    id: "phase3_after_60s",
+                    when: OnAfter(ticks: 1200),
+                    cond: Always,
+                    effects: [ChangePhase(phase: Phase3)],
+                    repeat: Once,
+                ),
+            ],
+        ),
+        // Demonstrates OnEnter triggering on a phase that isn't entered until
+        // another rule fires ChangePhase first.
+        (
+            name: "state_enter_demo",
+            rules: [
+                (
+                    id: "enter_p2_via_hp",
+                    when: OnHpBelow(percent: 0.5),
+                    cond: Always,
+                    effects: [ChangePhase(phase: Phase2)],
+                    repeat: Once,
+                ),
+                (
+                    id: "p2_to_p3_on_entry",
+                    when: OnEnter(phase: Phase2),
+                    cond: Always,
+                    effects: [ChangePhase(phase: Phase3)],
+                    repeat: Once,
+                ),
+            ],
+        ),
+        // Sandbox encounter that exercises every leaf-effect variant Step 2
+        // wires up. Used by data-driven smoke tests.
+        (
+            name: "runtime_actions_demo",
+            rules: [
+                (
+                    id: "start_marker",
+                    when: OnAfter(ticks: 35),
+                    cond: Always,
+                    effects: [StartMechanic(name: "marker", params: ())],
+                    repeat: Once,
+                ),
+                (
+                    id: "spawn_adds",
+                    when: OnAfter(ticks: 55),
+                    cond: Always,
+                    effects: [SpawnAdds(archetype: "trash", count: 4, tags: [])],
+                    repeat: Once,
+                ),
+                (
+                    id: "swap_kit",
+                    when: OnAfter(ticks: 65),
+                    cond: Always,
+                    effects: [ReplaceAbilityList(ability_ids: [24, 31])],
+                    repeat: Once,
+                ),
+                (
+                    id: "telegraph_then_cast",
+                    when: OnAfter(ticks: 70),
+                    cond: Always,
+                    effects: [
+                        Telegraph(skill_id: 24, target: TopThreat, lead_ticks: 40),
+                        CastSkill(skill_id: 24, target: TopThreat),
+                    ],
+                    repeat: Once,
+                ),
+                // Counter feedback example: spawning adds bumps a kill counter
+                // (would be done by an OnEntityDied rule in Step 3); here we
+                // just demonstrate the Effect leaf and the OnCounter trigger.
+                (
+                    id: "bump_counter",
+                    when: OnAfter(ticks: 25),
+                    cond: Always,
+                    effects: [IncrementCounter(name: "demo_counter", delta: 4)],
+                    repeat: Once,
+                ),
+                (
+                    id: "phase3_at_4_kills",
+                    when: OnCounter(name: "demo_counter", op: Ge, value: 4),
+                    cond: Always,
+                    effects: [ChangePhase(phase: Phase3)],
+                    repeat: Once,
+                ),
+            ],
+        ),
+        // ── First real fight ────────────────────────────────────
+        //
+        // The Crucible Warden is the integration acceptance test for the
+        // Step 3 encounter surface. It exercises every new primitive end
+        // to end:
+        //
+        //   • Phase 1 — FollowBoss aura volume (`warden_aura`) tracks the
+        //     boss; periodic Sequence{Telegraph → Wait → CastSkill} pattern.
+        //   • Phase 2 — Spawns 4 adds; OnEntityDied{tag="warden_minion"}
+        //     counts kills. OnCounter(Ge 4) advances to Phase 3 and starts
+        //     a marker mechanic.
+        //   • Phase 3 — OnMechanicEnded{name="marker"} fires the transition
+        //     Sequence and emits a Custom event the rules subscribe to.
+        //   • Enrage — HP 0.2 swaps the ability list and pulses an event
+        //     every 20 ticks; OnEvent reacts with a CastSkill.
+        //
+        // Skill ids: 24 (Fire Patch — single target), 25 (Lava Pool — area).
+        //
+        // Add tagging for OnEntityDied is wired by the worker when
+        // `apply_spawn_adds` runs through the SpawnAdds output: every
+        // scripted add picks up its archetype name as a tag and is
+        // auto-registered against the boss's encounter via
+        // `register_encounter_add`. The encounter author tags adds via
+        // the archetype name they request.
+        (
+            name: "crucible_warden",
+            rules: [
+                // ── Phase 1 ─────────────────────────────────────
+                (
+                    id: "p1_aura",
+                    when: OnEnter(phase: Phase1),
+                    cond: Always,
+                    effects: [
+                        SpawnVolume(
+                            tag: "warden_aura",
+                            shape: Sphere(radius: 4.0),
+                            anchor: FollowBoss,
+                            lifetime_ticks: None,
+                            entity_filter: ExcludeOwner,
+                        ),
+                    ],
+                    repeat: Once,
+                ),
+                (
+                    id: "p1_telegraph_pattern",
+                    when: OnEvery(ticks: 30),
+                    cond: PhaseIs(phase: Phase1),
+                    effects: [
+                        Sequence(steps: [
+                            Telegraph(skill_id: 24, target: TopThreat, lead_ticks: 20),
+                            Wait(ticks: 20),
+                            CastSkill(skill_id: 24, target: TopThreat),
+                        ]),
+                    ],
+                    repeat: EveryNTicks(interval: 30, max_fires: None),
+                ),
+                (
+                    id: "p1_to_p2_at_60",
+                    when: OnHpBelow(percent: 0.6),
+                    cond: Always,
+                    effects: [ChangePhase(phase: Phase2)],
+                    repeat: Once,
+                ),
+                // ── Phase 2 ─────────────────────────────────────
+                (
+                    id: "p2_summon_minions",
+                    when: OnEnter(phase: Phase2),
+                    cond: Always,
+                    effects: [
+                        EmitEncounterEvent(name: "summon_begin"),
+                        SpawnAdds(archetype: "warden_minion", count: 4, tags: ["warden_minion"]),
+                    ],
+                    repeat: Once,
+                ),
+                (
+                    id: "p2_count_minion_deaths",
+                    when: OnEntityDied(tag: "warden_minion"),
+                    cond: PhaseIs(phase: Phase2),
+                    effects: [IncrementCounter(name: "minions_slain", delta: 1)],
+                    repeat: EveryNTicks(interval: 1, max_fires: None),
+                ),
+                (
+                    id: "p2_to_p3_on_clear",
+                    when: OnCounter(name: "minions_slain", op: Ge, value: 4),
+                    cond: PhaseIs(phase: Phase2),
+                    effects: [
+                        ChangePhase(phase: Phase3),
+                        StartMechanic(name: "marker", params: ()),
+                    ],
+                    repeat: Once,
+                ),
+                // ── Phase 3 ─────────────────────────────────────
+                //
+                // The marker mechanic auto-finishes one tick after start.
+                // OnMechanicEnded fires on the tick after that, kicking off
+                // the transition Sequence: telegraph the AoE, wait 30 ticks,
+                // then both fire the cast and emit a Custom event the
+                // bookkeeping rule below subscribes to.
+                (
+                    id: "p3_transition_sequence",
+                    when: OnMechanicEnded(name: "marker"),
+                    cond: PhaseIs(phase: Phase3),
+                    effects: [
+                        Sequence(steps: [
+                            Telegraph(skill_id: 25, target: AllPlayers, lead_ticks: 30),
+                            Wait(ticks: 30),
+                            Parallel(steps: [
+                                CastSkill(skill_id: 25, target: TopThreat),
+                                EmitEncounterEvent(name: "p3_transition_done"),
+                            ]),
+                        ]),
+                    ],
+                    repeat: Once,
+                ),
+                (
+                    id: "p3_log_transition",
+                    when: OnEvent(event_name: "p3_transition_done"),
+                    cond: Always,
+                    effects: [IncrementCounter(name: "transitions", delta: 1)],
+                    repeat: Once,
+                ),
+                // ── Enrage ──────────────────────────────────────
+                (
+                    id: "enrage_at_20",
+                    when: OnHpBelow(percent: 0.2),
+                    cond: Always,
+                    effects: [
+                        ChangePhase(phase: Enrage),
+                        ReplaceAbilityList(ability_ids: [24, 25]),
+                        DespawnVolume(tag: "warden_aura"),
+                    ],
+                    repeat: Once,
+                ),
+                (
+                    id: "enrage_pulse",
+                    when: OnEvery(ticks: 20),
+                    cond: PhaseIs(phase: Enrage),
+                    effects: [EmitEncounterEvent(name: "enrage_pulse")],
+                    repeat: EveryNTicks(interval: 20, max_fires: None),
+                ),
+                (
+                    id: "enrage_react",
+                    when: OnEvent(event_name: "enrage_pulse"),
+                    cond: PhaseIs(phase: Enrage),
+                    effects: [CastSkill(skill_id: 24, target: TopThreat)],
+                    repeat: EveryNTicks(interval: 20, max_fires: None),
                 ),
             ],
         ),

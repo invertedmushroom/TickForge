@@ -157,6 +157,12 @@ impl SimulationRunner {
         self.pipeline.force_remove_entity(id)
     }
 
+    /// Remove a mirrored encounter add registration from the worker when the
+    /// reducer deletes the corresponding `encounter_add` row.
+    pub fn unregister_encounter_add(&mut self, add_entity: EntityId) {
+        self.pipeline.unregister_encounter_add(add_entity);
+    }
+
     /// Apply NPC spawn configuration (passive, no_chase, ability list).
     pub fn configure_npc(&mut self, id: EntityId, cfg: crate::entity_sync::NpcSpawnConfig) {
         if let Some(idx) = self.pipeline.state.entities.lookup(id) {
@@ -409,6 +415,20 @@ impl SimulationRunner {
         encounter: game_core::encounter::EncounterState,
     ) {
         self.pipeline.encounters.insert(boss_entity, encounter);
+    }
+
+    /// Register an encounter add membership projection with optional tags.
+    ///
+    /// Mirrors `encounter_add` table inserts into the pipeline maps used by
+    /// encounter `OnEntityDied { tag }` trigger fan-out.
+    pub fn register_encounter_add_with_tags(
+        &mut self,
+        add_entity: EntityId,
+        boss_entity: EntityId,
+        tags: &[String],
+    ) {
+        self.pipeline
+            .register_encounter_add_with_tags(add_entity, boss_entity, tags);
     }
 
     // ── Director management ────────────────────────────────────────

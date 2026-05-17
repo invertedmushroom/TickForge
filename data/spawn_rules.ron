@@ -6,10 +6,15 @@
 //     * OpenWorldCell(rx, rz)                       — one open-world cell (layer 0)
 //     * OpenWorldAny(rx_min, rx_max, rz_min, rz_max) — inclusive bounding box
 //     * Dungeon(template_id)                         — all instances of a template
-//   - `trigger` gates activation (WorldPhase / PlayerCountAtLeast / OnEvent).
+//   - `trigger` gates activation (WorldPhase / PlayerCountAtLeast).
 //   - `cooldown_ticks` = minimum ticks between firings.
 //   - `max_activations` = 0 means unlimited; otherwise hard cap.
-//   - `scaling` (optional) applies per-player and per-level multipliers.
+//   - `scaling` (optional) applies current per-player HP/count multipliers.
+//
+// Reserved but intentionally not authored here yet:
+//   - SpawnTrigger::OnEvent
+//   - SpawnScaling::per_level_hp_mult / level_source
+//   - SpawnEntityDef::encounter_template
 //
 // Hot-reload is NOT supported; rules are read once in coordinator startup.
 
@@ -29,5 +34,44 @@
             cooldown_ticks: 100,
             max_activations: 1,
         ),
+
+        // Single-cell trash/patrol proof. Fires when at least one player is
+        // active in the origin cell and demonstrates per-player scaling.
+        (
+            rule_id: "open_world_origin_patrol",
+            scope: OpenWorldCell(rx: 0, rz: 0),
+            trigger: PlayerCountAtLeast(threshold: 1),
+            spawns: [
+                (kind: Npc, max_hp: 120.0, offset: (8.0, 1.0, 8.0)),
+            ],
+            cooldown_ticks: 400,
+            max_activations: 2,
+            scaling: Some((
+                per_player_hp_mult: 0.25,
+                per_player_count: 0.5,
+                per_level_hp_mult: 0.0,
+                level_source: None,
+            )),
+        ),
+
+        // Dungeon-scoped player-count proof. Registered per live instance of
+        // `test_dungeon_01` and cleared when that instance expires.
+        (
+            rule_id: "training_dungeon_reinforcements",
+            scope: Dungeon(template_id: "test_dungeon_01"),
+            trigger: PlayerCountAtLeast(threshold: 2),
+            spawns: [
+                (kind: Npc, max_hp: 180.0, offset: (6.0, 1.0, -12.0)),
+            ],
+            cooldown_ticks: 300,
+            max_activations: 1,
+            scaling: Some((
+                per_player_hp_mult: 0.35,
+                per_player_count: 1.0,
+                per_level_hp_mult: 0.0,
+                level_source: None,
+            )),
+        ),
+
     ],
 )

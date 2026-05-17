@@ -41,7 +41,7 @@ impl Default for TickDriver {
 impl TickDriver {
     pub fn new() -> Self {
         Self {
-            summary_interval: 20,
+            summary_interval: 150,
         }
     }
 

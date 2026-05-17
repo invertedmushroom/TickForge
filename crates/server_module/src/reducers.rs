@@ -1,5 +1,5 @@
 use crate::tables::*;
-use spacetimedb::{ReducerContext, Table, TimeDuration, reducer};
+use spacetimedb::{reducer, ReducerContext, Table, TimeDuration};
 
 // ── Lifecycle ───────────────────────────────────────────────────────
 
@@ -256,6 +256,20 @@ pub fn world_clock(ctx: &ReducerContext, _schedule: WorldClockSchedule) -> Resul
         return Err("world_clock may only be invoked by the scheduler".into());
     }
 
+    let now = ctx.timestamp.to_micros_since_unix_epoch();
+    let expiry_report = expire_instances_inner(ctx, now)?;
+    if expiry_report.has_activity() {
+        log::info!(
+            "world_clock: instance maintenance expired={} returned_members={} stale_members={} marked_despawn={} cleared_counters={} cleared_phases={}",
+            expiry_report.expired_instances,
+            expiry_report.returned_members,
+            expiry_report.stale_members,
+            expiry_report.marked_despawn_entities,
+            expiry_report.cleared_counters,
+            expiry_report.cleared_phases,
+        );
+    }
+
     // ── Tier 2 evaluation: zone_counter → world_phase transitions ───
     //
     // Aggregate zone_counter rows per (layer, region_x, region_z) and
@@ -319,8 +333,6 @@ pub fn world_clock(ctx: &ReducerContext, _schedule: WorldClockSchedule) -> Resul
             .or_default()
             .push((name.as_str(), *value));
     }
-
-    let now = ctx.timestamp.to_micros_since_unix_epoch();
 
     for (&(layer, rx, rz), counters) in &zone_counters {
         // Find the highest-priority matching rule for this zone.
@@ -415,8 +427,6 @@ pub fn submit_intent(
             sequence_id, seq.last_processed_sequence
         ));
     }
-
-
 
     // Rate limit: cap the number of pending (unprocessed) intents per entity.
     // At 20 Hz a queue depth of 5 = 250 ms of buffered input — enough for normal
@@ -888,6 +898,7 @@ pub fn commit_tick_results(
     buff_cleared_entity_ids: Vec<u64>,
     npc_state_updates: Vec<NpcStateUpdate>,
     director_spawns: Vec<DirectorSpawnInput>,
+    encounter_memberships: Vec<EncounterAddMembershipInput>,
     interactable_updates: Vec<InteractableUpdate>,
     death_state_inserts: Vec<DeathStateInsertInput>,
     sim_log_entries: Vec<SimLogInput>,
@@ -1055,6 +1066,20 @@ pub fn commit_tick_results(
                     .interactable_config()
                     .entity_id()
                     .delete(&u.entity_id);
+                // Encounter add membership: delete by add_entity (this entity
+                // was an add) and cascade by boss_entity (this entity was a
+                // boss whose adds are now orphaned).
+                ctx.db.encounter_add().add_entity().delete(&u.entity_id);
+                let orphan_ids: Vec<u64> = ctx
+                    .db
+                    .encounter_add()
+                    .by_boss()
+                    .filter(&u.entity_id)
+                    .map(|r| r.add_entity)
+                    .collect();
+                for add_id in orphan_ids {
+                    ctx.db.encounter_add().add_entity().delete(&add_id);
+                }
                 // Note: death_state is NOT deleted here — players need it for respawn.
                 // Buff rows for Removed entities are already cleaned up by the
                 // buff_cleared section below — the worker explicitly adds Removed
@@ -1208,6 +1233,8 @@ pub fn commit_tick_results(
     // Persist Director spawns: create entity + companion rows for each spawn.
     // Uses auto_inc (entity_id: 0) just like player/NPC spawns — the DB
     // assigns unique IDs. Entity kind is tracked via EntityKind, not ID range.
+    let mut director_spawn_ids: Vec<u64> = Vec::with_capacity(director_spawns.len());
+    let mut director_spawn_layers: Vec<u32> = Vec::with_capacity(director_spawns.len());
     for s in director_spawns {
         let entity = ctx.db.entity().insert(Entity {
             entity_id: 0, // auto_inc
@@ -1218,6 +1245,8 @@ pub fn commit_tick_results(
             rls_group: 0,
         });
         let eid = entity.entity_id;
+        director_spawn_ids.push(eid);
+        director_spawn_layers.push(s.layer);
 
         ctx.db.entity_transform().insert(EntityTransform {
             entity_id: eid,
@@ -1255,6 +1284,85 @@ pub fn commit_tick_results(
         ctx.db.entity_layer().insert(EntityLayer {
             entity_id: eid,
             layer: s.layer,
+        });
+    }
+
+    // ── Encounter Add Memberships ─────────────────────────────────────
+    // Pair each membership with the matching director spawn by index and
+    // insert an `encounter_add` row carrying the boss link + tag list.
+    // See `docs/contracts/spawn_add_membership_contract.md`.
+    for m in encounter_memberships {
+        let idx = m.spawn_index as usize;
+        if idx >= director_spawn_ids.len() {
+            log::warn!(
+                "encounter_add: spawn_index {} out of range (director_spawns={}); skipping",
+                m.spawn_index,
+                director_spawn_ids.len()
+            );
+            continue;
+        }
+        // Validate boss exists; skip cleanly if not (e.g. boss died same tick).
+        if ctx.db.entity().entity_id().find(&m.boss_entity).is_none() {
+            log::warn!(
+                "encounter_add: boss_entity {} not found; skipping membership for add {}",
+                m.boss_entity,
+                director_spawn_ids[idx]
+            );
+            continue;
+        }
+        // Enforce Spec C rule #4 (dungeon_layer_propagation_contract.md):
+        // add and boss must share a visibility layer. Both sides are
+        // visible inside this transaction — the add layer was just
+        // inserted above, the boss layer is queryable via entity_layer.
+        let add_layer = director_spawn_layers[idx];
+        let boss_layer = ctx
+            .db
+            .entity_layer()
+            .entity_id()
+            .find(&m.boss_entity)
+            .map(|r| r.layer);
+        match boss_layer {
+            Some(bl) if bl == add_layer => {}
+            Some(bl) => {
+                log::warn!(
+                    "encounter_add: layer mismatch (add {} layer {} vs boss {} layer {}); skipping",
+                    director_spawn_ids[idx],
+                    add_layer,
+                    m.boss_entity,
+                    bl
+                );
+                continue;
+            }
+            None => {
+                log::warn!(
+                    "encounter_add: boss {} has no entity_layer row; skipping membership for add {}",
+                    m.boss_entity,
+                    director_spawn_ids[idx]
+                );
+                continue;
+            }
+        }
+        // Cap tags: ≤ 8 entries, each ≤ 32 bytes UTF-8.
+        let tags: Vec<String> = m
+            .tags
+            .into_iter()
+            .filter(|t| {
+                if t.len() > 32 {
+                    log::warn!("encounter_add: tag exceeds 32 bytes, dropping: {:?}", t);
+                    false
+                } else {
+                    true
+                }
+            })
+            .take(8)
+            .collect();
+
+        ctx.db.encounter_add().insert(EncounterAdd {
+            add_entity: director_spawn_ids[idx],
+            boss_entity: m.boss_entity,
+            tags,
+            archetype: m.archetype,
+            spawned_at_tick: tick_id,
         });
     }
 
@@ -1395,6 +1503,18 @@ pub struct DirectorSpawnInput {
     pub pos_y: f32,
     pub pos_z: f32,
     pub layer: u32,
+}
+
+/// Encounter-add membership entry emitted by the worker. Pairs with
+/// `director_spawns` by `spawn_index`. The reducer validates the index,
+/// caps tags, and inserts an `encounter_add` row alongside the spawned
+/// entity. See `docs/contracts/spawn_add_membership_contract.md`.
+#[derive(spacetimedb::SpacetimeType, Clone, Debug)]
+pub struct EncounterAddMembershipInput {
+    pub spawn_index: u32,
+    pub boss_entity: u64,
+    pub archetype: String,
+    pub tags: Vec<String>,
 }
 
 /// Authoritative death-state row produced by the simulation worker.
@@ -2606,6 +2726,27 @@ const INSTANCE_DISCONNECT_GRACE_MICROS: i64 = 120_000_000;
 /// Grace period before ALL-disconnected instance is expired (5 min in microseconds).
 const INSTANCE_ALL_DISCONNECT_GRACE_MICROS: i64 = 300_000_000;
 
+#[derive(Default, Debug, Clone, Copy)]
+struct ExpireReport {
+    expired_instances: usize,
+    returned_members: usize,
+    stale_members: usize,
+    marked_despawn_entities: usize,
+    cleared_counters: usize,
+    cleared_phases: usize,
+}
+
+impl ExpireReport {
+    fn has_activity(&self) -> bool {
+        self.expired_instances > 0
+            || self.returned_members > 0
+            || self.stale_members > 0
+            || self.marked_despawn_entities > 0
+            || self.cleared_counters > 0
+            || self.cleared_phases > 0
+    }
+}
+
 /// Embedded dungeon templates are parsed per reducer invocation.
 /// Instance creation is infrequent enough that this has not required caching so far.
 fn load_dungeon_template(
@@ -2815,9 +2956,18 @@ pub fn create_instance(
         });
 
         // BossSpawn entities get NpcConfig so the worker treats them as AI-driven.
-        if let game_schema::dungeon::InteractKindDef::BossSpawn { npc_name } = &def.kind {
+        if let game_schema::dungeon::InteractKindDef::BossSpawn {
+            npc_name,
+            encounter_name,
+        } = &def.kind
+        {
+            let encounter_key = encounter_name
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| npc_name.clone());
             ctx.db.npc_config().insert(NpcConfig {
                 entity_id: eid,
+                encounter_name: Some(encounter_key.clone()),
                 passive: false,
                 no_chase: false,
                 ability_id_1: None,
@@ -2828,8 +2978,8 @@ pub fn create_instance(
                 aggro_radius: 15.0,
             });
             log::info!(
-                "Boss entity {} ({npc_name}) spawned in instance layer={layer}",
-                eid
+                "Boss entity {} ({npc_name}) spawned in instance layer={layer} encounter={encounter_key}",
+                eid,
             );
         }
     }
@@ -3003,9 +3153,7 @@ pub fn leave_instance(ctx: &ReducerContext) -> Result<(), String> {
         .and_then(|tid| match load_dungeon_template(tid) {
             Ok(t) => pick_spawn_from(&t.exit_points, None),
             Err(e) => {
-                log::warn!(
-                    "leave_instance: could not load template '{tid}' for exit_points: {e}"
-                );
+                log::warn!("leave_instance: could not load template '{tid}' for exit_points: {e}");
                 None
             }
         })
@@ -3024,7 +3172,8 @@ pub fn leave_instance(ctx: &ReducerContext) -> Result<(), String> {
 }
 
 /// Scheduled cleanup: expire timed-out instances and remove long-disconnected members.
-/// Called by admin or trusted worker. In production, will be triggered by world_clock.
+/// Called by admin or trusted worker; `world_clock` also reuses the same inner
+/// maintenance path before evaluating zone counters.
 #[reducer]
 pub fn expire_instances(ctx: &ReducerContext) -> Result<(), String> {
     if !is_trusted_caller(ctx) && !is_module_admin(ctx) && !is_debug_caller(ctx) {
@@ -3032,6 +3181,23 @@ pub fn expire_instances(ctx: &ReducerContext) -> Result<(), String> {
     }
 
     let now = ctx.timestamp.to_micros_since_unix_epoch();
+    let report = expire_instances_inner(ctx, now)?;
+    if report.has_activity() {
+        log::info!(
+            "expire_instances: expired={} returned_members={} stale_members={} marked_despawn={} cleared_counters={} cleared_phases={}",
+            report.expired_instances,
+            report.returned_members,
+            report.stale_members,
+            report.marked_despawn_entities,
+            report.cleared_counters,
+            report.cleared_phases,
+        );
+    }
+    Ok(())
+}
+
+fn expire_instances_inner(ctx: &ReducerContext, now: i64) -> Result<ExpireReport, String> {
+    let mut report = ExpireReport::default();
 
     // Collect instances to expire (time-based).
     let expired: Vec<u64> = ctx
@@ -3069,6 +3235,7 @@ pub fn expire_instances(ctx: &ReducerContext) -> Result<(), String> {
         .collect();
 
     let to_expire: Vec<u64> = expired.into_iter().chain(all_disconnected).collect();
+    report.expired_instances = to_expire.len();
 
     for instance_id in &to_expire {
         // Remove all memberships — return members to open world.
@@ -3094,31 +3261,29 @@ pub fn expire_instances(ctx: &ReducerContext) -> Result<(), String> {
                 layer: 0,
             });
         }
+        report.returned_members += members.len();
 
         // Mark instance expired.
-        if let Some(inst) = ctx.db.instance().instance_id().find(instance_id) {
+        let instance_layer = if let Some(inst) = ctx.db.instance().instance_id().find(instance_id) {
+            let instance_layer = inst.layer;
             ctx.db.instance().instance_id().update(Instance {
                 instance_id: *instance_id,
                 template_id: inst.template_id,
-                layer: inst.layer,
+                layer: instance_layer,
                 layer_group: inst.layer_group,
                 state: InstanceState::Expired,
                 created_at: inst.created_at,
                 expires_at: inst.expires_at,
                 max_players: inst.max_players,
             });
-        }
+            instance_layer
+        } else {
+            0
+        };
 
         // Clean up interactable configs on the instance layer.
         // Entity cleanup (gates, switches, props) must go through force_remove_entity
         // in the tick pipeline. We mark them DespawnPending here; the worker handles removal.
-        let instance_layer = ctx
-            .db
-            .instance()
-            .instance_id()
-            .find(instance_id)
-            .map(|i| i.layer)
-            .unwrap_or(0);
         let instance_entities: Vec<u64> = ctx
             .db
             .entity_region()
@@ -3138,6 +3303,7 @@ pub fn expire_instances(ctx: &ReducerContext) -> Result<(), String> {
                         owner_identity: entity.owner_identity,
                         rls_group: 0,
                     });
+                    report.marked_despawn_entities += 1;
                 }
             }
         }
@@ -3153,6 +3319,7 @@ pub fn expire_instances(ctx: &ReducerContext) -> Result<(), String> {
             .map(|zc| zc.counter_id)
             .collect();
         let counter_count = stale_counters.len();
+        report.cleared_counters += counter_count;
         for counter_id in stale_counters {
             ctx.db.zone_counter().counter_id().delete(&counter_id);
         }
@@ -3167,6 +3334,7 @@ pub fn expire_instances(ctx: &ReducerContext) -> Result<(), String> {
             .map(|wp| wp.zone_id)
             .collect();
         let phase_count = stale_phases.len();
+        report.cleared_phases += phase_count;
         for zone_id in stale_phases {
             ctx.db.world_phase().zone_id().delete(&zone_id);
         }
@@ -3213,13 +3381,14 @@ pub fn expire_instances(ctx: &ReducerContext) -> Result<(), String> {
             entity_id: *eid,
             layer: 0,
         });
+        report.stale_members += 1;
         log::info!(
             "Instance: stale member {} removed (disconnect grace expired)",
             eid
         );
     }
 
-    Ok(())
+    Ok(report)
 }
 
 #[derive(spacetimedb::SpacetimeType, Clone, Debug)]
@@ -3680,6 +3849,18 @@ mod debug_reducers {
         ctx.db.npc_goal().entity_id().delete(&entity_id);
         ctx.db.instance_membership().entity_id().delete(&entity_id);
         ctx.db.interactable_config().entity_id().delete(&entity_id);
+        // Encounter add: drop this entity's row and cascade if it was a boss.
+        ctx.db.encounter_add().add_entity().delete(&entity_id);
+        let orphan_ids: Vec<u64> = ctx
+            .db
+            .encounter_add()
+            .by_boss()
+            .filter(&entity_id)
+            .map(|r| r.add_entity)
+            .collect();
+        for add_id in orphan_ids {
+            ctx.db.encounter_add().add_entity().delete(&add_id);
+        }
 
         log::info!("debug_remove_entity: entity={entity_id} force-removed");
         Ok(())
@@ -3727,6 +3908,7 @@ mod debug_reducers {
                     10000.0,
                     Some(NpcConfig {
                         entity_id: 0,
+                        encounter_name: None,
                         passive: true,
                         no_chase: false,
                         ability_id_1: None,
@@ -3749,6 +3931,7 @@ mod debug_reducers {
                     500.0,
                     Some(NpcConfig {
                         entity_id: 0,
+                        encounter_name: None,
                         passive: false,
                         no_chase: true,
                         ability_id_1: Some(1),
@@ -3771,6 +3954,7 @@ mod debug_reducers {
                     500.0,
                     Some(NpcConfig {
                         entity_id: 0,
+                        encounter_name: None,
                         passive: false,
                         no_chase: true,
                         ability_id_1: Some(2),
@@ -3793,6 +3977,7 @@ mod debug_reducers {
                     300.0,
                     Some(NpcConfig {
                         entity_id: 0,
+                        encounter_name: None,
                         passive: false,
                         no_chase: false,
                         ability_id_1: Some(1),
@@ -3832,6 +4017,7 @@ mod debug_reducers {
                             100.0,
                             Some(NpcConfig {
                                 entity_id: 0,
+                                encounter_name: None,
                                 passive: true,
                                 no_chase: false,
                                 ability_id_1: None,
@@ -3884,6 +4070,7 @@ mod debug_reducers {
                     100.0,
                     Some(NpcConfig {
                         entity_id: 0,
+                        encounter_name: None,
                         passive: true,
                         no_chase: false,
                         ability_id_1: None,
@@ -3948,6 +4135,7 @@ mod debug_reducers {
                     1000.0,
                     Some(NpcConfig {
                         entity_id: 0,
+                        encounter_name: None,
                         passive: false,
                         no_chase,
                         ability_id_1: Some(1), // Slash
@@ -3967,6 +4155,7 @@ mod debug_reducers {
                     1000.0,
                     Some(NpcConfig {
                         entity_id: 0,
+                        encounter_name: None,
                         passive: false,
                         no_chase,
                         ability_id_1: Some(1), // Slash

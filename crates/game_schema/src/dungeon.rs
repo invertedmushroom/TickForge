@@ -201,7 +201,10 @@ pub struct InteractableDef {
 pub enum InteractKindDef {
     Gate,
     Switch,
-    BossSpawn { npc_name: String },
+    BossSpawn {
+        npc_name: String,
+        encounter_name: Option<String>,
+    },
     NpcSpawn { npc_name: String },
     Chest,
 }

@@ -288,6 +288,17 @@ pub struct CommitDeathStateInsert {
     pub death_pos_z: f32,
 }
 
+/// Encounter-add membership entry paired with a `CommitDirectorSpawn` by
+/// `spawn_index`. Mirrors `game_core::director::PendingAddMembership` in
+/// SDK-free form. See `docs/contracts/spawn_add_membership_contract.md`.
+#[derive(Clone, Debug)]
+pub struct CommitEncounterAddMembership {
+    pub spawn_index: u32,
+    pub boss_entity: u64,
+    pub archetype: String,
+    pub tags: Vec<String>,
+}
+
 /// Complete marshalled payload for one tick commit.
 ///
 /// Contains all vectors the `commit_tick_results` reducer expects,
@@ -312,6 +323,10 @@ pub struct CommitPackage {
     pub npc_state_updates: Vec<CommitNpcState>,
     /// Entities spawned by the world director that need DB rows created.
     pub director_spawns: Vec<CommitDirectorSpawn>,
+    /// Encounter-add memberships paired with `director_spawns` by
+    /// `spawn_index`. Inserted as `encounter_add` rows in the same
+    /// transaction as the entity inserts.
+    pub encounter_memberships: Vec<CommitEncounterAddMembership>,
     /// Interactable state changes committed inline via `commit_tick_results`.
     pub interactable_updates: Vec<CommitInteractableUpdate>,
     /// Boss phase transitions from encounter executor.
@@ -449,6 +464,17 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
         })
         .collect();
 
+    let encounter_memberships = result
+        .encounter_memberships
+        .iter()
+        .map(|m| CommitEncounterAddMembership {
+            spawn_index: m.spawn_index,
+            boss_entity: m.boss_entity.0,
+            archetype: m.archetype.clone(),
+            tags: m.tags.clone(),
+        })
+        .collect();
+
     let interactable_updates = result
         .interactable_updates
         .iter()
@@ -484,6 +510,7 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
         buff_cleared_entity_ids,
         npc_state_updates,
         director_spawns,
+        encounter_memberships,
         interactable_updates,
         boss_phase_updates: result.boss_phase_updates,
         zone_counter_deltas: result.zone_counter_deltas,
@@ -770,7 +797,9 @@ fn classify_events(events: &[SimEvent]) -> (Vec<CommitCombatEvent>, Vec<CommitWo
             | EventPayload::HitboxRemoved { .. }
             | EventPayload::CooldownReady { .. }
             | EventPayload::TickBoundary
-            | EventPayload::CompensationApplied { .. } => {}
+            | EventPayload::CompensationApplied { .. }
+            | EventPayload::VolumeEnter { .. }
+            | EventPayload::VolumeExit { .. } => {}
             EventPayload::LockOnWarning { source, target } => {
                 combat_events.push(CommitCombatEvent {
                     source_entity: source.0,
@@ -1064,6 +1093,7 @@ mod tests {
             npc_state_updates: Vec::new(),
             region_updates: Vec::new(),
             director_spawns: Vec::new(),
+            encounter_memberships: Vec::new(),
             interactable_updates: Vec::new(),
             boss_phase_updates: Vec::new(),
             zone_counter_deltas: Vec::new(),
@@ -1122,6 +1152,61 @@ mod tests {
         let pkg = build(result, vec![10, 20, 30]);
 
         assert_eq!(pkg.consumed_intent_ids, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn build_marshals_encounter_memberships() {
+        let mut result = make_tick_result(77);
+        result.encounter_memberships = vec![
+            game_core::director::PendingAddMembership {
+                spawn_index: 2,
+                boss_entity: EntityId(9001),
+                archetype: "skeleton".to_string(),
+                tags: vec!["add".to_string(), "melee".to_string()],
+            },
+            game_core::director::PendingAddMembership {
+                spawn_index: 3,
+                boss_entity: EntityId(9002),
+                archetype: "caster".to_string(),
+                tags: vec!["add".to_string(), "ranged".to_string()],
+            },
+        ];
+
+        let pkg = build(result, vec![]);
+
+        assert_eq!(pkg.encounter_memberships.len(), 2);
+        assert_eq!(pkg.encounter_memberships[0].spawn_index, 2);
+        assert_eq!(pkg.encounter_memberships[0].boss_entity, 9001);
+        assert_eq!(pkg.encounter_memberships[0].archetype, "skeleton");
+        assert_eq!(
+            pkg.encounter_memberships[0].tags,
+            vec!["add".to_string(), "melee".to_string()]
+        );
+        assert_eq!(pkg.encounter_memberships[1].spawn_index, 3);
+        assert_eq!(pkg.encounter_memberships[1].boss_entity, 9002);
+        assert_eq!(pkg.encounter_memberships[1].archetype, "caster");
+        assert_eq!(
+            pkg.encounter_memberships[1].tags,
+            vec!["add".to_string(), "ranged".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_preserves_shifted_spawn_index_offsets() {
+        let mut result = make_tick_result(88);
+        // TickPipeline shifts membership spawn_index by the number of
+        // pre-existing director spawns before these are marshaled.
+        result.encounter_memberships = vec![game_core::director::PendingAddMembership {
+            spawn_index: 5,
+            boss_entity: EntityId(7000),
+            archetype: "brute".to_string(),
+            tags: vec!["elite".to_string()],
+        }];
+
+        let pkg = build(result, vec![]);
+
+        assert_eq!(pkg.encounter_memberships.len(), 1);
+        assert_eq!(pkg.encounter_memberships[0].spawn_index, 5);
     }
 
     #[test]
@@ -1373,6 +1458,7 @@ mod tests {
             npc_state_updates: Vec::new(),
             region_updates: Vec::new(),
             director_spawns: Vec::new(),
+            encounter_memberships: Vec::new(),
             interactable_updates: Vec::new(),
             boss_phase_updates: Vec::new(),
             zone_counter_deltas: Vec::new(),
@@ -1427,6 +1513,7 @@ mod tests {
                     layer: 0,
                 },
             ],
+            encounter_memberships: Vec::new(),
             interactable_updates: Vec::new(),
             boss_phase_updates: Vec::new(),
             zone_counter_deltas: Vec::new(),

@@ -2154,6 +2154,7 @@ fn run_f6_unauthorized_commit(conn: &DbConnection, r: &mut TestResults) {
         vec![],     // buff_cleared_entity_ids
         vec![],     // npc_state_updates
         vec![],     // director_spawns
+        vec![],     // encounter_memberships
         vec![],     // interactable_updates
         vec![],     // death_state_inserts
         vec![],     // sim_log_inputs
@@ -2207,6 +2208,7 @@ fn run_f7_cursor_safety(conn: &DbConnection, r: &mut TestResults) {
         vec![],
         vec![],
         vec![], // director_spawns
+        vec![], // encounter_memberships
         vec![], // interactable_updates
         vec![], // death_state_inserts
         vec![], // sim_log_inputs

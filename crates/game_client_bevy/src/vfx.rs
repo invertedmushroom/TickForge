@@ -698,7 +698,7 @@ fn despawn_hazard_visuals(
 // `duration_ticks` server ticks (server runs at 20Hz). Because the underlying
 // hitbox is one-shot/short-lived, we drive the lifetime entirely from
 // `duration_ticks` and do not require a corresponding remove event.
-
+#[allow(dead_code)]
 #[derive(Event)]
 pub struct ContactHitboxSpawnEvent {
     pub execution_id: u64,
