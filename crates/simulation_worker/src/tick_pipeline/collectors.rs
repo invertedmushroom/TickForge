@@ -1,5 +1,75 @@
 use super::*;
 
+/// Squared positional tolerance (metres²) for transform delta filtering.
+///
+/// Entities whose position moved less than ~2 cm since the last committed
+/// transform — and whose rotation is also within tolerance — are suppressed
+/// from the commit payload. Physics remains authoritative; only the replicated
+/// payload is delta-compressed. The bound is inherent: the client is always
+/// within `sqrt(TRANSFORM_POS_EPS_SQ)` of authoritative position, because the
+/// comparison is against the last *committed* value rather than the previous
+/// tick. Accumulated sub-epsilon motion trips the emit once it exceeds the
+/// bound.
+const TRANSFORM_POS_EPS_SQ: f32 = 0.02 * 0.02;
+
+/// Rotation tolerance expressed as `1.0 - |dot(prev, cur)|`.
+///
+/// `1e-5` corresponds to roughly 0.25° of angular difference — well below
+/// visible jitter on turning NPCs.
+const TRANSFORM_ROT_EPS: f32 = 1.0e-5;
+
+/// Squared linear-velocity threshold (m²/s²) treated as "moving" when deciding
+/// whether a zero-crossing should force an emit. `0.1²` matches the typical
+/// KCC standstill floor.
+const TRANSFORM_VEL_EPS_SQ: f32 = 0.1 * 0.1;
+
+#[inline]
+fn vec3_dist_sq(a: &Vec3f, b: &Vec3f) -> f32 {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    let dz = a.z - b.z;
+    dx * dx + dy * dy + dz * dz
+}
+
+#[inline]
+fn vec3_len_sq(v: &Vec3f) -> f32 {
+    v.x * v.x + v.y * v.y + v.z * v.z
+}
+
+/// Returns true when `cur` differs from `prev` by more than the configured
+/// epsilons on position or rotation. A `None` baseline (first commit for this
+/// entity) always counts as changed.
+///
+/// Linear velocity is included as a zero-crossing check only: if the previous
+/// committed snapshot had non-zero velocity and the current one is at rest,
+/// emit so the client stops extrapolating a stale direction. Without this,
+/// an NPC that halts with less than `sqrt(TRANSFORM_POS_EPS_SQ)` position
+/// delta on the stopping tick would leave the client's last-known velocity
+/// at its pre-stop value, causing visible slide until the next sub-epsilon
+/// accumulator trip. The symmetric rest→moving edge always trips the
+/// position check within a few ticks and needs no special case here.
+#[inline]
+fn transform_exceeds_epsilon(prev: Option<&Transform>, cur: &Transform) -> bool {
+    let Some(p) = prev else { return true };
+    if vec3_dist_sq(&p.position, &cur.position) > TRANSFORM_POS_EPS_SQ {
+        return true;
+    }
+    let dot = p.rotation.x * cur.rotation.x
+        + p.rotation.y * cur.rotation.y
+        + p.rotation.z * cur.rotation.z
+        + p.rotation.w * cur.rotation.w;
+    if 1.0 - dot.abs() > TRANSFORM_ROT_EPS {
+        return true;
+    }
+    // Moving → rest edge: prev linvel significant, cur linvel negligible.
+    let prev_vel_sq = vec3_len_sq(&p.linear_velocity);
+    let cur_vel_sq = vec3_len_sq(&cur.linear_velocity);
+    if prev_vel_sq > TRANSFORM_VEL_EPS_SQ && cur_vel_sq <= TRANSFORM_VEL_EPS_SQ {
+        return true;
+    }
+    false
+}
+
 impl TickPipeline {
     // ── Transform delta collection ──────────────────────────────
 
@@ -7,7 +77,9 @@ impl TickPipeline {
     ///
     /// The physics world remains the authoritative source of current transforms,
     /// so we still snapshot all transforms for lag compensation and region checks.
-    /// Only the reducer payload is delta-compressed.
+    /// Only the reducer payload is delta-compressed. Comparison uses an epsilon
+    /// on position and rotation so sub-threshold solver and KCC jitter does not
+    /// dominate the commit payload for clustered NPCs.
     pub(super) fn collect_transform_updates(
         &mut self,
         transforms: &[(EntityId, Transform)],
@@ -16,8 +88,8 @@ impl TickPipeline {
         out.reserve(transforms.len());
 
         for &(eid, tf) in transforms {
-            let changed = self.last_committed_transforms.get(&eid) != Some(&tf);
-            if changed {
+            let prev = self.last_committed_transforms.get(&eid);
+            if transform_exceeds_epsilon(prev, &tf) {
                 self.last_committed_transforms.insert(eid, tf);
                 out.push((eid, tf));
             }

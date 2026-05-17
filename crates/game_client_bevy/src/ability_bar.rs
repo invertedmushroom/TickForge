@@ -76,7 +76,7 @@ pub fn all_abilities() -> &'static [AbilityDef] {
 }
 
 fn build_ability_defs() -> Vec<AbilityDef> {
-    use game_core::combat::skill::{AbilityAction, AbilityFile};
+    use game_core::combat::skill::{AbilityAction, AbilityFile, HitEffectSpec, HitboxRules};
 
     let src = include_str!("../../../data/abilities.ron");
     let file = ron::from_str::<AbilityFile>(src)
@@ -107,15 +107,24 @@ fn build_ability_defs() -> Vec<AbilityDef> {
                 .iter()
                 .find(|t| t.ability_id == data.ability_id);
 
-            let (shape, offset) = timeline
-                .and_then(|t| {
-                    t.actions.iter().find_map(|a| match &a.action {
-                        AbilityAction::SpawnHitbox { shape, offset } => Some((
-                            skill_shape_to_client(*shape),
-                            [offset.x, offset.y, offset.z],
-                        )),
-                        _ => None,
-                    })
+            let first_spawn = timeline.and_then(|t| {
+                t.actions.iter().find_map(|a| match &a.action {
+                    AbilityAction::SpawnHitbox { shape, offset } => {
+                        Some((*shape, *offset, None::<&HitEffectSpec>, None::<HitboxRules>))
+                    }
+                    AbilityAction::SpawnConfiguredHitbox {
+                        shape,
+                        offset,
+                        effect,
+                        rules,
+                    } => Some((*shape, *offset, effect.as_deref(), *rules)),
+                    _ => None,
+                })
+            });
+
+            let (shape, offset) = first_spawn
+                .map(|(shape, offset, _, _)| {
+                    (skill_shape_to_client(shape), [offset.x, offset.y, offset.z])
                 })
                 .unwrap_or((AbilityShape::None, [0.0, 0.0, 0.0]));
 
@@ -126,7 +135,8 @@ fn build_ability_defs() -> Vec<AbilityDef> {
                         .actions
                         .iter()
                         .find_map(|a| match &a.action {
-                            AbilityAction::SpawnHitbox { .. } => Some(a.tick_offset),
+                            AbilityAction::SpawnHitbox { .. }
+                            | AbilityAction::SpawnConfiguredHitbox { .. } => Some(a.tick_offset),
                             _ => None,
                         })
                         .unwrap_or(0);
@@ -146,12 +156,24 @@ fn build_ability_defs() -> Vec<AbilityDef> {
                 id: data.ability_id,
                 name: data.name.clone(),
                 damage_type: data.damage_type,
-                on_hit_buffs: data.on_hit_buffs.clone(),
-                stun_ticks: data.stun_ticks,
-                knockdown_ticks: data.knockdown_ticks,
-                sleep_ticks: data.sleep_ticks,
-                silence_ticks: data.silence_ticks,
-                fear_ticks: data.fear_ticks,
+                on_hit_buffs: first_spawn
+                    .and_then(|(_, _, effect, _)| effect.map(|e| e.on_hit_buffs.clone()))
+                    .unwrap_or_else(|| data.on_hit_buffs.clone()),
+                stun_ticks: first_spawn
+                    .and_then(|(_, _, effect, _)| effect.map(|e| e.stun_ticks))
+                    .unwrap_or(data.stun_ticks),
+                knockdown_ticks: first_spawn
+                    .and_then(|(_, _, effect, _)| effect.map(|e| e.knockdown_ticks))
+                    .unwrap_or(data.knockdown_ticks),
+                sleep_ticks: first_spawn
+                    .and_then(|(_, _, effect, _)| effect.map(|e| e.sleep_ticks))
+                    .unwrap_or(data.sleep_ticks),
+                silence_ticks: first_spawn
+                    .and_then(|(_, _, effect, _)| effect.map(|e| e.silence_ticks))
+                    .unwrap_or(data.silence_ticks),
+                fear_ticks: first_spawn
+                    .and_then(|(_, _, effect, _)| effect.map(|e| e.fear_ticks))
+                    .unwrap_or(data.fear_ticks),
                 category,
                 cooldown_ticks,
                 color,
@@ -162,7 +184,9 @@ fn build_ability_defs() -> Vec<AbilityDef> {
                 projectile_speed: data.projectile_speed,
                 lock_on_timeout_ticks: data.lock_on_timeout_ticks,
                 linger_ticks,
-                damage_interval_ticks: data.damage_interval_ticks,
+                damage_interval_ticks: first_spawn
+                    .and_then(|(_, _, _, rules)| rules.map(|r| r.damage_interval_ticks))
+                    .unwrap_or(data.damage_interval_ticks),
                 charge_tiers: data.charge_tiers.clone().unwrap_or_default(),
             }
         })

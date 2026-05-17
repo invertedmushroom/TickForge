@@ -1,0 +1,33 @@
+// Data-driven spawn rules loaded at worker start.
+//
+// Schema: `game_schema::spawn::SpawnFile`.
+// Semantics:
+//   - `scope` selects which zones the rule applies to.
+//     * OpenWorldCell(rx, rz)                       — one open-world cell (layer 0)
+//     * OpenWorldAny(rx_min, rx_max, rz_min, rz_max) — inclusive bounding box
+//     * Dungeon(template_id)                         — all instances of a template
+//   - `trigger` gates activation (WorldPhase / PlayerCountAtLeast / OnEvent).
+//   - `cooldown_ticks` = minimum ticks between firings.
+//   - `max_activations` = 0 means unlimited; otherwise hard cap.
+//   - `scaling` (optional) applies per-player and per-level multipliers.
+//
+// Hot-reload is NOT supported; rules are read once in coordinator startup.
+
+(
+    rules: [
+        // Origin-area open-world boss spawn proof.
+        // Mirrors the hardcoded 3x3 grid previously registered in
+        // `coordinator.rs` on_applied. Fires when zone phase flips to
+        // "boss_ready" (driven by the 5-kills world_clock rule).
+        (
+            rule_id: "open_world_origin_boss",
+            scope: OpenWorldAny(rx_min: -1, rx_max: 1, rz_min: -1, rz_max: 1),
+            trigger: WorldPhase(phase_name: "boss_ready"),
+            spawns: [
+                (kind: Boss, max_hp: 500.0, offset: (0.0, 1.0, 0.0)),
+            ],
+            cooldown_ticks: 100,
+            max_activations: 1,
+        ),
+    ],
+)

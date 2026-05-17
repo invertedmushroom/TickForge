@@ -82,6 +82,7 @@ fn poll_combat_events(
     mut proj_launch: EventWriter<crate::vfx::ProjectileLaunchEvent>,
     mut skill_obj_remove: EventWriter<crate::vfx::SkillObjectRemoveEvent>,
     mut hazard_spawn: EventWriter<crate::vfx::HazardSpawnEvent>,
+    mut contact_hitbox_spawn: EventWriter<crate::vfx::ContactHitboxSpawnEvent>,
     mut charge_start: EventWriter<crate::vfx::ChargeStartEvent>,
     mut charge_tier: EventWriter<crate::vfx::ChargeTierReachedEvent>,
     mut hitbox_spawn: EventWriter<crate::vfx::HitboxSpawnedEvent>,
@@ -194,6 +195,17 @@ fn poll_combat_events(
             CombatEventKind::SkillObjectRemoved(exec_id) => {
                 skill_obj_remove.send(crate::vfx::SkillObjectRemoveEvent {
                     execution_id: *exec_id,
+                });
+            }
+            CombatEventKind::ContactHitboxSpawned(c) => {
+                contact_hitbox_spawn.send(crate::vfx::ContactHitboxSpawnEvent {
+                    execution_id: c.execution_id,
+                    parent_execution_id: c.parent_execution_id,
+                    ability_id: c.ability_id,
+                    source_entity_id: ev.source_entity,
+                    position: Vec3::new(c.pos_x, c.pos_y, c.pos_z),
+                    radius: c.radius,
+                    duration_ticks: c.duration_ticks,
                 });
             }
             CombatEventKind::ChargeStart(c) => {
@@ -566,6 +578,7 @@ fn format_combat_event(
             format!("{tgt} is immune to CC!"),
             Color::srgb(0.5, 0.5, 0.5),
         ),
+        CombatEventKind::ContactHitboxSpawned(_) => (String::new(), Color::WHITE),
     }
 }
 

@@ -12,6 +12,8 @@ mod diagnostics;
 mod dungeon_geometry;
 mod hud;
 #[cfg(feature = "connected")]
+mod terrain;
+#[cfg(feature = "connected")]
 mod input;
 #[cfg(feature = "connected")]
 mod inspector;
@@ -60,6 +62,7 @@ fn main() {
         app.add_plugins(inventory::InventoryPlugin);
         app.add_plugins(instance_panel::InstancePanelPlugin);
         app.add_plugins(dungeon_geometry::DungeonGeometryPlugin);
+        app.add_plugins(terrain::TerrainPlugin);
         app.configure_sets(
             Update,
             (
@@ -100,17 +103,23 @@ fn setup_scene(
     ));
 
     // Ground plane
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(100.0, 0.2, 100.0))),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.24, 0.36, 0.25),
-            perceptual_roughness: 1.0,
-            reflectance: 0.0,
-            metallic: 0.0,
-            ..default()
-        })),
+    let ground_mesh = meshes.add(Cuboid::new(100.0, 0.2, 100.0));
+    let ground_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.24, 0.36, 0.25),
+        perceptual_roughness: 1.0,
+        reflectance: 0.0,
+        metallic: 0.0,
+        ..default()
+    });
+    let mut ground_ent = commands.spawn((
+        Mesh3d(ground_mesh),
+        MeshMaterial3d(ground_mat),
         Transform::from_xyz(0.0, -0.1, 0.0),
     ));
+    #[cfg(feature = "connected")]
+    {
+        ground_ent.insert(crate::dungeon_geometry::DefaultGround);
+    }
 
     // Directional light (sun)
     commands.spawn((

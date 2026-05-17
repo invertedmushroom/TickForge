@@ -50,7 +50,9 @@ pub fn base_max_hp(kind: EntityKind) -> f32 {
         EntityKind::Boss => 500.0,
         EntityKind::Projectile => 1.0,
         EntityKind::Hazard => 1.0,
-        EntityKind::Prop => 1.0,
+        // Props (gates, switches, barrels) are indestructible
+        // they are excluded from the death-detection sweep in finalization.rs
+        EntityKind::Prop => f32::MAX,
     }
 }
 

@@ -1494,7 +1494,21 @@ fn run_f4_queue_overflow(conn: &DbConnection, r: &mut TestResults, entity_id: u6
     info!("  F4: {ok} accepted, {full} rejected as queue-full");
 
     if full >= 1 {
-        r.pass(&format!("F4  queue overflow triggered ({full}/8 rejected)"));
+        // Since we sent exactly 8 intents sequentially (0 to 7), if `full` were rejected,
+        // then `ok` intents were accepted (assuming no other failure modes).
+        // The last accepted sequence should be exactly `seq_base + 300 + ok - 1`.
+        let expected_max_seq = seq_base + 300 + ok as u64 - 1;
+        
+        let last_seq = match current_client_sequence(conn) {
+            Some(seq) => seq.last_processed_sequence,
+            None => 0,
+        };
+
+        if last_seq == expected_max_seq {
+            r.pass(&format!("F4  queue overflow triggered ({full}/8 rejected) and sequence correctly did not advance (seq={last_seq})"));
+        } else {
+            r.fail(&format!("F4  queue overflow triggered, but sequence improperly advanced to {last_seq} (expected {expected_max_seq})"));
+        }
     } else {
         r.warn_msg("F4  no overflow observed — worker may have drained between sends (not a bug)");
     }
@@ -1614,6 +1628,8 @@ fn run_f6_unauthorized_commit(conn: &DbConnection, r: &mut TestResults) {
         vec![],     // npc_state_updates
         vec![],     // director_spawns
         vec![],     // interactable_updates
+        vec![],     // death_state_inserts
+        vec![],     // sim_log_inputs
         move |_ctx, result: Result<Result<(), String>, spacetimedb_sdk::__codegen::InternalError>| {
             if let Ok(Err(e)) = &result {
                 if e.contains("trusted worker") || e.contains("unauthorized") || e.contains("rejected") {
@@ -1665,6 +1681,8 @@ fn run_f7_cursor_safety(conn: &DbConnection, r: &mut TestResults) {
         vec![],
         vec![], // director_spawns
         vec![], // interactable_updates
+        vec![], // death_state_inserts
+        vec![], // sim_log_inputs
         move |_ctx, _result| {
             d.store(true, Ordering::SeqCst);
         },

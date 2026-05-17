@@ -21,6 +21,7 @@ impl TickPipeline {
                 scheduled.source,
                 match &scheduled.action_type {
                     ScheduledActionType::AbilityFrame { action, .. } => action.label(),
+                    ScheduledActionType::ContactSpawnHitbox { .. } => "ContactSpawnHitbox",
                     ScheduledActionType::BuffExpire { .. } => "BuffExpire",
                 },
             );
@@ -31,6 +32,29 @@ impl TickPipeline {
                     ref action,
                 } => {
                     self.execute_ability_action(entity, ability_id, execution_id, action);
+                }
+                ScheduledActionType::ContactSpawnHitbox(payload) => {
+                    let ContactSpawnHitboxPayload {
+                        parent_execution_id,
+                        ability_id,
+                        shape,
+                        position,
+                        offset,
+                        effect,
+                        rules,
+                        duration_ticks,
+                    } = *payload;
+                    self.spawn_contact_hitbox(
+                        entity,
+                        parent_execution_id,
+                        ability_id,
+                        shape,
+                        position,
+                        offset,
+                        effect,
+                        rules,
+                        duration_ticks,
+                    );
                 }
                 ScheduledActionType::BuffExpire { buff_id } => {
                     self.emit_event(entity, EventPayload::BuffExpired { buff_id });
@@ -77,6 +101,193 @@ impl TickPipeline {
         }
     }
 
+    fn spawn_logical_hitbox(
+        &mut self,
+        entity: EntityId,
+        ability_id: u32,
+        execution_id: AbilityExecutionId,
+        shape: SkillShape,
+        offset: Vec3f,
+        effect_override: Option<HitEffectSpec>,
+        rules_override: Option<HitboxRules>,
+    ) {
+        let Some(ability) = self.abilities.get(ability_id) else {
+            return;
+        };
+        // Look up rewind_ticks from the execution context for this cast.
+        let rewind_ticks = self
+            .state
+            .combat
+            .executions
+            .get(execution_id)
+            .map(|ctx| ctx.rewind_ticks)
+            .unwrap_or(0);
+        // Preserve the no-override path: store `None` so combat.rs's hit
+        // resolution fast-path activates and reads scalar fields directly off
+        // `ability` (no per-hit Option<HitEffectSpec> clone, no per-spawn
+        // default_hit_effect() Vec allocations).
+        let rules = rules_override.unwrap_or_else(|| ability.default_hitbox_rules());
+
+        // Declare the hitbox logically — no Rapier sensor yet.
+        //
+        // The sensor is deferred to `ApplyDamageFrame` so that the Rapier
+        // physics step on the damage-frame tick is the first to see the
+        // collider, generating CollisionEvent::started on the correct tick.
+        self.state.combat.hitboxes.spawn_with_payload(
+            execution_id,
+            entity,
+            ability_id,
+            self.current_tick,
+            shape,
+            offset,
+            rewind_ticks,
+            effect_override,
+            rules,
+        );
+        audit!(
+            self.state,
+            Hitbox,
+            AbilityTimeline,
+            3,
+            Some(entity),
+            "spawn"
+        );
+        self.emit_event(entity, EventPayload::HitboxSpawned { ability_id });
+    }
+
+    fn spawn_contact_hitbox(
+        &mut self,
+        entity: EntityId,
+        parent_execution_id: AbilityExecutionId,
+        ability_id: u32,
+        shape: SkillShape,
+        position: Vec3f,
+        offset: Vec3f,
+        effect: HitEffectSpec,
+        rules: HitboxRules,
+        duration_ticks: u32,
+    ) {
+        let sensor_shape = skill_shape_to_sensor(shape);
+        let spawn_pos = Vec3f {
+            x: position.x + offset.x,
+            y: position.y + offset.y,
+            z: position.z + offset.z,
+        };
+        let child_execution_id = self.state.combat.executions.next_id();
+        let parent_facing = self
+            .state
+            .combat
+            .executions
+            .get(parent_execution_id)
+            .map(|ctx| ctx.facing)
+            .unwrap_or(Vec3f {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            });
+
+        self.state
+            .combat
+            .executions
+            .insert(AbilityExecutionContext {
+                execution_id: child_execution_id,
+                ability_id,
+                caster: entity,
+                started_at: self.current_tick,
+                targeting: ResolvedTargeting::Position { point: spawn_pos },
+                origin: spawn_pos,
+                facing: parent_facing,
+                params: AbilityParams::default(),
+                rewind_ticks: 0,
+            });
+
+        let handle = self.physics.spawn_world_sensor(
+            spawn_pos,
+            sensor_shape,
+            ColliderKind::Hitbox(child_execution_id.0),
+            entity,
+        );
+        self.state.combat.hitboxes.spawn_with_payload(
+            child_execution_id,
+            entity,
+            ability_id,
+            self.current_tick,
+            shape,
+            offset,
+            0,
+            Some(effect),
+            rules,
+        );
+        if self
+            .state
+            .combat
+            .hitboxes
+            .arm_at_tick(child_execution_id, handle, self.current_tick)
+        {
+            if let Some(hb) = self.state.combat.hitboxes.get_mut(child_execution_id) {
+                hb.world_sensor = true;
+            }
+            self.emit_event(entity, EventPayload::HitboxSpawned { ability_id });
+            // Dedicated, client-visible event so VFX can render a brief flash
+            // at the contact-spawn position. `HitboxSpawned` above is only used
+            // by internal pipeline listeners; it is dropped before commit.
+            let visual_radius = match sensor_shape {
+                game_core::physics_backend::SensorShape::Sphere { radius } => radius,
+                game_core::physics_backend::SensorShape::Capsule { radius, .. } => radius,
+            };
+            self.emit_event(
+                entity,
+                EventPayload::ContactHitboxSpawned {
+                    execution_id: child_execution_id.0,
+                    parent_execution_id: parent_execution_id.0,
+                    ability_id,
+                    position: spawn_pos,
+                    radius: visual_radius,
+                    duration_ticks,
+                },
+            );
+            if duration_ticks > 0 {
+                let tick_id = TickId(self.current_tick.0 + duration_ticks as u64);
+                let scheduled = ScheduledAction {
+                    id: {
+                        let id = self.next_scheduled_id;
+                        self.next_scheduled_id += 1;
+                        id
+                    },
+                    tick_id,
+                    entity,
+                    source: Some(child_execution_id),
+                    action_type: ScheduledActionType::AbilityFrame {
+                        execution_id: child_execution_id,
+                        ability_id,
+                        action: AbilityAction::RemoveHitbox,
+                    },
+                };
+                let pos = self
+                    .scheduled_actions
+                    .partition_point(|a| a.tick_id <= tick_id);
+                self.scheduled_actions.insert(pos, scheduled);
+            }
+            audit!(
+                self.state,
+                Hitbox,
+                AbilityTimeline,
+                3,
+                Some(entity),
+                "spawn_contact"
+            );
+        } else {
+            self.physics.remove_sensor(handle);
+            self.state.combat.executions.remove(child_execution_id);
+            // Symmetry with the success path: spawn_with_payload above wrote
+            // an `ActiveHitbox` into the store. If arming failed we must
+            // remove it too, otherwise the hitbox row leaks (sensor_handle
+            // = None, armed = false, never matched by force_remove_entities
+            // because we just removed the execution context).
+            self.state.combat.hitboxes.remove(child_execution_id);
+        }
+    }
+
     pub(super) fn execute_ability_action(
         &mut self,
         entity: EntityId,
@@ -86,50 +297,31 @@ impl TickPipeline {
     ) {
         match action {
             AbilityAction::SpawnHitbox { shape, offset } => {
-                // Look up rewind_ticks from the execution context for this cast.
-                let rewind_ticks = self
-                    .state
-                    .combat
-                    .executions
-                    .get(execution_id)
-                    .map(|ctx| ctx.rewind_ticks)
-                    .unwrap_or(0);
-                let allow_reentry = self.ability_prop(ability_id, |ad| ad.allow_reentry, false);
-                let damage_interval_ticks =
-                    self.ability_prop(ability_id, |ad| ad.damage_interval_ticks, 0);
-                let pierce = self.ability_prop(ability_id, |ad| ad.pierce, false);
-                let max_rewind_ticks =
-                    self.ability_prop(ability_id, |ad| ad.max_rewind_ticks, None);
-                // Declare the hitbox logically — no Rapier sensor yet.
-                //
-                // The sensor is deferred to `ApplyDamageFrame` so that the Rapier
-                // physics step on the damage-frame tick is the first to see the
-                // collider, generating CollisionEvent::started on the correct tick.
-                // Before this fix, SpawnHitbox spawned the sensor immediately, so
-                // Rapier fired contacts one tick early and damage landed on the spawn
-                // tick rather than the intended damage-frame tick.
-                self.state.combat.hitboxes.spawn(
-                    execution_id,
+                self.spawn_logical_hitbox(
                     entity,
                     ability_id,
-                    self.current_tick,
+                    execution_id,
                     *shape,
                     *offset,
-                    rewind_ticks,
-                    allow_reentry,
-                    damage_interval_ticks,
-                    pierce,
-                    max_rewind_ticks,
+                    None,
+                    None,
                 );
-                audit!(
-                    self.state,
-                    Hitbox,
-                    AbilityTimeline,
-                    3,
-                    Some(entity),
-                    "spawn"
+            }
+            AbilityAction::SpawnConfiguredHitbox {
+                shape,
+                offset,
+                effect,
+                rules,
+            } => {
+                self.spawn_logical_hitbox(
+                    entity,
+                    ability_id,
+                    execution_id,
+                    *shape,
+                    *offset,
+                    effect.as_deref().cloned(),
+                    *rules,
                 );
-                self.emit_event(entity, EventPayload::HitboxSpawned { ability_id });
             }
             AbilityAction::ApplyDamageFrame => {
                 // Fast path: MultiLockOn targeting bypasses the hitbox/sensor system.
@@ -261,7 +453,8 @@ impl TickPipeline {
 
                     if use_world_sensor {
                         let Some((targeting, origin, default_facing)) = ctx_data else {
-                            warn!(
+                            sim_warn!(
+                                self,
                                 "ApplyDamageFrame: execution context missing for exec_id={:?}, skipping world sensor",
                                 execution_id
                             );
@@ -775,7 +968,7 @@ impl TickPipeline {
                         );
                     }
                 } else {
-                    warn!("ApplyBuff: buff_id {} not found in registry", buff_id);
+                    sim_warn!(self, "ApplyBuff: buff_id {} not found in registry", buff_id);
                 }
             }
             AbilityAction::Telegraph { impact_delay } => {

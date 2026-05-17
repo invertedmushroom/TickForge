@@ -147,6 +147,16 @@ pub enum CommitCombatEventKind {
         pos_z: f32,
         radius: f32,
     },
+    ContactHitboxSpawned {
+        execution_id: u64,
+        parent_execution_id: u64,
+        ability_id: u32,
+        pos_x: f32,
+        pos_y: f32,
+        pos_z: f32,
+        radius: f32,
+        duration_ticks: u32,
+    },
     SkillObjectRemoved {
         execution_id: u64,
     },
@@ -267,6 +277,17 @@ pub struct CommitInteractableUpdate {
     pub new_state: game_core::sim_state::SimInteractState,
 }
 
+/// Authoritative `death_state` row insert produced by Phase 8b.
+#[derive(Clone, Debug)]
+pub struct CommitDeathStateInsert {
+    pub entity_id: u64,
+    pub killer_entity: Option<u64>,
+    pub layer: u32,
+    pub death_pos_x: f32,
+    pub death_pos_y: f32,
+    pub death_pos_z: f32,
+}
+
 /// Complete marshalled payload for one tick commit.
 ///
 /// Contains all vectors the `commit_tick_results` reducer expects,
@@ -299,6 +320,13 @@ pub struct CommitPackage {
     /// Zone counter increments from encounter executor / combat system.
     /// Each entry is (layer, region_x, region_z, counter_name, delta).
     pub zone_counter_deltas: Vec<(u32, i32, i32, String, f64)>,
+    /// Authoritative player-death rows. Inserted verbatim by the reducer
+    /// (no derivation from observed lifecycle transitions).
+    pub death_state_inserts: Vec<CommitDeathStateInsert>,
+    /// Simulation-pipeline diagnostic messages for this tick.
+    /// Forwarded to the `sim_log` event table via `commit_tick_results`.
+    /// Populated from `TickResult::sim_warnings`; level is always Warn (2).
+    pub sim_logs: Vec<String>,
 }
 
 /// Build a `CommitPackage` from a `TickResult` and consumed intent IDs.
@@ -430,6 +458,19 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
         })
         .collect();
 
+    let death_state_inserts = result
+        .death_state_inserts
+        .iter()
+        .map(|d| CommitDeathStateInsert {
+            entity_id: d.entity_id.0,
+            killer_entity: d.killer_entity.map(|k| k.0),
+            layer: d.layer,
+            death_pos_x: d.death_pos_x,
+            death_pos_y: d.death_pos_y,
+            death_pos_z: d.death_pos_z,
+        })
+        .collect();
+
     CommitPackage {
         tick_id,
         transforms,
@@ -446,6 +487,8 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
         interactable_updates,
         boss_phase_updates: result.boss_phase_updates,
         zone_counter_deltas: result.zone_counter_deltas,
+        death_state_inserts,
+        sim_logs: result.sim_warnings,
     }
 }
 
@@ -930,6 +973,30 @@ fn classify_events(events: &[SimEvent]) -> (Vec<CommitCombatEvent>, Vec<CommitWo
                     },
                 });
             }
+            EventPayload::ContactHitboxSpawned {
+                execution_id,
+                parent_execution_id,
+                ability_id,
+                position,
+                radius,
+                duration_ticks,
+            } => {
+                combat_events.push(CommitCombatEvent {
+                    source_entity: e.entity_id.0,
+                    target_entity: 0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CommitCombatEventKind::ContactHitboxSpawned {
+                        execution_id: *execution_id,
+                        parent_execution_id: *parent_execution_id,
+                        ability_id: *ability_id,
+                        pos_x: position.x,
+                        pos_y: position.y,
+                        pos_z: position.z,
+                        radius: *radius,
+                        duration_ticks: *duration_ticks,
+                    },
+                });
+            }
             EventPayload::SkillObjectRemoved { execution_id } => {
                 combat_events.push(CommitCombatEvent {
                     source_entity: e.entity_id.0,
@@ -1000,6 +1067,8 @@ mod tests {
             interactable_updates: Vec::new(),
             boss_phase_updates: Vec::new(),
             zone_counter_deltas: Vec::new(),
+            death_state_inserts: Vec::new(),
+            sim_warnings: Vec::new(),
         }
     }
 
@@ -1307,6 +1376,8 @@ mod tests {
             interactable_updates: Vec::new(),
             boss_phase_updates: Vec::new(),
             zone_counter_deltas: Vec::new(),
+            death_state_inserts: Vec::new(),
+            sim_warnings: Vec::new(),
         };
         let pkg = build(result, Vec::new());
 
@@ -1359,6 +1430,8 @@ mod tests {
             interactable_updates: Vec::new(),
             boss_phase_updates: Vec::new(),
             zone_counter_deltas: Vec::new(),
+            death_state_inserts: Vec::new(),
+            sim_warnings: Vec::new(),
         };
         let pkg = build(result, Vec::new());
 

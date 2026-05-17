@@ -80,7 +80,13 @@ impl TransformSnapshot {
         (value / SNAPSHOT_CELL_SIZE).floor() as i32
     }
 
-    fn new(tick: TickId, positions: Vec<(EntityId, Vec3f)>) -> Self {
+    /// Build a snapshot from a tick + (entity, position) pairs, populating the
+    /// XZ spatial bin index used by `nearby_positions`.
+    ///
+    /// Public so the live projectile pass can build an ad-hoc current-tick
+    /// snapshot for broadphase candidate filtering without inserting it into
+    /// the historical ring buffer (the buffer is owned by Phase 10).
+    pub fn new(tick: TickId, positions: Vec<(EntityId, Vec3f)>) -> Self {
         let mut spatial_bins: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
         for (index, (_, pos)) in positions.iter().enumerate() {
             let cell = (Self::cell_coord(pos.x), Self::cell_coord(pos.z));

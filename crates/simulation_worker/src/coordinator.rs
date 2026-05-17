@@ -43,10 +43,17 @@ struct CoordinatorState {
     items: game_core::stats::ItemRegistry,
     dungeons: game_core::dungeon::DungeonRegistry,
     encounters: game_core::encounter::EncounterRegistry,
+    /// Parsed `data/spawn_rules.ron` (Phase 7.5).  Consumed at on_applied to
+    /// populate open-world director events, and by the `instance` subscription
+    /// callbacks to register dungeon-scoped rules on instance creation.
+    spawn_rules: game_core::spawn_rules::SpawnRulesRegistry,
     /// Failed secondary reducer calls (boss_phase, zone_counter) that will be
     /// retried on the next successful commit. Prevents "acknowledged then
     /// forgotten" holes in progression tables.
     pending_secondary: Vec<SecondaryWrite>,
+    /// Voxel-terrain bindings, cached row→collider mapping, and the deferred
+    /// edit queue. See `TerrainState` (§4.8b Phase 5).
+    terrain: TerrainState,
 }
 
 /// If more than this many secondary writes accumulate without being delivered,
@@ -92,6 +99,8 @@ fn send_commit(reducers: &RemoteReducers, pkg: CommitPackage, state: Arc<Mutex<C
     let npc_state_updates = wire_npc_state_updates(&pkg);
     let director_spawns = wire_director_spawns(&pkg);
     let interactable_updates = wire_interactable_updates(&pkg);
+    let death_state_inserts = wire_death_state_inserts(&pkg);
+    let sim_log_entries = wire_sim_log_entries(&pkg);
     let boss_phase_updates = pkg.boss_phase_updates.clone();
     let zone_counter_deltas = pkg.zone_counter_deltas.clone();
 
@@ -111,6 +120,8 @@ fn send_commit(reducers: &RemoteReducers, pkg: CommitPackage, state: Arc<Mutex<C
         npc_state_updates,
         director_spawns,
         interactable_updates,
+        death_state_inserts,
+        sim_log_entries,
         move |rctx, outcome| {
             let reason = match &outcome {
                 Ok(Ok(())) => {
@@ -272,19 +283,53 @@ fn save_token(token: &str) {
 /// Start the coordinator loop. This blocks the current thread.
 pub fn run(config: CoordinatorConfig) {
     let tick_dt = 1.0 / 20.0; // 20 Hz — must match server TickConfig
-    let physics = PhysicsWorld::new(tick_dt);
+    let mut physics = PhysicsWorld::new(tick_dt);
     let abilities = load_abilities();
     let items = load_items();
     let buffs = load_buffs();
     let dungeons = load_dungeons();
     let encounters = load_encounters();
+    let spawn_rules = load_spawn_rules();
+
+    // Materialise named static layers (open world, hubs, …) from
+    // `data/layers.ron`. Replaces the previously-hardcoded layer-0
+    // placeholder floor in `PhysicsWorld::new` and gives every static
+    // layer the same compositional `geometry + Option<terrain_set>`
+    // shape used by `DungeonTemplate`. See docs/plan/plan.md §4.8b.
+    let world_layers = load_world_layers();
+    let mut initial_terrain_bindings: Vec<TerrainBinding> = Vec::new();
+    for layer_def in &world_layers {
+        materialize_layer(
+            &mut physics,
+            layer_def.layer_id,
+            &layer_def.geometry,
+            layer_def.terrain_set.as_deref(),
+            layer_def.collision_policy,
+        );
+        if let Some(set_name) = layer_def.terrain_set.as_deref() {
+            initial_terrain_bindings.push(TerrainBinding {
+                layer: layer_def.layer_id,
+                set_name: set_name.to_string(),
+                set_id: None,
+            });
+        }
+        info!(
+            "Static layer {} ('{}'): materialised {} geometry shape(s) (terrain_set={:?})",
+            layer_def.layer_id,
+            layer_def.name,
+            layer_def.geometry.len(),
+            layer_def.terrain_set,
+        );
+    }
 
     let state = Arc::new(Mutex::new(CoordinatorState {
-        sim: SimulationRunner::new(TickId(0), Box::new(physics), tick_dt, abilities, buffs),
+        sim: SimulationRunner::new(TickId(0), Box::new(physics), tick_dt, abilities, buffs, crate::lag_compensation::MAX_REWIND_TICKS),
         items,
         dungeons,
         encounters,
+        spawn_rules,
         pending_secondary: Vec::new(),
+        terrain: TerrainState::with_bindings(initial_terrain_bindings),
     }));
 
     let state_for_connect = Arc::clone(&state);
@@ -380,6 +425,14 @@ pub fn run(config: CoordinatorConfig) {
                 }
             };
 
+            // Drain any pending terrain edits BEFORE the tick step so a
+            // chunk swap never lands mid-step. Idle workers pay a single
+            // empty-vec branch (§4.8b Phase 5).
+            {
+                let CoordinatorState { sim, terrain, .. } = &mut *guard;
+                terrain.drain_into(sim.physics_mut());
+            }
+
             // Delegate tick orchestration to SimulationRunner.
             let result = match guard.sim.run_tick(canonical_tick, &intents) {
                 Ok(r) => r,
@@ -415,6 +468,10 @@ pub fn run(config: CoordinatorConfig) {
                 };
                 if !guard.sim.can_catch_up(canonical_tick) {
                     break;
+                }
+                {
+                    let CoordinatorState { sim, terrain, .. } = &mut *guard;
+                    terrain.drain_into(sim.physics_mut());
                 }
                 let result = match guard.sim.run_tick(canonical_tick, &[]) {
                     Ok(r) => r,
@@ -568,6 +625,18 @@ pub fn run(config: CoordinatorConfig) {
             })
             .collect();
 
+        // Resolve Y before the mutable borrow in sync_insert.
+        let spawn_pos = if matches!(
+            kind,
+            game_schema::EntityKind::Player
+                | game_schema::EntityKind::Npc
+                | game_schema::EntityKind::Boss
+        ) {
+            guard.sim.resolve_spawn_position(pos, layer)
+        } else {
+            pos
+        };
+
         EntitySync::sync_insert(
             &mut guard.sim,
             eid,
@@ -575,7 +644,7 @@ pub fn run(config: CoordinatorConfig) {
             state,
             tick,
             max_hp,
-            pos,
+            spawn_pos,
             layer,
             crate::entity_sync::RuntimeSnapshot {
                 buffs,
@@ -727,49 +796,89 @@ pub fn run(config: CoordinatorConfig) {
         if let Some(template) = guard.dungeons.get(&inst.template_id) {
             let template = template.clone();
             let layer = inst.layer;
-            for geo in &template.geometry {
-                use game_core::physics_backend::EnvironmentShape;
-                let shape = match &geo.shape {
-                    game_schema::dungeon::ShapeDef::Cuboid {
-                        half_x,
-                        half_y,
-                        half_z,
-                    } => EnvironmentShape::Cuboid {
-                        half_x: *half_x,
-                        half_y: *half_y,
-                        half_z: *half_z,
-                    },
-                    game_schema::dungeon::ShapeDef::Cylinder {
-                        half_height,
-                        radius,
-                    } => EnvironmentShape::Cylinder {
-                        half_height: *half_height,
-                        radius: *radius,
-                    },
-                };
-                let pos = game_protocol::types::Vec3f {
-                    x: geo.position[0],
-                    y: geo.position[1],
-                    z: geo.position[2],
-                };
-                guard
-                    .sim
-                    .physics_mut()
-                    .add_environment_collider_on_layer(shape, pos, layer);
-            }
+            materialize_layer(
+                guard.sim.physics_mut(),
+                layer,
+                &template.geometry,
+                template.terrain_set.as_deref(),
+                template.collision_policy,
+            );
             info!(
-                "Instance {} (template={}): spawned {} environment colliders on layer {}",
+                "Instance {} (template={}): materialised {} environment collider(s) on layer {} (terrain_set={:?})",
                 inst.instance_id,
                 inst.template_id,
                 template.geometry.len(),
-                layer
+                layer,
+                template.terrain_set,
             );
-            // Register per-layer collision policy so physics queries respect
-            // instance-specific rules (e.g. player-vs-player collision).
-            guard
-                .sim
-                .physics_mut()
-                .set_layer_policy(layer, template.collision_policy);
+            // Register terrain binding for this instance layer + enqueue
+            // every chunk currently cached for the matching set. Drain
+            // happens at the next tick boundary (§4.8b Phase 5).
+            //
+            // Note: register_binding picks up an existing set_id if any
+            // sibling layer already resolved this name; the explicit
+            // resolve_set call below is still needed for the
+            // first-binder case (no sibling has resolved yet) and is a
+            // no-op when a sibling already did.
+            if let Some(set_name) = template.terrain_set.as_deref() {
+                guard.terrain.register_binding(layer, set_name.to_string());
+                if let Some(set_row) = ctx.db.terrain_set().name().find(&set_name.to_string()) {
+                    let newly = guard.terrain.resolve_set(set_name, set_row.terrain_set_id);
+                    let chunks: Vec<_> = ctx
+                        .db
+                        .terrain_chunk()
+                        .iter()
+                        .filter(|c| c.terrain_set_id == set_row.terrain_set_id)
+                        .collect();
+                    let chunk_count = chunks.len();
+                    for c in chunks {
+                        guard.terrain.enqueue(TerrainEdit::Insert {
+                            terrain_set_id: c.terrain_set_id,
+                            row_id: c.row_id,
+                            vertices: c.vertices,
+                            indices: c.indices,
+                        });
+                    }
+                    info!(
+                        "Instance {}: terrain_set '{}' resolved to id {} ({} new layer(s) bound, \
+                         {} chunk(s) queued)",
+                        inst.instance_id,
+                        set_name,
+                        set_row.terrain_set_id,
+                        newly.len(),
+                        chunk_count,
+                    );
+                } else {
+                    info!(
+                        "Instance {}: terrain_set '{}' not yet observed — chunks will arrive via \
+                         live terrain_set/terrain_chunk callbacks",
+                        inst.instance_id, set_name,
+                    );
+                }
+            }
+
+            // Register any dungeon-scoped spawn rules for this template
+            // against the instance's layer.  Rules are cleared when the
+            // instance expires (see `on_update` Expired handler below).
+            let dungeon_events: Vec<game_core::director::DynamicEvent> = guard
+                .spawn_rules
+                .for_dungeon(&inst.template_id)
+                .filter_map(|rule| {
+                    // Dungeon-scoped rules use the instance-normalised zone
+                    // key (layer, 0, 0) — see `rule_to_dynamic_event`.
+                    game_core::spawn_rules::rule_to_dynamic_event(rule, 0, 0, layer)
+                })
+                .collect();
+            let dungeon_event_count = dungeon_events.len();
+            for ev in dungeon_events {
+                let _ = guard.sim.register_director_event(ev);
+            }
+            if dungeon_event_count > 0 {
+                info!(
+                    "Instance {} (template={}): registered {} director event(s) on layer {}",
+                    inst.instance_id, inst.template_id, dungeon_event_count, layer
+                );
+            }
         } else {
             warn!(
                 "Instance {} references unknown template '{}' — no geometry spawned",
@@ -799,9 +908,14 @@ pub fn run(config: CoordinatorConfig) {
                 .physics_mut()
                 .remove_environment_colliders_by_layer(new_inst.layer);
             guard.sim.physics_mut().remove_layer_policy(new_inst.layer);
+            let cleared = guard.sim.clear_director_for_layer(new_inst.layer);
+            // Drop any terrain binding on this layer so future edits to
+            // the same set don't try to apply to a freed layer.
+            guard.terrain.unbind_layer(new_inst.layer);
             info!(
-                "Instance {} expired: removed environment colliders from layer {}",
-                new_inst.instance_id, new_inst.layer
+                "Instance {} expired: removed environment colliders from layer {} \
+                 (cleared {} director event(s))",
+                new_inst.instance_id, new_inst.layer, cleared
             );
         });
 
@@ -825,13 +939,38 @@ pub fn run(config: CoordinatorConfig) {
     });
 
     let state_for_layer_update = Arc::clone(&state);
-    conn.db.entity_layer().on_update(move |_ctx, _old, row| {
+    conn.db.entity_layer().on_update(move |ctx, old, row| {
         let eid = EntityId(row.entity_id);
         let mut guard = match state_for_layer_update.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
         guard.sim.set_entity_layer(eid, row.layer);
+        // Reconcile physics/SimState to the new layer's authoritative
+        // spawn point. The reducer that triggered this layer change
+        // (join_instance / debug_join_instance / leave_instance) wrote a
+        // fresh entity_transform atomically; re-read it now, then
+        // raycast-snap Y via `reconcile_entity_to_position` so the body
+        // lands on the terrain that belongs to `new_layer`. Skip if the
+        // layer value did not actually change (same-value updates fire
+        // too under some subscription paths) or if the entity isn't in
+        // the sim yet (insert handler will seed it instead).
+        if old.layer == row.layer {
+            return;
+        }
+        if !guard.sim.entity_exists(eid) {
+            return;
+        }
+        if let Some(t) = ctx.db.entity_transform().entity_id().find(&row.entity_id) {
+            let advisory = game_protocol::types::Vec3f {
+                x: t.pos_x,
+                y: t.pos_y,
+                z: t.pos_z,
+            };
+            guard
+                .sim
+                .reconcile_entity_to_position(eid, advisory, row.layer);
+        }
         info!(
             "entity_layer.on_update: entity {} → layer {}",
             row.entity_id, row.layer
@@ -934,6 +1073,112 @@ pub fn run(config: CoordinatorConfig) {
             Err(poisoned) => poisoned.into_inner(),
         };
         guard.sim.remove_interactable(EntityId(row.entity_id));
+    });
+
+    // ── Voxel terrain (§4.8b Phase 5) ───────────────────────────────
+    //
+    // Three callbacks per table. The actual physics mutation is
+    // **deferred** — every callback only enqueues a `TerrainEdit`, which
+    // is drained from `pending_edits` at the start of the next tick
+    // before `run_tick` (see `sim_tick.on_insert` below). This keeps BVH
+    // rebuilds off the hot path: idle workers pay zero cost, and an
+    // edit lands at the next tick boundary instead of mid-step.
+
+    let state_for_terrain_set_insert = Arc::clone(&state);
+    conn.db.terrain_set().on_insert(move |ctx, row| {
+        let mut guard = match state_for_terrain_set_insert.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let newly_bound = guard.terrain.resolve_set(&row.name, row.terrain_set_id);
+        if newly_bound.is_empty() {
+            return;
+        }
+        // For every layer that just became hydratable, queue every cached
+        // terrain_chunk row matching this set. The drain at the next tick
+        // applies them to physics. Note we iterate the SDK cache here, not
+        // the queue — chunks may already be present (during initial
+        // SubscribeApplied) or arrive later via terrain_chunk.on_insert.
+        let chunks: Vec<_> = ctx
+            .db
+            .terrain_chunk()
+            .iter()
+            .filter(|c| c.terrain_set_id == row.terrain_set_id)
+            .collect();
+        let chunk_count = chunks.len();
+        for c in chunks {
+            guard.terrain.enqueue(TerrainEdit::Insert {
+                terrain_set_id: c.terrain_set_id,
+                row_id: c.row_id,
+                vertices: c.vertices,
+                indices: c.indices,
+            });
+        }
+        info!(
+            "terrain_set.on_insert: '{}' (id={}) → {} layer(s) bound, {} chunk(s) queued",
+            row.name,
+            row.terrain_set_id,
+            newly_bound.len(),
+            chunk_count,
+        );
+    });
+
+    let state_for_terrain_chunk_insert = Arc::clone(&state);
+    conn.db.terrain_chunk().on_insert(move |_ctx, row| {
+        let mut guard = match state_for_terrain_chunk_insert.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // Always enqueue: the drain skips chunks whose set has no bound
+        // layer yet, so an early arrival before terrain_set.on_insert
+        // would otherwise be lost. Once terrain_set resolves, that
+        // callback queues a fresh batch from the cache (which includes
+        // this row), keeping behaviour correct.
+        if guard
+            .terrain
+            .layers_for_set(row.terrain_set_id)
+            .is_empty()
+        {
+            return;
+        }
+        guard.terrain.enqueue(TerrainEdit::Insert {
+            terrain_set_id: row.terrain_set_id,
+            row_id: row.row_id,
+            vertices: row.vertices.clone(),
+            indices: row.indices.clone(),
+        });
+    });
+
+    let state_for_terrain_chunk_update = Arc::clone(&state);
+    conn.db.terrain_chunk().on_update(move |_ctx, _old, row| {
+        let mut guard = match state_for_terrain_chunk_update.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard
+            .terrain
+            .layers_for_set(row.terrain_set_id)
+            .is_empty()
+        {
+            return;
+        }
+        guard.terrain.enqueue(TerrainEdit::Update {
+            terrain_set_id: row.terrain_set_id,
+            row_id: row.row_id,
+            vertices: row.vertices.clone(),
+            indices: row.indices.clone(),
+        });
+    });
+
+    let state_for_terrain_chunk_delete = Arc::clone(&state);
+    conn.db.terrain_chunk().on_delete(move |_ctx, row| {
+        let mut guard = match state_for_terrain_chunk_delete.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.terrain.enqueue(TerrainEdit::Delete {
+            row_id: row.row_id,
+        });
     });
 
     // ── World Phase projection ──────────────────────────────────────
@@ -1094,6 +1339,7 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
             // subscription cache. This prevents historical sim_tick.on_insert callbacks
             // from replaying already-processed ticks after a worker restart.
             let max_tick = ctx.db.sim_tick().iter().map(|t| t.tick_id).max().unwrap_or(0);
+            let global_max_rewind_ticks = ctx.db.module_config().iter().next().map(|c| c.global_max_rewind_ticks).unwrap_or(crate::lag_compensation::MAX_REWIND_TICKS);
             {
                 let mut guard = match state.lock() {
                     Ok(g) => g,
@@ -1102,7 +1348,7 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
                         poisoned.into_inner()
                     }
                 };
-                guard.sim.seed(max_tick);
+                guard.sim.seed(max_tick, global_max_rewind_ticks);
 
                 // Recompute equipment modifiers for every entity that has
                 // equipment rows.  The per-row on_insert callback skips
@@ -1129,6 +1375,29 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
                 for row in ctx.db.entity_team().iter() {
                     guard.sim.set_entity_team(EntityId(row.entity_id), row.team_id);
                 }
+
+                // ── Register open-world director events from spawn rules ──
+                //
+                // Each (rx, rz, &SpawnRule) tuple yielded by the registry maps
+                // to one `DynamicEvent` registered against layer 0.  Dungeon
+                // rules are ignored here — they're registered per-instance by
+                // `instance.on_insert`.
+                let open_world: Vec<(i32, i32, game_core::director::DynamicEvent)> = guard
+                    .spawn_rules
+                    .for_open_world()
+                    .into_iter()
+                    .filter_map(|(rx, rz, rule)| {
+                        game_core::spawn_rules::rule_to_dynamic_event(rule, rx, rz, /*layer=*/ 0)
+                            .map(|ev| (rx, rz, ev))
+                    })
+                    .collect();
+                let registered = open_world.len();
+                for (_, _, ev) in open_world {
+                    let _ = guard.sim.register_director_event(ev);
+                }
+                info!(
+                    "Registered {registered} open-world director event(s) from spawn_rules.ron",
+                );
             }
             info!(
                 "Subscription applied — {} sim_tick rows, {} intent rows, {} entity rows; seeding last_processed_tick={} pipeline_start_tick={}",
@@ -1145,6 +1414,7 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
             error!("Subscription error: {err}");
         })
         .subscribe([
+            "SELECT * FROM module_config",
             "SELECT * FROM sim_tick",
             "SELECT * FROM player_intent",
             "SELECT * FROM entity",
@@ -1160,6 +1430,13 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
             "SELECT * FROM npc_config",
             "SELECT * FROM entity_team",
             "SELECT * FROM entity_layer",
+            // Terrain: full snapshot once at SubscribeApplied, then per-row
+            // deltas via on_insert/on_update/on_delete. A single chunk edit
+            // costs one row delta + one TriMesh rebuild — not a reload.
+            // Future: scope per-set (WHERE terrain_set_id IN (...)) when
+            // one DB hosts many disjoint maps.
+            "SELECT * FROM terrain_set",
+            "SELECT * FROM terrain_chunk",
         ]);
 }
 
@@ -1228,6 +1505,8 @@ fn build_ability_registry() -> AbilityRegistry {
         launch_lift: 0.0,
         launch_recovery_ticks: 0,
         usable_while_cc: false,
+        require_grounded: true,
+
         fear_ticks: 0,
         silence_ticks: 0,
         sleep_ticks: 0,
@@ -1236,6 +1515,7 @@ fn build_ability_registry() -> AbilityRegistry {
         targeting_mode: game_core::combat::skill::TargetingMode::DirectionTarget,
         cast_facing_policy: game_core::combat::skill::CastFacingPolicy::FaceAimDirection,
         lock_on_timeout_ticks: None,
+        heal_amount: 0.0,
         max_rewind_ticks: None,
         target_filter: TargetFilter::Hostile,
     });
@@ -1385,6 +1665,335 @@ fn load_dungeons() -> game_core::dungeon::DungeonRegistry {
     }
 }
 
+// ── Static-layer registry ───────────────────────────────────────
+
+/// Load named static layers (open world, hubs, persistent test rooms)
+/// from `data/layers.ron`. Falls back to an empty list if the file is
+/// missing — the worker will still run, but no static-layer floors
+/// will exist and any layer-0 entity will fall through forever (loud
+/// failure mode by design; see `PhysicsWorld::new`).
+fn load_world_layers() -> Vec<game_schema::dungeon::WorldLayerDef> {
+    use game_schema::dungeon::WorldLayersFile;
+    const PATH: &str = "data/layers.ron";
+    let result = std::fs::read_to_string(PATH)
+        .map_err(|e| format!("read '{PATH}': {e}"))
+        .and_then(|src| {
+            ron::from_str::<WorldLayersFile>(&src).map_err(|e| format!("parse '{PATH}': {e}"))
+        });
+    match result {
+        Ok(file) => {
+            let mut layers = file.layers;
+            // Reserved-range guard: dungeon instances allocate from 100+;
+            // a static layer with `layer_id >= 100` would collide with a
+            // future instance allocation. Drop it loudly rather than mix.
+            let before = layers.len();
+            layers.retain(|l| {
+                if l.layer_id >= 100 {
+                    error!(
+                        "data/layers.ron: dropping layer '{}' (layer_id={} >= 100 \
+                         conflicts with dynamic instance allocator range)",
+                        l.name, l.layer_id
+                    );
+                    false
+                } else {
+                    true
+                }
+            });
+            info!(
+                "Loaded {} world layer(s) from {PATH} ({} dropped as reserved-range conflicts)",
+                layers.len(),
+                before - layers.len(),
+            );
+            layers
+        }
+        Err(e) => {
+            warn!(
+                "Could not load {PATH} ({e}) — no static layers will be materialised; \
+                 expect entities on un-authored layers to fall forever"
+            );
+            Vec::new()
+        }
+    }
+}
+
+// ── Voxel terrain state (§4.8b Phase 5) ─────────────────────────────
+//
+// The worker treats baked `terrain_chunk` rows as immutable-during-tick
+// environment colliders. Live edits from the offline editor (rare) are
+// captured by SDK `on_insert` / `on_update` / `on_delete` callbacks and
+// queued in `pending_edits`; the queue is drained at the start of each
+// tick before `run_tick`, so a chunk swap never lands mid-step.
+//
+// Steady-state cost is zero: the queue is empty in production and the
+// drain branch is predicted away. Edit cost is bounded — one BVH
+// rebuild per edited chunk, batched if multiple edits arrive between
+// ticks.
+
+/// One pending live terrain edit, waiting to be applied at the next
+/// tick boundary.
+#[derive(Debug, Clone)]
+enum TerrainEdit {
+    /// New chunk row appeared (initial subscription snapshot OR live
+    /// `terrain_chunk_upsert` of a previously-absent chunk).
+    Insert {
+        terrain_set_id: u32,
+        row_id: u64,
+        vertices: Vec<f32>,
+        indices: Vec<u32>,
+    },
+    /// Existing row was rebaked. Old colliders for this `row_id` must
+    /// be removed first.
+    Update {
+        terrain_set_id: u32,
+        row_id: u64,
+        vertices: Vec<f32>,
+        indices: Vec<u32>,
+    },
+    /// Editor removed a chunk. Old colliders for this `row_id` are
+    /// dropped on every layer that was bound to its set.
+    Delete { row_id: u64 },
+}
+
+/// Single (layer ↔ terrain_set name) binding. `set_id` is filled in
+/// once the `terrain_set` row with that name is observed; before then
+/// the chunk callbacks have no layer to route edits to and the queue
+/// drain skips them.
+#[derive(Debug, Clone)]
+struct TerrainBinding {
+    layer: u32,
+    set_name: String,
+    set_id: Option<u32>,
+}
+
+/// Worker-side voxel-terrain state.
+#[derive(Debug, Default)]
+struct TerrainState {
+    bindings: Vec<TerrainBinding>,
+    /// `row_id` → list of `(layer, opaque_handle)` for every layer this
+    /// chunk has been applied to. A single chunk may be applied to
+    /// multiple layers when multiple bindings share a `terrain_set_id`.
+    chunk_handles: std::collections::HashMap<u64, Vec<(u32, u64)>>,
+    pending_edits: Vec<TerrainEdit>,
+}
+
+impl TerrainState {
+    fn with_bindings(bindings: Vec<TerrainBinding>) -> Self {
+        Self {
+            bindings,
+            ..Self::default()
+        }
+    }
+
+    /// Register a new (layer, set_name) binding. Called from
+    /// `materialize_layer` callers when `terrain_set` is `Some`. If a
+    /// `terrain_set` with that name has already been observed, the
+    /// `set_id` is filled in immediately.
+    fn register_binding(&mut self, layer: u32, set_name: String) {
+        let set_id = self
+            .bindings
+            .iter()
+            .find(|b| b.set_name == set_name && b.set_id.is_some())
+            .and_then(|b| b.set_id);
+        // Drop any prior binding for this layer (defensive; layer reuse
+        // across instance recreation must not double-route).
+        self.bindings.retain(|b| b.layer != layer);
+        self.bindings.push(TerrainBinding {
+            layer,
+            set_name,
+            set_id,
+        });
+    }
+
+    /// Mark every binding with `set_name` as resolved to `set_id`.
+    /// Returns the layers that newly became hydratable.
+    fn resolve_set(&mut self, set_name: &str, set_id: u32) -> Vec<u32> {
+        let mut newly = Vec::new();
+        for b in &mut self.bindings {
+            if b.set_name == set_name && b.set_id != Some(set_id) {
+                b.set_id = Some(set_id);
+                newly.push(b.layer);
+            }
+        }
+        newly
+    }
+
+    /// Drop a binding (instance expiry path). Bulk
+    /// `remove_environment_colliders_by_layer(layer)` already cleared
+    /// the colliders themselves; this just cleans the tracking map.
+    fn unbind_layer(&mut self, layer: u32) {
+        self.bindings.retain(|b| b.layer != layer);
+        for handles in self.chunk_handles.values_mut() {
+            handles.retain(|(l, _)| *l != layer);
+        }
+        self.chunk_handles.retain(|_, h| !h.is_empty());
+    }
+
+    fn layers_for_set(&self, set_id: u32) -> Vec<u32> {
+        self.bindings
+            .iter()
+            .filter(move |b| b.set_id == Some(set_id))
+            .map(|b| b.layer)
+            .collect()
+    }
+
+    fn enqueue(&mut self, edit: TerrainEdit) {
+        self.pending_edits.push(edit);
+    }
+
+    /// Apply every queued edit to `physics`. Each `Insert` / `Update` /
+    /// `Delete` becomes at most N collider operations where N is the
+    /// number of layers bound to the chunk's set. Idempotent — clearing
+    /// the queue costs zero when no edits arrived.
+    fn drain_into(&mut self, physics: &mut dyn game_core::physics_backend::PhysicsBackend) {
+        if self.pending_edits.is_empty() {
+            return;
+        }
+        let edits = std::mem::take(&mut self.pending_edits);
+        let mut applied_inserts = 0usize;
+        let mut applied_updates = 0usize;
+        let mut applied_deletes = 0usize;
+        for edit in edits {
+            match edit {
+                TerrainEdit::Insert {
+                    terrain_set_id,
+                    row_id,
+                    vertices,
+                    indices,
+                } => {
+                    if self.apply_chunk(physics, terrain_set_id, row_id, vertices, indices) {
+                        applied_inserts += 1;
+                    }
+                }
+                TerrainEdit::Update {
+                    terrain_set_id,
+                    row_id,
+                    vertices,
+                    indices,
+                } => {
+                    self.drop_chunk_colliders(physics, row_id);
+                    if self.apply_chunk(physics, terrain_set_id, row_id, vertices, indices) {
+                        applied_updates += 1;
+                    }
+                }
+                TerrainEdit::Delete { row_id } => {
+                    if self.chunk_handles.contains_key(&row_id) {
+                        self.drop_chunk_colliders(physics, row_id);
+                        applied_deletes += 1;
+                    }
+                }
+            }
+        }
+        if applied_inserts + applied_updates + applied_deletes > 0 {
+            info!(
+                "TerrainState: applied {applied_inserts} insert(s), {applied_updates} update(s), \
+                 {applied_deletes} delete(s) at tick boundary"
+            );
+        }
+    }
+
+    /// Returns `true` if the chunk was applied to at least one layer.
+    fn apply_chunk(
+        &mut self,
+        physics: &mut dyn game_core::physics_backend::PhysicsBackend,
+        terrain_set_id: u32,
+        row_id: u64,
+        vertices: Vec<f32>,
+        indices: Vec<u32>,
+    ) -> bool {
+        let layers = self.layers_for_set(terrain_set_id);
+        if layers.is_empty() {
+            return false;
+        }
+        // `TerrainEdit::Update` already cleared old handles; for `Insert`
+        // there should be none. Defensive cleanup keeps the map tidy if
+        // the editor double-inserts the same row.
+        self.drop_chunk_colliders(physics, row_id);
+
+        let mut new_handles = Vec::with_capacity(layers.len());
+        for layer in layers {
+            let shape = game_core::physics_backend::EnvironmentShape::TriMesh {
+                vertices: vertices.clone(),
+                indices: indices.clone(),
+            };
+            let opaque = physics.add_environment_collider_on_layer(
+                shape,
+                game_protocol::types::Vec3f::new(0.0, 0.0, 0.0),
+                layer,
+            );
+            new_handles.push((layer, opaque));
+        }
+        self.chunk_handles.insert(row_id, new_handles);
+        true
+    }
+
+    fn drop_chunk_colliders(
+        &mut self,
+        physics: &mut dyn game_core::physics_backend::PhysicsBackend,
+        row_id: u64,
+    ) {
+        if let Some(handles) = self.chunk_handles.remove(&row_id) {
+            for (_layer, opaque) in handles {
+                physics.remove_environment_collider(opaque);
+            }
+        }
+    }
+}
+
+/// Materialise environment colliders + collision policy for a layer.
+///
+/// Used by both worker startup (for each `WorldLayerDef`) and instance
+/// creation (for each `DungeonTemplate`). Composes:
+///
+/// 1. Any pre-existing environment colliders on `layer` are removed
+///    first so this call is idempotent. In particular, the layer-0
+///    placeholder floor stamped by `PhysicsWorld::new` is replaced by
+///    the authored `WorldLayerDef::geometry` when one exists.
+/// 2. Hand-authored `geometry` — every `GeometryDef` becomes one
+///    parentless environment collider stamped with `layer`.
+/// 3. **Baked terrain binding** — when `terrain_set` is `Some`, the layer
+///    is registered with `terrain` so that:
+///      - any chunks already cached locally are hydrated immediately
+///        (live path: instance creation after subscription is up), and
+///      - any chunks arriving later are routed to this layer via the
+///        `terrain_chunk.on_*` callbacks (covers initial subscription
+///        and live editor edits both).
+///    The collider rebuild itself happens through the deferred edit
+///    queue (see `TerrainState::pending_edits`), draining at the start
+///    of each tick. This keeps mid-tick BVH rebuilds out of the hot
+///    path (see `docs/plan/plan.md` §4.8b, Phase 5).
+/// 4. The layer's `LayerCollisionPolicy`, registered last so policy
+///    queries during the materialisation itself never observe a
+///    half-built layer.
+/// 4. The layer's `LayerCollisionPolicy`, registered last so policy
+///    queries during the materialisation itself never observe a
+///    half-built layer.
+fn materialize_layer(
+    physics: &mut dyn game_core::physics_backend::PhysicsBackend,
+    layer: u32,
+    geometry: &[game_schema::dungeon::GeometryDef],
+    terrain_set: Option<&str>,
+    policy: game_schema::dungeon::LayerCollisionPolicy,
+) {
+    physics.remove_environment_colliders_by_layer(layer);
+    for geo in geometry {
+        let shape = game_core::dungeon::shape_def_to_environment(&geo.shape);
+        let pos = game_protocol::types::Vec3f {
+            x: geo.position[0],
+            y: geo.position[1],
+            z: geo.position[2],
+        };
+        physics.add_environment_collider_on_layer(shape, pos, layer);
+    }
+    // Terrain hydration is owned by the caller via `TerrainState`: the
+    // (layer, terrain_set name) binding is recorded there and chunks are
+    // applied through the deferred edit queue (see §4.8b Phase 5). We
+    // keep the parameter so this signature is uniform across both call
+    // sites (`run()` startup loop and `Instance::on_insert`) and so the
+    // intent is visible at the call site.
+    let _ = terrain_set;
+    physics.set_layer_policy(layer, policy);
+}
+
 /// Load encounter definitions from `data/encounters.ron`.
 fn load_encounters() -> game_core::encounter::EncounterRegistry {
     use game_core::encounter::{EncounterFile, EncounterRegistry};
@@ -1407,6 +2016,29 @@ fn load_encounters() -> game_core::encounter::EncounterRegistry {
         Err(e) => {
             warn!("Could not load {PATH} ({e}) — using empty encounter registry");
             EncounterRegistry::new()
+        }
+    }
+}
+
+// ── Spawn-rules registry ────────────────────────────────────────
+
+/// Load `data/spawn_rules.ron` (Phase 7.5).  Falls back to empty.
+fn load_spawn_rules() -> game_core::spawn_rules::SpawnRulesRegistry {
+    use game_core::spawn_rules::SpawnRulesRegistry;
+    const PATH: &str = "data/spawn_rules.ron";
+    let result = std::fs::read_to_string(PATH)
+        .map_err(|e| format!("read '{PATH}': {e}"))
+        .and_then(|src| {
+            SpawnRulesRegistry::from_ron(&src).map_err(|e| format!("parse '{PATH}': {e}"))
+        });
+    match result {
+        Ok(reg) => {
+            info!("Loaded {} spawn rule(s) from {PATH}", reg.len());
+            reg
+        }
+        Err(e) => {
+            warn!("Could not load {PATH} ({e}) — using empty spawn-rules registry");
+            SpawnRulesRegistry::new()
         }
     }
 }
@@ -1724,6 +2356,25 @@ fn wire_combat_event(e: &CommitCombatEvent) -> CombatEventInput {
                 pos_z: *pos_z,
                 radius: *radius,
             }),
+            CommitCombatEventKind::ContactHitboxSpawned {
+                execution_id,
+                parent_execution_id,
+                ability_id,
+                pos_x,
+                pos_y,
+                pos_z,
+                radius,
+                duration_ticks,
+            } => CombatEventKind::ContactHitboxSpawned(ContactHitboxSpawnedData {
+                execution_id: *execution_id,
+                parent_execution_id: *parent_execution_id,
+                ability_id: *ability_id,
+                pos_x: *pos_x,
+                pos_y: *pos_y,
+                pos_z: *pos_z,
+                radius: *radius,
+                duration_ticks: *duration_ticks,
+            }),
             CommitCombatEventKind::SkillObjectRemoved { execution_id } => {
                 CombatEventKind::SkillObjectRemoved(*execution_id)
             }
@@ -1901,6 +2552,31 @@ fn convert_entity_kind_to_wire(
     }
 }
 
+fn wire_death_state_inserts(pkg: &CommitPackage) -> Vec<DeathStateInsertInput> {
+    pkg.death_state_inserts
+        .iter()
+        .map(|d| DeathStateInsertInput {
+            entity_id: d.entity_id,
+            killer_entity: d.killer_entity,
+            layer: d.layer,
+            death_pos_x: d.death_pos_x,
+            death_pos_y: d.death_pos_y,
+            death_pos_z: d.death_pos_z,
+        })
+        .collect()
+}
+
+/// Convert pipeline sim_warnings into `SimLogInput` wire entries (level=Warn).
+fn wire_sim_log_entries(pkg: &CommitPackage) -> Vec<SimLogInput> {
+    pkg.sim_logs
+        .iter()
+        .map(|msg| SimLogInput {
+            level: 2, // Warn
+            message: msg.clone(),
+        })
+        .collect()
+}
+
 fn wire_interactable_updates(pkg: &CommitPackage) -> Vec<InteractableUpdate> {
     pkg.interactable_updates
         .iter()
@@ -1957,6 +2633,113 @@ fn wire_cc_effect(cc: game_schema::CCEffect) -> CcEffect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terrain_state_register_resolve_unbind_roundtrip() {
+        let mut t = TerrainState::default();
+        t.register_binding(100, "alpha".into());
+        t.register_binding(101, "alpha".into());
+        t.register_binding(102, "beta".into());
+        // Before resolve, no set_id is bound.
+        assert!(t.layers_for_set(7).is_empty());
+
+        let newly = t.resolve_set("alpha", 7);
+        assert_eq!(newly.len(), 2);
+        let mut layers = t.layers_for_set(7);
+        layers.sort();
+        assert_eq!(layers, vec![100, 101]);
+        assert!(t.layers_for_set(8).is_empty());
+
+        // Re-resolving with the same id is a no-op (no double-counting).
+        let newly2 = t.resolve_set("alpha", 7);
+        assert!(newly2.is_empty());
+
+        // A subsequent register_binding on a resolved set name picks up
+        // the existing set_id immediately.
+        t.register_binding(103, "alpha".into());
+        let mut layers = t.layers_for_set(7);
+        layers.sort();
+        assert_eq!(layers, vec![100, 101, 103]);
+
+        t.unbind_layer(101);
+        let mut layers = t.layers_for_set(7);
+        layers.sort();
+        assert_eq!(layers, vec![100, 103]);
+    }
+
+    #[test]
+    fn terrain_state_drain_empty_is_noop() {
+        let mut t = TerrainState::default();
+        let mut physics = crate::physics::rapier_world::PhysicsWorld::new(0.05);
+        // Should not touch physics or panic.
+        t.drain_into(&mut physics);
+        assert!(t.pending_edits.is_empty());
+        assert!(t.chunk_handles.is_empty());
+    }
+
+    #[test]
+    fn terrain_state_drain_skips_unbound_set() {
+        let mut t = TerrainState::default();
+        let mut physics = crate::physics::rapier_world::PhysicsWorld::new(0.05);
+        t.enqueue(TerrainEdit::Insert {
+            terrain_set_id: 99,
+            row_id: 1,
+            vertices: vec![0.0; 9],
+            indices: vec![0, 1, 2],
+        });
+        t.drain_into(&mut physics);
+        // No binding -> chunk is dropped without recording a handle.
+        assert!(t.chunk_handles.is_empty());
+        assert!(t.pending_edits.is_empty());
+    }
+
+    #[test]
+    fn terrain_state_apply_then_delete_swaps_chunk_per_layer() {
+        use game_core::physics_backend::PhysicsBackend;
+
+        let mut t = TerrainState::default();
+        t.register_binding(200, "x".into());
+        t.register_binding(201, "x".into());
+        t.resolve_set("x", 42);
+
+        let mut physics = crate::physics::rapier_world::PhysicsWorld::new(0.05);
+        // Single triangle in the XZ plane.
+        let verts = vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let idx = vec![0u32, 1, 2];
+
+        t.enqueue(TerrainEdit::Insert {
+            terrain_set_id: 42,
+            row_id: 7,
+            vertices: verts.clone(),
+            indices: idx.clone(),
+        });
+        t.drain_into(&mut physics);
+        assert_eq!(t.chunk_handles.get(&7).map(|v| v.len()), Some(2));
+
+        // Update replaces handles for the same row.
+        t.enqueue(TerrainEdit::Update {
+            terrain_set_id: 42,
+            row_id: 7,
+            vertices: verts,
+            indices: idx,
+        });
+        t.drain_into(&mut physics);
+        assert_eq!(t.chunk_handles.get(&7).map(|v| v.len()), Some(2));
+
+        // Delete drops the row entirely.
+        t.enqueue(TerrainEdit::Delete { row_id: 7 });
+        t.drain_into(&mut physics);
+        assert!(!t.chunk_handles.contains_key(&7));
+
+        // Layer unbind drops the binding and clears the (now empty) map.
+        t.unbind_layer(200);
+        t.unbind_layer(201);
+        // Removing a layer should also clear environment colliders via
+        // the worker's bulk path; here we just check our tracking.
+        assert!(t.bindings.is_empty());
+        // Sanity: physics isn't broken.
+        let _ = physics.as_any();
+    }
 
     #[test]
     fn convert_intent_action_preserves_target_hint() {
@@ -2020,7 +2803,7 @@ mod tests {
     }
 
     #[test]
-    fn load_abilities_parses_backstab_as_entity_target() {
+    fn load_abilities_parses_backstab_as_raycast_strict() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
@@ -2038,7 +2821,117 @@ mod tests {
 
         assert_eq!(
             backstab.targeting_mode,
-            game_core::combat::skill::TargetingMode::EntityTarget
+            game_core::combat::skill::TargetingMode::RaycastStrict
         );
+    }
+
+    #[test]
+    fn materialize_layer_replaces_existing_geometry() {
+        use game_core::physics_backend::PhysicsBackend;
+        use game_schema::dungeon::{GeometryDef, LayerCollisionPolicy, ShapeDef};
+
+        // PhysicsWorld::new stamps a placeholder cuboid floor on layer 0
+        // (top at y≈0.1). Materialising an authored layer 0 must REPLACE
+        // the placeholder, not stack on top of it.
+        //
+        // Verification via public API: author a floor at y=-20 (below the
+        // placeholder). A downward ray from y=50 must hit y≈-20 (top of
+        // authored floor). If the placeholder were still present, the ray
+        // would hit y≈0.1 first.
+        let mut world = PhysicsWorld::new(1.0 / 60.0);
+        let geometry = vec![GeometryDef {
+            shape: ShapeDef::Cuboid {
+                half_x: 50.0,
+                half_y: 0.5,
+                half_z: 50.0,
+            },
+            position: [0.0, -20.0, 0.0],
+        }];
+        materialize_layer(
+            &mut world,
+            0,
+            &geometry,
+            None,
+            LayerCollisionPolicy::default(),
+        );
+        world.step();
+
+        let hit = world
+            .raycast_surface(
+                game_protocol::types::Vec3f::new(0.0, 50.0, 0.0),
+                game_protocol::types::Vec3f::new(0.0, -1.0, 0.0),
+                200.0,
+                0,
+            )
+            .expect("authored layer-0 floor must be hit");
+        // Top of authored cuboid is y = -20 + 0.5 = -19.5.
+        assert!(
+            (hit.y - (-19.5)).abs() < 0.2,
+            "expected y≈-19.5 (authored floor), got y={} (placeholder not replaced?)",
+            hit.y
+        );
+    }
+
+    #[test]
+    fn materialize_layer_combines_authored_geometry_and_terrain_set_request() {
+        use game_core::physics_backend::PhysicsBackend;
+        use game_schema::dungeon::{GeometryDef, LayerCollisionPolicy, ShapeDef};
+
+        // Hand-authored geometry alongside a terrain_set reference.
+        // The terrain_set hookup is a no-op until §4.8b Phase 1+5 lands,
+        // but the authored geometry must still materialise on the layer.
+        let mut world = PhysicsWorld::new(1.0 / 60.0);
+        let geometry = vec![GeometryDef {
+            shape: ShapeDef::Cuboid {
+                half_x: 5.0,
+                half_y: 0.5,
+                half_z: 5.0,
+            },
+            position: [0.0, 5.0, 0.0],
+        }];
+        materialize_layer(
+            &mut world,
+            42,
+            &geometry,
+            Some("future_terrain_set"),
+            LayerCollisionPolicy::default(),
+        );
+        world.step();
+
+        // Layer-42 caster sees the authored floor (top at y=5.5).
+        let hit = world
+            .raycast_surface(
+                game_protocol::types::Vec3f::new(0.0, 20.0, 0.0),
+                game_protocol::types::Vec3f::new(0.0, -1.0, 0.0),
+                100.0,
+                42,
+            )
+            .expect("authored geometry must materialise even when terrain_set is requested");
+        assert!(
+            (hit.y - 5.5).abs() < 0.2,
+            "expected authored floor at y≈5.5, got {}",
+            hit.y
+        );
+    }
+
+    #[test]
+    fn shipped_layers_ron_parses() {
+        use game_schema::dungeon::WorldLayersFile;
+        let src = include_str!("../../../data/layers.ron");
+        let file: WorldLayersFile =
+            ron::from_str(src).expect("data/layers.ron must be valid RON");
+        assert!(
+            !file.layers.is_empty(),
+            "shipped layers.ron should declare at least one static layer"
+        );
+        for l in &file.layers {
+            assert!(
+                l.layer_id < 100,
+                "static layer '{}' has reserved-range conflict (layer_id={} >= 100)",
+                l.name,
+                l.layer_id
+            );
+            assert!(!l.name.is_empty(), "layer name must not be empty");
+        }
     }
 }

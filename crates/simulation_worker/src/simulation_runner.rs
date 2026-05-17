@@ -37,9 +37,10 @@ impl SimulationRunner {
         dt: f32,
         abilities: AbilityRegistry,
         buff_registry: game_core::combat::status::BuffRegistry,
+        global_max_rewind_ticks: u32,
     ) -> Self {
         Self {
-            pipeline: TickPipeline::new(start_tick, physics, dt, abilities, buff_registry),
+            pipeline: TickPipeline::new(start_tick, physics, dt, abilities, buff_registry, global_max_rewind_ticks),
             commit: CommitAuthority::new(),
             tick_driver: TickDriver::new(),
             pending_stat_recalcs: HashSet::new(),
@@ -88,10 +89,11 @@ impl SimulationRunner {
 
     /// Seed the commit cursor and pipeline tick counter from a
     /// subscription snapshot.  Called once during `on_applied`.
-    pub fn seed(&mut self, max_committed_tick: u64) {
+    pub fn seed(&mut self, max_committed_tick: u64, global_max_rewind_ticks: u32) {
         self.commit.seed(max_committed_tick);
         self.pipeline
             .set_current_tick(TickId(max_committed_tick + 1));
+        self.pipeline.set_global_max_rewind_ticks(global_max_rewind_ticks);
     }
 
     /// Record a successful commit acknowledgement.
@@ -226,6 +228,118 @@ impl SimulationRunner {
         self.pipeline.physics.set_entity_layer(id, layer);
     }
 
+    /// Reposition an entity after a layer change or boundary event.
+    ///
+    /// `advisory` is the position a reducer just wrote to DB
+    /// (typically `DungeonTemplate.spawn_point`). This resolves the
+    /// authoritative Y by raycasting down against terrain on `new_layer`
+    /// via `raycast_surface`; if the ray hits, the character center snaps
+    /// to `hit.y + CAPSULE_HALF_HEIGHT + CAPSULE_RADIUS` so the capsule
+    /// rests on the surface. If nothing is hit (hole in terrain, off the
+    /// heightfield) the advisory Y is used unchanged.
+    ///
+    /// Callers must have already updated the entity's layer via
+    /// `set_entity_layer` so the raycast filter sees the correct
+    /// terrain. The physics body is teleported; no contact resolution.
+    pub fn reconcile_entity_to_position(
+        &mut self,
+        id: EntityId,
+        advisory: Vec3f,
+        new_layer: u32,
+    ) -> bool {
+        let resolved = self.resolve_spawn_position(advisory, new_layer);
+        self.pipeline.physics.teleport_entity(id, resolved)
+    }
+
+    /// Compute the authoritative ground-snapped position for `advisory` on
+    /// `layer`. Exposed separately so `entity.on_insert` can resolve Y
+    /// before the entity is spawned into physics.
+    ///
+    /// Currently assumes the standard character capsule
+    /// (`CAPSULE_HALF_HEIGHT` + `CAPSULE_RADIUS`). When per-kind collider
+    /// sizes are introduced (e.g. distinct boss capsules), callers must
+    /// switch to a variant that takes the capsule dimensions, or the
+    /// spawn Y will embed larger bodies into the terrain by the size
+    /// difference and force the KCC to push them out on first tick.
+    pub fn resolve_spawn_position(&self, advisory: Vec3f, layer: u32) -> Vec3f {
+        self.resolve_spawn_position_with_capsule(
+            advisory,
+            layer,
+            game_core::physics_constants::CAPSULE_HALF_HEIGHT,
+            game_core::physics_constants::CAPSULE_RADIUS,
+        )
+    }
+
+    /// Variant of [`Self::resolve_spawn_position`] that takes explicit
+    /// capsule dimensions. Use this once per-kind collider sizes diverge
+    /// from the standard character capsule.
+    pub fn resolve_spawn_position_with_capsule(
+        &self,
+        advisory: Vec3f,
+        layer: u32,
+        capsule_half_height: f32,
+        capsule_radius: f32,
+    ) -> Vec3f {
+        /// Lift the ray origin well above the tallest expected terrain to
+        /// guarantee we're outside any volume before casting down.
+        const SKY_LIFT: f32 = 200.0;
+        const MAX_DROP: f32 = 400.0;
+        /// Probe distance for the cave-detection upward cast. A ceiling
+        /// within this range above `advisory` indicates the spawn point is
+        /// inside an enclosed volume; we then cast down from `advisory`
+        /// itself instead of the sky to bypass that ceiling.
+        const CEILING_PROBE: f32 = 50.0;
+
+        let down = Vec3f {
+            x: 0.0,
+            y: -1.0,
+            z: 0.0,
+        };
+        let up = Vec3f {
+            x: 0.0,
+            y: 1.0,
+            z: 0.0,
+        };
+
+        // Cave-aware origin selection (§4.8b Phase 6).
+        //
+        // The naive "lift to sky, cast down" snaps to the first surface
+        // below the sky — which is the *cave ceiling* when `advisory` is
+        // inside a cave. Probe upward from `advisory` first: if we hit a
+        // surface within `CEILING_PROBE`, treat `advisory` as inside an
+        // enclosed volume and cast down from `advisory` (bypassing the
+        // ceiling). Otherwise fall back to the sky cast, which is more
+        // forgiving to imprecise authored spawn-point Ys on open terrain.
+        let inside_cave = self
+            .pipeline
+            .physics
+            .raycast_surface(advisory, up, CEILING_PROBE, layer)
+            .is_some();
+
+        let ray_origin = if inside_cave {
+            advisory
+        } else {
+            Vec3f {
+                x: advisory.x,
+                y: advisory.y + SKY_LIFT,
+                z: advisory.z,
+            }
+        };
+
+        match self
+            .pipeline
+            .physics
+            .raycast_surface(ray_origin, down, MAX_DROP, layer)
+        {
+            Some(hit) => Vec3f {
+                x: advisory.x,
+                y: hit.y + capsule_half_height + capsule_radius,
+                z: advisory.z,
+            },
+            None => advisory,
+        }
+    }
+
     /// Update an entity's team membership in the dense cache.
     pub fn set_entity_team(&mut self, id: EntityId, team_id: u32) {
         if let Some(idx) = self.pipeline.state.entities.lookup(id) {
@@ -296,6 +410,27 @@ impl SimulationRunner {
     ) {
         self.pipeline.encounters.insert(boss_entity, encounter);
     }
+
+    // ── Director management ────────────────────────────────────────
+
+    /// Register a dynamic world event with the Director (Phase 7.5).
+    ///
+    /// Used by the coordinator at startup to wire open-world spawn rules,
+    /// and by `instance.on_insert` to register dungeon-scoped rules.
+    pub fn register_director_event(
+        &mut self,
+        def: game_core::director::DynamicEvent,
+    ) -> game_core::director::EventId {
+        self.pipeline.director_mut().register_event(def)
+    }
+
+    /// Bulk-remove all director events bound to a visibility layer.
+    ///
+    /// Called when a dungeon instance expires so stale triggers on the
+    /// recycled layer cannot fire.  Returns the number of events removed.
+    pub fn clear_director_for_layer(&mut self, layer: u32) -> usize {
+        self.pipeline.director_mut().clear_for_layer(layer)
+    }
 }
 
 #[cfg(test)]
@@ -332,6 +467,8 @@ mod tests {
             launch_lift: 0.0,
             launch_recovery_ticks: 0,
             usable_while_cc: false,
+            require_grounded: true,
+            heal_amount: 0.0,
             fear_ticks: 0,
             silence_ticks: 0,
             sleep_ticks: 0,
@@ -491,6 +628,7 @@ mod tests {
             0.05,
             test_registry(),
             game_core::combat::status::BuffRegistry::new(),
+            crate::lag_compensation::MAX_REWIND_TICKS,
         )
     }
 
@@ -520,7 +658,7 @@ mod tests {
     #[test]
     fn seed_aligns_commit_and_pipeline() {
         let mut runner = make_runner();
-        runner.seed(50);
+        runner.seed(50, 4);
 
         // Ticks up to 50 are already committed.
         let result = runner.run_tick(50, &[]);
@@ -644,5 +782,200 @@ mod tests {
         let third = runner.run_tick(4, &intents).unwrap();
         assert_eq!(third.tick_id, TickId(3));
         assert_eq!(third.summary.intents_processed, 1);
+    }
+
+    /// Phase 2c coverage: `resolve_spawn_position` must raycast-snap the
+    /// capsule center to `surface_y + CAPSULE_HALF_HEIGHT + CAPSULE_RADIUS`
+    /// on the requested layer's terrain, replacing whatever Y the reducer
+    /// advisory carried.
+    #[test]
+    fn resolve_spawn_position_snaps_y_to_heightfield() {
+        use crate::physics::rapier_world::PhysicsWorld;
+        use game_core::physics_backend::{EnvironmentShape, PhysicsBackend};
+        use game_core::physics_constants::{CAPSULE_HALF_HEIGHT, CAPSULE_RADIUS};
+
+        let mut world = PhysicsWorld::new(1.0 / 60.0);
+        // Flat heightfield at y=2.0 on the shared layer (0).
+        world.add_environment_collider_on_layer(
+            EnvironmentShape::Heightfield {
+                nrows: 3,
+                ncols: 3,
+                scale_x: 10.0,
+                scale_y: 1.0,
+                scale_z: 10.0,
+                heights: vec![2.0_f32; 9],
+            },
+            game_protocol::types::Vec3f::new(0.0, 0.0, 0.0),
+            0,
+        );
+        world.step();
+
+        let runner = SimulationRunner::new(
+            TickId(1),
+            Box::new(world),
+            1.0 / 60.0,
+            test_registry(),
+            game_core::combat::status::BuffRegistry::new(),
+            crate::lag_compensation::MAX_REWIND_TICKS,
+        );
+
+        // Advisory Y is garbage (50 m in the air): should be replaced by
+        // terrain surface + capsule offset.
+        let advisory = Vec3f {
+            x: 0.5,
+            y: 50.0,
+            z: -1.0,
+        };
+        let resolved = runner.resolve_spawn_position(advisory, 0);
+        let expected_y = 2.0 + CAPSULE_HALF_HEIGHT + CAPSULE_RADIUS;
+        assert!(
+            (resolved.y - expected_y).abs() < 0.1,
+            "resolved y={} want≈{}",
+            resolved.y,
+            expected_y
+        );
+        // XZ passes through unchanged.
+        assert_eq!(resolved.x, advisory.x);
+        assert_eq!(resolved.z, advisory.z);
+    }
+
+    /// If the raycast misses (no terrain on `layer`), the advisory
+    /// position must be returned verbatim so the reducer's hint is the
+    /// authoritative fallback.
+    #[test]
+    fn resolve_spawn_position_passthrough_on_miss() {
+        use crate::physics::rapier_world::PhysicsWorld;
+
+        let mut world = PhysicsWorld::new(1.0 / 60.0);
+        world.step();
+
+        let runner = SimulationRunner::new(
+            TickId(1),
+            Box::new(world),
+            1.0 / 60.0,
+            test_registry(),
+            game_core::combat::status::BuffRegistry::new(),
+            crate::lag_compensation::MAX_REWIND_TICKS,
+        );
+
+        // No heightfield authored on layer 99: with strict same-layer
+        // queries, the downward raycast cannot see the layer-0 placeholder
+        // floor, so it misses regardless of XZ. XZ is kept at extreme
+        // values for legacy parity with the prior shared-plane test.
+        let advisory = Vec3f {
+            x: 10_000.0,
+            y: 7.5,
+            z: -10_000.0,
+        };
+        let resolved = runner.resolve_spawn_position(advisory, 99);
+        assert_eq!(resolved.x, advisory.x);
+        assert_eq!(resolved.y, advisory.y);
+        assert_eq!(resolved.z, advisory.z);
+    }
+
+    /// §4.8b Phase 6: a spawn point inside a cave (advisory below a
+    /// ceiling) must snap to the cave floor, not the ceiling above it.
+    /// The naive sky-down cast hit the ceiling first; the cave-aware
+    /// path probes upward, detects the ceiling, and casts down from
+    /// `advisory` itself instead.
+    #[test]
+    fn resolve_spawn_position_snaps_to_cave_floor_not_ceiling() {
+        use crate::physics::rapier_world::PhysicsWorld;
+        use game_core::physics_backend::{EnvironmentShape, PhysicsBackend};
+        use game_core::physics_constants::{CAPSULE_HALF_HEIGHT, CAPSULE_RADIUS};
+
+        let mut world = PhysicsWorld::new(1.0 / 60.0);
+        // Cave floor at y=0 (cuboid top surface at y=0).
+        world.add_environment_collider_on_layer(
+            EnvironmentShape::Cuboid {
+                half_x: 50.0,
+                half_y: 0.5,
+                half_z: 50.0,
+            },
+            Vec3f::new(0.0, -0.5, 0.0),
+            5,
+        );
+        // Cave ceiling at y=10 (cuboid bottom surface at y=10).
+        world.add_environment_collider_on_layer(
+            EnvironmentShape::Cuboid {
+                half_x: 50.0,
+                half_y: 0.5,
+                half_z: 50.0,
+            },
+            Vec3f::new(0.0, 10.5, 0.0),
+            5,
+        );
+        world.step();
+
+        let runner = SimulationRunner::new(
+            TickId(1),
+            Box::new(world),
+            1.0 / 60.0,
+            test_registry(),
+            game_core::combat::status::BuffRegistry::new(),
+            crate::lag_compensation::MAX_REWIND_TICKS,
+        );
+
+        // Advisory inside the cave: y=5 (between floor=0 and ceiling=10).
+        let advisory = Vec3f {
+            x: 1.0,
+            y: 5.0,
+            z: 2.0,
+        };
+        let resolved = runner.resolve_spawn_position(advisory, 5);
+        let expected_y = 0.0 + CAPSULE_HALF_HEIGHT + CAPSULE_RADIUS;
+        assert!(
+            (resolved.y - expected_y).abs() < 0.1,
+            "cave spawn snapped to ceiling instead of floor: y={} want≈{}",
+            resolved.y,
+            expected_y
+        );
+    }
+
+    /// §4.8b Phase 6: open-terrain spawns still benefit from sky-cast
+    /// robustness — an advisory placed 100 m above the surface still
+    /// snaps correctly because no ceiling is detected above it.
+    #[test]
+    fn resolve_spawn_position_snaps_open_terrain_from_far_above() {
+        use crate::physics::rapier_world::PhysicsWorld;
+        use game_core::physics_backend::{EnvironmentShape, PhysicsBackend};
+        use game_core::physics_constants::{CAPSULE_HALF_HEIGHT, CAPSULE_RADIUS};
+
+        let mut world = PhysicsWorld::new(1.0 / 60.0);
+        // Single ground cuboid, no ceiling above.
+        world.add_environment_collider_on_layer(
+            EnvironmentShape::Cuboid {
+                half_x: 50.0,
+                half_y: 0.5,
+                half_z: 50.0,
+            },
+            Vec3f::new(0.0, -0.5, 0.0),
+            6,
+        );
+        world.step();
+
+        let runner = SimulationRunner::new(
+            TickId(1),
+            Box::new(world),
+            1.0 / 60.0,
+            test_registry(),
+            game_core::combat::status::BuffRegistry::new(),
+            crate::lag_compensation::MAX_REWIND_TICKS,
+        );
+
+        // Advisory miles above terrain — sky-cast must still find ground.
+        let advisory = Vec3f {
+            x: 0.0,
+            y: 150.0,
+            z: 0.0,
+        };
+        let resolved = runner.resolve_spawn_position(advisory, 6);
+        let expected_y = 0.0 + CAPSULE_HALF_HEIGHT + CAPSULE_RADIUS;
+        assert!(
+            (resolved.y - expected_y).abs() < 0.1,
+            "open-terrain spawn failed to snap from far above: y={} want≈{}",
+            resolved.y,
+            expected_y
+        );
     }
 }

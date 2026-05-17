@@ -373,6 +373,7 @@ mod tests {
             0.05,
             AbilityRegistry::new(),
             game_core::combat::status::BuffRegistry::new(),
+            crate::lag_compensation::MAX_REWIND_TICKS,
         )
     }
 

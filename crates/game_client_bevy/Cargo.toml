@@ -18,7 +18,7 @@ game_core = { workspace = true }
 game_schema = { workspace = true }
 ron = { workspace = true }
 spacetimedb-sdk = { workspace = true, optional = true }
-bevy = "0.15"
+bevy = { version = "0.15", features = ["jpeg"] }
 log = { workspace = true }
 env_logger = { workspace = true }
 crossbeam-channel = "0.5"

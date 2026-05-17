@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use game_protocol::entity_id::EntityId;
 use game_protocol::tick::TickId;
 use game_schema::EntityKind;
+use game_schema::spawn::SpawnScaling;
 use serde::{Deserialize, Serialize};
 
 /// Width of a spatial grid cell in world units — must match `tick_pipeline::CELL_SIZE`.
@@ -102,6 +103,12 @@ pub struct DynamicEvent {
     pub cooldown_ticks: u64,
     /// Maximum number of activations (0 = unlimited).
     pub max_activations: u32,
+    /// Optional per-player / per-level scaling applied at resolution time.
+    ///
+    /// When `None`, falls back to the built-in `ScalingFactor::from_player_count`
+    /// curve for the spawn-count multiplier and leaves `max_hp` unchanged.
+    #[serde(default)]
+    pub scaling: Option<SpawnScaling>,
 }
 
 /// Runtime tracking for a registered event.
@@ -159,6 +166,17 @@ impl DirectorState {
         self.events.remove(&id).is_some()
     }
 
+    /// Remove every registered event whose region layer matches.
+    ///
+    /// Used when a dungeon instance expires: all rules registered under that
+    /// instance's layer are cleared in bulk so stale triggers don't fire
+    /// against a recycled layer.
+    pub fn clear_for_layer(&mut self, layer: u32) -> usize {
+        let before = self.events.len();
+        self.events.retain(|_, rt| rt.def.region.2 != layer);
+        before - self.events.len()
+    }
+
     /// Evaluate all registered events against current region player counts.
     ///
     /// Returns spawn directives for the tick pipeline to execute. Updates
@@ -193,18 +211,44 @@ impl DirectorState {
                 .trigger
                 .evaluate(player_count, current_tick, world_phases)
             {
-                let scaling = ScalingFactor::from_player_count(player_count);
                 let (rx, rz, layer) = rt.def.region;
                 let center_x = (rx as f32 + 0.5) * REGION_CELL_SIZE;
                 let center_z = (rz as f32 + 0.5) * REGION_CELL_SIZE;
 
+                // Resolve count & hp multipliers from the rule's optional
+                // scaling, falling back to the built-in density curve.
+                let (count, hp_mult) = match &rt.def.scaling {
+                    Some(s) => {
+                        let extras = player_count.saturating_sub(1) as f32;
+                        let count = (1.0 + s.per_player_count * extras).round().max(1.0) as u32;
+                        let hp_mult = 1.0 + s.per_player_hp_mult * extras;
+                        // Note: per_level_hp_mult / level_source are accepted
+                        // in the schema but not yet applied — player levels
+                        // are not tracked in the sim state yet.
+                        (count, hp_mult)
+                    }
+                    None => {
+                        let sf = ScalingFactor::from_player_count(player_count);
+                        (sf.spawn_rate.round().max(1.0) as u32, 1.0)
+                    }
+                };
+
                 for directive in &rt.def.spawns {
-                    // Scale spawn count by region density.
-                    let count = (scaling.spawn_rate).round().max(1.0) as u32;
+                    // Props are indestructible by contract — the tick
+                    // pipeline excludes them from the death sweep. Any
+                    // finite max_hp authored in a spawn rule would leave
+                    // a damaged prop stuck at 0 HP (no despawn, no
+                    // cleanup). Force the indestructible sentinel so
+                    // `apply_damage` cannot drive them below 1.0.
+                    let max_hp = if directive.kind == EntityKind::Prop {
+                        f32::MAX
+                    } else {
+                        directive.max_hp * hp_mult
+                    };
                     for _ in 0..count {
                         spawns.push(DirectorSpawn {
                             kind: directive.kind,
-                            max_hp: directive.max_hp,
+                            max_hp,
                             position: game_protocol::types::Vec3f {
                                 x: center_x + directive.offset[0],
                                 y: directive.offset[1],
@@ -324,6 +368,7 @@ mod tests {
             }],
             cooldown_ticks: 10,
             max_activations: 0,
+            scaling: None,
         });
 
         let mut counts = HashMap::new();
@@ -358,6 +403,7 @@ mod tests {
             }],
             cooldown_ticks: 0,
             max_activations: 2,
+            scaling: None,
         });
 
         let mut counts = HashMap::new();
@@ -395,10 +441,85 @@ mod tests {
             spawns: vec![],
             cooldown_ticks: 0,
             max_activations: 0,
+            scaling: None,
         });
         assert_eq!(director.event_count(), 1);
         assert!(director.remove_event(eid));
         assert_eq!(director.event_count(), 0);
         assert!(!director.remove_event(eid));
+    }
+
+    #[test]
+    fn clear_for_layer_removes_matching_events() {
+        let mut director = DirectorState::new();
+        // Two events on the same dungeon layer, one on open world.
+        director.register_event(DynamicEvent {
+            region: (0, 0, 200),
+            trigger: DirectorTrigger::PlayerCountAtLeast { threshold: 1 },
+            spawns: vec![],
+            cooldown_ticks: 0,
+            max_activations: 0,
+            scaling: None,
+        });
+        director.register_event(DynamicEvent {
+            region: (3, 4, 200),
+            trigger: DirectorTrigger::PlayerCountAtLeast { threshold: 1 },
+            spawns: vec![],
+            cooldown_ticks: 0,
+            max_activations: 0,
+            scaling: None,
+        });
+        director.register_event(DynamicEvent {
+            region: (0, 0, 0),
+            trigger: DirectorTrigger::PlayerCountAtLeast { threshold: 1 },
+            spawns: vec![],
+            cooldown_ticks: 0,
+            max_activations: 0,
+            scaling: None,
+        });
+        assert_eq!(director.event_count(), 3);
+        let removed = director.clear_for_layer(200);
+        assert_eq!(removed, 2);
+        assert_eq!(director.event_count(), 1);
+        // Open-world event still present.
+        assert_eq!(director.clear_for_layer(200), 0);
+    }
+
+    #[test]
+    fn scaling_applies_per_player_hp_and_count() {
+        use game_schema::spawn::SpawnScaling;
+        let mut director = DirectorState::new();
+        director.register_event(DynamicEvent {
+            region: (0, 0, 0),
+            trigger: DirectorTrigger::PlayerCountAtLeast { threshold: 1 },
+            spawns: vec![SpawnDirective {
+                kind: EntityKind::Boss,
+                max_hp: 100.0,
+                offset: [0.0, 0.0, 0.0],
+            }],
+            cooldown_ticks: 0,
+            max_activations: 0,
+            scaling: Some(SpawnScaling {
+                per_player_hp_mult: 0.5, // +50% per extra player
+                per_player_count: 1.0,   // +1 copy per extra player
+                ..Default::default()
+            }),
+        });
+
+        let mut counts = HashMap::new();
+        counts.insert((0, 0, 0), 3u32); // 3 players → 2 extras
+        let wp = HashMap::new();
+        let spawns = director.evaluate(&counts, TickId(1), &wp);
+
+        // count = 1 + 1.0 * 2 = 3
+        assert_eq!(spawns.len(), 3);
+        // hp = 100 * (1 + 0.5 * 2) = 200
+        for s in &spawns {
+            assert!(
+                (s.max_hp - 200.0).abs() < 1e-4,
+                "unexpected hp {}",
+                s.max_hp
+            );
+        }
     }
 }
