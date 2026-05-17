@@ -41,6 +41,7 @@ pub struct CoordinatorConfig {
 struct CoordinatorState {
     sim: SimulationRunner,
     items: game_core::stats::ItemRegistry,
+    dungeons: game_core::dungeon::DungeonRegistry,
 }
 
 /// Send (or re-send) a commit payload to SpacetimeDB.
@@ -174,10 +175,12 @@ pub fn run(config: CoordinatorConfig) {
     let abilities = load_abilities();
     let items = load_items();
     let buffs = load_buffs();
+    let dungeons = load_dungeons();
 
     let state = Arc::new(Mutex::new(CoordinatorState {
         sim: SimulationRunner::new(TickId(0), Box::new(physics), tick_dt, abilities, buffs),
         items,
+        dungeons,
     }));
 
     let state_for_connect = Arc::clone(&state);
@@ -831,6 +834,35 @@ fn load_buffs() -> BuffRegistry {
         Err(e) => {
             warn!("Could not load {PATH} ({e}) — using empty buff registry");
             BuffRegistry::new()
+        }
+    }
+}
+
+// ── Dungeon registry ────────────────────────────────────────────
+
+/// Load dungeon templates from `data/dungeons.ron`.
+/// Falls back to an empty registry if the file is missing or malformed.
+fn load_dungeons() -> game_core::dungeon::DungeonRegistry {
+    use game_core::dungeon::{DungeonFile, DungeonRegistry};
+    const PATH: &str = "data/dungeons.ron";
+    let result = std::fs::read_to_string(PATH)
+        .map_err(|e| format!("read '{PATH}': {e}"))
+        .and_then(|src| {
+            ron::from_str::<DungeonFile>(&src).map_err(|e| format!("parse '{PATH}': {e}"))
+        });
+    match result {
+        Ok(file) => {
+            let count = file.templates.len();
+            let mut reg = DungeonRegistry::new();
+            for t in file.templates {
+                reg.register(t);
+            }
+            info!("Loaded {count} dungeon template(s) from {PATH}");
+            reg
+        }
+        Err(e) => {
+            warn!("Could not load {PATH} ({e}) — using empty dungeon registry");
+            DungeonRegistry::new()
         }
     }
 }

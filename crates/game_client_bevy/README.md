@@ -17,7 +17,7 @@ Summary:
 **`game_client_bevy`** — a Bevy 0.15 3D client for the Jump MMO server.
 
 ### Files created:
-- Cargo.toml — Bevy 0.15 + SpacetimeDB SDK 2.0, reuses `game_client` module_bindings
+- Cargo.toml — Bevy 0.15 + SpacetimeDB SDK 2.1, reuses `game_client` module_bindings
 - main.rs — App bootstrap with ground plane, directional light, ambient light
 - spacetime.rs — `SpacetimePlugin`: connects to SpacetimeDB, subscribes to `nearby_transforms`/`entity`/`entity_health`/`sim_tick`/`combat_event`, calls `spawn_player`, pumps `frame_tick()` each Bevy frame
 - sync.rs — `SyncPlugin`: maps server entities → Bevy capsule meshes (green = local player, blue = other players, red = NPCs, purple = bosses), smooth position interpolation, health sync, auto-despawn on leave, and a local facing indicator mesh for manual testing

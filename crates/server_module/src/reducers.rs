@@ -12,6 +12,7 @@ pub fn init(ctx: &ReducerContext) {
         key: 0,
         admin: ctx.sender(),
         last_committed_tick: 0,
+        next_instance_layer: 100,
     });
 
     // Seed tick 0
@@ -43,12 +44,62 @@ pub fn init(ctx: &ReducerContext) {
 pub fn client_connected(ctx: &ReducerContext) {
     let caller = ctx.sender();
     log::info!("Client connected: {:?}", caller);
+
+    // Reconnect: if the player has an instance_membership with disconnect_at
+    // inside the grace window, clear it and restore them to the instance layer.
+    if let Some(seq) = ctx.db.client_sequence().client_identity().find(&caller) {
+        if let Some(membership) = ctx.db.instance_membership().entity_id().find(&seq.entity_id) {
+            if membership.disconnect_at.is_some() {
+                // Check the instance still exists and is active.
+                if let Some(instance) = ctx.db.instance().instance_id().find(&membership.instance_id) {
+                    if instance.state == InstanceState::Active || instance.state == InstanceState::Pending {
+                        // Clear disconnect timer — player is back.
+                        ctx.db.instance_membership().entity_id().update(InstanceMembership {
+                            entity_id: seq.entity_id,
+                            instance_id: membership.instance_id,
+                            disconnect_at: None,
+                        });
+                        // Restore entity_region to the instance layer.
+                        if let Some(er) = ctx.db.entity_region().entity_id().find(&seq.entity_id) {
+                            ctx.db.entity_region().entity_id().update(EntityRegion {
+                                entity_id: seq.entity_id,
+                                region_x: er.region_x,
+                                region_z: er.region_z,
+                                layer: instance.layer,
+                            });
+                        }
+                        log::info!(
+                            "Instance reconnect: entity {} restored to instance {} (layer {})",
+                            seq.entity_id, membership.instance_id, instance.layer
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[reducer(client_disconnected)]
 pub fn client_disconnected(ctx: &ReducerContext) {
     let caller = ctx.sender();
     log::info!("Client disconnected: {:?}", caller);
+
+    // If the player is in an instance, set disconnect_at for grace window.
+    if let Some(seq) = ctx.db.client_sequence().client_identity().find(&caller) {
+        if let Some(membership) = ctx.db.instance_membership().entity_id().find(&seq.entity_id) {
+            if membership.disconnect_at.is_none() {
+                ctx.db.instance_membership().entity_id().update(InstanceMembership {
+                    entity_id: seq.entity_id,
+                    instance_id: membership.instance_id,
+                    disconnect_at: Some(ctx.timestamp.to_micros_since_unix_epoch()),
+                });
+                log::info!(
+                    "Instance disconnect: entity {} in instance {} — grace window started",
+                    seq.entity_id, membership.instance_id
+                );
+            }
+        }
+    }
 }
 
 // ── Tick Trigger ────────────────────────────────────────────────────
@@ -527,6 +578,8 @@ pub fn commit_tick_results(
                 ctx.db.entity_team().entity_id().delete(&u.entity_id);
                 ctx.db.boss_phase().boss_entity_id().delete(&u.entity_id);
                 ctx.db.npc_goal().entity_id().delete(&u.entity_id);
+                ctx.db.instance_membership().entity_id().delete(&u.entity_id);
+                ctx.db.interactable_config().entity_id().delete(&u.entity_id);
                 // Note: death_state is NOT deleted here — players need it for respawn.
                 // Buffs and threat rows for Removed entities are already cleaned
                 // up by the buff_cleared / threat_cleared sections below — the
@@ -1540,6 +1593,291 @@ pub fn increment_zone_counter(
     Ok(())
 }
 
+// ── Instance Management ─────────────────────────────────────────────
+// Dungeon instancing lifecycle. Layers 0 = open world, 1–99 reserved,
+// 100+ dynamic instances. Cross-layer transfers are reducer-driven:
+// source worker drops entity via subscription, destination picks it up.
+
+/// Grace period before a disconnected player is removed from an instance (2 min in microseconds).
+const INSTANCE_DISCONNECT_GRACE_MICROS: i64 = 120_000_000;
+/// Grace period before ALL-disconnected instance is expired (5 min in microseconds).
+const INSTANCE_ALL_DISCONNECT_GRACE_MICROS: i64 = 300_000_000;
+
+#[reducer]
+pub fn create_instance(
+    ctx: &ReducerContext,
+    template_id: String,
+    max_players: u32,
+) -> Result<(), String> {
+    if !is_trusted_caller(ctx) && !is_module_admin(ctx) && !is_debug_caller(ctx) {
+        return Err("create_instance: trusted caller only".into());
+    }
+
+    let mut cfg = ctx.db.module_config().key().find(0)
+        .ok_or("ModuleConfig not found")?;
+    let layer = cfg.next_instance_layer;
+    cfg.next_instance_layer = layer + 1;
+    ctx.db.module_config().key().update(cfg);
+
+    let now = ctx.timestamp.to_micros_since_unix_epoch();
+    // Default expiry: 2 hours.
+    let expires_at = now + 7_200_000_000;
+
+    let inst = ctx.db.instance().insert(Instance {
+        instance_id: 0,
+        template_id: template_id.clone(),
+        layer,
+        layer_group: 0,
+        state: InstanceState::Active,
+        created_at: now,
+        expires_at,
+        max_players,
+    });
+
+    log::info!(
+        "Instance created: id={} template={} layer={} max_players={}",
+        inst.instance_id, template_id, layer, max_players
+    );
+    Ok(())
+}
+
+#[reducer]
+pub fn join_instance(ctx: &ReducerContext, instance_id: u64) -> Result<(), String> {
+    let caller = ctx.sender();
+    let seq = ctx.db.client_sequence().client_identity().find(&caller)
+        .ok_or("Not registered")?;
+    let entity_id = seq.entity_id;
+
+    let instance = ctx.db.instance().instance_id().find(&instance_id)
+        .ok_or("Instance not found")?;
+    if instance.state != InstanceState::Active && instance.state != InstanceState::Pending {
+        return Err(format!("Instance is {:?} — cannot join", instance.state));
+    }
+
+    if ctx.db.instance_membership().entity_id().find(&entity_id).is_some() {
+        return Err("Already in an instance".into());
+    }
+
+    // Check party requirement (must be in a party to enter dungeons).
+    if ctx.db.party_member().entity_id().filter(&entity_id).next().is_none() {
+        return Err("Must be in a party to enter an instance".into());
+    }
+
+    let member_count = ctx.db.instance_membership().instance_id().filter(&instance_id).count() as u32;
+    if member_count >= instance.max_players {
+        return Err("Instance is full".into());
+    }
+
+    // Create membership.
+    ctx.db.instance_membership().insert(InstanceMembership {
+        entity_id,
+        instance_id,
+        disconnect_at: None,
+    });
+
+    // Move entity to instance layer.
+    if let Some(er) = ctx.db.entity_region().entity_id().find(&entity_id) {
+        ctx.db.entity_region().entity_id().update(EntityRegion {
+            entity_id,
+            region_x: er.region_x,
+            region_z: er.region_z,
+            layer: instance.layer,
+        });
+    }
+
+    log::info!(
+        "Instance join: entity {} joined instance {} (layer {})",
+        entity_id, instance_id, instance.layer
+    );
+    Ok(())
+}
+
+#[reducer]
+pub fn leave_instance(ctx: &ReducerContext) -> Result<(), String> {
+    let caller = ctx.sender();
+    let seq = ctx.db.client_sequence().client_identity().find(&caller)
+        .ok_or("Not registered")?;
+    let entity_id = seq.entity_id;
+
+    let membership = ctx.db.instance_membership().entity_id().find(&entity_id)
+        .ok_or("Not in an instance")?;
+    let _instance_id = membership.instance_id;
+
+    // Remove membership.
+    ctx.db.instance_membership().entity_id().delete(&entity_id);
+
+    // Return entity to open world (layer 0).
+    if let Some(er) = ctx.db.entity_region().entity_id().find(&entity_id) {
+        ctx.db.entity_region().entity_id().update(EntityRegion {
+            entity_id,
+            region_x: er.region_x,
+            region_z: er.region_z,
+            layer: 0,
+        });
+    }
+
+    log::info!("Instance leave: entity {} returned to open world", entity_id);
+    Ok(())
+}
+
+/// Scheduled cleanup: expire timed-out instances and remove long-disconnected members.
+/// Called by admin or trusted worker. In production, will be triggered by world_clock.
+#[reducer]
+pub fn expire_instances(ctx: &ReducerContext) -> Result<(), String> {
+    if !is_trusted_caller(ctx) && !is_module_admin(ctx) && !is_debug_caller(ctx) {
+        return Err("expire_instances: trusted caller only".into());
+    }
+
+    let now = ctx.timestamp.to_micros_since_unix_epoch();
+
+    // Collect instances to expire (time-based).
+    let expired: Vec<u64> = ctx.db.instance().iter()
+        .filter(|i| {
+            (i.state == InstanceState::Active || i.state == InstanceState::Pending)
+                && i.expires_at < now
+        })
+        .map(|i| i.instance_id)
+        .collect();
+
+    // Check instances where ALL members are disconnected beyond grace period.
+    let all_disconnected: Vec<u64> = ctx.db.instance().iter()
+        .filter(|i| i.state == InstanceState::Active || i.state == InstanceState::Pending)
+        .filter(|i| !expired.contains(&i.instance_id))
+        .filter(|i| {
+            let members: Vec<_> = ctx.db.instance_membership().instance_id()
+                .filter(&i.instance_id).collect();
+            !members.is_empty() && members.iter().all(|m| {
+                m.disconnect_at.is_some_and(|d| now - d > INSTANCE_ALL_DISCONNECT_GRACE_MICROS)
+            })
+        })
+        .map(|i| i.instance_id)
+        .collect();
+
+    let to_expire: Vec<u64> = expired.into_iter().chain(all_disconnected).collect();
+
+    for instance_id in &to_expire {
+        // Remove all memberships — return members to open world.
+        let members: Vec<u64> = ctx.db.instance_membership().instance_id()
+            .filter(instance_id)
+            .map(|m| m.entity_id)
+            .collect();
+        for eid in &members {
+            ctx.db.instance_membership().entity_id().delete(eid);
+            if let Some(er) = ctx.db.entity_region().entity_id().find(eid) {
+                ctx.db.entity_region().entity_id().update(EntityRegion {
+                    entity_id: *eid,
+                    region_x: er.region_x,
+                    region_z: er.region_z,
+                    layer: 0,
+                });
+            }
+        }
+
+        // Mark instance expired.
+        if let Some(inst) = ctx.db.instance().instance_id().find(instance_id) {
+            ctx.db.instance().instance_id().update(Instance {
+                instance_id: *instance_id,
+                template_id: inst.template_id,
+                layer: inst.layer,
+                layer_group: inst.layer_group,
+                state: InstanceState::Expired,
+                created_at: inst.created_at,
+                expires_at: inst.expires_at,
+                max_players: inst.max_players,
+            });
+        }
+
+        // Clean up interactable configs on the instance layer.
+        // Entity cleanup (gates, switches, props) must go through force_remove_entity
+        // in the tick pipeline. We mark them DespawnPending here; the worker handles removal.
+        let instance_layer = ctx.db.instance().instance_id().find(instance_id)
+            .map(|i| i.layer)
+            .unwrap_or(0);
+        let instance_entities: Vec<u64> = ctx.db.entity_region().iter()
+            .filter(|er| er.layer == instance_layer)
+            .map(|er| er.entity_id)
+            .collect();
+        for eid in instance_entities {
+            // Only mark non-player entities for despawn.
+            if let Some(entity) = ctx.db.entity().entity_id().find(&eid) {
+                if entity.kind != EntityKind::Player && entity.state == EntityState::Active {
+                    ctx.db.entity().entity_id().update(Entity {
+                        entity_id: eid,
+                        kind: entity.kind,
+                        state: EntityState::DespawnPending,
+                        spawned_at_tick: entity.spawned_at_tick,
+                        owner_identity: entity.owner_identity,
+                    });
+                }
+            }
+        }
+
+        log::info!("Instance expired: id={} layer={}", instance_id, instance_layer);
+    }
+
+    // Remove individual members disconnected > 2 min (party continues).
+    let stale_members: Vec<u64> = ctx.db.instance_membership().iter()
+        .filter(|m| m.disconnect_at.is_some_and(|d| now - d > INSTANCE_DISCONNECT_GRACE_MICROS))
+        .filter(|m| {
+            // Only remove if the instance is still active (not already expired above).
+            ctx.db.instance().instance_id().find(&m.instance_id)
+                .is_some_and(|i| i.state == InstanceState::Active)
+        })
+        .map(|m| m.entity_id)
+        .collect();
+    for eid in &stale_members {
+        ctx.db.instance_membership().entity_id().delete(eid);
+        if let Some(er) = ctx.db.entity_region().entity_id().find(eid) {
+            ctx.db.entity_region().entity_id().update(EntityRegion {
+                entity_id: *eid,
+                region_x: er.region_x,
+                region_z: er.region_z,
+                layer: 0,
+            });
+        }
+        log::info!("Instance: stale member {} removed (disconnect grace expired)", eid);
+    }
+
+    Ok(())
+}
+
+/// Update interactable state. Trusted-worker only.
+/// Called by the simulation worker when an interact event changes object state.
+#[reducer]
+pub fn commit_interactable_updates(
+    ctx: &ReducerContext,
+    updates: Vec<InteractableUpdate>,
+) -> Result<(), String> {
+    if !is_trusted_caller(ctx) {
+        return Err("commit_interactable_updates: trusted worker only".into());
+    }
+    for u in updates {
+        if let Some(_existing) = ctx.db.interactable_config().entity_id().find(&u.entity_id) {
+            ctx.db.interactable_config().entity_id().update(InteractableConfig {
+                entity_id: u.entity_id,
+                interact_kind: u.interact_kind,
+                linked_entity: u.linked_entity,
+                required_buff: u.required_buff,
+                required_item: u.required_item,
+                interact_range: u.interact_range,
+                state: u.state,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(spacetimedb::SpacetimeType, Clone, Debug)]
+pub struct InteractableUpdate {
+    pub entity_id: u64,
+    pub interact_kind: InteractKind,
+    pub linked_entity: Option<u64>,
+    pub required_buff: Option<u32>,
+    pub required_item: Option<u32>,
+    pub interact_range: f32,
+    pub state: InteractState,
+}
+
 // ── Debug Reducers ──────────────────────────────────────────────────
 // Admin-only test utilities for skill/combat development.
 // Gated behind the `debug` compile-time feature.
@@ -1775,12 +2113,14 @@ mod debug_reducers {
             ctx.db.threat_entry().threat_id().delete(&id);
         }
 
-        // Party, boss phase, death state, NPC goals.
+        // Party, boss phase, death state, NPC goals, instances, interactables.
         ctx.db.party_member().entity_id().delete(&entity_id);
         ctx.db.party_invite().invitee_entity().delete(&entity_id);
         ctx.db.boss_phase().boss_entity_id().delete(&entity_id);
         ctx.db.death_state().entity_id().delete(&entity_id);
         ctx.db.npc_goal().entity_id().delete(&entity_id);
+        ctx.db.instance_membership().entity_id().delete(&entity_id);
+        ctx.db.interactable_config().entity_id().delete(&entity_id);
 
         log::info!("debug_remove_entity: entity={entity_id} force-removed");
         Ok(())

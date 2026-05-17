@@ -8,6 +8,7 @@ use game_schema::EntityKind;
 use game_core::physics_backend::{
     ColliderKind,
     CollisionEvent as GameCollisionEvent,
+    EnvironmentShape,
     MoveResult,
     PhysicsBackend,
     RayHit,
@@ -58,6 +59,10 @@ pub struct PhysicsWorld {
     sensor_handles: HashMap<u64, ColliderHandle>,
     // World-space (parentless) sensors → owning entity for collision resolution.
     world_sensor_owners: HashMap<ColliderHandle, EntityId>,
+    // Layer-tagged environment colliders for dungeon instance bulk removal.
+    env_collider_counter: u64,
+    env_collider_handles: HashMap<u64, ColliderHandle>,
+    env_colliders_by_layer: HashMap<u32, Vec<u64>>,
 }
 
 /// Result of a raycast query.
@@ -101,6 +106,9 @@ impl PhysicsWorld {
             sensor_handle_counter: 0,
             sensor_handles: HashMap::new(),
             world_sensor_owners: HashMap::new(),
+            env_collider_counter: 0,
+            env_collider_handles: HashMap::new(),
+            env_colliders_by_layer: HashMap::new(),
         };
 
         // Default ground plane — every world has a floor.
@@ -1083,6 +1091,61 @@ impl PhysicsBackend for PhysicsWorld {
             rotation,
         ));
         true
+    }
+
+    fn add_environment_collider_on_layer(
+        &mut self,
+        shape: EnvironmentShape,
+        position: game_protocol::types::Vec3f,
+        layer: u32,
+    ) -> u64 {
+        let rapier_shape: SharedShape = match shape {
+            EnvironmentShape::Cuboid { half_x, half_y, half_z } => {
+                SharedShape::cuboid(half_x, half_y, half_z)
+            }
+            EnvironmentShape::Cylinder { half_height, radius } => {
+                SharedShape::cylinder(half_height, radius)
+            }
+        };
+        let col_handle = self.add_environment_collider(
+            rapier_shape,
+            Vector::new(position.x, position.y, position.z),
+        );
+        let opaque = self.env_collider_counter;
+        self.env_collider_counter += 1;
+        self.env_collider_handles.insert(opaque, col_handle);
+        self.env_colliders_by_layer.entry(layer).or_default().push(opaque);
+        opaque
+    }
+
+    fn remove_environment_colliders_by_layer(&mut self, layer: u32) {
+        if let Some(handles) = self.env_colliders_by_layer.remove(&layer) {
+            for opaque in handles {
+                if let Some(col_handle) = self.env_collider_handles.remove(&opaque) {
+                    self.collider_kinds.remove(&col_handle);
+                    self.colliders.remove(
+                        col_handle,
+                        &mut self.islands,
+                        &mut self.bodies,
+                        true,
+                    );
+                }
+            }
+        }
+    }
+
+    fn set_collider_enabled(&mut self, entity_id: EntityId, enabled: bool) -> bool {
+        if let Some(&body_handle) = self.entity_to_body.get(&entity_id) {
+            if let Some(body) = self.bodies.get(body_handle) {
+                if let Some(&col_handle) = body.colliders().first() {
+                    if let Some(collider) = self.colliders.get_mut(col_handle) {
+                        collider.set_enabled(enabled);
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 }
 

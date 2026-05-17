@@ -13,5 +13,5 @@ debug = []
 
 [dependencies]
 game_schema = { workspace = true, features = ["spacetimedb"] }
-spacetimedb = "2.0"
+spacetimedb = "2.1"
 log = { workspace = true }

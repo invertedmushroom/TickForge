@@ -172,6 +172,42 @@ pub trait PhysicsBackend: Send {
     /// through walls). Used by `TeleportBehindTarget` and `TeleportForward` abilities.
     /// No-op and returns `false` if the entity has no physics body.
     fn teleport_entity(&mut self, entity_id: EntityId, position: Vec3f) -> bool;
+
+    // ── Environment collider layer management ───────────────────
+
+    /// Add static environment geometry at the given position, tagged with an instance layer.
+    /// Returns an opaque handle for later removal.
+    /// Used by dungeon instance creation to spawn walls, floors, pillars.
+    fn add_environment_collider_on_layer(
+        &mut self,
+        shape: EnvironmentShape,
+        position: Vec3f,
+        layer: u32,
+    ) -> u64 {
+        let _ = (shape, position, layer);
+        0
+    }
+
+    /// Remove all environment colliders tagged with the given layer.
+    /// Used for bulk cleanup when a dungeon instance expires.
+    fn remove_environment_colliders_by_layer(&mut self, layer: u32) {
+        let _ = layer;
+    }
+
+    /// Toggle a prop entity's collider enabled/disabled (gate open/close).
+    /// Uses Rapier's `Collider::set_enabled()` natively.
+    fn set_collider_enabled(&mut self, entity_id: EntityId, enabled: bool) -> bool {
+        let _ = (entity_id, enabled);
+        false
+    }
+}
+
+/// Abstract shape for environment colliders (walls, floors, pillars).
+/// Maps to a physics engine shape without exposing engine-specific types.
+#[derive(Clone, Debug)]
+pub enum EnvironmentShape {
+    Cuboid { half_x: f32, half_y: f32, half_z: f32 },
+    Cylinder { half_height: f32, radius: f32 },
 }
 
 /// Result of a `move_character` call.

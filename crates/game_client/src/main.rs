@@ -7,12 +7,19 @@ fn main() {
 
         let args: Vec<String> = std::env::args().collect();
         let test_mode = args.iter().any(|a| a == "--test");
+        let multi_test_mode = args.iter().any(|a| a == "--test-multi");
 
         let config = ClientConfig {
             uri: std::env::var("STDB_URI").unwrap_or_else(|_| "http://localhost:3000".into()),
             module_name: std::env::var("STDB_MODULE").unwrap_or_else(|_| "jump".into()),
             auth_token: std::env::var("STDB_TOKEN").ok(),
         };
+
+        if multi_test_mode {
+            log::info!("Running multi-client tests against {}:{}", config.uri, config.module_name);
+            let exit_code = game_client::multi_client_test::run_tests(config);
+            std::process::exit(exit_code);
+        }
 
         if test_mode {
             log::info!("Running integration tests against {}:{}", config.uri, config.module_name);

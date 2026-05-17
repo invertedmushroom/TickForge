@@ -19,6 +19,9 @@ pub struct ModuleConfig {
     /// Last sim tick successfully committed by the simulation worker.
     /// Read by tick_trigger to gate backpressure (skip insert when backlog is too large).
     pub last_committed_tick: u64,
+    /// Next dynamic instance layer to allocate. Layers 0–99 are reserved;
+    /// dynamic instances start at 100 and increment.
+    pub next_instance_layer: u32,
 }
 // ── Simulation Clock ────────────────────────────────────────────────
 // Per spec: tick number must be committed through the database.
@@ -682,4 +685,81 @@ pub struct DeathState {
     pub death_pos_x: f32,
     pub death_pos_y: f32,
     pub death_pos_z: f32,
+}
+
+// ── Instance Management ─────────────────────────────────────────────
+// Dungeon/instanced zone lifecycle. Layer 0 = open world, 1–99 reserved
+// persistent zones, 100+ dynamic instances.
+// Single writer: instance reducers (create_instance, join_instance, etc.)
+
+#[derive(SpacetimeType, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstanceState {
+    Pending,
+    Active,
+    Completed,
+    Expired,
+}
+
+#[table(accessor = instance, public)]
+pub struct Instance {
+    #[primary_key]
+    #[auto_inc]
+    pub instance_id: u64,
+    pub template_id: String,
+    pub layer: u32,
+    pub layer_group: u32,
+    pub state: InstanceState,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub max_players: u32,
+}
+
+#[table(accessor = instance_membership, public)]
+pub struct InstanceMembership {
+    #[primary_key]
+    pub entity_id: u64,
+    #[index(btree)]
+    pub instance_id: u64,
+    /// Set on disconnect. If all members disconnect > grace period → expire instance.
+    pub disconnect_at: Option<i64>,
+}
+
+// ── Interactable Config ─────────────────────────────────────────────
+// Per-entity config for interactive world objects (gates, switches,
+// chests, grabs). Sim worker subscribes for physics-driven interactions.
+// Single writer: instance spawn path (create_instance) and
+// commit_interactable_updates reducer (trusted worker).
+
+#[derive(SpacetimeType, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InteractKind {
+    Switch,
+    Gate,
+    Grab,
+    Chest,
+}
+
+#[derive(SpacetimeType, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InteractState {
+    /// Default resting state (gate closed, switch off, chest sealed).
+    Idle,
+    /// Active state (gate open, switch on, chest opened, grab held).
+    Active,
+    /// Cooldown before returning to Idle (one-shot switches, etc.)
+    Cooldown,
+}
+
+#[table(accessor = interactable_config, public)]
+pub struct InteractableConfig {
+    #[primary_key]
+    pub entity_id: u64,
+    pub interact_kind: InteractKind,
+    /// Entity this interactable controls (e.g. switch → gate entity).
+    pub linked_entity: Option<u64>,
+    /// Buff required to interact. None = no requirement.
+    pub required_buff: Option<u32>,
+    /// Item required to interact. None = no requirement.
+    pub required_item: Option<u32>,
+    /// Max interaction distance. Default 3.0.
+    pub interact_range: f32,
+    pub state: InteractState,
 }

@@ -67,6 +67,8 @@ enum TestCmd {
     Fast,
     Worker,
     Cli,
+    /// Run multi-client integration tests (requires running server + worker)
+    MultiClient,
     Workspace,
     /// Run the deterministic replay test suite (uses fixtures in crates/simulation_worker/tests/fixtures)
     Replay(BuildProfileArgs),
@@ -205,6 +207,15 @@ fn run_test(cmd: TestCmd) -> Result<()> {
             "connected",
             "--",
             "--test",
+        ])),
+        TestCmd::MultiClient => run_command(cargo_cmd([
+            "run",
+            "-p",
+            "game_client",
+            "--features",
+            "connected",
+            "--",
+            "--test-multi",
         ])),
         TestCmd::Workspace => run_command(cargo_cmd([
             "test",

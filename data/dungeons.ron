@@ -1,0 +1,32 @@
+(
+    templates: [
+        (
+            template_id: "test_dungeon_01",
+            name: "Training Grounds",
+            max_players: 4,
+            spawn_point: (0.0, 1.0, 0.0),
+            geometry: [
+                // Floor
+                (shape: Cuboid(half_x: 20.0, half_y: 0.5, half_z: 20.0), position: (0.0, -0.5, 0.0)),
+                // North wall
+                (shape: Cuboid(half_x: 20.0, half_y: 3.0, half_z: 0.5), position: (0.0, 3.0, -20.0)),
+                // South wall
+                (shape: Cuboid(half_x: 20.0, half_y: 3.0, half_z: 0.5), position: (0.0, 3.0, 20.0)),
+                // East wall
+                (shape: Cuboid(half_x: 0.5, half_y: 3.0, half_z: 20.0), position: (20.0, 3.0, 0.0)),
+                // West wall
+                (shape: Cuboid(half_x: 0.5, half_y: 3.0, half_z: 20.0), position: (-20.0, 3.0, 0.0)),
+                // Center pillar
+                (shape: Cylinder(half_height: 3.0, radius: 1.0), position: (0.0, 3.0, 0.0)),
+            ],
+            interactables: [
+                // Gate blocking boss arena
+                (local_id: 1, kind: Gate, position: (0.0, 1.5, -10.0), linked_to: None, required_buff: None, required_item: None, interact_range: None),
+                // Switch that opens the gate
+                (local_id: 2, kind: Switch, position: (5.0, 1.0, -8.0), linked_to: Some(1), required_buff: None, required_item: None, interact_range: Some(3.0)),
+                // Boss spawn behind the gate
+                (local_id: 3, kind: BossSpawn(npc_name: "TrainingDummy"), position: (0.0, 1.0, -15.0), linked_to: None, required_buff: None, required_item: None, interact_range: None),
+            ],
+        ),
+    ],
+)
