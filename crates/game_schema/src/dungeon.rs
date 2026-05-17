@@ -189,12 +189,22 @@ pub enum ShapeDef {
 #[derive(Clone, Debug, Deserialize)]
 pub struct InteractableDef {
     pub local_id: u32,
+    #[serde(default)]
+    pub script_id: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub kind: InteractKindDef,
     pub position: [f32; 3],
     pub linked_to: Option<u32>,
     pub required_buff: Option<u32>,
     pub required_item: Option<u32>,
     pub interact_range: Option<f32>,
+    #[serde(default)]
+    pub puzzle_group: Option<String>,
+    #[serde(default)]
+    pub puzzle_required_count: Option<u32>,
+    #[serde(default)]
+    pub puzzle_window_ticks: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -205,6 +215,8 @@ pub enum InteractKindDef {
         npc_name: String,
         encounter_name: Option<String>,
     },
-    NpcSpawn { npc_name: String },
+    NpcSpawn {
+        npc_name: String,
+    },
     Chest,
 }

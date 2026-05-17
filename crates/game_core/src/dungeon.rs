@@ -74,9 +74,9 @@ pub fn resolve_linked_entities(
 ) -> Vec<ResolvedInteractable> {
     defs.iter()
         .map(|def| {
-            let entity_id = *local_to_entity.get(&def.local_id).unwrap_or_else(|| {
-                panic!("Missing entity ID for local_id {}", def.local_id)
-            });
+            let entity_id = *local_to_entity
+                .get(&def.local_id)
+                .unwrap_or_else(|| panic!("Missing entity ID for local_id {}", def.local_id));
             let linked_entity = def
                 .linked_to
                 .and_then(|lid| local_to_entity.get(&lid).copied());
@@ -269,7 +269,8 @@ mod tests {
             ],
         )"#;
 
-        let file: DungeonFile = ron::from_str(LEGACY).expect("legacy BossSpawn syntax should parse");
+        let file: DungeonFile =
+            ron::from_str(LEGACY).expect("legacy BossSpawn syntax should parse");
         match &file.templates[0].interactables[0].kind {
             InteractKindDef::BossSpawn {
                 npc_name,
@@ -287,12 +288,17 @@ mod tests {
     fn make_def(local_id: u32, kind: InteractKindDef, linked_to: Option<u32>) -> InteractableDef {
         InteractableDef {
             local_id,
+            script_id: None,
+            tags: Vec::new(),
             kind,
             position: [0.0, 0.0, 0.0],
             linked_to,
             required_buff: None,
             required_item: None,
             interact_range: None,
+            puzzle_group: None,
+            puzzle_required_count: None,
+            puzzle_window_ticks: None,
         }
     }
 

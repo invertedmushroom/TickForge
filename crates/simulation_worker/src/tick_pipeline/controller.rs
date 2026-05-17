@@ -18,6 +18,8 @@ impl TickPipeline {
         // Runs before intent processing; is_cc_disabled blocks their normal intents.
         self.drive_fear_movement();
 
+        self.expire_timed_lever_puzzles();
+
         // Track which (entity, ability) pairs have been cast in this Phase 2 pass.
         // Without this, two UseAbility intents for the same ability targeting the same
         // tick both pass is_on_cooldown() — the cooldown map isn't updated until Phase 3.
@@ -813,6 +815,7 @@ impl TickPipeline {
         if !self.same_layer(entity_id, target) {
             return;
         }
+        let info = self.state.interactables.get(&target).cloned();
         if let (Some(actor_t), Some(target_t)) = (
             self.physics.get_transform(entity_id),
             self.physics.get_transform(target),
@@ -821,9 +824,34 @@ impl TickPipeline {
             let dz = target_t.position.z - actor_t.position.z;
             let dist_sq = dx * dx + dz * dz;
 
-            let max_range = game_core::physics_constants::INTERACT_RADIUS;
+            let max_range = info
+                .as_ref()
+                .map(|i| i.interact_range)
+                .unwrap_or(game_core::physics_constants::INTERACT_RADIUS);
             if dist_sq > max_range * max_range {
                 return;
+            }
+
+            if let Some(info) = &info {
+                let Some(actor_idx) = self.state.entities.lookup(entity_id) else {
+                    return;
+                };
+                if let Some(required_buff) = info.required_buff {
+                    let has_buff = self
+                        .state
+                        .status
+                        .get_buffs(actor_idx)
+                        .iter()
+                        .any(|buff| buff.buff_id == required_buff);
+                    if !has_buff {
+                        return;
+                    }
+                }
+                if let Some(required_item) = info.required_item
+                    && !self.entity_has_item(entity_id, required_item)
+                {
+                    return;
+                }
             }
 
             self.set_entity_body_facing(
@@ -838,43 +866,23 @@ impl TickPipeline {
             self.emit_event(entity_id, EventPayload::InteractTriggered { target });
 
             // Branch by interactable kind for state mutations.
-            let info = match self.state.interactables.get(&target) {
-                Some(info) => info.clone(),
+            let info = match info {
+                Some(info) => info,
                 None => return, // Not an interactable — event-only interaction
             };
 
             match info.kind {
                 SimInteractKind::Switch => {
-                    // Toggle: Idle ↔ Active
-                    let new_state = match info.state {
-                        SimInteractState::Idle => SimInteractState::Active,
-                        SimInteractState::Active => SimInteractState::Idle,
-                        SimInteractState::Cooldown => return, // Cannot interact during cooldown
-                    };
-
-                    // Update the switch itself.
-                    if let Some(entry) = self.state.interactables.get_mut(&target) {
-                        entry.state = new_state;
-                    }
-                    self.pending_interactable_updates.push((target, new_state));
-
-                    // Toggle linked gate collider.
-                    if let Some(gate_id) = info.linked_entity {
-                        let gate_enabled = new_state == SimInteractState::Active;
-                        // Gate Active = open = collider disabled (passable).
-                        // Gate Idle = closed = collider enabled (blocking).
-                        self.physics.set_collider_enabled(gate_id, !gate_enabled);
-
-                        let gate_state = if gate_enabled {
-                            SimInteractState::Active
-                        } else {
-                            SimInteractState::Idle
+                    if info.puzzle_group.is_some() && info.puzzle_window_ticks > 0 {
+                        self.activate_timed_lever(target, &info);
+                    } else {
+                        // Toggle: Idle ↔ Active
+                        let new_state = match info.state {
+                            SimInteractState::Idle => SimInteractState::Active,
+                            SimInteractState::Active => SimInteractState::Idle,
+                            SimInteractState::Cooldown => return, // Cannot interact during cooldown
                         };
-                        if let Some(entry) = self.state.interactables.get_mut(&gate_id) {
-                            entry.state = gate_state;
-                        }
-                        self.pending_interactable_updates
-                            .push((gate_id, gate_state));
+                        self.set_interactable_state_runtime(target, new_state);
                     }
                 }
                 SimInteractKind::Chest => {
@@ -882,15 +890,92 @@ impl TickPipeline {
                         return;
                     }
                     // Mark chest as Active (opened). Future: emit loot event.
-                    if let Some(entry) = self.state.interactables.get_mut(&target) {
-                        entry.state = SimInteractState::Active;
-                    }
-                    self.pending_interactable_updates
-                        .push((target, SimInteractState::Active));
+                    self.set_interactable_state_runtime(target, SimInteractState::Active);
                 }
                 SimInteractKind::Gate | SimInteractKind::Grab => {
                     // Gates are not directly interactable (controlled by switches).
                     // Grab: future implementation.
+                }
+            }
+        }
+    }
+
+    fn expire_timed_lever_puzzles(&mut self) {
+        use game_core::sim_state::SimInteractState;
+
+        let expired: Vec<String> = self
+            .lever_puzzles
+            .iter()
+            .filter(|(_, runtime)| runtime.expires_at <= self.current_tick)
+            .map(|(group, _)| group.clone())
+            .collect();
+        for group in expired {
+            if let Some(runtime) = self.lever_puzzles.remove(&group) {
+                for lever in runtime.activated {
+                    self.set_interactable_own_state_runtime(lever, SimInteractState::Idle);
+                }
+            }
+        }
+    }
+
+    fn activate_timed_lever(
+        &mut self,
+        lever: EntityId,
+        info: &game_core::sim_state::InteractableInfo,
+    ) {
+        use game_core::sim_state::SimInteractState;
+
+        if info.state != SimInteractState::Idle {
+            return;
+        }
+        let Some(group) = info.puzzle_group.clone() else {
+            return;
+        };
+        let required_count = if info.puzzle_required_count > 0 {
+            info.puzzle_required_count as usize
+        } else {
+            self.state
+                .interactables
+                .values()
+                .filter(|other| other.puzzle_group.as_deref() == Some(group.as_str()))
+                .count()
+        };
+        if required_count == 0 {
+            return;
+        }
+
+        self.set_interactable_own_state_runtime(lever, SimInteractState::Active);
+        let expires_at = TickId(
+            self.current_tick
+                .0
+                .saturating_add(info.puzzle_window_ticks as u64),
+        );
+        let complete = {
+            let runtime =
+                self.lever_puzzles
+                    .entry(group.clone())
+                    .or_insert_with(|| LeverPuzzleRuntime {
+                        activated: BTreeSet::new(),
+                        expires_at,
+                    });
+            runtime.activated.insert(lever);
+            runtime.activated.len() >= required_count
+        };
+
+        if complete {
+            let activated = self
+                .lever_puzzles
+                .remove(&group)
+                .map(|runtime| runtime.activated)
+                .unwrap_or_default();
+            for lever_id in activated {
+                let linked_gate = self
+                    .state
+                    .interactables
+                    .get(&lever_id)
+                    .and_then(|lever_info| lever_info.linked_entity);
+                if let Some(gate_id) = linked_gate {
+                    self.set_interactable_state_runtime(gate_id, SimInteractState::Active);
                 }
             }
         }

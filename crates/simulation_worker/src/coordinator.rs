@@ -99,12 +99,28 @@ fn send_commit(reducers: &RemoteReducers, pkg: CommitPackage, state: Arc<Mutex<C
         interactable_updates,
         death_state_inserts,
         sim_log_entries,
-        boss_phase_updates.into_iter().map(|(boss_entity_id, phase, entered_at_tick)| crate::module_bindings::BossPhaseUpdateInput {
-            boss_entity_id, phase, entered_at_tick
-        }).collect(),
-        zone_counter_deltas.into_iter().map(|(layer, region_x, region_z, counter_name, delta)| crate::module_bindings::ZoneCounterDeltaInput {
-            layer, region_x, region_z, counter_name, delta
-        }).collect(),
+        boss_phase_updates
+            .into_iter()
+            .map(|(boss_entity_id, phase, entered_at_tick)| {
+                crate::module_bindings::BossPhaseUpdateInput {
+                    boss_entity_id,
+                    phase,
+                    entered_at_tick,
+                }
+            })
+            .collect(),
+        zone_counter_deltas
+            .into_iter()
+            .map(|(layer, region_x, region_z, counter_name, delta)| {
+                crate::module_bindings::ZoneCounterDeltaInput {
+                    layer,
+                    region_x,
+                    region_z,
+                    counter_name,
+                    delta,
+                }
+            })
+            .collect(),
         move |rctx, outcome| {
             let reason = match &outcome {
                 Ok(Ok(())) => {
@@ -166,50 +182,6 @@ fn send_commit(reducers: &RemoteReducers, pkg: CommitPackage, state: Arc<Mutex<C
                 std::process::exit(1);
             }
         }
-    }
-}
-
-/// Dispatch a single secondary reducer call. Returns the error string on failure.
-fn send_secondary(reducers: &RemoteReducers, write: &SecondaryWrite) -> Result<(), String> {
-    match write {
-        SecondaryWrite::BossPhase {
-            boss_entity_id,
-            phase,
-            entered_at_tick,
-        } => reducers
-            .commit_boss_phase(*boss_entity_id, *phase, *entered_at_tick)
-            .map_err(|e| format!("commit_boss_phase: {e}")),
-        SecondaryWrite::ZoneCounter {
-            layer,
-            region_x,
-            region_z,
-            counter_name,
-            delta,
-        } => reducers
-            .increment_zone_counter(*layer, *region_x, *region_z, counter_name.clone(), *delta)
-            .map_err(|e| format!("increment_zone_counter: {e}")),
-    }
-}
-
-/// Dispatch a single secondary reducer call. Returns the error string on failure.
-fn send_secondary(reducers: &RemoteReducers, write: &SecondaryWrite) -> Result<(), String> {
-    match write {
-        SecondaryWrite::BossPhase {
-            boss_entity_id,
-            phase,
-            entered_at_tick,
-        } => reducers
-            .commit_boss_phase(*boss_entity_id, *phase, *entered_at_tick)
-            .map_err(|e| format!("commit_boss_phase: {e}")),
-        SecondaryWrite::ZoneCounter {
-            layer,
-            region_x,
-            region_z,
-            counter_name,
-            delta,
-        } => reducers
-            .increment_zone_counter(*layer, *region_x, *region_z, counter_name.clone(), *delta)
-            .map_err(|e| format!("increment_zone_counter: {e}")),
     }
 }
 
@@ -644,7 +616,8 @@ pub fn run(config: CoordinatorConfig) {
                     }
                 }
 
-                let enc_state = game_core::encounter::EncounterState::new(eid, rules, tick);
+                let enc_state =
+                    game_core::encounter::EncounterState::new_dormant(eid, rules, tick);
                 guard.sim.register_encounter(eid, enc_state);
                 info!(
                     "Registered encounter rules '{}' for boss entity {}",
@@ -1116,9 +1089,7 @@ pub fn run(config: CoordinatorConfig) {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard
-            .sim
-            .unregister_encounter_add(EntityId(row.add_entity));
+        guard.sim.unregister_encounter_add(EntityId(row.add_entity));
     });
 
     // ── World Phase projection ──────────────────────────────────────
@@ -1255,6 +1226,57 @@ pub fn run(config: CoordinatorConfig) {
         recompute_equipment(&ctx.db, &mut guard, eid);
     });
 
+    // ── Inventory bridge ───────────────────────────────────────────
+    // Mirror item counts into SimState so interactable `required_item`
+    // gates can be enforced inside Phase 2 without consulting the DB.
+
+    let state_for_inventory_insert = Arc::clone(&state);
+    conn.db.player_inventory().on_insert(move |ctx, row| {
+        if matches!(ctx.event, spacetimedb_sdk::Event::SubscribeApplied) {
+            return;
+        }
+        let mut guard = match state_for_inventory_insert.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
+            .sim
+            .add_inventory_item_count(EntityId(row.owner_entity), row.item_id, row.quantity);
+    });
+
+    let state_for_inventory_update = Arc::clone(&state);
+    conn.db
+        .player_inventory()
+        .on_update(move |_ctx, old_row, new_row| {
+            let mut guard = match state_for_inventory_update.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.sim.remove_inventory_item_count(
+                EntityId(old_row.owner_entity),
+                old_row.item_id,
+                old_row.quantity,
+            );
+            guard.sim.add_inventory_item_count(
+                EntityId(new_row.owner_entity),
+                new_row.item_id,
+                new_row.quantity,
+            );
+        });
+
+    let state_for_inventory_delete = Arc::clone(&state);
+    conn.db.player_inventory().on_delete(move |_ctx, row| {
+        let mut guard = match state_for_inventory_delete.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.sim.remove_inventory_item_count(
+            EntityId(row.owner_entity),
+            row.item_id,
+            row.quantity,
+        );
+    });
+
     // Block on the connection thread — the callbacks above drive the simulation.
     conn.run_threaded()
         .join()
@@ -1302,6 +1324,15 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
                     .collect();
                 for eid in equipped_entities {
                     recompute_equipment(&ctx.db, &mut guard, eid);
+                }
+
+                guard.sim.clear_inventory_items();
+                for row in ctx.db.player_inventory().iter() {
+                    guard.sim.add_inventory_item_count(
+                        EntityId(row.owner_entity),
+                        row.item_id,
+                        row.quantity,
+                    );
                 }
 
                 // Seed entity layers from entity_layer rows (public
@@ -1389,6 +1420,7 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
             "SELECT * FROM active_buff",
             "SELECT * FROM npc_state",
             "SELECT * FROM player_equipment",
+            "SELECT * FROM player_inventory",
             "SELECT * FROM instance",
             "SELECT * FROM interactable_config",
             "SELECT * FROM world_phase",
@@ -2283,6 +2315,14 @@ fn convert_interactable_info(
     InteractableInfo {
         kind,
         linked_entity: row.linked_entity.map(EntityId),
+        required_buff: row.required_buff,
+        required_item: row.required_item,
+        interact_range: row.interact_range,
+        script_id: row.script_id.clone(),
+        tags: row.tags.clone(),
+        puzzle_group: row.puzzle_group.clone(),
+        puzzle_required_count: row.puzzle_required_count,
+        puzzle_window_ticks: row.puzzle_window_ticks,
         state,
     }
 }
@@ -2395,6 +2435,48 @@ fn wire_combat_event(e: &CommitCombatEvent) -> CombatEventInput {
             } => CombatEventKind::TelegraphWarning(TelegraphWarningData {
                 target: *target,
                 impact_tick: *impact_tick,
+            }),
+            CommitCombatEventKind::AreaTelegraph {
+                ability_id,
+                pos_x,
+                pos_y,
+                pos_z,
+                radius,
+                shape,
+                impact_tick,
+            } => CombatEventKind::AreaTelegraph(AreaTelegraphData {
+                ability_id: *ability_id,
+                pos_x: *pos_x,
+                pos_y: *pos_y,
+                pos_z: *pos_z,
+                radius: *radius,
+                shape: shape.clone(),
+                impact_tick: *impact_tick,
+            }),
+            CommitCombatEventKind::EncounterCue {
+                cue_id,
+                anchor_entity,
+                pos_x,
+                pos_y,
+                pos_z,
+                shape,
+                inner_radius,
+                outer_radius,
+                half_height,
+                starts_at_tick,
+                expires_at_tick,
+            } => CombatEventKind::EncounterCue(EncounterCueData {
+                cue_id: cue_id.clone(),
+                anchor_entity: *anchor_entity,
+                pos_x: *pos_x,
+                pos_y: *pos_y,
+                pos_z: *pos_z,
+                shape: shape.clone(),
+                inner_radius: *inner_radius,
+                outer_radius: *outer_radius,
+                half_height: *half_height,
+                starts_at_tick: *starts_at_tick,
+                expires_at_tick: *expires_at_tick,
             }),
             CommitCombatEventKind::LockOnAcquired => CombatEventKind::LockOnAcquired,
             CommitCombatEventKind::LockOnSessionStarted { ability_id } => {
@@ -3038,7 +3120,9 @@ mod tests {
         }
     }
 
-    fn one_rule(phase: game_core::encounter::BossPhase) -> Vec<game_core::encounter::EncounterRule> {
+    fn one_rule(
+        phase: game_core::encounter::BossPhase,
+    ) -> Vec<game_core::encounter::EncounterRule> {
         vec![game_core::encounter::EncounterRule {
             trigger: game_core::encounter::EncounterTrigger::OnHpBelowOnce { percent: 0.5 },
             action: game_core::encounter::EncounterAction::ChangePhase { phase },
@@ -3049,7 +3133,10 @@ mod tests {
     #[test]
     fn resolve_boss_encounter_rules_prefers_configured_key() {
         let mut reg = game_core::encounter::EncounterRegistry::new();
-        reg.register("default".to_string(), one_rule(game_core::encounter::BossPhase::Phase2));
+        reg.register(
+            "default".to_string(),
+            one_rule(game_core::encounter::BossPhase::Phase2),
+        );
         reg.register(
             "state_enter_demo".to_string(),
             one_rule(game_core::encounter::BossPhase::Phase3),
@@ -3065,7 +3152,10 @@ mod tests {
     #[test]
     fn resolve_boss_encounter_rules_falls_back_to_default() {
         let mut reg = game_core::encounter::EncounterRegistry::new();
-        reg.register("default".to_string(), one_rule(game_core::encounter::BossPhase::Phase2));
+        reg.register(
+            "default".to_string(),
+            one_rule(game_core::encounter::BossPhase::Phase2),
+        );
 
         let (key, rules, fell_back) =
             resolve_boss_encounter_rules(&reg, Some("missing_key")).expect("fallback rules");
@@ -3077,7 +3167,10 @@ mod tests {
     #[test]
     fn resolve_boss_encounter_rules_uses_default_when_unconfigured() {
         let mut reg = game_core::encounter::EncounterRegistry::new();
-        reg.register("default".to_string(), one_rule(game_core::encounter::BossPhase::Phase2));
+        reg.register(
+            "default".to_string(),
+            one_rule(game_core::encounter::BossPhase::Phase2),
+        );
 
         let (key, rules, fell_back) =
             resolve_boss_encounter_rules(&reg, None).expect("default rules");

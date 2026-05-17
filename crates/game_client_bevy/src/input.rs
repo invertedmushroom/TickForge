@@ -4,8 +4,8 @@ use game_client::module_bindings::*;
 use spacetimedb_sdk::Table;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::ability_bar::{AbilityCooldowns, BLOCK_ABILITY_ID, ClientTargetingMode, all_abilities};
@@ -177,10 +177,7 @@ impl IntentRingBuffer {
         self.snapshot_filtered(Some((Instant::now(), min_age)))
     }
 
-    fn snapshot_filtered(
-        &self,
-        age_gate: Option<(Instant, Duration)>,
-    ) -> Vec<BatchedIntent> {
+    fn snapshot_filtered(&self, age_gate: Option<(Instant, Duration)>) -> Vec<BatchedIntent> {
         let Ok(mut guard) = self.inner.lock() else {
             return Vec::new();
         };
@@ -482,11 +479,7 @@ fn resend_intent_batch(
     }
 
     // Track the highest sequence in this batch for log correlation.
-    let highest_seq = snapshot
-        .iter()
-        .map(|i| i.sequence_id)
-        .max()
-        .unwrap_or(0);
+    let highest_seq = snapshot.iter().map(|i| i.sequence_id).max().unwrap_or(0);
 
     if let Err(e) = stdb.conn.reducers.submit_intents_batch_then(
         entity_id,
@@ -1432,7 +1425,11 @@ mod tests {
 
         ring.mark_acked(2);
         let snap = ring.snapshot_stale(RESEND_MIN_AGE);
-        assert_eq!(snap.len(), 1, "entries up to the acked seq should be pruned");
+        assert_eq!(
+            snap.len(),
+            1,
+            "entries up to the acked seq should be pruned"
+        );
         assert_eq!(snap[0].sequence_id, 3);
     }
 

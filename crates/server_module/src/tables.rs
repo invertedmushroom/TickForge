@@ -343,6 +343,8 @@ pub enum CombatEventKind {
     Blocked(BlockedData),
     Covered(CoveredData),
     TelegraphWarning(TelegraphWarningData),
+    AreaTelegraph(AreaTelegraphData),
+    EncounterCue(EncounterCueData),
     LockOnAcquired,
     LockOnSessionStarted(LockOnSessionStartedData),
     LockOnCanceled(LockOnCanceledData),
@@ -373,6 +375,32 @@ pub enum CombatEventKind {
 pub struct TelegraphWarningData {
     pub target: u64,
     pub impact_tick: u64,
+}
+
+#[derive(SpacetimeType, Clone, Debug)]
+pub struct AreaTelegraphData {
+    pub ability_id: u32,
+    pub pos_x: f32,
+    pub pos_y: f32,
+    pub pos_z: f32,
+    pub radius: f32,
+    pub shape: String,
+    pub impact_tick: u64,
+}
+
+#[derive(SpacetimeType, Clone, Debug)]
+pub struct EncounterCueData {
+    pub cue_id: String,
+    pub anchor_entity: Option<u64>,
+    pub pos_x: f32,
+    pub pos_y: f32,
+    pub pos_z: f32,
+    pub shape: String,
+    pub inner_radius: f32,
+    pub outer_radius: f32,
+    pub half_height: f32,
+    pub starts_at_tick: u64,
+    pub expires_at_tick: u64,
 }
 
 #[derive(SpacetimeType, Clone, Debug)]
@@ -824,12 +852,22 @@ pub struct InteractableConfig {
     pub interact_kind: InteractKind,
     /// Entity this interactable controls (e.g. switch → gate entity).
     pub linked_entity: Option<u64>,
+    /// Stable script identifier from the dungeon template.
+    pub script_id: Option<String>,
+    /// Stable tags from the dungeon template.
+    pub tags: Vec<String>,
     /// Buff required to interact. None = no requirement.
     pub required_buff: Option<u32>,
     /// Item required to interact. None = no requirement.
     pub required_item: Option<u32>,
     /// Max interaction distance. Default 3.0.
     pub interact_range: f32,
+    /// Timed multi-lever puzzle group. None = not part of a puzzle.
+    pub puzzle_group: Option<String>,
+    /// Number of levers required within the window. 0 = infer group size.
+    pub puzzle_required_count: u32,
+    /// Window in ticks for timed puzzle activation. 0 = no timed puzzle.
+    pub puzzle_window_ticks: u32,
     pub state: InteractState,
 }
 

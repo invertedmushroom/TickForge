@@ -115,14 +115,15 @@ impl TickPipeline {
                 }
             });
         let layer = self.layer_of_idx(idx);
-        self.pending_death_state_inserts.push(super::DeathStateInsertEntry {
-            entity_id: id,
-            killer_entity: killer,
-            layer,
-            death_pos_x: pos.x,
-            death_pos_y: pos.y,
-            death_pos_z: pos.z,
-        });
+        self.pending_death_state_inserts
+            .push(super::DeathStateInsertEntry {
+                entity_id: id,
+                killer_entity: killer,
+                layer,
+                death_pos_x: pos.x,
+                death_pos_y: pos.y,
+                death_pos_z: pos.z,
+            });
     }
 
     // ── Phase 8a: Cooldown expiry ───────────────────────────────

@@ -381,7 +381,10 @@ fn build_trimesh_mesh(vertices: &[f32], indices: &[u32]) -> Mesh {
         );
         return Cuboid::new(1.0, 1.0, 1.0).into();
     }
-    let positions: Vec<[f32; 3]> = vertices.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+    let positions: Vec<[f32; 3]> = vertices
+        .chunks_exact(3)
+        .map(|c| [c[0], c[1], c[2]])
+        .collect();
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,

@@ -10,9 +10,9 @@ mod combat_log;
 mod diagnostics;
 #[cfg(feature = "connected")]
 mod dungeon_geometry;
-mod hud;
 #[cfg(feature = "connected")]
-mod terrain;
+mod encounter_panel;
+mod hud;
 #[cfg(feature = "connected")]
 mod input;
 #[cfg(feature = "connected")]
@@ -26,9 +26,9 @@ mod spacetime;
 #[cfg(feature = "connected")]
 mod sync;
 #[cfg(feature = "connected")]
-mod vfx;
+mod terrain;
 #[cfg(feature = "connected")]
-mod encounter_panel;
+mod vfx;
 
 use bevy::pbr::{NotShadowCaster, NotShadowReceiver};
 use bevy::prelude::*;

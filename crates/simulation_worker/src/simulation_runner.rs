@@ -42,7 +42,14 @@ impl SimulationRunner {
         global_max_rewind_ticks: u32,
     ) -> Self {
         Self {
-            pipeline: TickPipeline::new(start_tick, physics, dt, abilities, buff_registry, global_max_rewind_ticks),
+            pipeline: TickPipeline::new(
+                start_tick,
+                physics,
+                dt,
+                abilities,
+                buff_registry,
+                global_max_rewind_ticks,
+            ),
             commit: CommitAuthority::new(),
             tick_driver: TickDriver::new(),
             pending_stat_recalcs: HashSet::new(),
@@ -96,7 +103,8 @@ impl SimulationRunner {
         self.commit.seed(max_committed_tick);
         self.pipeline
             .set_current_tick(TickId(max_committed_tick + 1));
-        self.pipeline.set_global_max_rewind_ticks(global_max_rewind_ticks);
+        self.pipeline
+            .set_global_max_rewind_ticks(global_max_rewind_ticks);
     }
 
     /// Record a successful commit acknowledgement.
@@ -217,6 +225,20 @@ impl SimulationRunner {
     /// Remove an interactable entry from the sim state.
     pub fn remove_interactable(&mut self, id: EntityId) {
         self.pipeline.state.interactables.remove(&id);
+    }
+
+    pub fn add_inventory_item_count(&mut self, entity: EntityId, item_id: u32, count: u32) {
+        self.pipeline
+            .add_inventory_item_count(entity, item_id, count);
+    }
+
+    pub fn remove_inventory_item_count(&mut self, entity: EntityId, item_id: u32, count: u32) {
+        self.pipeline
+            .remove_inventory_item_count(entity, item_id, count);
+    }
+
+    pub fn clear_inventory_items(&mut self) {
+        self.pipeline.inventory_items.clear();
     }
 
     /// Returns the visibility layer for an entity (0 = open world).
@@ -1029,7 +1051,7 @@ mod tests {
 
         // Register with tags
         runner.register_encounter_add_with_tags(add, boss, &["my_tag".to_string()]);
-        
+
         // Verify they are registered
         assert_eq!(runner.pipeline.add_to_boss.get(&add), Some(&boss));
         assert!(runner.pipeline.entity_tags.contains_key(&add));

@@ -1,5 +1,5 @@
 use crate::tables::*;
-use spacetimedb::{reducer, ReducerContext, Table, TimeDuration};
+use spacetimedb::{ReducerContext, Table, TimeDuration, reducer};
 
 // ── Lifecycle ───────────────────────────────────────────────────────
 
@@ -1378,9 +1378,14 @@ pub fn commit_tick_results(
                     entity_id: existing.entity_id,
                     interact_kind: existing.interact_kind,
                     linked_entity: existing.linked_entity,
+                    script_id: existing.script_id,
+                    tags: existing.tags,
                     required_buff: existing.required_buff,
                     required_item: existing.required_item,
                     interact_range: existing.interact_range,
+                    puzzle_group: existing.puzzle_group,
+                    puzzle_required_count: existing.puzzle_required_count,
+                    puzzle_window_ticks: existing.puzzle_window_ticks,
                     state: u.state,
                 });
         }
@@ -1398,7 +1403,6 @@ pub fn commit_tick_results(
             message: entry.message,
         });
     }
-
 
     // Process boss_phase_updates inline.
     for update in boss_phase_updates {
@@ -1439,10 +1443,7 @@ pub fn commit_tick_results(
 
         if let Some(mut existing_row) = existing {
             existing_row.value += delta.delta;
-            ctx.db
-                .zone_counter()
-                .counter_id()
-                .update(existing_row);
+            ctx.db.zone_counter().counter_id().update(existing_row);
         } else {
             ctx.db.zone_counter().insert(ZoneCounter {
                 counter_id: 0,
@@ -3040,9 +3041,14 @@ pub fn create_instance(
             entity_id: eid,
             interact_kind,
             linked_entity,
+            script_id: def.script_id.clone(),
+            tags: def.tags.clone(),
             required_buff: def.required_buff,
             required_item: def.required_item,
             interact_range: def.interact_range.unwrap_or(3.0),
+            puzzle_group: def.puzzle_group.clone(),
+            puzzle_required_count: def.puzzle_required_count.unwrap_or(0),
+            puzzle_window_ticks: def.puzzle_window_ticks.unwrap_or(0),
             state: InteractState::Idle,
         });
     }

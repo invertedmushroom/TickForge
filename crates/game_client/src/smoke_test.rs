@@ -1447,9 +1447,7 @@ fn run_b3_out_of_order(conn: &DbConnection, r: &mut TestResults, entity_id: u64,
             "B3  shuffled batch sorted, cursor={cursor} == max"
         ));
     } else {
-        r.fail(&format!(
-            "B3  expected cursor={target_max}, got {cursor}"
-        ));
+        r.fail(&format!("B3  expected cursor={target_max}, got {cursor}"));
     }
     pump(conn, 200);
 }
@@ -1500,12 +1498,7 @@ fn run_b4_in_batch_duplicate(
     pump(conn, 200);
 }
 
-fn run_b5_stale_in_batch(
-    conn: &DbConnection,
-    r: &mut TestResults,
-    entity_id: u64,
-    seq_base: u64,
-) {
+fn run_b5_stale_in_batch(conn: &DbConnection, r: &mut TestResults, entity_id: u64, seq_base: u64) {
     info!("  B5: Stale entry in batch is silently skipped");
 
     let cursor_before = current_client_sequence(conn)
@@ -1514,7 +1507,11 @@ fn run_b5_stale_in_batch(
 
     // Stale = below current cursor. Mix one stale with two valid;
     // the reducer must skip the stale and insert the rest.
-    let stale_seq = if cursor_before > 0 { cursor_before - 1 } else { 1 };
+    let stale_seq = if cursor_before > 0 {
+        cursor_before - 1
+    } else {
+        1
+    };
     let intents = vec![
         batched_stop(stale_seq),
         batched_stop(seq_base + 1),
@@ -1550,12 +1547,7 @@ fn run_b5_stale_in_batch(
     pump(conn, 200);
 }
 
-fn run_b6_max_batch_len(
-    conn: &DbConnection,
-    r: &mut TestResults,
-    entity_id: u64,
-    seq_base: u64,
-) {
+fn run_b6_max_batch_len(conn: &DbConnection, r: &mut TestResults, entity_id: u64, seq_base: u64) {
     info!("  B6: MAX_BATCH_LEN overflow rejected");
 
     let cursor_before = current_client_sequence(conn)
@@ -1708,8 +1700,7 @@ fn run_b8_queue_cap_tail_drop(
     // the trailing 3 (seq+6..seq+8) are silently dropped. Cursor must
     // advance to seq+5 (highest INSERTED) — never to seq+8 — otherwise
     // the redundant-resend mechanism would convert into stale rejections.
-    let intents: Vec<BatchedIntent> =
-        (1..=8u64).map(|i| batched_stop(seq_base + i)).collect();
+    let intents: Vec<BatchedIntent> = (1..=8u64).map(|i| batched_stop(seq_base + i)).collect();
     let target_inserted_max = seq_base + 5;
 
     let done = Arc::new(AtomicBool::new(false));
@@ -2025,7 +2016,7 @@ fn run_f4_queue_overflow(conn: &DbConnection, r: &mut TestResults, entity_id: u6
         // then `ok` intents were accepted (assuming no other failure modes).
         // The last accepted sequence should be exactly `seq_base + 300 + ok - 1`.
         let expected_max_seq = seq_base + 300 + ok as u64 - 1;
-        
+
         let last_seq = match current_client_sequence(conn) {
             Some(seq) => seq.last_processed_sequence,
             None => 0,

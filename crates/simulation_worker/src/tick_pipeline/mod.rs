@@ -18,18 +18,19 @@ pub(super) use game_protocol::types::{Quatf, Vec3f};
 pub(super) use game_schema::EntityKind;
 #[allow(unused_imports)]
 pub(super) use log::warn;
-pub(super) use std::collections::{HashMap, HashSet};
+pub(super) use std::collections::{BTreeSet, HashMap, HashSet};
 
 mod ai;
 mod archetype;
 mod collectors;
 mod combat;
 mod controller;
+mod encounter_runtime;
 mod finalization;
 mod skill_dispatch;
-mod volumes;
 #[cfg(test)]
 mod tests;
+mod volumes;
 
 pub(super) use archetype::NpcArchetypeRegistry;
 
@@ -262,6 +263,11 @@ pub(super) struct LockOnSession {
 /// Default lock-on session timeout in ticks (20 s at 20 Hz).
 const LOCK_ON_SESSION_TIMEOUT_TICKS: u32 = 400;
 
+pub(super) struct LeverPuzzleRuntime {
+    pub activated: BTreeSet<EntityId>,
+    pub expires_at: TickId,
+}
+
 pub struct TickPipeline {
     pub(super) current_tick: TickId,
     pub(super) event_sequence: u32,
@@ -282,6 +288,10 @@ pub struct TickPipeline {
     /// CooldownReady events. Retroactive cooldown reduction is a direct mutation of the ready_at
     /// value. Entity despawn cleaning removes all entries in a single `retain` call.
     pub(super) cooldowns: HashMap<(EntityId, u32), TickId>,
+    /// Same-tick cast reservations for AI and encounter outputs. Timeline
+    /// cooldown actions run earlier than encounter execution, so this closes
+    /// the per-tick duplicate window before `CooldownStart` is processed.
+    pub(super) ability_cast_reservations: HashSet<(EntityId, u32)>,
     /// Monotonically increasing counter for `ScheduledAction::id`.
     /// Assigned at scheduling time; never reused within a session.
     pub(super) next_scheduled_id: u64,
@@ -337,8 +347,7 @@ pub struct TickPipeline {
     /// Volume edge events queued by the latest occupant sync, keyed by
     /// owning boss. Drained by `volumes_take_rule_events` before encounter
     /// rule evaluation. Each pair = (volume, list of (entity, is_enter)).
-    pub(super) pending_volume_events:
-        HashMap<EntityId, Vec<game_core::encounter::VolumeRuleEvent>>,
+    pub(super) pending_volume_events: HashMap<EntityId, Vec<game_core::encounter::VolumeRuleEvent>>,
     /// Entities whose cached `StatBlock` needs recalculation.
     /// Populated by: (a) equipment changes (via `mark_stats_dirty`),
     /// (b) buff changes (copied from `StatusState::dirty_entities` at Phase 10).
@@ -348,6 +357,9 @@ pub struct TickPipeline {
     /// Aggregated equipment modifiers per entity. Updated by the coordinator
     /// when `player_equipment` rows change; read by `phase_stat_recalc`.
     pub(super) equipment_modifiers: HashMap<EntityId, game_core::stats::EquipmentModifiers>,
+    /// Item counts mirrored from `player_inventory`, used by Phase 2
+    /// interactable gating without consulting the DB mid-tick.
+    pub(super) inventory_items: HashMap<EntityId, HashMap<u32, u32>>,
     /// Last emitted (NpcAiState, target) per NPC. `collect_npc_state_updates`
     /// only emits when the current value differs, eliminating redundant upserts
     /// for idle NPCs whose state never changes.
@@ -374,6 +386,8 @@ pub struct TickPipeline {
     /// Each entry is (entity_id, new_state). Drained in Phase 10 commit.
     pub(super) pending_interactable_updates:
         Vec<(EntityId, game_core::sim_state::SimInteractState)>,
+    /// Active timed lever puzzle windows keyed by dungeon-authored group id.
+    pub(super) lever_puzzles: HashMap<String, LeverPuzzleRuntime>,
     /// Deferred heals queued during Phase 7 (AI decisions) and drained in Phase 8b.
     /// Keeps Health mutations centralised in combat/finalization phases.
     /// Each entry is (entity_id, heal_amount, heal_source).
@@ -421,6 +435,12 @@ impl TickPipeline {
 
         let removed_set: HashSet<EntityId> = ids.iter().copied().collect();
 
+        // 0) Give encounter mechanics a final stop callback while the boss
+        //    entity, layer cache, and owned volumes are still available.
+        for id in &removed_set {
+            self.cleanup_encounter_for_boss_removal(*id);
+        }
+
         // 1) Determine all execution IDs owned by ANY removed caster so we can
         //    fully remove dependent runtime objects (scheduled actions, sensors, hitboxes).
         let execs_to_remove: HashSet<AbilityExecutionId> = self
@@ -454,6 +474,13 @@ impl TickPipeline {
         // 3) Single-pass cooldown cleanup.
         self.cooldowns
             .retain(|&(eid, _), _| !removed_set.contains(&eid));
+        self.ability_cast_reservations
+            .retain(|(eid, _)| !removed_set.contains(eid));
+        self.inventory_items
+            .retain(|eid, _| !removed_set.contains(eid));
+        for puzzle in self.lever_puzzles.values_mut() {
+            puzzle.activated.retain(|eid| !removed_set.contains(eid));
+        }
 
         // 4) Single-pass follow-up windows + charging cleanup.
         self.state
@@ -609,6 +636,7 @@ impl TickPipeline {
             buff_registry,
             state: SimState::new(),
             cooldowns: HashMap::new(),
+            ability_cast_reservations: HashSet::new(),
             next_scheduled_id: 0,
             summary: TickSummary::default(),
             entity_regions: HashMap::new(),
@@ -626,6 +654,7 @@ impl TickPipeline {
             pending_volume_events: HashMap::new(),
             stats_dirty: HashSet::new(),
             equipment_modifiers: HashMap::new(),
+            inventory_items: HashMap::new(),
             npc_state_prev: HashMap::new(),
             weapon_swap_cooldowns: HashMap::new(),
             region_types: HashMap::new(),
@@ -633,6 +662,7 @@ impl TickPipeline {
             cover_blockers: Vec::new(),
             global_max_rewind_ticks,
             pending_interactable_updates: Vec::new(),
+            lever_puzzles: HashMap::new(),
             pending_heals: Vec::new(),
             pending_zone_counter_deltas: Vec::new(),
             pending_death_state_inserts: Vec::new(),
@@ -678,10 +708,7 @@ impl TickPipeline {
 
     /// Replace the mechanic factory registry (e.g., to register custom
     /// mechanics at startup before any encounter rules execute).
-    pub fn set_mechanic_registry(
-        &mut self,
-        registry: game_core::encounter::MechanicRegistry,
-    ) {
+    pub fn set_mechanic_registry(&mut self, registry: game_core::encounter::MechanicRegistry) {
         self.mechanics = registry;
     }
 
@@ -1352,12 +1379,146 @@ impl TickPipeline {
             .is_some_and(|&ready_at| self.current_tick < ready_at)
     }
 
+    pub(super) fn ability_ready_at(&self, entity: EntityId, ability_id: u32, tick: TickId) -> bool {
+        self.cooldowns
+            .get(&(entity, ability_id))
+            .map_or(true, |&ready_at| ready_at <= tick)
+            && !self
+                .ability_cast_reservations
+                .contains(&(entity, ability_id))
+    }
+
+    pub(super) fn reserve_ability_cast(&mut self, entity: EntityId, ability_id: u32) -> bool {
+        if self.is_on_cooldown(entity, ability_id) {
+            return false;
+        }
+        self.ability_cast_reservations.insert((entity, ability_id))
+    }
+
+    pub(super) fn release_ability_reservation(&mut self, entity: EntityId, ability_id: u32) {
+        self.ability_cast_reservations.remove(&(entity, ability_id));
+    }
+
     /// Test-visible alias for `is_on_cooldown`. Production code uses the private method
     /// directly; tests need it to assert post-cast cooldown state without going through
     /// a UseAbility intent.
     #[cfg(test)]
     pub fn is_on_cooldown_pub(&self, entity: EntityId, ability_id: u32) -> bool {
         self.is_on_cooldown(entity, ability_id)
+    }
+
+    pub fn add_inventory_item_count(&mut self, entity: EntityId, item_id: u32, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let entry = self.inventory_items.entry(entity).or_default();
+        let current = entry.get(&item_id).copied().unwrap_or(0);
+        entry.insert(item_id, current.saturating_add(count));
+    }
+
+    pub fn remove_inventory_item_count(&mut self, entity: EntityId, item_id: u32, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let mut remove_owner = false;
+        if let Some(items) = self.inventory_items.get_mut(&entity) {
+            let remaining = items
+                .get(&item_id)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(count);
+            if remaining == 0 {
+                items.remove(&item_id);
+            } else {
+                items.insert(item_id, remaining);
+            }
+            remove_owner = items.is_empty();
+        }
+        if remove_owner {
+            self.inventory_items.remove(&entity);
+        }
+    }
+
+    pub(super) fn entity_has_item(&self, entity: EntityId, item_id: u32) -> bool {
+        self.inventory_items
+            .get(&entity)
+            .and_then(|items| items.get(&item_id))
+            .is_some_and(|count| *count > 0)
+    }
+
+    pub(super) fn set_interactable_state_runtime(
+        &mut self,
+        entity: EntityId,
+        state: game_core::sim_state::SimInteractState,
+    ) {
+        let mut visited = HashSet::new();
+        self.set_interactable_state_runtime_inner(entity, state, &mut visited);
+    }
+
+    fn set_interactable_state_runtime_inner(
+        &mut self,
+        entity: EntityId,
+        state: game_core::sim_state::SimInteractState,
+        visited: &mut HashSet<EntityId>,
+    ) {
+        use game_core::sim_state::SimInteractKind;
+
+        if !visited.insert(entity) {
+            log::warn!(
+                "Interactable state propagation cycle detected at entity {}; stopping",
+                entity.0
+            );
+            return;
+        }
+
+        let Some(info) = self.state.interactables.get(&entity).cloned() else {
+            return;
+        };
+        self.set_interactable_own_state_runtime(entity, state);
+
+        match info.kind {
+            SimInteractKind::Gate => {
+                self.physics.set_collider_enabled(
+                    entity,
+                    state != game_core::sim_state::SimInteractState::Active,
+                );
+            }
+            SimInteractKind::Switch => {
+                if let Some(linked_entity) = info.linked_entity {
+                    let gate_state = if state == game_core::sim_state::SimInteractState::Active {
+                        game_core::sim_state::SimInteractState::Active
+                    } else {
+                        game_core::sim_state::SimInteractState::Idle
+                    };
+                    self.set_interactable_state_runtime_inner(linked_entity, gate_state, visited);
+                }
+            }
+            SimInteractKind::Chest | SimInteractKind::Grab => {}
+        }
+    }
+
+    pub(super) fn set_interactable_own_state_runtime(
+        &mut self,
+        entity: EntityId,
+        state: game_core::sim_state::SimInteractState,
+    ) {
+        if let Some(entry) = self.state.interactables.get_mut(&entity) {
+            entry.state = state;
+        }
+        self.pending_interactable_updates.push((entity, state));
+    }
+
+    pub(super) fn toggle_interactable_state_runtime(&mut self, entity: EntityId) {
+        use game_core::sim_state::SimInteractState;
+        let Some(info) = self.state.interactables.get(&entity).cloned() else {
+            return;
+        };
+        let new_state = match info.state {
+            SimInteractState::Idle => SimInteractState::Active,
+            SimInteractState::Active => SimInteractState::Idle,
+            SimInteractState::Cooldown => return,
+        };
+        self.set_interactable_state_runtime(entity, new_state);
     }
 
     /// Returns true if the entity cannot move this tick.
@@ -1422,6 +1583,12 @@ impl TickPipeline {
         let t = &self.state.combat.tactical[idx.as_usize()];
         t.movement_conditions
             .contains(game_core::combat::tactical::MovementConditions::SILENCED)
+    }
+
+    pub(super) fn buff_is_mechanic_locked(&self, buff_id: u32) -> bool {
+        self.buff_registry.get(buff_id).is_some_and(|template| {
+            template.removal_policy == game_core::combat::status::BuffRemovalPolicy::MechanicLocked
+        })
     }
 
     /// Clear a specific CC effect's timer and movement-condition bitflag.
@@ -1538,6 +1705,7 @@ impl TickPipeline {
         self.state.audit.reset();
         self.event_sequence = 0;
         self.pending_events.clear();
+        self.ability_cast_reservations.clear();
         self.pending_heals.clear();
         // Defensive symmetry with `pending_heals.clear()`: the buffer is
         // normally drained via `mem::take` in commit assembly, but an
@@ -1625,6 +1793,11 @@ impl TickPipeline {
                 | game_core::encounter::EncounterOutput::StopMechanic { .. }
                 | game_core::encounter::EncounterOutput::SpawnAdds { .. }
                 | game_core::encounter::EncounterOutput::Telegraph { .. }
+                | game_core::encounter::EncounterOutput::EncounterCue { .. }
+                | game_core::encounter::EncounterOutput::ApplyBuff { .. }
+                | game_core::encounter::EncounterOutput::RemoveBuffs { .. }
+                | game_core::encounter::EncounterOutput::SetInteractableState { .. }
+                | game_core::encounter::EncounterOutput::ToggleInteractable { .. }
                 | game_core::encounter::EncounterOutput::SpawnVolume { .. }
                 | game_core::encounter::EncounterOutput::DespawnVolume { .. } => {
                     // Runtime encounter actions are applied inside phase_encounter_execution.
@@ -1791,17 +1964,14 @@ impl TickPipeline {
     /// `EncounterState::evaluate`, so `OnEntityDied` triggers fire on the
     /// tick following the death.
     pub(super) fn forward_death_to_encounter(&mut self, entity: EntityId) {
-        let tags = self
-            .entity_tags
-            .get(&entity)
-            .cloned()
-            .unwrap_or_default();
+        let tags = self.entity_tags.get(&entity).cloned().unwrap_or_default();
         // Boss death — encounter is keyed by the boss entity itself.
         if let Some(enc) = self.encounters.get_mut(&entity) {
-            enc.bus.push(game_core::encounter::EncounterEvent::EntityDied {
-                entity,
-                tags: tags.clone(),
-            });
+            enc.bus
+                .push(game_core::encounter::EncounterEvent::EntityDied {
+                    entity,
+                    tags: tags.clone(),
+                });
             return;
         }
         // Add death — owning boss recorded at spawn.
@@ -1820,10 +1990,8 @@ impl TickPipeline {
                 return;
             }
             if let Some(enc) = self.encounters.get_mut(&boss) {
-                enc.bus.push(game_core::encounter::EncounterEvent::EntityDied {
-                    entity,
-                    tags,
-                });
+                enc.bus
+                    .push(game_core::encounter::EncounterEvent::EntityDied { entity, tags });
             }
         }
     }

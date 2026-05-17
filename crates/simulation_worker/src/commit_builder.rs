@@ -117,6 +117,28 @@ pub enum CommitCombatEventKind {
         target: u64,
         impact_tick: u64,
     },
+    AreaTelegraph {
+        ability_id: u32,
+        pos_x: f32,
+        pos_y: f32,
+        pos_z: f32,
+        radius: f32,
+        shape: String,
+        impact_tick: u64,
+    },
+    EncounterCue {
+        cue_id: String,
+        anchor_entity: Option<u64>,
+        pos_x: f32,
+        pos_y: f32,
+        pos_z: f32,
+        shape: String,
+        inner_radius: f32,
+        outer_radius: f32,
+        half_height: f32,
+        starts_at_tick: u64,
+        expires_at_tick: u64,
+    },
     LockOnAcquired,
     LockOnSessionStarted {
         ability_id: u32,
@@ -647,6 +669,61 @@ fn classify_events(events: &[SimEvent]) -> (Vec<CommitCombatEvent>, Vec<CommitWo
                     event_kind: CommitCombatEventKind::TelegraphWarning {
                         target: target.0,
                         impact_tick: *impact_tick,
+                    },
+                });
+            }
+            EventPayload::AreaTelegraph {
+                source,
+                ability_id,
+                position,
+                radius,
+                shape,
+                impact_tick,
+            } => {
+                combat_events.push(CommitCombatEvent {
+                    source_entity: source.0,
+                    target_entity: 0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CommitCombatEventKind::AreaTelegraph {
+                        ability_id: *ability_id,
+                        pos_x: position.x,
+                        pos_y: position.y,
+                        pos_z: position.z,
+                        radius: *radius,
+                        shape: shape.clone(),
+                        impact_tick: *impact_tick,
+                    },
+                });
+            }
+            EventPayload::EncounterCue {
+                source,
+                target,
+                cue_id,
+                anchor_entity,
+                position,
+                shape,
+                inner_radius,
+                outer_radius,
+                half_height,
+                starts_at_tick,
+                expires_at_tick,
+            } => {
+                combat_events.push(CommitCombatEvent {
+                    source_entity: source.0,
+                    target_entity: target.0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CommitCombatEventKind::EncounterCue {
+                        cue_id: cue_id.clone(),
+                        anchor_entity: anchor_entity.map(|id| id.0),
+                        pos_x: position.x,
+                        pos_y: position.y,
+                        pos_z: position.z,
+                        shape: shape.clone(),
+                        inner_radius: *inner_radius,
+                        outer_radius: *outer_radius,
+                        half_height: *half_height,
+                        starts_at_tick: *starts_at_tick,
+                        expires_at_tick: *expires_at_tick,
                     },
                 });
             }

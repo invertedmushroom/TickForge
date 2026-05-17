@@ -1963,7 +1963,10 @@ mod tests {
             let pos = world
                 .get_body_position(entity)
                 .expect("character body should still exist");
-            assert!(result.grounded, "character should stay grounded on flat trimesh");
+            assert!(
+                result.grounded,
+                "character should stay grounded on flat trimesh"
+            );
             assert!(
                 (pos.y - expected_y).abs() < 0.05,
                 "character drifted off floor rest height: expected y≈{}, got {}",

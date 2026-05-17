@@ -17,7 +17,7 @@ use game_protocol::entity_id::EntityId;
 use game_protocol::event::EventPayload;
 use game_protocol::types::Vec3f;
 
-use super::{ColliderKind, TickPipeline, TickId};
+use super::{ColliderKind, TickId, TickPipeline};
 
 impl TickPipeline {
     /// Drain queued [`VolumeRuleEvent`]s for a single boss. Called once per
@@ -32,10 +32,7 @@ impl TickPipeline {
     /// Snapshot `tag → distinct-occupant-count` for this boss's volumes.
     /// Used by `Cond::OccupancyCmp`. Same entity in two volumes with the
     /// same tag is counted once.
-    pub(super) fn volumes_occupancy_by_tag(
-        &self,
-        boss_id: EntityId,
-    ) -> HashMap<String, u32> {
+    pub(super) fn volumes_occupancy_by_tag(&self, boss_id: EntityId) -> HashMap<String, u32> {
         let mut out: HashMap<String, u32> = HashMap::new();
         let Some(store) = self.volumes.get(&boss_id) else {
             return out;
@@ -50,6 +47,29 @@ impl TickPipeline {
         }
         for (tag, set) in by_tag {
             out.insert(tag, set.len() as u32);
+        }
+        out
+    }
+
+    /// Snapshot `tag -> distinct occupants` for this boss's volumes.
+    /// Used by rule-visible set-membership and buff conditions.
+    pub(super) fn volumes_occupants_by_tag_map(
+        &self,
+        boss_id: EntityId,
+    ) -> HashMap<String, Vec<EntityId>> {
+        let mut out: HashMap<String, Vec<EntityId>> = HashMap::new();
+        let Some(store) = self.volumes.get(&boss_id) else {
+            return out;
+        };
+        let mut by_tag: HashMap<String, std::collections::BTreeSet<EntityId>> = HashMap::new();
+        for v in store.iter_sorted() {
+            let entry = by_tag.entry(v.tag.clone()).or_default();
+            for e in &v.occupants {
+                entry.insert(*e);
+            }
+        }
+        for (tag, set) in by_tag {
+            out.insert(tag, set.into_iter().collect());
         }
         out
     }
@@ -125,6 +145,9 @@ impl TickPipeline {
                 String,
                 Option<EntityId>,
                 EntityKindFilter,
+                VolumeShape,
+                Vec3f,
+                u32,
             )> = match self.volumes.get(&boss_id) {
                 Some(store) => store
                     .iter_sorted()
@@ -136,6 +159,9 @@ impl TickPipeline {
                             v.tag.clone(),
                             v.owner,
                             v.entity_filter.clone(),
+                            v.shape,
+                            v.position,
+                            v.layer,
                         )
                     })
                     .collect(),
@@ -143,7 +169,7 @@ impl TickPipeline {
             };
             let mut diffs: Vec<(VolumeId, String, Vec<EntityId>, Vec<EntityId>)> =
                 Vec::with_capacity(snapshots.len());
-            for (id, handle, tag, owner, filter) in snapshots {
+            for (id, handle, tag, owner, filter, shape, position, volume_layer) in snapshots {
                 let raw_occupants = self.physics.sensor_intersections(handle);
                 let filtered: Vec<EntityId> = raw_occupants
                     .into_iter()
@@ -151,8 +177,12 @@ impl TickPipeline {
                         let Some(idx) = self.state.entities.lookup(*entity) else {
                             return false;
                         };
+                        if self.layer_of_idx(idx) != volume_layer {
+                            return false;
+                        }
                         let kind = self.state.entities.kinds[idx.as_usize()];
                         filter.accepts(kind, *entity, owner)
+                            && self.volume_shape_accepts(shape, position, *entity)
                     })
                     .collect();
                 let store = self
@@ -164,10 +194,7 @@ impl TickPipeline {
                 }
             }
             for (id, tag, entered, exited) in diffs {
-                let queue = self
-                    .pending_volume_events
-                    .entry(boss_id)
-                    .or_default();
+                let queue = self.pending_volume_events.entry(boss_id).or_default();
                 for entity in &entered {
                     queue.push(VolumeRuleEvent::Enter {
                         tag: tag.clone(),
@@ -215,6 +242,7 @@ impl TickPipeline {
         entity_filter: EntityKindFilter,
         follow_owner: bool,
     ) -> VolumeId {
+        let layer = self.layer_of(boss_id);
         let store = self.volumes.entry(boss_id).or_default();
         let id = store.allocate_id();
         let sensor_shape = match shape {
@@ -226,6 +254,14 @@ impl TickPipeline {
                 half_height,
                 radius,
             },
+            VolumeShape::Ring {
+                outer_radius,
+                half_height,
+                ..
+            } => SensorShape::Capsule {
+                half_height,
+                radius: outer_radius,
+            },
         };
         let handle = self.physics.spawn_world_sensor(
             position,
@@ -233,13 +269,14 @@ impl TickPipeline {
             ColliderKind::Volume(id.0),
             boss_id,
         );
-        let expires_at = lifetime_ticks.map(|n| TickId(self.current_tick.0.saturating_add(n as u64)));
+        let expires_at =
+            lifetime_ticks.map(|n| TickId(self.current_tick.0.saturating_add(n as u64)));
         store.insert(Volume {
             id,
             tag,
             shape,
             position,
-            layer: 0,
+            layer,
             sensor_handle: handle,
             spawned_at: self.current_tick,
             expires_at,
@@ -249,6 +286,43 @@ impl TickPipeline {
             follow_owner,
         });
         id
+    }
+
+    fn volume_shape_accepts(&self, shape: VolumeShape, center: Vec3f, entity: EntityId) -> bool {
+        match shape {
+            VolumeShape::Sphere { .. } | VolumeShape::Capsule { .. } => true,
+            VolumeShape::Ring {
+                inner_radius,
+                outer_radius,
+                half_height,
+            } => {
+                let Some(transform) = self.physics.get_transform(entity) else {
+                    return false;
+                };
+                let dx = transform.position.x - center.x;
+                let dz = transform.position.z - center.z;
+                let dy = (transform.position.y - center.y).abs();
+                let dist_sq = dx * dx + dz * dz;
+                dy <= half_height
+                    && dist_sq >= inner_radius * inner_radius
+                    && dist_sq <= outer_radius * outer_radius
+            }
+        }
+    }
+
+    pub(super) fn volumes_occupants_by_tag(&self, boss_id: EntityId, tag: &str) -> Vec<EntityId> {
+        let Some(store) = self.volumes.get(&boss_id) else {
+            return Vec::new();
+        };
+        let mut occupants = std::collections::BTreeSet::new();
+        for v in store.iter_sorted() {
+            if v.tag == tag {
+                for entity in &v.occupants {
+                    occupants.insert(*entity);
+                }
+            }
+        }
+        occupants.into_iter().collect()
     }
 
     /// Resolve a [`VolumeAnchor`] against the current sim state for this boss.
@@ -294,14 +368,13 @@ impl TickPipeline {
                         entity: *entity,
                     },
                 );
-                self.pending_volume_events
-                    .entry(boss_id)
-                    .or_default()
-                    .push(VolumeRuleEvent::Exit {
+                self.pending_volume_events.entry(boss_id).or_default().push(
+                    VolumeRuleEvent::Exit {
                         tag: volume.tag.clone(),
                         entity: *entity,
                         volume_id: volume.id,
-                    });
+                    },
+                );
             }
             log::debug!(
                 "Volume despawn: boss {} tag '{}' id {} at tick {}",
@@ -329,14 +402,13 @@ impl TickPipeline {
                         entity: *entity,
                     },
                 );
-                self.pending_volume_events
-                    .entry(boss_id)
-                    .or_default()
-                    .push(VolumeRuleEvent::Exit {
+                self.pending_volume_events.entry(boss_id).or_default().push(
+                    VolumeRuleEvent::Exit {
                         tag: volume.tag.clone(),
                         entity: *entity,
                         volume_id: volume.id,
-                    });
+                    },
+                );
             }
         }
     }

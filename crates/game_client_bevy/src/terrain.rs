@@ -54,7 +54,10 @@ fn all_layers() -> &'static WorldLayersFile {
 /// `terrain_set` name so layers that don't decouple visual from collision
 /// still work without extra config.
 fn visual_asset_for_layer(layer_id: u32) -> Option<&'static str> {
-    let layer = all_layers().layers.iter().find(|l| l.layer_id == layer_id)?;
+    let layer = all_layers()
+        .layers
+        .iter()
+        .find(|l| l.layer_id == layer_id)?;
     layer
         .client_visual
         .as_deref()
@@ -127,11 +130,7 @@ fn sync_terrain_visual(
 
     let scene_handle: Handle<Scene> = asset_server.load(asset_path.as_str());
     let entity = commands
-        .spawn((
-            SceneRoot(scene_handle),
-            Transform::IDENTITY,
-            TerrainScene,
-        ))
+        .spawn((SceneRoot(scene_handle), Transform::IDENTITY, TerrainScene))
         .id();
 
     active.layer = Some(layer_id);

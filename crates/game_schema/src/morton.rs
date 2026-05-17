@@ -82,7 +82,10 @@ pub fn decode_chunk_morton(m: u64) -> (i32, i32, i32) {
 /// Flat per-voxel index inside a chunk of side `n`: `x + y*n + z*n*n`.
 #[inline]
 pub fn voxel_idx(x: u32, y: u32, z: u32, n: u32) -> u32 {
-    debug_assert!(x < n && y < n && z < n, "voxel ({x},{y},{z}) out of chunk side {n}");
+    debug_assert!(
+        x < n && y < n && z < n,
+        "voxel ({x},{y},{z}) out of chunk side {n}"
+    );
     x + y * n + z * n * n
 }
 
@@ -102,7 +105,11 @@ mod tests {
             (0, 0, -1),
             (123, -456, 789),
             (-100_000, 100_000, -50_000),
-            (CHUNK_MORTON_BIAS - 1, CHUNK_MORTON_BIAS - 1, CHUNK_MORTON_BIAS - 1),
+            (
+                CHUNK_MORTON_BIAS - 1,
+                CHUNK_MORTON_BIAS - 1,
+                CHUNK_MORTON_BIAS - 1,
+            ),
             (-CHUNK_MORTON_BIAS, -CHUNK_MORTON_BIAS, -CHUNK_MORTON_BIAS),
         ];
         for (cx, cy, cz) in cases {

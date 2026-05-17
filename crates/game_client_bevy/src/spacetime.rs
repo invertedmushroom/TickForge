@@ -135,6 +135,8 @@ fn connect(mut commands: Commands) {
                     "SELECT * FROM instance_membership",
                     "SELECT * FROM death_state",
                     "SELECT * FROM entity_layer",
+                    "SELECT * FROM encounter_add",
+                    "SELECT * FROM entity_health",
                 ]);
 
             // Spawn the player.

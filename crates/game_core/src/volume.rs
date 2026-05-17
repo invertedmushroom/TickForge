@@ -29,8 +29,20 @@ pub struct VolumeId(pub u64);
 /// upright cylindrical zones (e.g., totems, beam columns).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum VolumeShape {
-    Sphere { radius: f32 },
-    Capsule { half_height: f32, radius: f32 },
+    Sphere {
+        radius: f32,
+    },
+    Capsule {
+        half_height: f32,
+        radius: f32,
+    },
+    /// Horizontal annulus centered on the volume position. Used by encounter
+    /// mechanics where distance from an anchor matters more than a filled AoE.
+    Ring {
+        inner_radius: f32,
+        outer_radius: f32,
+        half_height: f32,
+    },
 }
 
 /// Policy for which entities count as occupants of a [`Volume`].
@@ -144,10 +156,7 @@ impl VolumeStore {
     /// physics sensor and supplying its handle. Returns the volume's id.
     pub fn insert(&mut self, volume: Volume) -> VolumeId {
         let id = volume.id;
-        self.by_tag
-            .entry(volume.tag.clone())
-            .or_default()
-            .push(id);
+        self.by_tag.entry(volume.tag.clone()).or_default().push(id);
         self.volumes.insert(id, volume);
         id
     }
@@ -188,10 +197,7 @@ impl VolumeStore {
 
     /// Volume ids matching `tag` in insertion order.
     pub fn ids_with_tag(&self, tag: &str) -> &[VolumeId] {
-        self.by_tag
-            .get(tag)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+        self.by_tag.get(tag).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// First volume matching `tag` (most-recently-inserted call sites usually
@@ -362,10 +368,7 @@ mod tests {
 
         // Duplicates in input are deduped.
         let (entered, exited) = store
-            .update_occupants(
-                id,
-                vec![EntityId(7), EntityId(3), EntityId(5), EntityId(7)],
-            )
+            .update_occupants(id, vec![EntityId(7), EntityId(3), EntityId(5), EntityId(7)])
             .expect("present");
         assert!(entered.is_empty());
         assert!(exited.is_empty());

@@ -751,10 +751,7 @@ fn spawn_contact_hitbox_visuals(
             Mesh3d(mesh),
             MeshMaterial3d(mat),
             Transform::from_translation(ev.position),
-            ContactHitboxVisual {
-                age: 0.0,
-                lifetime,
-            },
+            ContactHitboxVisual { age: 0.0, lifetime },
         ));
     }
 }
@@ -1419,10 +1416,7 @@ struct TelegraphVisual {
     impact_tick: u64,
 }
 
-fn spawn_telegraph_visuals(
-    mut commands: Commands,
-    mut events: EventReader<TelegraphVfxEvent>,
-) {
+fn spawn_telegraph_visuals(mut commands: Commands, mut events: EventReader<TelegraphVfxEvent>) {
     for ev in events.read() {
         commands.spawn(TelegraphVisual {
             target: ev.target,

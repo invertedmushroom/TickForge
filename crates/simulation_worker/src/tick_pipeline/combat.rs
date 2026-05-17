@@ -210,8 +210,10 @@ impl TickPipeline {
             })
             .unwrap_or(1.0);
 
-        let base_damage =
-            effect_ref.map(|e| e.base_damage).unwrap_or(ability.base_damage) * charge_mult;
+        let base_damage = effect_ref
+            .map(|e| e.base_damage)
+            .unwrap_or(ability.base_damage)
+            * charge_mult;
         let damage_type = effect_ref
             .map(|e| e.damage_type)
             .unwrap_or(ability.damage_type);
@@ -233,7 +235,9 @@ impl TickPipeline {
         let launch_recovery_ticks = effect_ref
             .map(|e| e.launch_recovery_ticks)
             .unwrap_or(ability.launch_recovery_ticks);
-        let stun_ticks = effect_ref.map(|e| e.stun_ticks).unwrap_or(ability.stun_ticks);
+        let stun_ticks = effect_ref
+            .map(|e| e.stun_ticks)
+            .unwrap_or(ability.stun_ticks);
         let knockdown_ticks = effect_ref
             .map(|e| e.knockdown_ticks)
             .unwrap_or(ability.knockdown_ticks);
@@ -243,13 +247,14 @@ impl TickPipeline {
         let silence_ticks = effect_ref
             .map(|e| e.silence_ticks)
             .unwrap_or(ability.silence_ticks);
-        let fear_ticks = effect_ref.map(|e| e.fear_ticks).unwrap_or(ability.fear_ticks);
+        let fear_ticks = effect_ref
+            .map(|e| e.fear_ticks)
+            .unwrap_or(ability.fear_ticks);
         // Only the override path can carry per-hitbox `on_contact` actions.
         // Default abilities never trigger contact follow-ups, so an empty Vec
         // here is allocation-free.
-        let on_contact: Vec<HitEffectAction> = effect_ref
-            .map(|e| e.on_contact.clone())
-            .unwrap_or_default();
+        let on_contact: Vec<HitEffectAction> =
+            effect_ref.map(|e| e.on_contact.clone()).unwrap_or_default();
 
         let attacker_idx = self.state.entities.lookup(attacker);
 
@@ -270,8 +275,8 @@ impl TickPipeline {
             // Outgoing damage stat scales healing too — keeps healing-power
             // semantics aligned with damage modifiers until a dedicated
             // `outgoing_heal_mult` stat is added.
-            let out_mult: f32 = attacker_idx
-                .map_or(1.0, |idx| self.state.stats.get(idx).damage_out_mult);
+            let out_mult: f32 =
+                attacker_idx.map_or(1.0, |idx| self.state.stats.get(idx).damage_out_mult);
             let scaled_heal = heal_amount * charge_mult * out_mult;
             let actual = self
                 .state
@@ -1549,8 +1554,7 @@ impl TickPipeline {
         // the previous per-projectile loop's `physics.get_transform()?` check.
         let mut live_positions: Vec<(EntityId, Vec3f)> = Vec::new();
         for slot in 0..self.state.entities.len() {
-            if self.state.entities.states[slot]
-                != game_core::entity::lifecycle::EntityState::Active
+            if self.state.entities.states[slot] != game_core::entity::lifecycle::EntityState::Active
             {
                 continue;
             }

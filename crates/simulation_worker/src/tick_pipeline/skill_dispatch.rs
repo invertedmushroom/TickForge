@@ -1007,7 +1007,18 @@ impl TickPipeline {
                 // B6: Remove up to `count` Condition debuffs from self.
                 // If any removed debuff had a cc_effect, also clear the matching CC timer.
                 if let Some(idx) = self.state.entities.lookup(entity) {
-                    let removed = self.state.status.cleanse_conditions(idx, *count);
+                    let locked: HashSet<u32> = self
+                        .state
+                        .status
+                        .get_buffs(idx)
+                        .iter()
+                        .filter(|ab| self.buff_is_mechanic_locked(ab.buff_id))
+                        .map(|ab| ab.buff_id)
+                        .collect();
+                    let removed = self
+                        .state
+                        .status
+                        .cleanse_conditions_where(idx, *count, |ab| !locked.contains(&ab.buff_id));
                     for ab in &removed {
                         self.emit_event(
                             entity,
@@ -1041,9 +1052,27 @@ impl TickPipeline {
             AbilityAction::ClearCC { cc_effect } => {
                 // B6: Clear a specific CC effect from self.
                 if let Some(idx) = self.state.entities.lookup(entity) {
-                    self.clear_cc_by_effect(entity, idx, *cc_effect);
                     // Also remove the matching CC condition debuff.
-                    if let Some(ab) = self.state.status.remove_cc_debuff(idx, *cc_effect) {
+                    let locked_cc_present = self.state.status.get_buffs(idx).iter().any(|ab| {
+                        ab.modifiers.cc_effect == Some(*cc_effect)
+                            && self.buff_is_mechanic_locked(ab.buff_id)
+                    });
+                    let locked: HashSet<u32> = self
+                        .state
+                        .status
+                        .get_buffs(idx)
+                        .iter()
+                        .filter(|ab| self.buff_is_mechanic_locked(ab.buff_id))
+                        .map(|ab| ab.buff_id)
+                        .collect();
+                    if let Some(ab) =
+                        self.state
+                            .status
+                            .remove_cc_debuff_where(idx, *cc_effect, |ab| {
+                                !locked.contains(&ab.buff_id)
+                            })
+                    {
+                        self.clear_cc_by_effect(entity, idx, *cc_effect);
                         self.emit_event(
                             entity,
                             EventPayload::BuffExpired {
@@ -1051,6 +1080,8 @@ impl TickPipeline {
                             },
                         );
                         self.stats_dirty.insert(entity);
+                    } else if !locked_cc_present {
+                        self.clear_cc_by_effect(entity, idx, *cc_effect);
                     }
                     self.emit_event(
                         entity,
@@ -1073,14 +1104,32 @@ impl TickPipeline {
                         CCEffect::Fear,
                     ];
                     for cc in &all_cc {
-                        self.clear_cc_by_effect(entity, idx, *cc);
-                        if let Some(ab) = self.state.status.remove_cc_debuff(idx, *cc) {
+                        let locked_cc_present = self.state.status.get_buffs(idx).iter().any(|ab| {
+                            ab.modifiers.cc_effect == Some(*cc)
+                                && self.buff_is_mechanic_locked(ab.buff_id)
+                        });
+                        let locked: HashSet<u32> = self
+                            .state
+                            .status
+                            .get_buffs(idx)
+                            .iter()
+                            .filter(|ab| self.buff_is_mechanic_locked(ab.buff_id))
+                            .map(|ab| ab.buff_id)
+                            .collect();
+                        if let Some(ab) = self
+                            .state
+                            .status
+                            .remove_cc_debuff_where(idx, *cc, |ab| !locked.contains(&ab.buff_id))
+                        {
+                            self.clear_cc_by_effect(entity, idx, *cc);
                             self.emit_event(
                                 entity,
                                 EventPayload::BuffExpired {
                                     buff_id: ab.buff_id,
                                 },
                             );
+                        } else if !locked_cc_present {
+                            self.clear_cc_by_effect(entity, idx, *cc);
                         }
                     }
                     self.stats_dirty.insert(entity);

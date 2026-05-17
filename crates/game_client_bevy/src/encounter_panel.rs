@@ -4,16 +4,17 @@ use spacetimedb_sdk::Table;
 
 use crate::spacetime::{LocalPlayerEntity, StdbConnection};
 
+/// Legacy F8 debug panel for boss/encounter visibility.
+///
+/// This panel is intentionally lightweight and hidden by default. Remove it
+/// once the Bevy client has a more complete runtime diagnostics flow.
 pub struct EncounterPanelPlugin;
 
 impl Plugin for EncounterPanelPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<EncounterPanelVisible>();
         app.add_systems(Startup, spawn_encounter_panel);
-        app.add_systems(
-            Update,
-            (toggle_encounter_panel, update_encounter_panel),
-        );
+        app.add_systems(Update, (toggle_encounter_panel, update_encounter_panel));
     }
 }
 
@@ -30,7 +31,7 @@ fn spawn_encounter_panel(mut commands: Commands) {
             font_size: 13.0,
             ..default()
         },
-        TextColor(Color::srgba(1.0, 0.85, 0.7, 0.95)),
+        TextColor(Color::srgba(0.85, 0.9, 1.0, 0.95)),
         Node {
             position_type: PositionType::Absolute,
             right: Val::Px(10.0),
@@ -38,7 +39,7 @@ fn spawn_encounter_panel(mut commands: Commands) {
             max_width: Val::Px(400.0),
             ..default()
         },
-        BackgroundColor(Color::srgba(0.1, 0.05, 0.05, 0.85)),
+        BackgroundColor(Color::srgba(0.05, 0.05, 0.1, 0.85)),
         Visibility::Hidden,
         EncounterPanel,
     ));
@@ -76,51 +77,97 @@ fn update_encounter_panel(
     };
 
     let Some(stdb) = stdb else {
-        **text = "--- Encounter Panel (F8) ---\nNot connected".into();
+        **text = "--- F8 Debug Panel ---\nNot connected".into();
         return;
     };
 
-    let _entity_id = local_player.entity_id.unwrap_or(0);
+    let entity_id = local_player.entity_id.unwrap_or(0);
+    let my_region = stdb.conn.db.my_region().iter().next();
+    let current_layer = my_region.as_ref().map(|r| r.layer).unwrap_or(0);
+    let region_desc = my_region
+        .as_ref()
+        .map(|r| format!("L{} [{},{}]", r.layer, r.region_x, r.region_z))
+        .unwrap_or_else(|| "unknown".to_string());
 
-    let current_layer = stdb
-        .conn
-        .db
-        .my_region()
-        .iter()
-        .next()
-        .map(|r| r.layer)
-        .unwrap_or(0);
+    let nearby_entities = stdb.conn.db.nearby_entities().count();
+    let nearby_health = stdb.conn.db.nearby_health().count();
+    let active_buff_count = stdb.conn.db.active_buff().count();
+    let npc_state_count = stdb.conn.db.npc_state().count();
+    let player_inventory_count = stdb.conn.db.player_inventory().count();
+    let player_equipment_count = stdb.conn.db.player_equipment().count();
+    let module_config_count = stdb.conn.db.module_config().count();
+    let interactable_count = stdb.conn.db.interactable_config().count();
+    let death_state_count = stdb.conn.db.death_state().count();
+    let boss_phase_count = stdb.conn.db.boss_phase().count();
+    let world_phase_count = stdb.conn.db.world_phase().count();
+    let zone_counter_count = stdb.conn.db.zone_counter().count();
+    let instance_count = stdb.conn.db.instance().count();
+    let membership_count = stdb.conn.db.instance_membership().count();
+    let entity_layer_count = stdb.conn.db.entity_layer().count();
+    let encounter_add_count = stdb.conn.db.encounter_add().count();
+    let entity_health_count = stdb.conn.db.entity_health().count();
 
     let mut lines = vec![
-        "--- Encounter Panel (F8) ---".to_string(),
-        format!("Layer: {current_layer}"),
+        "--- F8 Debug Panel ---".to_string(),
+        format!("Local entity: {}", entity_id),
+        format!("Region: {}", region_desc),
+        format!("Layer: {}", current_layer),
+        format!(
+            "Nearby rows: entities={} health={}",
+            nearby_entities, nearby_health
+        ),
+        format!(
+            "Global rows: bosses={} worlds={} zones={} instances={} memberships={}",
+            boss_phase_count,
+            world_phase_count,
+            zone_counter_count,
+            instance_count,
+            membership_count,
+        ),
+        format!(
+            "Game state rows: buffs={} npcs={} deaths={} interact={} layers={}",
+            active_buff_count,
+            npc_state_count,
+            death_state_count,
+            interactable_count,
+            entity_layer_count,
+        ),
+        format!(
+            "Player rows: inv={} equip={} module_cfg={} encounter_add={} health={}",
+            player_inventory_count,
+            player_equipment_count,
+            module_config_count,
+            encounter_add_count,
+            entity_health_count,
+        ),
     ];
 
-    // Find all bosses in the local layer
-    // We only want to show bosses that are in our layer (if we can infer it, otherwise show all and filter later)
-    // boss_phase doesn't have layer, but entity_layer does.
-    let mut active_bosses = Vec::new();
-    for phase_info in stdb.conn.db.boss_phase().iter() {
-        let is_in_my_layer = stdb.conn.db.entity_layer().entity_id().find(&phase_info.boss_entity_id).map(|el| el.layer) == Some(current_layer);
-        
-        if is_in_my_layer {
-            active_bosses.push(phase_info);
-        }
+    let membership = stdb
+        .conn
+        .db
+        .instance_membership()
+        .iter()
+        .find(|m| m.entity_id == entity_id);
+
+    match membership {
+        Some(m) => lines.push(format!("Member of instance #{}", m.instance_id)),
+        None => lines.push("Not in instance".to_string()),
     }
 
-    if active_bosses.is_empty() {
-        lines.push("No active bosses in current layer.".to_string());
-    } else {
-        for boss_phase in active_bosses {
-            lines.push(String::new());
-            
-            // Get HP
-            let hp_str = match stdb.conn.db.entity_health().entity_id().find(&boss_phase.boss_entity_id) {
+    if boss_phase_count > 0 {
+        lines.push(String::new());
+        lines.push("Boss phases:".to_string());
+        for boss_phase in stdb.conn.db.boss_phase().iter() {
+            let hp_str = match stdb
+                .conn
+                .db
+                .entity_health()
+                .entity_id()
+                .find(&boss_phase.boss_entity_id)
+            {
                 Some(h) => format!("{:.0}/{:.0}", h.hp, h.max_hp),
                 None => "Dead/Missing".to_string(),
             };
-
-            // Format Phase Name
             let phase_name = match boss_phase.phase {
                 1 => "Phase 1",
                 2 => "Phase 2",
@@ -128,31 +175,77 @@ fn update_encounter_panel(
                 99 => "Enrage",
                 _ => "Custom",
             };
-
             lines.push(format!(
-                "BOSS #{} [{}] HP: {}",
-                boss_phase.boss_entity_id, phase_name, hp_str
+                "  BOSS #{} {} HP={} entered={}",
+                boss_phase.boss_entity_id, phase_name, hp_str, boss_phase.entered_at_tick,
             ));
 
-            // Find Adds
-            let adds: Vec<_> = stdb.conn.db.encounter_add().iter().filter(|a| a.boss_entity == boss_phase.boss_entity_id).collect();
-            
+            let adds: Vec<_> = stdb
+                .conn
+                .db
+                .encounter_add()
+                .iter()
+                .filter(|a| a.boss_entity == boss_phase.boss_entity_id)
+                .collect();
+
             if adds.is_empty() {
-                lines.push("  Adds: None".to_string());
+                lines.push("    Adds: None".to_string());
             } else {
-                lines.push(format!("  Adds ({}):", adds.len()));
+                lines.push(format!("    Adds ({}):", adds.len()));
                 for add in adds {
-                    // Filter dead adds if they aren't removed immediately, but usually health is a good indicator
-                    let add_hp = match stdb.conn.db.entity_health().entity_id().find(&add.add_entity) {
+                    let add_hp = match stdb
+                        .conn
+                        .db
+                        .entity_health()
+                        .entity_id()
+                        .find(&add.add_entity)
+                    {
                         Some(h) => format!("{:.0}/{:.0}", h.hp, h.max_hp),
                         None => "Dead".to_string(),
                     };
-                    let tags_str = if add.tags.is_empty() { "[]".to_string() } else { format!("{:?}", add.tags) };
+                    let tags_str = if add.tags.is_empty() {
+                        "[]".to_string()
+                    } else {
+                        format!("{:?}", add.tags)
+                    };
                     lines.push(format!(
-                        "    - #{} {} HP: {} {}",
+                        "      - #{} {} HP={} {}",
                         add.add_entity, add.archetype, add_hp, tags_str
                     ));
                 }
+            }
+        }
+    }
+
+    if world_phase_count > 0 {
+        lines.push(String::new());
+        lines.push("World phases:".to_string());
+        for wp in stdb.conn.db.world_phase().iter() {
+            let layer = wp.zone_id / 1_000_000;
+            let rem = wp.zone_id % 1_000_000;
+            let rx = (rem / 1000) as i32 - 500;
+            let rz = (rem % 1000) as i32 - 500;
+            lines.push(format!("  L{} ({},{}) -> {}", layer, rx, rz, wp.phase_name));
+        }
+    }
+
+    if zone_counter_count > 0 {
+        lines.push(String::new());
+        lines.push("Zone counters:".to_string());
+        if let Some(region) = my_region {
+            for zc in stdb.conn.db.zone_counter().iter().filter(|zc| {
+                zc.layer == region.layer
+                    && zc.region_x == region.region_x
+                    && zc.region_z == region.region_z
+            }) {
+                lines.push(format!("  {} = {}", zc.counter_name, zc.value));
+            }
+        } else {
+            for zc in stdb.conn.db.zone_counter().iter() {
+                lines.push(format!(
+                    "  L{} ({},{}) {} = {}",
+                    zc.layer, zc.region_x, zc.region_z, zc.counter_name, zc.value
+                ));
             }
         }
     }

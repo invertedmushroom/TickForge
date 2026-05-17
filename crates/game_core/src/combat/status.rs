@@ -23,6 +23,17 @@ impl Default for BuffKind {
     }
 }
 
+/// Who is allowed to remove a buff before natural expiry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BuffRemovalPolicy {
+    /// Normal buffs can be removed by cleanse, stunbreak, or explicit effects.
+    #[default]
+    Normal,
+    /// Encounter/mechanic-owned buffs. Counterplay actions skip these; the
+    /// owning mechanic must remove them explicitly.
+    MechanicLocked,
+}
+
 // Re-export from game_schema so all existing `status::CCEffect` imports keep working.
 pub use game_schema::CCEffect;
 
@@ -105,6 +116,8 @@ pub struct BuffTemplate {
     /// Duration in ticks. `None` = permanent until explicitly removed.
     pub duration_ticks: Option<u32>,
     pub max_stacks: u32,
+    #[serde(default)]
+    pub removal_policy: BuffRemovalPolicy,
     #[serde(default)]
     pub modifiers: BuffModifiers,
 }
@@ -233,4 +246,19 @@ impl ThreatTable {
 #[derive(Clone, Debug, Deserialize)]
 pub struct BuffFile {
     pub buffs: Vec<BuffTemplate>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_shipped_buffs_ron() {
+        let file: BuffFile =
+            ron::from_str(include_str!("../../../../data/buffs.ron")).expect("buffs parse");
+        assert!(
+            file.buffs.iter().any(|buff| buff.buff_id == 802),
+            "Manaya boss-lock buff should stay authored in data/buffs.ron"
+        );
+    }
 }

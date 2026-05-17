@@ -437,8 +437,7 @@ fn sync_entities(
                 let prev_server_tick = smoothing.last_server_tick;
                 let new_server_tick = snapshot.tick as u64;
                 if new_server_tick > prev_server_tick && prev_server_tick != 0 {
-                    telemetry
-                        .record_snapshot_gap(new_server_tick.saturating_sub(prev_server_tick));
+                    telemetry.record_snapshot_gap(new_server_tick.saturating_sub(prev_server_tick));
                 }
                 update_authoritative_state(&mut smoothing, snapshot);
 

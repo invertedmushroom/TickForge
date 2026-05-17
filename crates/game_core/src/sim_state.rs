@@ -29,6 +29,7 @@ pub enum AuditSubsystem {
     CooldownTracker,
     StatusEffects,
     AiDecisions,
+    EncounterRuntime,
 }
 
 /// Domain tags for mutation audit records.
@@ -232,6 +233,7 @@ pub fn is_ownership_allowed(domain: AuditDomain, subsystem: AuditSubsystem, phas
             (subsystem == AuditSubsystem::AbilityTimeline && phase == 3)
                 || (subsystem == AuditSubsystem::Combat && phase == 6)
                 || (subsystem == AuditSubsystem::StatusEffects && phase == 8)
+                || (subsystem == AuditSubsystem::EncounterRuntime && phase == 7)
         }
         AuditDomain::Ai => subsystem == AuditSubsystem::AiDecisions && phase == 7,
         // Window: AbilityTimeline writes in phase 3, CooldownTracker drains in phase 8.
@@ -513,11 +515,26 @@ impl StatusState {
 
     /// Remove up to `count` Condition debuffs (oldest first), returning the removed buffs.
     pub fn cleanse_conditions(&mut self, idx: EntityIndex, count: u32) -> Vec<ActiveBuff> {
+        self.cleanse_conditions_where(idx, count, |_| true)
+    }
+
+    /// Remove up to `count` Condition debuffs accepted by `can_remove`.
+    pub fn cleanse_conditions_where<F>(
+        &mut self,
+        idx: EntityIndex,
+        count: u32,
+        mut can_remove: F,
+    ) -> Vec<ActiveBuff>
+    where
+        F: FnMut(&ActiveBuff) -> bool,
+    {
         let buffs = &mut self.buffs[idx.as_usize()];
         let mut removed = Vec::new();
         let mut i = 0;
         while i < buffs.len() && (removed.len() as u32) < count {
-            if buffs[i].buff_kind == crate::combat::status::BuffKind::Condition {
+            if buffs[i].buff_kind == crate::combat::status::BuffKind::Condition
+                && can_remove(&buffs[i])
+            {
                 removed.push(buffs.swap_remove(i));
             } else {
                 i += 1;
@@ -541,6 +558,50 @@ impl StatusState {
             .position(|b| b.modifiers.cc_effect == Some(cc_effect))?;
         self.dirty_entities.insert(idx.as_usize());
         Some(buffs.swap_remove(pos))
+    }
+
+    /// Remove the first CC debuff accepted by `can_remove`.
+    pub fn remove_cc_debuff_where<F>(
+        &mut self,
+        idx: EntityIndex,
+        cc_effect: game_schema::CCEffect,
+        mut can_remove: F,
+    ) -> Option<ActiveBuff>
+    where
+        F: FnMut(&ActiveBuff) -> bool,
+    {
+        let buffs = &mut self.buffs[idx.as_usize()];
+        let pos = buffs
+            .iter()
+            .position(|b| b.modifiers.cc_effect == Some(cc_effect) && can_remove(b))?;
+        self.dirty_entities.insert(idx.as_usize());
+        Some(buffs.swap_remove(pos))
+    }
+
+    /// Remove buffs by id when `can_remove` accepts the active instance.
+    pub fn remove_buffs_by_ids_where<F>(
+        &mut self,
+        idx: EntityIndex,
+        buff_ids: &[u32],
+        mut can_remove: F,
+    ) -> Vec<ActiveBuff>
+    where
+        F: FnMut(&ActiveBuff) -> bool,
+    {
+        let buffs = &mut self.buffs[idx.as_usize()];
+        let mut removed = Vec::new();
+        let mut i = 0;
+        while i < buffs.len() {
+            if buff_ids.contains(&buffs[i].buff_id) && can_remove(&buffs[i]) {
+                removed.push(buffs.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        if !removed.is_empty() {
+            self.dirty_entities.insert(idx.as_usize());
+        }
+        removed
     }
 }
 
@@ -584,12 +645,18 @@ pub enum SimInteractState {
 }
 
 /// Per-entity interactable info tracked by the simulation.
-// TODO: include `required_buff` and `required_item` in `InteractableInfo`
-// so runtime interaction checks can enforce gated interactions.
 #[derive(Clone, Debug)]
 pub struct InteractableInfo {
     pub kind: SimInteractKind,
     pub linked_entity: Option<EntityId>,
+    pub required_buff: Option<u32>,
+    pub required_item: Option<u32>,
+    pub interact_range: f32,
+    pub script_id: Option<String>,
+    pub tags: Vec<String>,
+    pub puzzle_group: Option<String>,
+    pub puzzle_required_count: u32,
+    pub puzzle_window_ticks: u32,
     pub state: SimInteractState,
 }
 

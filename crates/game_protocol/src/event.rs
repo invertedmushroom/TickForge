@@ -56,6 +56,34 @@ pub enum EventPayload {
         /// Tick when the damage frame will land.
         impact_tick: u64,
     },
+    /// Warning that a world-position AoE is incoming.
+    AreaTelegraph {
+        source: EntityId,
+        ability_id: u32,
+        position: crate::types::Vec3f,
+        radius: f32,
+        shape: String,
+        /// Tick when the damage frame will land.
+        impact_tick: u64,
+    },
+    /// Client-facing encounter presentation cue.
+    ///
+    /// Encounter rules use this for mechanic warnings and renderable
+    /// non-damaging elements. It is separate from internal encounter bus
+    /// events, which are rule wiring and are not committed for clients.
+    EncounterCue {
+        source: EntityId,
+        target: EntityId,
+        cue_id: String,
+        anchor_entity: Option<EntityId>,
+        position: crate::types::Vec3f,
+        shape: String,
+        inner_radius: f32,
+        outer_radius: f32,
+        half_height: f32,
+        starts_at_tick: u64,
+        expires_at_tick: u64,
+    },
     BuffApplied {
         buff_id: u32,
         source: EntityId,

@@ -770,10 +770,7 @@ fn dev_import_terrain(args: ImportTerrainArgs) -> Result<()> {
         );
         args.set_id
     });
-    println!(
-        "terrain_set '{}' → id={}",
-        args.set_name, resolved_set_id
-    );
+    println!("terrain_set '{}' → id={}", args.set_name, resolved_set_id);
 
     // 2) per-chunk: weld + upsert chunk + upsert manifest.
     let mut sorted_keys: Vec<(i32, i32)> = buckets.keys().copied().collect();
@@ -1060,9 +1057,7 @@ fn call_reducer_http(reducer: &str, json_body: &str, token: &str) -> Result<()> 
 
     if !(200..300).contains(&status_code) {
         let body = response.split("\r\n\r\n").nth(1).unwrap_or("").trim();
-        bail!(
-            "reducer `{reducer}` HTTP call failed ({status_line}):\n{body}"
-        );
+        bail!("reducer `{reducer}` HTTP call failed ({status_line}):\n{body}");
     }
     Ok(())
 }

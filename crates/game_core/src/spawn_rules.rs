@@ -199,13 +199,15 @@ mod tests {
         assert!(reg.for_open_world().iter().any(|(rx, rz, rule)| *rx == 0
             && *rz == 0
             && rule.rule_id == "open_world_origin_patrol"));
-        assert!(reg
-            .for_dungeon("test_dungeon_01")
-            .any(|rule| rule.rule_id == "training_dungeon_reinforcements"));
-        assert!(reg
-            .all()
-            .iter()
-            .any(|rule| matches!(rule.trigger, SpawnTrigger::PlayerCountAtLeast { .. })));
+        assert!(
+            reg.for_dungeon("test_dungeon_01")
+                .any(|rule| rule.rule_id == "training_dungeon_reinforcements")
+        );
+        assert!(
+            reg.all()
+                .iter()
+                .any(|rule| matches!(rule.trigger, SpawnTrigger::PlayerCountAtLeast { .. }))
+        );
         assert!(reg.all().iter().any(|rule| rule.scaling.is_some()));
     }
 

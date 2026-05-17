@@ -5,10 +5,11 @@
 //! potentially fires; conditions gate _whether_ it fires; effects are leaf
 //! actions executed in order on the tick the rule fires.
 //!
-//! Step 2 of the encounter rethink keeps composers (`Sequence`/`Parallel`/
-//! `Wait`) and event-driven triggers as **stubs**: the variants exist so RON
-//! authors don't churn when Step 3 lands the event bus, but the stub triggers
-//! never fire and stub effects are no-ops with a warn log.
+//! `Sequence`/`Parallel`/`Wait` are live composers. A `Sequence` applies steps
+//! until the first `Wait`, parks the remaining tail as an encounter-owned
+//! continuation, and resumes it from the start of a later `evaluate()` call.
+//! Event-driven triggers consume the encounter bus snapshot for the current
+//! tick.
 //!
 //! Mechanic instantiation is decoupled from rule evaluation: `evaluate()`
 //! returns an [`EncounterOutput::StartMechanic { name, params }`], which the
@@ -16,6 +17,7 @@
 //! with a live [`MechanicCtx`].
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -109,11 +111,7 @@ pub enum Trigger {
     OnEntityDied { tag: String },
     /// Counter-on-encounter comparison; fires on the tick the comparison flips
     /// from false → true.
-    OnCounter {
-        name: String,
-        op: CmpOp,
-        value: i64,
-    },
+    OnCounter { name: String, op: CmpOp, value: i64 },
     /// Fires when a mechanic with the matching `name` finished this tick.
     OnMechanicEnded { name: String },
     /// An entity entered a volume matching `tag`. Volume events are wired
@@ -131,18 +129,45 @@ pub enum Trigger {
 pub enum Cond {
     /// Always true. Default for rules without an explicit gate.
     Always,
-    PhaseIs { phase: BossPhase },
-    HpPctCmp { op: CmpOp, value: f32 },
-    CounterCmp { name: String, op: CmpOp, value: i64 },
-    All { conds: Vec<Cond> },
-    Any { conds: Vec<Cond> },
-    Not { cond: Box<Cond> },
+    PhaseIs {
+        phase: BossPhase,
+    },
+    HpPctCmp {
+        op: CmpOp,
+        value: f32,
+    },
+    CounterCmp {
+        name: String,
+        op: CmpOp,
+        value: i64,
+    },
+    All {
+        conds: Vec<Cond>,
+    },
+    Any {
+        conds: Vec<Cond>,
+    },
+    Not {
+        cond: Box<Cond>,
+    },
     /// True when at least `count` distinct entities of any kind currently
     /// overlap any volume tagged `tag` (across all volumes with that tag).
     OccupancyCmp {
         tag: String,
         op: CmpOp,
         count: i64,
+    },
+    /// True when every occupant of `source_tag` is present in exactly one of
+    /// the `member_tags`. Empty source occupancy is valid.
+    VolumeOccupantsExactlyOneOf {
+        source_tag: String,
+        member_tags: Vec<String>,
+    },
+    /// True when every current occupant of `tag` has `buff_id`. Empty
+    /// occupancy is valid.
+    AllVolumeOccupantsHaveBuff {
+        tag: String,
+        buff_id: u32,
     },
 }
 
@@ -168,6 +193,50 @@ pub enum Target {
     AllPlayers,
     /// All entities currently inside any volume matching `tag`.
     VolumeOccupants { tag: String },
+    /// Runtime-only explicit entity target, used by mechanics after sampling
+    /// players from live state. Authors should not use this in RON.
+    RuntimeEntity { entity: EntityId },
+    /// A world-space point offset from the boss's cast-time facing.
+    BossOffset { offset: [f32; 3] },
+    /// A fixed world-space point in the encounter arena.
+    FixedPoint { position: [f32; 3] },
+}
+
+/// Stable selector for dungeon interactables whose runtime entity IDs are
+/// assigned by instance creation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum InteractableSelector {
+    ScriptId { script_id: String },
+    Tag { tag: String },
+}
+
+/// Runtime state value an encounter script can apply to an interactable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InteractableStateValue {
+    Idle,
+    Active,
+    Cooldown,
+}
+
+/// Shared volume definition usable by built-in mechanics.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MechanicZoneParam {
+    pub tag: String,
+    pub shape: VolumeShape,
+    #[serde(default = "MechanicZoneParam::default_anchor")]
+    pub anchor: VolumeAnchor,
+    #[serde(default)]
+    pub priority: u32,
+    #[serde(default)]
+    pub buff_id: Option<u32>,
+    #[serde(default)]
+    pub lifetime_ticks: Option<u32>,
+}
+
+impl MechanicZoneParam {
+    fn default_anchor() -> VolumeAnchor {
+        VolumeAnchor::FollowBoss
+    }
 }
 
 // ── Mechanic params ─────────────────────────────────────────────
@@ -184,6 +253,8 @@ pub struct MechanicParams {
     pub floats: BTreeMap<String, f64>,
     #[serde(default)]
     pub strings: BTreeMap<String, String>,
+    #[serde(default)]
+    pub zones: Vec<MechanicZoneParam>,
 }
 
 impl MechanicParams {
@@ -204,6 +275,57 @@ impl MechanicParams {
     }
 }
 
+/// How a buff effect should combine with existing active buffs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum BuffApplyMode {
+    StackOrRefresh,
+    ReplaceAny(Vec<u32>),
+}
+
+impl Default for BuffApplyMode {
+    fn default() -> Self {
+        BuffApplyMode::StackOrRefresh
+    }
+}
+
+/// Where a client-facing encounter cue should be anchored.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum EncounterCueAnchor {
+    /// Follow the boss entity. The worker also snapshots the boss position when
+    /// the cue is emitted so clients can render immediately.
+    Boss,
+    /// Follow the target that receives the cue.
+    Target,
+    /// Render at a fixed world position.
+    FixedPoint { position: [f32; 3] },
+}
+
+impl Default for EncounterCueAnchor {
+    fn default() -> Self {
+        EncounterCueAnchor::Boss
+    }
+}
+
+/// Presentation shape for a client-facing encounter cue.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum EncounterCueShape {
+    None,
+    Sphere {
+        radius: f32,
+    },
+    Ring {
+        inner_radius: f32,
+        outer_radius: f32,
+        half_height: f32,
+    },
+}
+
+impl Default for EncounterCueShape {
+    fn default() -> Self {
+        EncounterCueShape::None
+    }
+}
+
 // ── Effects (leaves only — composers reserved for Step 3) ───────
 
 /// Leaf actions emitted by rule evaluation.
@@ -213,15 +335,24 @@ impl MechanicParams {
 /// continuations require per-rule state and are part of Step 3.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Effect {
-    ChangePhase { phase: BossPhase },
-    CastSkill { skill_id: u32, target: Target },
-    ReplaceAbilityList { ability_ids: Vec<u32> },
+    ChangePhase {
+        phase: BossPhase,
+    },
+    CastSkill {
+        skill_id: u32,
+        target: Target,
+    },
+    ReplaceAbilityList {
+        ability_ids: Vec<u32>,
+    },
     StartMechanic {
         name: String,
         #[serde(default)]
         params: MechanicParams,
     },
-    StopMechanic { name: String },
+    StopMechanic {
+        name: String,
+    },
     /// Spawn `count` scripted adds of the named NPC archetype, each
     /// labelled with `tags` so downstream rules (`OnEntityDied { tag }`,
     /// `WhenAdds { tag, … }`) can match. See
@@ -239,8 +370,50 @@ pub enum Effect {
         target: Target,
         lead_ticks: u32,
     },
+    /// Client-facing encounter presentation cue. This is distinct from
+    /// `EmitEncounterEvent`: encounter events are internal rule wiring, while
+    /// cues are committed for clients to render mechanic UI/VFX.
+    EncounterCue {
+        target: Target,
+        cue_id: String,
+        #[serde(default)]
+        anchor: EncounterCueAnchor,
+        #[serde(default)]
+        shape: EncounterCueShape,
+        #[serde(default)]
+        lead_ticks: u32,
+        #[serde(default)]
+        duration_ticks: u32,
+    },
+    /// Apply a buff through the worker's authoritative status pipeline.
+    ApplyBuff {
+        target: Target,
+        buff_id: u32,
+        #[serde(default)]
+        mode: BuffApplyMode,
+    },
+    /// Remove specific buffs from target entities. `force=true` bypasses
+    /// mechanic-lock policy for cleanup paths owned by the mechanic itself.
+    RemoveBuffs {
+        target: Target,
+        buff_ids: Vec<u32>,
+        #[serde(default)]
+        force: bool,
+    },
+    /// Set a dungeon interactable state by stable script selector.
+    SetInteractableState {
+        selector: InteractableSelector,
+        state: InteractableStateValue,
+    },
+    /// Toggle a dungeon interactable by stable script selector.
+    ToggleInteractable {
+        selector: InteractableSelector,
+    },
     /// Mutate per-encounter counter (in-memory; not committed to DB).
-    IncrementCounter { name: String, delta: i64 },
+    IncrementCounter {
+        name: String,
+        delta: i64,
+    },
     /// Mutate the world `zone_counter` table (committed Tier-2).
     IncrementZoneCounter {
         layer: u32,
@@ -251,7 +424,9 @@ pub enum Effect {
     },
     /// Step 3 hook — pushed into the encounter event bus when it lands; for
     /// now this is just a log line.
-    EmitEncounterEvent { name: String },
+    EmitEncounterEvent {
+        name: String,
+    },
     /// Spawn a gameplay volume. The volume tracks its occupants every tick
     /// and emits `VolumeEnter`/`VolumeExit` events on the sim event bus.
     /// `lifetime_ticks = None` keeps the volume alive until an explicit
@@ -269,17 +444,25 @@ pub enum Effect {
         entity_filter: EntityKindFilter,
     },
     /// Despawn all volumes matching `tag` for this encounter's boss.
-    DespawnVolume { tag: String },
+    DespawnVolume {
+        tag: String,
+    },
     /// Sleep `ticks` ticks before applying the next step in a containing
     /// `Sequence`. A bare `Wait` outside a `Sequence` is a no-op.
-    Wait { ticks: u32 },
+    Wait {
+        ticks: u32,
+    },
     /// Apply `steps` in order, with `Wait` parking the remaining tail as a
     /// continuation that resumes on a future tick. The continuation is
     /// owned by the encounter and re-entered at the start of `evaluate`.
-    Sequence { steps: Vec<Effect> },
+    Sequence {
+        steps: Vec<Effect>,
+    },
     /// Apply every `step` this tick, in order. Equivalent to inlining the
     /// list, but explicit for authoring clarity.
-    Parallel { steps: Vec<Effect> },
+    Parallel {
+        steps: Vec<Effect>,
+    },
 }
 
 /// Where to spawn a volume. Resolved by the worker against the encounter's
@@ -408,6 +591,16 @@ pub trait MechanicCtx {
     /// emitted by a [`Rule`], producing the same [`EncounterOutput`]s and
     /// state mutations (phase change, counter increment, etc.).
     fn emit_effect(&mut self, effect: Effect);
+
+    /// Snapshot occupants of all volumes matching `tag` for this encounter.
+    fn volume_occupants(&self, _tag: &str) -> Vec<EntityId> {
+        Vec::new()
+    }
+
+    /// Returns whether `entity` currently has `buff_id`.
+    fn has_buff(&self, _entity: EntityId, _buff_id: u32) -> bool {
+        false
+    }
 
     // ── Convenience wrappers (default-implemented over `emit_effect`). ──
 
@@ -562,6 +755,142 @@ impl Mechanic for MarkerMechanic {
     }
 }
 
+/// Generic timed pulse mechanic that owns encounter volumes and emits named
+/// encounter events on a fixed cadence.
+pub struct TimedVolumePulseMechanic {
+    name: String,
+    first_pulse_event: String,
+    pulse_event: String,
+    pulse_interval_ticks: u32,
+    initial_delay_ticks: u32,
+    zones: Vec<MechanicZoneParam>,
+    owned_tags: Vec<String>,
+    next_pulse_tick: Option<TickId>,
+    pulse_count: u32,
+    finished: bool,
+    cleanup_sent: bool,
+    outcome: Option<MechanicOutcome>,
+}
+
+impl TimedVolumePulseMechanic {
+    pub fn from_params(params: &MechanicParams) -> Self {
+        let first_pulse_event = params
+            .string("first_pulse_event")
+            .unwrap_or("timed_volume_first_pulse")
+            .to_string();
+        let pulse_event = params
+            .string("pulse_event")
+            .unwrap_or("timed_volume_pulse")
+            .to_string();
+        let pulse_interval_ticks = params
+            .int("pulse_interval_ticks")
+            .and_then(|v| u32::try_from(v.max(1)).ok())
+            .unwrap_or(200);
+        let initial_delay_ticks = params
+            .int("initial_delay_ticks")
+            .and_then(|v| u32::try_from(v.max(1)).ok())
+            .unwrap_or(1);
+        let mut zones = params.zones.clone();
+        zones.sort_by_key(|z| (z.priority, z.tag.clone()));
+        let mut owned_tags: Vec<String> = zones.iter().map(|z| z.tag.clone()).collect();
+        owned_tags.sort();
+        owned_tags.dedup();
+        Self {
+            name: "timed_volume_pulse".to_string(),
+            first_pulse_event,
+            pulse_event,
+            pulse_interval_ticks,
+            initial_delay_ticks,
+            zones,
+            owned_tags,
+            next_pulse_tick: None,
+            pulse_count: 0,
+            finished: false,
+            cleanup_sent: false,
+            outcome: None,
+        }
+    }
+
+    fn cleanup(&mut self, ctx: &mut dyn MechanicCtx) {
+        if self.cleanup_sent {
+            return;
+        }
+        self.cleanup_sent = true;
+        for tag in &self.owned_tags {
+            ctx.emit_effect(Effect::DespawnVolume { tag: tag.clone() });
+        }
+    }
+}
+
+impl Mechanic for TimedVolumePulseMechanic {
+    fn start(&mut self, ctx: &mut dyn MechanicCtx) {
+        self.next_pulse_tick = Some(TickId(
+            ctx.current_tick()
+                .0
+                .saturating_add(self.initial_delay_ticks as u64),
+        ));
+        for zone in &self.zones {
+            ctx.emit_effect(Effect::SpawnVolume {
+                tag: zone.tag.clone(),
+                shape: zone.shape,
+                anchor: zone.anchor.clone(),
+                lifetime_ticks: zone.lifetime_ticks,
+                entity_filter: EntityKindFilter::Kinds(vec![game_schema::EntityKind::Player]),
+            });
+        }
+    }
+
+    fn tick(&mut self, ctx: &mut dyn MechanicCtx) {
+        if self.finished {
+            return;
+        }
+        let Some(next_pulse_tick) = self.next_pulse_tick else {
+            return;
+        };
+        if ctx.current_tick().0 < next_pulse_tick.0 {
+            return;
+        }
+
+        let event_name = if self.pulse_count == 0 {
+            &self.first_pulse_event
+        } else {
+            &self.pulse_event
+        };
+        if !event_name.is_empty() {
+            ctx.emit_effect(Effect::EmitEncounterEvent {
+                name: event_name.clone(),
+            });
+        }
+        self.pulse_count = self.pulse_count.saturating_add(1);
+        self.next_pulse_tick = Some(TickId(
+            ctx.current_tick()
+                .0
+                .saturating_add(self.pulse_interval_ticks as u64),
+        ));
+    }
+
+    fn on_event(&mut self, ctx: &mut dyn MechanicCtx, event_name: &str) {
+        let expected = format!("mechanic:{}:stop", self.name);
+        if event_name == expected {
+            self.cleanup(ctx);
+            self.finished = true;
+            self.outcome = Some(MechanicOutcome::Cancelled);
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn outcome(&self) -> Option<MechanicOutcome> {
+        self.outcome
+    }
+}
+
 // ── Mechanic registry ───────────────────────────────────────────
 
 type MechanicFactory = Arc<dyn Fn(&MechanicParams) -> Box<dyn Mechanic> + Send + Sync>;
@@ -579,11 +908,14 @@ impl MechanicRegistry {
         }
     }
 
-    /// Registry pre-populated with built-in mechanics (`marker`).
+    /// Registry pre-populated with built-in mechanics.
     pub fn with_builtins() -> Self {
         let mut reg = Self::new();
         reg.register("marker", |_params| {
             Box::new(MarkerMechanic::new("marker".to_string()))
+        });
+        reg.register("timed_volume_pulse", |params| {
+            Box::new(TimedVolumePulseMechanic::from_params(params))
         });
         reg
     }
@@ -678,6 +1010,41 @@ pub enum EncounterOutput {
         target: Target,
         lead_ticks: u32,
     },
+    /// Worker should emit client-facing encounter presentation cues.
+    EncounterCue {
+        boss_entity_id: EntityId,
+        target: Target,
+        cue_id: String,
+        anchor: EncounterCueAnchor,
+        shape: EncounterCueShape,
+        lead_ticks: u32,
+        duration_ticks: u32,
+    },
+    /// Worker should apply a buff to resolved targets.
+    ApplyBuff {
+        boss_entity_id: EntityId,
+        target: Target,
+        buff_id: u32,
+        mode: BuffApplyMode,
+    },
+    /// Worker should remove buffs from resolved targets.
+    RemoveBuffs {
+        boss_entity_id: EntityId,
+        target: Target,
+        buff_ids: Vec<u32>,
+        force: bool,
+    },
+    /// Worker should set interactable state for every matching selector target.
+    SetInteractableState {
+        boss_entity_id: EntityId,
+        selector: InteractableSelector,
+        state: InteractableStateValue,
+    },
+    /// Worker should toggle interactable state for every matching selector target.
+    ToggleInteractable {
+        boss_entity_id: EntityId,
+        selector: InteractableSelector,
+    },
     /// Worker should spawn a gameplay volume.
     SpawnVolume {
         boss_entity_id: EntityId,
@@ -700,6 +1067,10 @@ pub enum EncounterOutput {
 pub struct EncounterState {
     pub boss_entity: EntityId,
     pub phase: BossPhase,
+    /// Dormant encounters are registered but do not tick mechanics or rules
+    /// until the worker activates the boss arena.
+    pub active: bool,
+    pub activated_at_tick: Option<TickId>,
     pub rules: Vec<Rule>,
     pub active_mechanics: Vec<Box<dyn Mechanic>>,
     pub phase_start_tick: TickId,
@@ -722,6 +1093,8 @@ impl EncounterState {
         let mut state = Self {
             boss_entity,
             phase: BossPhase::Phase1,
+            active: true,
+            activated_at_tick: Some(start_tick),
             rules,
             active_mechanics: Vec::new(),
             phase_start_tick: start_tick,
@@ -735,6 +1108,24 @@ impl EncounterState {
             rule.hp_threshold_armed = true;
         }
         state
+    }
+
+    pub fn new_dormant(boss_entity: EntityId, rules: Vec<Rule>, start_tick: TickId) -> Self {
+        let mut state = Self::new(boss_entity, rules, start_tick);
+        state.active = false;
+        state.activated_at_tick = None;
+        state
+    }
+
+    pub fn activate(&mut self, current_tick: TickId) {
+        self.active = true;
+        self.activated_at_tick = Some(current_tick);
+        self.phase_start_tick = current_tick;
+        self.last_hp_pct = 1.0;
+        self.pending_continuations.clear();
+        for rule in &mut self.rules {
+            rule.hp_threshold_armed = true;
+        }
     }
 
     /// Tick all active mechanics and prune any that have finished. Pruned
@@ -780,6 +1171,37 @@ impl EncounterState {
                     .unwrap_or(0) as i64;
                 op.cmp_i64(n, *count)
             }
+            Cond::VolumeOccupantsExactlyOneOf {
+                source_tag,
+                member_tags,
+            } => inputs
+                .volume_occupants_by_tag
+                .get(source_tag.as_str())
+                .into_iter()
+                .flatten()
+                .all(|entity| {
+                    member_tags
+                        .iter()
+                        .filter(|tag| {
+                            inputs
+                                .volume_occupants_by_tag
+                                .get(tag.as_str())
+                                .is_some_and(|occupants| occupants.contains(entity))
+                        })
+                        .count()
+                        == 1
+                }),
+            Cond::AllVolumeOccupantsHaveBuff { tag, buff_id } => inputs
+                .volume_occupants_by_tag
+                .get(tag.as_str())
+                .into_iter()
+                .flatten()
+                .all(|entity| {
+                    inputs
+                        .entity_buffs_by_entity
+                        .get(entity)
+                        .is_some_and(|buffs| buffs.contains(buff_id))
+                }),
         }
     }
 
@@ -844,9 +1266,7 @@ impl EncounterState {
             }
 
             let (triggered, occurrences) = match &rule.when {
-                Trigger::OnEnter { phase } => {
-                    (&self.phase == phase && rule.fire_count == 0, 1u32)
-                }
+                Trigger::OnEnter { phase } => (&self.phase == phase && rule.fire_count == 0, 1u32),
                 Trigger::OnHpBelow { percent } => (
                     rule.hp_threshold_armed && last_hp >= *percent && boss_hp_pct < *percent,
                     1u32,
@@ -862,9 +1282,9 @@ impl EncounterState {
                 Trigger::OnEvent { event_name } => {
                     let count = bus_events
                         .iter()
-                        .filter(|e| {
-                            matches!(e, EncounterEvent::Custom { name } if name == event_name)
-                        })
+                        .filter(
+                            |e| matches!(e, EncounterEvent::Custom { name } if name == event_name),
+                        )
                         .count() as u32;
                     (count > 0, count)
                 }
@@ -1058,6 +1478,61 @@ impl EncounterState {
                     lead_ticks,
                 });
             }
+            Effect::EncounterCue {
+                target,
+                cue_id,
+                anchor,
+                shape,
+                lead_ticks,
+                duration_ticks,
+            } => {
+                outputs.push(EncounterOutput::EncounterCue {
+                    boss_entity_id: self.boss_entity,
+                    target,
+                    cue_id,
+                    anchor,
+                    shape,
+                    lead_ticks,
+                    duration_ticks,
+                });
+            }
+            Effect::ApplyBuff {
+                target,
+                buff_id,
+                mode,
+            } => {
+                outputs.push(EncounterOutput::ApplyBuff {
+                    boss_entity_id: self.boss_entity,
+                    target,
+                    buff_id,
+                    mode,
+                });
+            }
+            Effect::RemoveBuffs {
+                target,
+                buff_ids,
+                force,
+            } => {
+                outputs.push(EncounterOutput::RemoveBuffs {
+                    boss_entity_id: self.boss_entity,
+                    target,
+                    buff_ids,
+                    force,
+                });
+            }
+            Effect::SetInteractableState { selector, state } => {
+                outputs.push(EncounterOutput::SetInteractableState {
+                    boss_entity_id: self.boss_entity,
+                    selector,
+                    state,
+                });
+            }
+            Effect::ToggleInteractable { selector } => {
+                outputs.push(EncounterOutput::ToggleInteractable {
+                    boss_entity_id: self.boss_entity,
+                    selector,
+                });
+            }
             Effect::IncrementCounter { name, delta } => {
                 let entry = self.counters.entry(name.clone()).or_insert(0);
                 *entry = entry.saturating_add(delta);
@@ -1176,9 +1651,14 @@ impl EncounterState {
 #[derive(Default)]
 pub struct EncounterEvalInputs<'a> {
     /// Map of `volume.tag` → number of distinct entities currently inside
-    /// any volume with that tag (summed across volumes — duplicates if the
-    /// same entity is in two volumes with the same tag are counted twice).
+    /// any volume with that tag.
     pub volume_occupancy_by_tag: HashMap<&'a str, u32>,
+    /// Map of `volume.tag` → distinct current occupants for rule-visible
+    /// set membership checks.
+    pub volume_occupants_by_tag: HashMap<&'a str, Vec<EntityId>>,
+    /// Map of entity → active buff ids for entities sampled by encounter
+    /// volumes this tick.
+    pub entity_buffs_by_entity: HashMap<EntityId, BTreeSet<u32>>,
     /// Volume edge events emitted on the previous occupant-sync step. The
     /// worker drains these into the encounter for one evaluate, then clears.
     pub volume_events: &'a [VolumeRuleEvent],
@@ -1188,6 +1668,8 @@ impl<'a> EncounterEvalInputs<'a> {
     pub fn empty() -> Self {
         EncounterEvalInputs {
             volume_occupancy_by_tag: HashMap::new(),
+            volume_occupants_by_tag: HashMap::new(),
+            entity_buffs_by_entity: HashMap::new(),
             volume_events: &[],
         }
     }
@@ -1196,8 +1678,16 @@ impl<'a> EncounterEvalInputs<'a> {
 /// Volume edge events visible to encounter rules this tick.
 #[derive(Clone, Debug, PartialEq)]
 pub enum VolumeRuleEvent {
-    Enter { tag: String, entity: EntityId, volume_id: VolumeId },
-    Exit { tag: String, entity: EntityId, volume_id: VolumeId },
+    Enter {
+        tag: String,
+        entity: EntityId,
+        volume_id: VolumeId,
+    },
+    Exit {
+        tag: String,
+        entity: EntityId,
+        volume_id: VolumeId,
+    },
 }
 
 /// Typed events visible to `OnEvent`/`OnEntityDied`/`OnMechanicEnded`
@@ -1210,16 +1700,31 @@ pub enum EncounterEvent {
     /// strings the worker attached to the entity (e.g. add archetype name).
     EntityDied { entity: EntityId, tags: Vec<String> },
     /// An entity took damage this tick. Reserved for richer triggers.
-    EntityDamaged { source: EntityId, target: EntityId, amount: f32 },
+    EntityDamaged {
+        source: EntityId,
+        target: EntityId,
+        amount: f32,
+    },
     /// A mechanic finished and was pruned this tick.
-    MechanicEnded { name: String, outcome: MechanicOutcome },
+    MechanicEnded {
+        name: String,
+        outcome: MechanicOutcome,
+    },
     /// A custom named event raised via `MechanicCtx::log_event` /
     /// `Effect::EmitEncounterEvent`.
     Custom { name: String },
     /// Mirrors `VolumeRuleEvent::Enter` for trigger uniformity.
-    VolumeEnter { tag: String, entity: EntityId, volume_id: VolumeId },
+    VolumeEnter {
+        tag: String,
+        entity: EntityId,
+        volume_id: VolumeId,
+    },
     /// Mirrors `VolumeRuleEvent::Exit` for trigger uniformity.
-    VolumeExit { tag: String, entity: EntityId, volume_id: VolumeId },
+    VolumeExit {
+        tag: String,
+        entity: EntityId,
+        volume_id: VolumeId,
+    },
 }
 
 /// Single-tick FIFO of encounter events. Owned by `EncounterState` and
@@ -1248,7 +1753,10 @@ impl EncounterBus {
 }
 
 /// Maximum number of pending continuations a single encounter may queue.
-/// Bounds memory and protects against runaway `Sequence`/`Wait` chains.
+///
+/// Authoring note: each `Sequence` that reaches a `Wait` parks one tail here
+/// until it resumes. Extra tails are dropped once the cap is reached, bounding
+/// memory and protecting the worker from runaway scripted chains.
 pub const MAX_PENDING_CONTINUATIONS: usize = 32;
 
 /// Parked tail of a `Sequence` waiting for a `Wait` to elapse before its
@@ -1416,6 +1924,62 @@ mod tests {
     }
 
     #[test]
+    fn cond_volume_occupants_exactly_one_of_checks_membership() {
+        let enc = EncounterState::new(EntityId(33), Vec::new(), TickId(0));
+        let cond = Cond::VolumeOccupantsExactlyOneOf {
+            source_tag: "arena".to_string(),
+            member_tags: vec!["near".to_string(), "far".to_string()],
+        };
+
+        let p1 = EntityId(101);
+        let p2 = EntityId(102);
+        let mut inputs = EncounterEvalInputs::empty();
+        inputs.volume_occupants_by_tag.insert("arena", vec![p1, p2]);
+        inputs.volume_occupants_by_tag.insert("near", vec![p1]);
+        inputs.volume_occupants_by_tag.insert("far", vec![p2]);
+        assert!(enc.eval_cond(&cond, 1.0, &inputs));
+
+        inputs.volume_occupants_by_tag.insert("near", Vec::new());
+        inputs.volume_occupants_by_tag.insert("far", Vec::new());
+        assert!(
+            !enc.eval_cond(&cond, 1.0, &inputs),
+            "arena occupant in no member zone is invalid"
+        );
+
+        inputs.volume_occupants_by_tag.insert("near", vec![p1]);
+        inputs.volume_occupants_by_tag.insert("far", vec![p1]);
+        assert!(
+            !enc.eval_cond(&cond, 1.0, &inputs),
+            "arena occupant in multiple member zones is invalid"
+        );
+    }
+
+    #[test]
+    fn cond_all_volume_occupants_have_buff_checks_snapshot() {
+        let enc = EncounterState::new(EntityId(34), Vec::new(), TickId(0));
+        let cond = Cond::AllVolumeOccupantsHaveBuff {
+            tag: "near".to_string(),
+            buff_id: 800,
+        };
+        let p1 = EntityId(201);
+        let p2 = EntityId(202);
+        let mut inputs = EncounterEvalInputs::empty();
+        inputs.volume_occupants_by_tag.insert("near", vec![p1, p2]);
+        inputs
+            .entity_buffs_by_entity
+            .insert(p1, BTreeSet::from([800, 900]));
+        inputs
+            .entity_buffs_by_entity
+            .insert(p2, BTreeSet::from([800]));
+        assert!(enc.eval_cond(&cond, 1.0, &inputs));
+
+        inputs
+            .entity_buffs_by_entity
+            .insert(p2, BTreeSet::from([801]));
+        assert!(!enc.eval_cond(&cond, 1.0, &inputs));
+    }
+
+    #[test]
     fn counter_increment_and_trigger_edge() {
         let rules = vec![
             rule(
@@ -1450,9 +2014,10 @@ mod tests {
         assert_eq!(enc.counters.get("kills").copied(), Some(4));
 
         let out = enc.evaluate(1.0, TickId(1), &EncounterEvalInputs::empty());
-        assert!(out
-            .iter()
-            .any(|o| matches!(o, EncounterOutput::ChangeBossPhase { new_phase: 2, .. })));
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, EncounterOutput::ChangeBossPhase { new_phase: 2, .. }))
+        );
     }
 
     #[test]
@@ -1489,9 +2054,11 @@ mod tests {
             .expect("shipped encounters.ron should parse");
         assert!(file.encounters.iter().any(|def| def.name == "default"));
         let all_rules: Vec<&Rule> = file.encounters.iter().flat_map(|d| &d.rules).collect();
-        assert!(all_rules
-            .iter()
-            .any(|r| matches!(r.when, Trigger::OnHpBelow { .. })));
+        assert!(
+            all_rules
+                .iter()
+                .any(|r| matches!(r.when, Trigger::OnHpBelow { .. }))
+        );
         assert!(all_rules.iter().any(|r| {
             r.effects
                 .iter()
@@ -1513,6 +2080,8 @@ mod tests {
     fn mechanic_registry_builtins_have_marker() {
         let reg = MechanicRegistry::with_builtins();
         assert!(reg.contains("marker"));
+        assert!(reg.contains("timed_volume_pulse"));
+        assert!(!reg.contains("manayas_core"));
         let m = reg
             .instantiate("marker", &MechanicParams::empty())
             .expect("marker instantiates");
@@ -1560,6 +2129,65 @@ mod tests {
         ctx.tick = TickId(1);
         m.tick(&mut ctx);
         assert!(m.is_finished());
+    }
+
+    #[test]
+    fn timed_volume_pulse_spawns_volumes_and_emits_named_pulses() {
+        let reg = MechanicRegistry::with_builtins();
+        let mut params = MechanicParams::empty();
+        params.ints.insert("initial_delay_ticks".to_string(), 1);
+        params.ints.insert("pulse_interval_ticks".to_string(), 2);
+        params
+            .strings
+            .insert("first_pulse_event".to_string(), "first".to_string());
+        params
+            .strings
+            .insert("pulse_event".to_string(), "again".to_string());
+        params.zones.push(MechanicZoneParam {
+            tag: "arena".to_string(),
+            shape: VolumeShape::Sphere { radius: 5.0 },
+            anchor: VolumeAnchor::FollowBoss,
+            priority: 0,
+            buff_id: None,
+            lifetime_ticks: None,
+        });
+
+        let mut ctx = FakeMechanicCtx::new(TickId(10), EntityId(99));
+        let mut m = reg
+            .instantiate("timed_volume_pulse", &params)
+            .expect("timed pulse instantiates");
+        m.start(&mut ctx);
+        assert!(matches!(
+            ctx.emitted.first(),
+            Some(Effect::SpawnVolume { tag, .. }) if tag == "arena"
+        ));
+
+        ctx.emitted.clear();
+        m.tick(&mut ctx);
+        assert!(ctx.emitted.is_empty(), "initial delay should hold pulse");
+
+        ctx.tick = TickId(11);
+        m.tick(&mut ctx);
+        assert!(matches!(
+            ctx.emitted.as_slice(),
+            [Effect::EmitEncounterEvent { name }] if name == "first"
+        ));
+
+        ctx.emitted.clear();
+        ctx.tick = TickId(13);
+        m.tick(&mut ctx);
+        assert!(matches!(
+            ctx.emitted.as_slice(),
+            [Effect::EmitEncounterEvent { name }] if name == "again"
+        ));
+
+        ctx.emitted.clear();
+        m.on_event(&mut ctx, "mechanic:timed_volume_pulse:stop");
+        assert!(m.is_finished());
+        assert!(matches!(
+            ctx.emitted.as_slice(),
+            [Effect::DespawnVolume { tag }] if tag == "arena"
+        ));
     }
 
     #[test]
