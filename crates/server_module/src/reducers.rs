@@ -1292,7 +1292,7 @@ pub fn commit_tick_results(
     // ── Encounter Add Memberships ─────────────────────────────────────
     // Pair each membership with the matching director spawn by index and
     // insert an `encounter_add` row carrying the boss link + tag list.
-    // See `docs/contracts/spawn_add_membership_contract.md`.
+    // The subscription and reducer paths both rely on this pairing invariant.
     for m in encounter_memberships {
         let idx = m.spawn_index as usize;
         if idx >= director_spawn_ids.len() {
@@ -1586,7 +1586,7 @@ pub struct DirectorSpawnInput {
 /// Encounter-add membership entry emitted by the worker. Pairs with
 /// `director_spawns` by `spawn_index`. The reducer validates the index,
 /// caps tags, and inserts an `encounter_add` row alongside the spawned
-/// entity. See `docs/contracts/spawn_add_membership_contract.md`.
+/// entity.
 #[derive(spacetimedb::SpacetimeType, Clone, Debug)]
 pub struct EncounterAddMembershipInput {
     pub spawn_index: u32,

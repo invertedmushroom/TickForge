@@ -64,8 +64,7 @@ pub struct WorldLayerDef {
     /// Optional reference to a baked voxel terrain set. When Some,
     /// the worker also loads the matching `terrain_chunk` rows and
     /// adds them as TriMesh colliders on this layer. Authoring of
-    /// terrain rows is offline / editor-side — see
-    /// `docs/plan/plan.md` §4.8b.
+    /// terrain rows is offline / editor-side.
     #[serde(default)]
     pub terrain_set: Option<String>,
     /// Optional client-side visual mesh override. The Bevy client loads
@@ -125,7 +124,7 @@ pub struct DungeonTemplate {
     /// the worker materialises the matching `terrain_chunk` rows on the
     /// instance's layer in addition to `geometry` above. Many instances
     /// can share one terrain set; rows live once and are referenced by
-    /// id. See `docs/plan/plan.md` §4.8b.
+    /// id.
     #[serde(default)]
     pub terrain_set: Option<String>,
 }
@@ -174,8 +173,7 @@ pub enum ShapeDef {
     /// Used for editor-baked open-world / cave geometry. Hand-authored
     /// dungeon RON files normally use `Cuboid`, `Cylinder`, or
     /// `Heightfield`; `TriMesh` is here so the same `ShapeDef` enum
-    /// can describe terrain colliders sourced from the voxel pipeline
-    /// (see `docs/plan/plan.md` §4.8b).
+    /// can describe terrain colliders sourced from the voxel pipeline.
     TriMesh {
         vertices: Vec<f32>,
         indices: Vec<u32>,

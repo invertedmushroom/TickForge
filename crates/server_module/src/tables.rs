@@ -98,7 +98,7 @@ pub struct EntityLayer {
 // owning boss and the tags assigned at spawn time. Worker subscribes to
 // rebuild in-memory `add_to_boss` and `entity_tags` so encounter rules
 // like `OnEntityDied { tag }` can fire deterministically in production.
-// See `docs/contracts/spawn_add_membership_contract.md`.
+// The subscription and reducer paths both rely on this pairing invariant.
 //
 // Primary writer: `commit_tick_results` reducer (insert at spawn time).
 // Cleanup writer: `commit_tick_results` reducer when the add or its boss

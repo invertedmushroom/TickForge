@@ -214,7 +214,6 @@ pub struct TickResult {
     pub director_spawns: Vec<DirectorSpawn>,
     /// Encounter-add membership entries, one per encounter-spawned add.
     /// `spawn_index` references the corresponding slot in `director_spawns`.
-    /// See `docs/contracts/spawn_add_membership_contract.md`.
     pub encounter_memberships: Vec<game_core::director::PendingAddMembership>,
     /// Interactable state changes this tick (entity_id, new SimInteractState).
     pub interactable_updates: Vec<(EntityId, game_core::sim_state::SimInteractState)>,
@@ -768,8 +767,7 @@ impl TickPipeline {
     /// bus as `EncounterEvent::EntityDied`. Optionally tags the add with
     /// `tag` for `OnEntityDied { tag }` matching.
     ///
-    /// Per `docs/contracts/dungeon_layer_propagation_contract.md` rule #4,
-    /// cross-layer registrations are rejected with a warning: the maps
+    /// Cross-layer registrations are rejected with a warning: the maps
     /// remain unchanged and the spawn proceeds without encounter
     /// membership. Existing teardown removes the orphan add.
     pub fn register_encounter_add(
@@ -795,7 +793,6 @@ impl TickPipeline {
 
     /// Multi-tag variant used by the production `encounter_add.on_insert`
     /// subscription path. Each tag is applied via `set_entity_tag`.
-    /// See `docs/contracts/spawn_add_membership_contract.md`.
     ///
     /// Layer-match enforcement for Spec C rule #4 lives in the
     /// `commit_tick_results` reducer, where both layers are visible
@@ -821,9 +818,8 @@ impl TickPipeline {
     /// Symmetric counterpart of `register_encounter_add_with_tags`, driven
     /// by the `encounter_add.on_delete` subscription callback.
     ///
-    /// The reducer cascade-deletes `encounter_add` rows in two cases (see
-    /// `docs/contracts/spawn_add_membership_contract.md`): by `add_entity`
-    /// when the add itself is removed, and by `by_boss()` when the boss is
+    /// The reducer cascade-deletes `encounter_add` rows in two cases: by
+    /// `add_entity` when the add itself is removed, and by `by_boss()` when the boss is
     /// removed. The first case is already covered by `force_remove_entities`
     /// clearing `add_to_boss` / `entity_tags` on worker-side entity removal;
     /// the second case can leave add entities briefly outliving their

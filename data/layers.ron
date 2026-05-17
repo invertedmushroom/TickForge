@@ -5,7 +5,7 @@
 // Each entry is the static-layer counterpart to `DungeonTemplate`:
 // hand-authored `geometry` (cuboids / cylinders / heightfield tiles)
 // always materialise, and an optional `terrain_set` references baked
-// voxel-terrain chunks loaded from the DB. See docs/plan/plan.md §4.8b.
+// voxel-terrain chunks loaded from the DB.
 (
     layers: [
         // ── Layer 0: open-world ─────────────────────────────────────

@@ -312,7 +312,7 @@ pub struct CommitDeathStateInsert {
 
 /// Encounter-add membership entry paired with a `CommitDirectorSpawn` by
 /// `spawn_index`. Mirrors `game_core::director::PendingAddMembership` in
-/// SDK-free form. See `docs/contracts/spawn_add_membership_contract.md`.
+/// SDK-free form.
 #[derive(Clone, Debug)]
 pub struct CommitEncounterAddMembership {
     pub spawn_index: u32,

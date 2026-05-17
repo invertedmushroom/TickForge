@@ -189,8 +189,8 @@ impl MutationAudit {
 /// Check whether a (domain, subsystem, phase) triple is a valid ownership combination.
 ///
 /// Returns `true` if the subsystem is the documented owner for the given domain in the
-/// given phase. The allowed triples match the in-memory ownership matrix from
-/// `docs/architecture.md`. Enforcement is active in debug/test builds only —
+/// given phase. The allowed triples match the in-memory ownership matrix.
+/// Enforcement is active in debug/test builds only —
 /// `MutationAudit::record()` calls this and panics on violation.
 ///
 /// **Documented exceptions wired into the rules:**

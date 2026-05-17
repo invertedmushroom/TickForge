@@ -134,7 +134,7 @@ pub struct DirectorSpawn {
 /// Encounter membership entry paired with a `DirectorSpawn` produced by an
 /// encounter rule's `SpawnAdds` effect. The commit reducer reads this to
 /// insert an `encounter_add` row tying the new entity to its owning boss
-/// and tags. See `docs/contracts/spawn_add_membership_contract.md`.
+/// and tags.
 #[derive(Clone, Debug)]
 pub struct PendingAddMembership {
     /// Index into the same tick's `director_spawns` vector. The reducer

@@ -219,7 +219,7 @@ pub fn run(config: CoordinatorConfig) {
     // `data/layers.ron`. Replaces the previously-hardcoded layer-0
     // placeholder floor in `PhysicsWorld::new` and gives every static
     // layer the same compositional `geometry + Option<terrain_set>`
-    // shape used by `DungeonTemplate`. See docs/plan/plan.md §4.8b.
+    // shape used by `DungeonTemplate`.
     let world_layers = load_world_layers();
     let mut initial_terrain_bindings: Vec<TerrainBinding> = Vec::new();
     for layer_def in &world_layers {
@@ -1099,7 +1099,6 @@ pub fn run(config: CoordinatorConfig) {
     // ── Encounter Add Membership projection ─────────────────────────
     // Mirror encounter_add rows into the pipeline's add_to_boss/entity_tags
     // maps so encounter rules like `OnEntityDied { tag }` fire in production.
-    // See `docs/contracts/spawn_add_membership_contract.md`.
     //
     // Replay ordering note: this fires independently of `entity.on_insert`.
     // `register_encounter_add_with_tags` only writes the two HashMaps and
@@ -1122,7 +1121,6 @@ pub fn run(config: CoordinatorConfig) {
     // Symmetric on_delete: clear mirrored worker state when the reducer
     // cascade-deletes membership rows (especially via `by_boss()` on boss
     // death, where the add entity may briefly outlive its membership row).
-    // See `docs/contracts/spawn_add_membership_contract.md`.
     let state_for_add_delete = Arc::clone(&state);
     conn.db.encounter_add().on_delete(move |_ctx, row| {
         let mut guard = match state_for_add_delete.lock() {
@@ -2106,7 +2104,7 @@ impl TerrainState {
 ///    The collider rebuild itself happens through the deferred edit
 ///    queue (see `TerrainState::pending_edits`), draining at the start
 ///    of each tick. This keeps mid-tick BVH rebuilds out of the hot
-///    path (see `docs/plan/plan.md` §4.8b, Phase 5).
+///    path.
 /// 4. The layer's `LayerCollisionPolicy`, registered last so policy
 ///    queries during the materialisation itself never observe a
 ///    half-built layer.

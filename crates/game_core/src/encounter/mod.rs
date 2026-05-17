@@ -363,8 +363,7 @@ pub enum Effect {
     },
     /// Spawn `count` scripted adds of the named NPC archetype, each
     /// labelled with `tags` so downstream rules (`OnEntityDied { tag }`,
-    /// `WhenAdds { tag, … }`) can match. See
-    /// `docs/contracts/spawn_add_membership_contract.md`.
+    /// `WhenAdds { tag, … }`) can match.
     SpawnAdds {
         archetype: String,
         count: u32,
