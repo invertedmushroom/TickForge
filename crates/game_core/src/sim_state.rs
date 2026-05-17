@@ -168,12 +168,12 @@ impl MutationAudit {
 ///
 /// **Documented exceptions wired into the rules:**
 /// - `Execution`: writable by both `Controller` (phase 2, cast) and `AbilityTimeline`
-///    (phase 3, remove/cull).
+///   (phase 3, remove/cull).
 /// - `Cooldown`: writable by `AbilityTimeline` (phase 3, start) and `CooldownTracker`
-///    (phase 8, expire).
+///   (phase 8, expire).
 /// - `Lifecycle` phase-8 cleanup through `force_remove_entity` mutates hitboxes,
-///    executions, and cooldowns directly without audit calls — those paths are owned
-///    by the lifecycle system and intentionally bypass per-record enforcement.
+///   executions, and cooldowns directly without audit calls — those paths are owned
+///   by the lifecycle system and intentionally bypass per-record enforcement.
 #[cfg(any(debug_assertions, test))]
 pub fn is_ownership_allowed(domain: AuditDomain, subsystem: AuditSubsystem, phase: u8) -> bool {
     match domain {
@@ -458,12 +458,11 @@ impl SimState {
             }
             let entity_id = self.entities.id_of(EntityIndex(i as u32));
             self.status.buffs[i].retain(|b| {
-                if let Some(expires_at) = b.expires_at {
-                    if expires_at <= current_tick {
+                if let Some(expires_at) = b.expires_at
+                    && expires_at <= current_tick {
                         expired.push((entity_id, b.buff_id));
                         return false;
                     }
-                }
                 true
             });
         }
@@ -475,7 +474,7 @@ impl SimState {
     /// Check if an entity is in the Active state.
     pub fn is_active(&self, id: EntityId) -> bool {
         self.entities.lookup(id)
-            .map_or(false, |idx| self.entities.is_active(idx))
+            .is_some_and(|idx| self.entities.is_active(idx))
     }
 
     /// Get current HP for an entity.

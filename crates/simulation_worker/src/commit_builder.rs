@@ -8,7 +8,7 @@
 //!
 //! This module is not feature-gated: it depends only on `game_protocol` and
 //! `game_schema`, so all marshalling logic is testable without the SDK.
-#[allow(unused_imports)]
+#[cfg(test)]
 use game_protocol::entity_id::EntityId;
 use game_protocol::event::{EventPayload, SimEvent};
 use game_schema::DamageType;

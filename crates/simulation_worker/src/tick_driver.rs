@@ -38,6 +38,12 @@ pub struct TickDriver {
     pub summary_interval: u64,
 }
 
+impl Default for TickDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TickDriver {
     pub fn new() -> Self {
         Self {
@@ -99,7 +105,7 @@ impl TickDriver {
 
     /// Emit a structured tick summary when interesting or periodic.
     fn log_summary(&self, tick: u64, summary: &TickSummary) {
-        if tick % self.summary_interval == 0
+        if tick.is_multiple_of(self.summary_interval)
             || summary.damage_events > 0
             || summary.deaths > 0
             || summary.despawns > 0

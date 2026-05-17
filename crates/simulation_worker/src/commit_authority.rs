@@ -35,6 +35,12 @@ pub struct CommitAuthority {
     pending_commit_tick: Option<u64>,
 }
 
+impl Default for CommitAuthority {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CommitAuthority {
     /// Create a new authority starting at tick 0 with nothing in-flight.
     pub fn new() -> Self {

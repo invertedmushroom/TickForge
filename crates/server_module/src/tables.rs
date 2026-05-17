@@ -221,11 +221,16 @@ pub enum WorldEventKind {
 
 // ── AOI / Spatial ───────────────────────────────────────────────────
 // Per spec: world divided into grid cells, clients subscribe by region.
+// Table is PRIVATE — clients must use the `my_region` / `nearby_transforms`
+// Views for AOI-filtered access (see views.rs).  The simulation worker
+// writes via `commit_tick_results` reducer (server-side, unaffected by
+// table visibility).
 
-#[table(accessor = entity_region, public, index(accessor = by_region, btree(columns = [region_x, region_z, layer])))]
+#[table(accessor = entity_region, index(accessor = by_region, btree(columns = [region_x, region_z, layer])))]
 pub struct EntityRegion {
     #[primary_key]
     pub entity_id: u64,
+    #[index(btree)]
     pub region_x: i32,
     pub region_z: i32,
     /// Visibility layer for instancing, phasing, and stealth.

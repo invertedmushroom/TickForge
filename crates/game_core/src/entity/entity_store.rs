@@ -68,6 +68,11 @@ impl EntityStore {
     }
 
     #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.index_to_id.is_empty()
+    }
+
+    #[inline]
     pub fn is_active(&self, idx: EntityIndex) -> bool {
         self.states[idx.as_usize()] == EntityState::Active
     }

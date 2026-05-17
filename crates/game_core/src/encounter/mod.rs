@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// Each boss is a list of EncounterRule { trigger, condition, action }.
 /// Encounter controller owns phase sequencing, one-time flags, and
 /// active mechanics list.
-
+///
 /// Boss phase identifier.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BossPhase {

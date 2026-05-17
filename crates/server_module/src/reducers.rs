@@ -302,8 +302,8 @@ pub fn spawn_npc(
 
     ctx.db.entity_region().insert(EntityRegion {
         entity_id: eid,
-        region_x: 0,
-        region_z: 0,
+        region_x: (pos_x / 50.0).floor() as i32,
+        region_z: (pos_z / 50.0).floor() as i32,
         layer: 0,
     });
 

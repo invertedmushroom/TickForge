@@ -14,16 +14,17 @@ use game_core::entity::entity_index::EntityIndex;
 use game_core::sim_state::SimState;
 use game_protocol::types::{Quatf, Vec3f};
 use game_schema::EntityKind;
+use crate::lag_compensation::{self, TransformHistory};
 
 // ── Region / AOI constants ──────────────────────────────────────────
 
 /// Width of a spatial grid cell in world units.
-pub const CELL_SIZE: f32 = 50.0;
+pub(crate) const CELL_SIZE: f32 = 50.0;
 
 /// Hysteresis band in world units. An entity must move at least this far
 /// past a cell boundary before a region transition is emitted. Prevents
 /// thrashing when entities oscillate on cell edges.
-pub const HYSTERESIS_BAND: f32 = 5.0;
+pub(crate) const HYSTERESIS_BAND: f32 = 5.0;
 
 /// A spatial grid cell assignment with a visibility layer.
 ///
@@ -170,7 +171,7 @@ pub struct TickPipeline {
     /// Static ability definitions — looked up during combat resolution.
     abilities: AbilityRegistry,
     /// Runtime entity state — lifecycle, health, buffs, threat, AI, contacts.
-    pub state: SimState,
+    pub(crate) state: SimState,
     /// Explicit cooldown state — maps (EntityId, ability_id) → tick when the cooldown expires.
     ///
     /// The HashMap owns cooldown truth: O(1) lookup in Phase 2, drained in Phase 8 to emit
@@ -198,6 +199,10 @@ pub struct TickPipeline {
     /// Seeded at spawn (from initial position → cell), updated each tick when
     /// a transition is emitted. Entries are removed in `force_remove_entity`.
     entity_regions: HashMap<EntityId, RegionCell>,
+    /// Ring buffer of recent transform snapshots for lag-compensation rewind.
+    /// Populated at the end of each tick (Phase 10) with entity positions.
+    /// Phase 6 reads historical positions for compensated hit detection.
+    transform_history: TransformHistory,
 }
 
 impl TickPipeline {
@@ -245,6 +250,13 @@ impl TickPipeline {
         self.pending_impulses.retain(|&(eid, _)| eid != id);
         self.state.combat.active_windows.retain(|&(eid, _), _| eid != id);
 
+        // 4b) Scrub this entity from all NPC threat tables so they acquire new targets.
+        // Leaving a removed entity in threat tables can cause NPCs to lock onto a
+        // non-existent target and no-op during movement (physics transform missing).
+        for table in self.state.combat.threat_tables.iter_mut().flatten() {
+            table.entries.retain(|e| e.source != id);
+        }
+
         // 5) Remove hitbox sensors and execution contexts owned by this entity
         for exec_id in execs_to_remove.iter().copied() {
             if let Some(handle) = self
@@ -289,6 +301,7 @@ impl TickPipeline {
             pending_impulses: Vec::new(),
             summary: TickSummary::default(),
             entity_regions: HashMap::new(),
+            transform_history: TransformHistory::new(),
 }
     }
 
@@ -343,14 +356,15 @@ impl TickPipeline {
             EntityKind::Projectile | EntityKind::Hazard => {}
         }
         // Record spawn position as patrol home for NPC/Boss entities.
-        if kind == EntityKind::Npc || kind == EntityKind::Boss {
-            if let Some(idx) = self.state.entities.lookup(id) {
+        if (kind == EntityKind::Npc || kind == EntityKind::Boss)
+            && let Some(idx) = self.state.entities.lookup(id) {
                 self.state.ai.home_positions[idx.as_usize()] = position;
             }
-        }
 
-        // Seed the initial region cell from the spawn position.
-        self.entity_regions.insert(id, RegionCell::from_position(&position));
+        // NOTE: entity_regions is NOT seeded here. collect_region_updates() will
+        // discover the entity on its first tick (via the `None` branch) and emit
+        // an initial region update, which guarantees the DB receives the correct
+        // cell computed from the actual spawn position.
     }
 
     /// Seed runtime state from DB rows recovered on worker restart.
@@ -370,11 +384,10 @@ impl TickPipeline {
             }
         }
         for (eid, entries) in threats {
-            if let Some(idx) = self.state.entities.lookup(*eid) {
-                if let Some(ref mut table) = self.state.combat.threat_tables[idx.as_usize()] {
+            if let Some(idx) = self.state.entities.lookup(*eid)
+                && let Some(ref mut table) = self.state.combat.threat_tables[idx.as_usize()] {
                     table.entries = entries.clone();
                 }
-            }
         }
         for (eid, ai_state, _target) in npc_states {
             if let Some(idx) = self.state.entities.lookup(*eid) {
@@ -431,22 +444,7 @@ impl TickPipeline {
         self.scheduled_actions.sort_by_key(|a| a.tick_id);
     }
 
-    /// Schedule a single deferred action (buff expiry, etc.).
-    /// Same rules as `schedule_ability` — future ticks only, not idempotent.
-    /// The action's `id` is assigned by the pipeline (caller-provided value is overwritten).
-    pub fn schedule_action(&mut self, mut action: ScheduledAction) {
-        debug_assert!(
-            action.tick_id >= self.current_tick,
-            "scheduled action for past tick {} (current: {})",
-            action.tick_id, self.current_tick
-        );
-        action.id = self.next_scheduled_id;
-        self.next_scheduled_id += 1;
-        self.scheduled_actions.push(action);
-        // Maintain sort — binary search for insertion would be faster, but
-        // the queue is small enough that a full sort is fine at 20 Hz.
-        self.scheduled_actions.sort_by_key(|a| a.tick_id);
-    }
+    
 
     /// Returns true if `ability_id` is on cooldown for `entity` this tick.
     ///
@@ -456,7 +454,7 @@ impl TickPipeline {
     fn is_on_cooldown(&self, entity: EntityId, ability_id: u32) -> bool {
         self.cooldowns
             .get(&(entity, ability_id))
-            .map_or(false, |&ready_at| self.current_tick < ready_at)
+            .is_some_and(|&ready_at| self.current_tick < ready_at)
     }
 
     /// Test-visible alias for `is_on_cooldown`. Production code uses the private method
@@ -558,6 +556,14 @@ impl TickPipeline {
         let transforms = self.physics.get_all_transforms();
         let region_updates = self.collect_region_updates(&transforms);
 
+        // Snapshot positions into the transform history ring buffer for lag compensation.
+        // Must happen before advancing current_tick so the snapshot is tagged with the
+        // tick that produced these positions.
+        self.transform_history.record(
+            self.current_tick,
+            transforms.iter().map(|(eid, t)| (*eid, t.position)).collect(),
+        );
+
         let result = TickResult {
             tick_id: self.current_tick,
             transforms,
@@ -625,7 +631,7 @@ impl TickPipeline {
 
             // Only process intents for active entities.
             let is_active = self.state.entities.lookup(entity_id)
-                .map_or(false, |idx| self.state.entities.is_active(idx));
+                .is_some_and(|idx| self.state.entities.is_active(idx));
             if !is_active {
                 continue;
             }
@@ -699,7 +705,7 @@ impl TickPipeline {
                         // the timeline can branch to a combo/follow-up execution path.
                         let variant = if self.state.combat.active_windows
                             .get(&(entity_id, ability_id))
-                            .map_or(false, |&exp| self.current_tick <= exp)
+                            .is_some_and(|&exp| self.current_tick <= exp)
                         {
                             1
                         } else {
@@ -707,6 +713,12 @@ impl TickPipeline {
                         };
                         let params = AbilityParams { charge_level: 0, variant };
                         let execution_id = self.state.combat.executions.next_id();
+                        // Compute lag compensation rewind from the client's observed tick.
+                        // client_time_ms carries the client's last rendered tick number.
+                        let rewind_ticks = lag_compensation::compute_rewind_ticks(
+                            self.current_tick,
+                            intent.client_time_ms,
+                        );
                         self.state.combat.executions.insert(AbilityExecutionContext {
                             execution_id,
                             ability_id,
@@ -716,6 +728,7 @@ impl TickPipeline {
                             origin,
                             facing,
                             params,
+                            rewind_ticks,
                         });
                         audit!(self.state, Execution, Controller, 2, Some(entity_id), "cast");
                         self.schedule_ability(entity_id, &timeline, self.current_tick, execution_id);
@@ -851,6 +864,9 @@ impl TickPipeline {
             .filter(|&id| !self.execution_is_alive(id))
             .collect();
         for id in dead {
+            if let Some(ctx) = self.state.combat.executions.get(id) {
+                audit!(self.state, Execution, AbilityTimeline, 3, Some(ctx.caster), "cull");
+            }
             self.state.combat.executions.remove(id);
         }
     }
@@ -864,6 +880,11 @@ impl TickPipeline {
     ) {
         match action {
             AbilityAction::SpawnHitbox { shape, offset } => {
+                // Look up rewind_ticks from the execution context for this cast.
+                let rewind_ticks = self.state.combat.executions
+                    .get(execution_id)
+                    .map(|ctx| ctx.rewind_ticks)
+                    .unwrap_or(0);
                 // Declare the hitbox logically — no Rapier sensor yet.
                 //
                 // The sensor is deferred to `ApplyDamageFrame` so that the Rapier
@@ -872,7 +893,7 @@ impl TickPipeline {
                 // Before this fix, SpawnHitbox spawned the sensor immediately, so
                 // Rapier fired contacts one tick early and damage landed on the spawn
                 // tick rather than the intended damage-frame tick.
-                self.state.combat.hitboxes.spawn(execution_id, entity, ability_id, self.current_tick, *shape, *offset);
+                self.state.combat.hitboxes.spawn(execution_id, entity, ability_id, self.current_tick, *shape, *offset, rewind_ticks);
                 audit!(self.state, Hitbox, AbilityTimeline, 3, Some(entity), "spawn");
                 self.emit_event(entity, EventPayload::HitboxSpawned { ability_id });
             }
@@ -912,16 +933,28 @@ impl TickPipeline {
                         self.physics.remove_sensor(handle);
                     }
                 }
-                // Cast complete — remove the execution context now that its last
-                // physics action has run and no dependent runtime object remains.
-                self.state.combat.executions.remove(execution_id);
-                audit!(self.state, Execution, AbilityTimeline, 3, Some(entity), "remove");
+                // Execution context cleanup is deferred to the uniform culling pass
+                // at the end of Phase 3.  execution_is_alive() will return false
+                // now that the hitbox has been removed, so the context will be
+                // collected on the same tick.
                 self.emit_event(entity, EventPayload::HitboxRemoved { ability_id });
             }
             AbilityAction::CooldownStart { duration_ticks } => {
                 // Insert directly into the cooldown map — no scheduled action needed.
                 // Phase 8 drains entries where ready_at ≤ current_tick and emits CooldownReady.
                 // Retroactive cooldown reduction: mutate the ready_at value for the entry directly.
+                // If an existing entry for this (entity, ability) already reached readiness
+                // on this same tick, emit the pending CooldownReady before overwriting it,
+                // otherwise the ready event can be lost when the new ready_at is in future.
+                if let Some(&old_ready) = self.cooldowns.get(&(entity, ability_id)) {
+                    if old_ready <= self.current_tick {
+                        // Remove the old entry and emit its CooldownReady now.
+                        self.cooldowns.remove(&(entity, ability_id));
+                        // This retroactive emission is initiated from AbilityTimeline (Phase 3).
+                        audit!(self.state, Cooldown, AbilityTimeline, 3, Some(entity), "expire_retro");
+                        self.emit_event(entity, EventPayload::CooldownReady { ability_id });
+                    }
+                }
                 let ready_at = TickId(self.current_tick.0 + *duration_ticks as u64);
                 self.cooldowns.insert((entity, ability_id), ready_at);
                 audit!(self.state, Cooldown, AbilityTimeline, 3, Some(entity), "start");
@@ -974,6 +1007,7 @@ impl TickPipeline {
 
     fn phase_combat_resolution(&mut self) {
         self.resolve_hits();
+        self.resolve_compensated_hits();
     }
 
     /// Hit resolution chain: contacts → dedup → ability lookup → damage → threat → events.
@@ -1103,6 +1137,161 @@ impl TickPipeline {
         }
     }
 
+    /// Lag-compensated hit detection — second pass after `resolve_hits`.
+    ///
+    /// For each armed hitbox with `rewind_ticks > 0`, performs standalone Parry shape
+    /// intersection tests against each entity's historical position from the transform
+    /// history buffer. Entities already hit by the normal contact-based pass (Phase 5)
+    /// are skipped via the `already_hit` dedup set on the hitbox.
+    ///
+    /// This does NOT touch Rapier bodies or the BVH — all tests are pure math on
+    /// positioned shapes. Cost is O(hitboxes × entities) with O(1) per intersection.
+    fn resolve_compensated_hits(&mut self) {
+        // Collect compensated hitboxes: armed, rewind_ticks > 0.
+        let compensated: Vec<_> = self
+            .state
+            .combat
+            .hitboxes
+            .iter_armed_compensated()
+            .map(|hb| (hb.execution_id, hb.owner, hb.ability_id, hb.shape, hb.offset, hb.rewind_ticks))
+            .collect();
+
+        if compensated.is_empty() {
+            return;
+        }
+
+        for (exec_id, attacker, ability_id, shape, offset, rewind_ticks) in compensated {
+            // Resolve the hitbox's world position from the attacker's current
+            // transform.  The normal Rapier sensor is parented to the attacker's
+            // body, so it rotates with them — the compensated test must match.
+            // Falling back to cast-time origin+facing only when the physics body
+            // is gone (entity despawned between phases).
+            let (attacker_pos, facing) = match self.state.combat.executions.get(exec_id) {
+                Some(ctx) => {
+                    if let Some(t) = self.physics.get_transform(attacker) {
+                        let yaw = 2.0 * t.rotation.y.atan2(t.rotation.w);
+                        let current_facing = Vec3f { x: yaw.sin(), y: 0.0, z: yaw.cos() };
+                        (t.position, current_facing)
+                    } else {
+                        (ctx.origin, ctx.facing)
+                    }
+                }
+                None => continue,
+            };
+
+            let hitbox_pos =
+                lag_compensation::hitbox_world_position(attacker_pos, facing, offset);
+            let hitbox_shape = lag_compensation::hitbox_sensor_shape(shape);
+
+            // Determine the historical tick to sample.
+            let rewind_tick = TickId(self.current_tick.0.saturating_sub(rewind_ticks as u64));
+            let snapshot = match self.transform_history.get_snapshot(rewind_tick) {
+                Some(s) => s,
+                None => continue, // Not enough history yet.
+            };
+
+            // Test each entity in the snapshot for overlap with the hitbox.
+            for &(target_id, ref historical_pos) in &snapshot.positions {
+                // Skip self-hits.
+                if target_id == attacker {
+                    continue;
+                }
+
+                // Skip entities already hit by the normal pass or a prior compensated test.
+                if self.state.combat.hitboxes.has_hit(exec_id, target_id) {
+                    continue;
+                }
+
+                // Only compensate for active entities with a dense index.
+                let target_idx = match self.state.entities.lookup(target_id) {
+                    Some(idx) if self.state.entities.is_active(idx) => idx,
+                    _ => continue,
+                };
+
+                // Run the standalone shape intersection test.
+                if !lag_compensation::shapes_intersect(hitbox_shape, hitbox_pos, *historical_pos) {
+                    continue;
+                }
+
+                // Record this as a hit (dedup).
+                if !self.state.combat.hitboxes.record_hit(exec_id, target_id) {
+                    continue;
+                }
+
+                // ── Damage pipeline (same as resolve_hits) ──────────────
+
+                let ability = match self.abilities.get(ability_id) {
+                    Some(a) => a,
+                    None => continue,
+                };
+
+                let base_damage = ability.base_damage;
+                let damage_type = ability.damage_type;
+                let threat_mult = ability.threat_multiplier;
+
+                let attacker_idx = self.state.entities.lookup(attacker);
+
+                // Tactical routing.
+                let tactical = self.state.combat.tactical[target_idx.as_usize()];
+                if tactical.dodge_active {
+                    continue;
+                }
+
+                let out_mult: f32 = attacker_idx.map_or(0.0, |idx| {
+                    self.state.status.buffs[idx.as_usize()]
+                        .iter()
+                        .filter_map(|b| b.modifiers.damage_out_pct)
+                        .sum()
+                });
+                let in_mult: f32 = self.state.status.buffs[target_idx.as_usize()]
+                    .iter()
+                    .filter_map(|b| b.modifiers.damage_in_pct)
+                    .sum();
+                let block_factor = if tactical.blocking { 0.5 } else { 1.0 };
+                let effective_damage =
+                    base_damage * (1.0 + out_mult) * (1.0 + in_mult).max(0.0) * block_factor;
+
+                let actual = self
+                    .state
+                    .combat
+                    .health
+                    .apply_damage(target_idx, effective_damage, Some(attacker));
+                audit!(self.state, Health, Combat, 6, Some(target_id), "damage_compensated");
+                self.summary.damage_events += 1;
+
+                if let Some(table) =
+                    self.state.combat.threat_tables[target_idx.as_usize()].as_mut()
+                {
+                    table.add_threat(attacker, actual * threat_mult);
+                    audit!(self.state, Threat, Combat, 6, Some(target_id), "add_threat_compensated");
+                }
+
+                self.pending_events.push(SimEvent {
+                    tick_id: self.current_tick,
+                    event_sequence: self.event_sequence,
+                    entity_id: target_id,
+                    payload: EventPayload::Damage {
+                        source: attacker,
+                        amount: actual,
+                        damage_type,
+                    },
+                });
+                self.event_sequence += 1;
+
+                self.pending_events.push(SimEvent {
+                    tick_id: self.current_tick,
+                    event_sequence: self.event_sequence,
+                    entity_id: target_id,
+                    payload: EventPayload::SkillHit {
+                        skill_id: ability_id,
+                        source: attacker,
+                    },
+                });
+                self.event_sequence += 1;
+            }
+        }
+    }
+
     // ── Phase 7: AI decisions ───────────────────────────────────
 
     fn phase_ai_decisions(&mut self) {
@@ -1125,6 +1314,7 @@ impl TickPipeline {
                 .iter()
                 .find_map(|b| b.modifiers.ai_override);
 
+            // 1) State transitions: apply override if present, otherwise run normal transitions.
             if let Some(ai_override) = override_opt {
                 match ai_override {
                     AiOverride::ForceFlee => {
@@ -1136,70 +1326,83 @@ impl TickPipeline {
                         audit!(self.state, Ai, AiDecisions, 7, None, "override_idle");
                     }
                     AiOverride::ForceFocus { target } => {
-                        // Inject high threat for the forced target so standard combat AI
+                        // Inject a safe high threat for the forced target so standard combat AI
                         // selects it as top threat this tick without bypassing combat state.
                         if let Some(ref mut table) = self.state.combat.threat_tables[i] {
-                            table.add_threat(target, f32::MAX / 2.0);
+                            // Use a capped value to avoid f32 overflow → INFINITY.
+                            table.add_threat(target, 1_000_000.0);
                         }
                         self.state.ai.npc_ai[i] = Some(NpcAiState::Combat);
                         audit!(self.state, Ai, AiDecisions, 7, None, "override_focus");
                     }
                 }
-                continue; // Skip standard AI for this entity this tick.
-            }
-
-            match ai_state {
-                NpcAiState::Idle => {
-                    // Check if anyone is on the threat table → transition to Combat.
-                    if let Some(ref table) = self.state.combat.threat_tables[i] {
-                        if table.top_threat().is_some() {
-                            self.state.ai.npc_ai[i] = Some(NpcAiState::Combat);
-                            audit!(self.state, Ai, AiDecisions, 7, None, "idle_to_combat");
+            } else {
+                // Standard state transitions (do not perform movement here).
+                match ai_state {
+                    NpcAiState::Idle | NpcAiState::Patrol => {
+                        // Check if anyone is on the threat table → transition to Combat.
+                        if let Some(ref table) = self.state.combat.threat_tables[i]
+                            && table.top_threat().is_some() {
+                                self.state.ai.npc_ai[i] = Some(NpcAiState::Combat);
+                                audit!(self.state, Ai, AiDecisions, 7, None, "to_combat");
+                            }
+                    }
+                    NpcAiState::Combat => {
+                        // If threat table is empty, return to Idle.
+                        let top_target = self.state.combat.threat_tables[i]
+                            .as_ref()
+                            .and_then(|t| t.top_threat());
+                        match top_target {
+                            None => {
+                                self.state.ai.npc_ai[i] = Some(NpcAiState::Idle);
+                                audit!(self.state, Ai, AiDecisions, 7, None, "combat_to_idle");
+                            }
+                            Some(_) => {
+                                // stay in Combat; action execution below will handle movement
+                            }
                         }
                     }
-                }
-                NpcAiState::Combat => {
-                    // If threat table is empty, return to Idle.
-                    let top_target = self.state.combat.threat_tables[i]
-                        .as_ref()
-                        .and_then(|t| t.top_threat());
-                    match top_target {
-                        None => {
+                    NpcAiState::Flee => {
+                        // Flee behavior: remain fleeing while any top threat exists.
+                        // Only return to Idle when no threats remain.
+                        let top_target = self.state.combat.threat_tables[i]
+                            .as_ref()
+                            .and_then(|t| t.top_threat());
+                        if top_target.is_none() {
                             self.state.ai.npc_ai[i] = Some(NpcAiState::Idle);
-                            audit!(self.state, Ai, AiDecisions, 7, None, "combat_to_idle");
+                            audit!(self.state, Ai, AiDecisions, 7, None, "flee_to_idle");
                         }
-                        Some(target_id) => {
-                            // Chase the top-threat target.
-                            let npc_id = self.state.entities.id_of(*idx);
-                            self.npc_move_toward(npc_id, *idx, target_id, self.dt);
-                            audit!(self.state, Transform, AiDecisions, 7, Some(npc_id), "chase");
-                        }
+                    }
+                    NpcAiState::Scripted => {
+                        // No scripted behavior yet — placeholder.
+                    }
+                }
+            }
+
+            // 2) Action execution: run movement/behavior for the current state.
+            let current_state = self.state.ai.npc_ai[i].unwrap();
+            match current_state {
+                NpcAiState::Combat => {
+                    if let Some(target_id) = self.state.combat.threat_tables[i].as_ref().and_then(|t| t.top_threat()) {
+                        let npc_id = self.state.entities.id_of(*idx);
+                        self.npc_move_toward(npc_id, *idx, target_id, self.dt);
+                        audit!(self.state, Transform, AiDecisions, 7, Some(npc_id), "chase");
                     }
                 }
                 NpcAiState::Flee => {
-                    // Move away from the top-threat source.
-                    let top_target = self.state.combat.threat_tables[i]
-                        .as_ref()
-                        .and_then(|t| t.top_threat());
-                    if let Some(threat_source) = top_target {
+                    if let Some(threat_source) = self.state.combat.threat_tables[i].as_ref().and_then(|t| t.top_threat()) {
                         let npc_id = self.state.entities.id_of(*idx);
                         self.npc_move_away(npc_id, *idx, threat_source, self.dt);
                         audit!(self.state, Transform, AiDecisions, 7, Some(npc_id), "flee");
                     }
                 }
                 NpcAiState::Patrol => {
-                    // Move back toward the home/spawn position.
-                    // If threat appears, transition to Combat next tick via Idle→Combat path;
-                    // the Patrol branch itself does not check threat (clean state transitions).
                     let npc_id = self.state.entities.id_of(*idx);
                     let home = self.state.ai.home_positions[i];
                     self.npc_move_toward_pos(npc_id, home, self.dt);
                     audit!(self.state, Transform, AiDecisions, 7, Some(npc_id), "patrol");
                 }
-                NpcAiState::Scripted => {
-                    // No scripted behavior yet — scripted sequences are driven by
-                    // scheduled AbilityActions; this branch is a placeholder.
-                }
+                _ => {}
             }
         }
     }
@@ -1371,7 +1574,7 @@ impl TickPipeline {
             let pos = &tf.position;
             let new_cell = match self.entity_regions.get(&eid) {
                 Some(current) => RegionCell::from_position_with_hysteresis(pos, current),
-                // Entity not tracked yet (shouldn't happen — spawn seeds it).
+                // Entity not tracked yet (expected on first tick after spawn).
                 None => RegionCell::from_position(pos),
             };
             let changed = self.entity_regions.get(&eid) != Some(&new_cell);
@@ -2827,6 +3030,107 @@ mod tests {
             after.position.x < before.position.x,
             "Patrolling NPC must move toward home (x should decrease); before={}, after={}",
             before.position.x, after.position.x,
+        );
+    }
+
+    // ── RegionCell tests ────────────────────────────────────────
+
+    #[test]
+    fn region_cell_from_position_basic() {
+        // Position in the middle of cell (0,0)
+        let pos = Vec3f::new(10.0, 0.0, 10.0);
+        let cell = RegionCell::from_position(&pos);
+        assert_eq!(cell.region_x, 0);
+        assert_eq!(cell.region_z, 0);
+        assert_eq!(cell.layer, 0);
+    }
+
+    #[test]
+    fn region_cell_from_position_negative() {
+        // Position in cell (-1, -1) — just past the negative boundary
+        let pos = Vec3f::new(-1.0, 5.0, -1.0);
+        let cell = RegionCell::from_position(&pos);
+        assert_eq!(cell.region_x, -1);
+        assert_eq!(cell.region_z, -1);
+    }
+
+    #[test]
+    fn region_cell_from_position_exact_boundary() {
+        // Position right on the cell boundary at CELL_SIZE
+        let pos = Vec3f::new(CELL_SIZE, 0.0, CELL_SIZE);
+        let cell = RegionCell::from_position(&pos);
+        assert_eq!(cell.region_x, 1);
+        assert_eq!(cell.region_z, 1);
+    }
+
+    #[test]
+    fn hysteresis_prevents_thrashing() {
+        // Entity is in cell (0,0), barely crosses into cell (1,0) but within
+        // the hysteresis band — should stay in (0,0).
+        let current = RegionCell { region_x: 0, region_z: 0, layer: 0 };
+        let pos = Vec3f::new(CELL_SIZE + 1.0, 0.0, 25.0); // 1 unit past boundary < HYSTERESIS_BAND
+        let cell = RegionCell::from_position_with_hysteresis(&pos, &current);
+        assert_eq!(cell.region_x, 0, "Should stay in cell 0 due to hysteresis");
+        assert_eq!(cell.region_z, 0);
+    }
+
+    #[test]
+    fn hysteresis_allows_transition_past_band() {
+        // Entity in cell (0,0), moves well past boundary + hysteresis band
+        let current = RegionCell { region_x: 0, region_z: 0, layer: 0 };
+        let pos = Vec3f::new(CELL_SIZE + HYSTERESIS_BAND + 1.0, 0.0, 25.0);
+        let cell = RegionCell::from_position_with_hysteresis(&pos, &current);
+        assert_eq!(cell.region_x, 1, "Should transition to cell 1 past hysteresis band");
+    }
+
+    #[test]
+    fn hysteresis_preserves_layer() {
+        let current = RegionCell { region_x: 0, region_z: 0, layer: 42 };
+        let pos = Vec3f::new(CELL_SIZE + HYSTERESIS_BAND + 1.0, 0.0, 25.0);
+        let cell = RegionCell::from_position_with_hysteresis(&pos, &current);
+        assert_eq!(cell.layer, 42, "Layer should be preserved through hysteresis");
+        assert_eq!(cell.region_x, 1);
+    }
+
+    #[test]
+    fn region_updates_emitted_on_spawn_tick() {
+        let reg = setup_ability_registry();
+        let mut pipeline = make_pipeline(reg);
+        let id = EntityId(1);
+        pipeline.spawn_entity_from_snapshot(
+            id, EntityKind::Player, TickId(0), 100.0,
+            Vec3f::new(75.0, 0.0, 75.0), // cell (1, 1)
+        );
+
+        let result = pipeline.run_tick(&[]);
+        // First tick always emits an initial region update because
+        // spawn_entity_from_snapshot does NOT seed entity_regions —
+        // collect_region_updates discovers the entity as new.
+        assert_eq!(result.region_updates.len(), 1, "Expected initial region update on spawn tick");
+        let (eid, cell) = &result.region_updates[0];
+        assert_eq!(*eid, id);
+        assert_eq!(cell.region_x, 1);
+        assert_eq!(cell.region_z, 1);
+        assert_eq!(cell.layer, 0);
+    }
+
+    #[test]
+    fn no_region_update_without_movement() {
+        let reg = setup_ability_registry();
+        let mut pipeline = make_pipeline(reg);
+        let id = EntityId(1);
+        pipeline.spawn_entity_from_snapshot(
+            id, EntityKind::Player, TickId(0), 100.0,
+            Vec3f::new(75.0, 0.0, 75.0),
+        );
+
+        // First tick: initial region emitted
+        let _ = pipeline.run_tick(&[]);
+        // Second tick: no movement → no region update
+        let result = pipeline.run_tick(&[]);
+        assert!(
+            result.region_updates.is_empty(),
+            "No region update when entity hasn't moved"
         );
     }
 }

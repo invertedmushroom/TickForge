@@ -43,6 +43,10 @@ pub struct ActiveHitbox {
     pub sensor_handle: Option<u64>,
     /// Entities already hit by this hitbox instance (single-hit dedup).
     pub already_hit: HashSet<EntityId>,
+    /// Lag compensation: number of ticks to rewind target positions when testing
+    /// for overlap. Copied from the `AbilityExecutionContext` in Phase 3.
+    /// 0 means no compensation.
+    pub rewind_ticks: u32,
 }
 
 /// Tracks all active hitbox colliders in the simulation.
@@ -62,7 +66,7 @@ impl HitboxStore {
 
     /// Register a new unarmed hitbox (logical declaration only — no Rapier sensor yet).
     /// Call `arm()` when `ApplyDamageFrame` fires to materialise the physics sensor.
-    pub fn spawn(&mut self, execution_id: AbilityExecutionId, owner: EntityId, ability_id: u32, tick: TickId, shape: SkillShape, offset: Vec3f) {
+    pub fn spawn(&mut self, execution_id: AbilityExecutionId, owner: EntityId, ability_id: u32, tick: TickId, shape: SkillShape, offset: Vec3f, rewind_ticks: u32) {
         self.active.insert(execution_id, ActiveHitbox {
             execution_id,
             owner,
@@ -73,23 +77,15 @@ impl HitboxStore {
             armed: false,
             sensor_handle: None,
             already_hit: HashSet::new(),
+            rewind_ticks,
         });
     }
 
     /// Register a hitbox that is already armed (Rapier sensor already live).
     /// Use this in tests that bypass the timeline and inject sensors directly.
     pub fn spawn_armed(&mut self, execution_id: AbilityExecutionId, owner: EntityId, ability_id: u32, tick: TickId, shape: SkillShape, offset: Vec3f, sensor_handle: u64) {
-        self.active.insert(execution_id, ActiveHitbox {
-            execution_id,
-            owner,
-            ability_id,
-            spawned_at: tick,
-            shape,
-            offset,
-            armed: true,
-            sensor_handle: Some(sensor_handle),
-            already_hit: HashSet::new(),
-        });
+        self.spawn(execution_id, owner, ability_id, tick, shape, offset, 0);
+        self.arm(execution_id, sensor_handle);
     }
 
     /// Mark a hitbox as armed (Rapier sensor now live). Returns `true` if the hitbox
@@ -129,7 +125,7 @@ impl HitboxStore {
     pub fn has_hit(&self, execution_id: AbilityExecutionId, target: EntityId) -> bool {
         self.active
             .get(&execution_id)
-            .map_or(false, |hb| hb.already_hit.contains(&target))
+            .is_some_and(|hb| hb.already_hit.contains(&target))
     }
 
     /// Record that this hitbox hit a target.
@@ -161,6 +157,12 @@ impl HitboxStore {
             .values()
             .filter(|hb| hb.owner == entity_id)
             .collect()
+    }
+
+    /// Iterate all armed hitboxes that require lag-compensated hit detection.
+    /// Returns hitboxes where `armed == true && rewind_ticks > 0`.
+    pub fn iter_armed_compensated(&self) -> impl Iterator<Item = &ActiveHitbox> {
+        self.active.values().filter(|hb| hb.armed && hb.rewind_ticks > 0)
     }
 
     /// Total number of active hitboxes.
@@ -210,7 +212,7 @@ mod tests {
     #[test]
     fn spawn_and_remove() {
         let mut store = HitboxStore::new();
-        store.spawn(exec(1), eid(1), 100, TickId(5), SkillShape::Sphere, Vec3f::ZERO);
+        store.spawn(exec(1), eid(1), 100, TickId(5), SkillShape::Sphere, Vec3f::ZERO, 0);
         assert_eq!(store.len(), 1);
         assert!(store.get(exec(1)).is_some());
 
@@ -222,7 +224,7 @@ mod tests {
     #[test]
     fn hit_dedup() {
         let mut store = HitboxStore::new();
-        store.spawn(exec(42), eid(1), 42, TickId(0), SkillShape::Sphere, Vec3f::ZERO);
+        store.spawn(exec(42), eid(1), 42, TickId(0), SkillShape::Sphere, Vec3f::ZERO, 0);
 
         assert!(!store.has_hit(exec(42), eid(2)));
         assert!(store.record_hit(exec(42), eid(2))); // first hit → true
@@ -233,9 +235,9 @@ mod tests {
     #[test]
     fn remove_all_for_entity() {
         let mut store = HitboxStore::new();
-        store.spawn(exec(10), eid(1), 10, TickId(0), SkillShape::Sphere, Vec3f::ZERO);
-        store.spawn(exec(20), eid(1), 20, TickId(1), SkillShape::Sphere, Vec3f::ZERO);
-        store.spawn(exec(30), eid(2), 10, TickId(0), SkillShape::Sphere, Vec3f::ZERO);
+        store.spawn(exec(10), eid(1), 10, TickId(0), SkillShape::Sphere, Vec3f::ZERO, 0);
+        store.spawn(exec(20), eid(1), 20, TickId(1), SkillShape::Sphere, Vec3f::ZERO, 0);
+        store.spawn(exec(30), eid(2), 10, TickId(0), SkillShape::Sphere, Vec3f::ZERO, 0);
 
         let mut removed = store.remove_all_for_entity(eid(1));
         removed.sort_by_key(|id| id.0);
@@ -249,8 +251,8 @@ mod tests {
         // With execution-ID keys an entity can have two live hitboxes from the
         // same ability simultaneously — the key concern that motivated this refactor.
         let mut store = HitboxStore::new();
-        store.spawn(exec(1), eid(1), 5, TickId(0), SkillShape::Sphere, Vec3f::ZERO);
-        store.spawn(exec(2), eid(1), 5, TickId(1), SkillShape::Sphere, Vec3f::ZERO);
+        store.spawn(exec(1), eid(1), 5, TickId(0), SkillShape::Sphere, Vec3f::ZERO, 0);
+        store.spawn(exec(2), eid(1), 5, TickId(1), SkillShape::Sphere, Vec3f::ZERO, 0);
 
         assert_eq!(store.len(), 2, "two casts must produce two independent entries");
         assert!(store.get(exec(1)).is_some());
@@ -272,7 +274,7 @@ mod tests {
     fn arm_gates_damage_frame() {
         let mut store = HitboxStore::new();
         let e1 = exec(5);
-        store.spawn(e1, eid(1), 5, TickId(0), SkillShape::Sphere, Vec3f::ZERO);
+        store.spawn(e1, eid(1), 5, TickId(0), SkillShape::Sphere, Vec3f::ZERO, 0);
         assert_eq!(store.armed_count(), 0, "freshly spawned hitbox must not be armed");
 
         assert!(store.arm(e1, 100), "arm() must return true when hitbox exists and is unarmed");

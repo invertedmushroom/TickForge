@@ -291,14 +291,20 @@ pub fn run(config: CoordinatorConfig) {
             .entity_id()
             .find(&new_entity.entity_id)
             .map(|h| h.max_hp)
-            .unwrap_or(100.0);
+            .unwrap_or_else(|| {
+                warn!("entity {} has no entity_health companion row at spawn — defaulting to 100 hp", new_entity.entity_id);
+                100.0
+            });
 
         let pos = ctx.db
             .entity_transform()
             .entity_id()
             .find(&new_entity.entity_id)
             .map(|t| game_protocol::types::Vec3f { x: t.pos_x, y: t.pos_y, z: t.pos_z })
-            .unwrap_or(game_protocol::types::Vec3f { x: 0.0, y: 1.0, z: 0.0 });
+            .unwrap_or_else(|| {
+                warn!("entity {} has no entity_transform companion row at spawn — defaulting to origin", new_entity.entity_id);
+                game_protocol::types::Vec3f { x: 0.0, y: 1.0, z: 0.0 }
+            });
 
         // Read runtime state from the SDK cache for restart continuity.
         let buffs: Vec<game_core::combat::status::ActiveBuff> = ctx.db
@@ -342,7 +348,7 @@ pub fn run(config: CoordinatorConfig) {
                 poisoned.into_inner()
             }
         };
-        EntitySync::sync_insert(&mut guard.sim, eid, kind, state, tick, max_hp, pos, buffs, threats, npc_state);
+        EntitySync::sync_insert(&mut guard.sim, eid, kind, state, tick, max_hp, pos, crate::entity_sync::RuntimeSnapshot { buffs, threats, npc_state });
     });
 
     // entity.on_update — thin adapter over EntitySync::sync_update.

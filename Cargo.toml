@@ -4,6 +4,7 @@ members = [
     "crates/game_protocol",
     "crates/game_core",
     "crates/simulation_worker",
+    "crates/game_client",
     "crates/server_module",
 ]
 default-members = [
@@ -11,6 +12,7 @@ default-members = [
     "crates/game_protocol",
     "crates/game_core",
     "crates/simulation_worker",
+    "crates/game_client",
 ]
 resolver = "2"
 

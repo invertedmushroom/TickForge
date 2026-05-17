@@ -69,8 +69,7 @@ impl PhysicsWorld {
     /// For 20Hz: dt = 0.05
     /// For 60Hz: dt = 1/60 ≈ 0.01667
     pub fn new(dt: f32) -> Self {
-        let mut params = IntegrationParameters::default();
-        params.dt = dt;
+        let params = IntegrationParameters { dt, ..Default::default() };
 
         let (collision_send, collision_recv) = mpsc::channel();
         let (contact_force_send, contact_force_recv) = mpsc::channel();
@@ -385,8 +384,7 @@ impl PhysicsWorld {
                 .keys()
                 .filter(|ch| {
                     self.colliders.get(**ch)
-                        .and_then(|c| c.parent())
-                        .map_or(false, |p| p == body_handle)
+                        .and_then(|c| c.parent()) == Some(body_handle)
                 })
                 .copied()
                 .collect();
@@ -395,8 +393,8 @@ impl PhysicsWorld {
             // so the internal `sensor_handles` map does not grow unbounded.
             self.sensor_handles.retain(|_, ch| !attached.contains(ch));
 
-            for ch in attached.iter().copied() {
-                self.collider_kinds.remove(&ch);
+            for ch in attached.iter() {
+                self.collider_kinds.remove(ch);
             }
             self.bodies.remove(
                 body_handle,
@@ -437,8 +435,8 @@ impl PhysicsWorld {
         entity_id: EntityId,
         position: Vector,
     ) -> bool {
-        if let Some(handle) = self.entity_to_body.get(&entity_id) {
-            if let Some(body) = self.bodies.get_mut(*handle) {
+        if let Some(handle) = self.entity_to_body.get(&entity_id)
+            && let Some(body) = self.bodies.get_mut(*handle) {
                 let rotation = *body.rotation();
                 body.set_next_kinematic_position(Pose::from_parts(
                     position,
@@ -446,7 +444,6 @@ impl PhysicsWorld {
                 ));
                 return true;
             }
-        }
         false
     }
 
@@ -456,8 +453,8 @@ impl PhysicsWorld {
         entity_id: EntityId,
         rotation: Rotation,
     ) -> bool {
-        if let Some(handle) = self.entity_to_body.get(&entity_id) {
-            if let Some(body) = self.bodies.get_mut(*handle) {
+        if let Some(handle) = self.entity_to_body.get(&entity_id)
+            && let Some(body) = self.bodies.get_mut(*handle) {
                 let position = body.translation();
                 body.set_next_kinematic_position(Pose::from_parts(
                     position,
@@ -465,7 +462,6 @@ impl PhysicsWorld {
                 ));
                 return true;
             }
-        }
         false
     }
 
@@ -596,12 +592,11 @@ impl PhysicsBackend for PhysicsWorld {
         entity_id: EntityId,
         velocity: game_protocol::types::Vec3f,
     ) -> bool {
-        if let Some(handle) = self.entity_to_body.get(&entity_id) {
-            if let Some(body) = self.bodies.get_mut(*handle) {
+        if let Some(handle) = self.entity_to_body.get(&entity_id)
+            && let Some(body) = self.bodies.get_mut(*handle) {
                 body.set_linvel(Vector::new(velocity.x, velocity.y, velocity.z), true);
                 return true;
             }
-        }
         false
     }
 

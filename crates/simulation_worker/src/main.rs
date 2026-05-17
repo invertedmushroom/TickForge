@@ -52,11 +52,10 @@ fn main() {
         for tick in 0..200 {
             world.step();
 
-            if tick % 20 == 0 {
-                if let Some(pos) = world.get_body_position(ball_id) {
+            if tick % 20 == 0
+                && let Some(pos) = world.get_body_position(ball_id) {
                     info!("Tick {:>3}: ball position = ({:.3}, {:.3}, {:.3})", tick, pos.x, pos.y, pos.z);
                 }
-            }
         }
 
         // Final position

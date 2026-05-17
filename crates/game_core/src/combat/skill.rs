@@ -220,6 +220,10 @@ pub struct AbilityExecutionContext {
     /// Runtime parameters for this cast (charge tier, follow-up variant, etc.).
     /// Resolved in Phase 2 from intent data and `CombatState::active_windows`.
     pub params: AbilityParams,
+    /// Number of ticks to rewind target positions for lag compensation.
+    /// Computed in Phase 2 from the intent's observed-tick delta, clamped to MAX_REWIND_TICKS.
+    /// 0 means no compensation (local or very-low-latency client).
+    pub rewind_ticks: u32,
 }
 
 /// Sparse store for all in-flight ability executions.
