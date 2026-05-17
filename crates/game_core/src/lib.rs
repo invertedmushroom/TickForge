@@ -4,6 +4,8 @@ pub mod director;
 pub mod encounter;
 pub mod entity;
 pub mod physics_backend;
+pub mod physics_constants;
+pub mod region;
 pub mod sim_state;
 pub mod sparse_set;
 pub mod stats;

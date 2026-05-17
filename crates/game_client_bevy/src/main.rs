@@ -15,6 +15,7 @@ mod admin;
 #[cfg(feature = "connected")]
 mod inventory;
 mod ability_bar;
+mod ability_visuals;
 mod camera;
 mod diagnostics;
 mod hud;

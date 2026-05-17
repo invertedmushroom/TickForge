@@ -25,6 +25,7 @@ pub fn base_speed(kind: EntityKind) -> f32 {
         EntityKind::Boss      => 2.5,
         EntityKind::Projectile => 12.0,
         EntityKind::Hazard    => 0.0,
+        EntityKind::Prop      => 0.0,
     }
 }
 
@@ -36,6 +37,7 @@ pub fn base_attack_power(kind: EntityKind) -> f32 {
         EntityKind::Boss       => 1.5,
         EntityKind::Projectile => 1.0,
         EntityKind::Hazard     => 1.0,
+        EntityKind::Prop       => 0.0,
     }
 }
 
@@ -48,6 +50,7 @@ pub fn base_max_hp(kind: EntityKind) -> f32 {
         EntityKind::Boss       => 500.0,
         EntityKind::Projectile => 1.0,
         EntityKind::Hazard     => 1.0,
+        EntityKind::Prop       => 1.0,
     }
 }
 
@@ -66,6 +69,7 @@ pub struct EquipmentModifiers {
     pub damage_out: f32,
     pub damage_in: f32,
     pub cooldown_reduce: f32,
+    pub cc_duration_reduce: f32,
 }
 
 impl EquipmentModifiers {
@@ -79,6 +83,7 @@ impl EquipmentModifiers {
             result.damage_out += m.damage_out;
             result.damage_in += m.damage_in;
             result.cooldown_reduce += m.cooldown_reduce;
+            result.cc_duration_reduce += m.cc_duration_reduce;
         }
         result
     }
@@ -138,6 +143,8 @@ pub struct StatBlock {
     pub cooldown_reduce_pct: f32,
     /// Attack power multiplier applied to ability base_damage.
     pub attack_power: f32,
+    /// CC duration reduction fraction in [0, 0.75]. 0.3 = 30% shorter CC durations.
+    pub cc_duration_reduce: f32,
 }
 
 impl Default for StatBlock {
@@ -149,6 +156,7 @@ impl Default for StatBlock {
             damage_in_mult: 1.0,
             cooldown_reduce_pct: 0.0,
             attack_power: 1.0,
+            cc_duration_reduce: 0.0,
         }
     }
 }
@@ -167,14 +175,21 @@ impl StatBlock {
             .sum::<f32>()
             + equip.cooldown_reduce)
             .clamp(0.0, 0.99);
+        let cc_reduce: f32 = (buffs
+            .iter()
+            .filter_map(|b| b.modifiers.cc_duration_reduce_pct)
+            .sum::<f32>()
+            + equip.cc_duration_reduce)
+            .clamp(0.0, 0.75);
 
         Self {
             max_hp: spawn_max_hp + equip.max_hp,
             movement_speed: (base_speed(kind) + equip.speed) * (1.0 + speed_pct).max(0.0),
-            damage_out_mult: (1.0 + equip.damage_out + dmg_out).max(0.0),
-            damage_in_mult: (1.0 + equip.damage_in + dmg_in).max(0.0),
+            damage_out_mult: (1.0 + equip.damage_out + dmg_out).max(0.05),
+            damage_in_mult: (1.0 + equip.damage_in + dmg_in).max(0.05),
             cooldown_reduce_pct: cd_reduce,
             attack_power: base_attack_power(kind) + equip.attack_power,
+            cc_duration_reduce: cc_reduce,
         }
     }
 }
@@ -228,6 +243,7 @@ mod tests {
     const NO_EQUIP: EquipmentModifiers = EquipmentModifiers {
         max_hp: 0.0, attack_power: 0.0, speed: 0.0,
         damage_out: 0.0, damage_in: 0.0, cooldown_reduce: 0.0,
+        cc_duration_reduce: 0.0,
     };
 
     fn make_buff(speed: Option<f32>, dmg_out: Option<f32>, dmg_in: Option<f32>, cd: Option<f32>) -> ActiveBuff {
@@ -235,6 +251,7 @@ mod tests {
             buff_id: 1,
             source: EntityId(0),
             target: EntityId(0),
+            buff_kind: Default::default(),
             stacks: 1,
             max_stacks: 1,
             expires_at: None,
@@ -243,9 +260,9 @@ mod tests {
                 damage_in_pct: dmg_in,
                 cooldown_reduce_pct: cd,
                 speed_pct: speed,
-                ai_override: None,
-                root: None,
+                ..Default::default()
             },
+            last_dot_tick: None,
         }
     }
 

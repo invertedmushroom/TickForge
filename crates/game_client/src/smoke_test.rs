@@ -181,6 +181,8 @@ pub fn run_tests(config: ClientConfig) -> i32 {
                     "SELECT * FROM client_sequence",
                     "SELECT * FROM module_config",
                     "SELECT * FROM sim_tick",
+                    "SELECT * FROM entity_team",
+                    "SELECT * FROM active_buff",
                 ]);
         }
 
@@ -306,11 +308,462 @@ fn run_aoi_tests(conn: &DbConnection, r: &mut TestResults) {
     } else {
         r.fail(&format!("T5  {distant} distant entities in nearby_transforms — AOI broken!"));
     }
+
+    // T6–T8: adjacency tests (spawn NPCs at known positions, verify visibility).
+    run_adjacency_tests(conn, r);
+
+    // T9–T10: layer isolation tests (same cell, different layer → invisible).
+    run_layer_tests(conn, r);
+
+    // ST1–ST4: stealth visibility tests (team-based filtering).
+    run_stealth_tests(conn, r);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Smoke Tests (intent submission, tick advancement, combat)
+// Adjacency Tests — verify 3x3 cell boundary in nearby_transforms
 // ═══════════════════════════════════════════════════════════════════════
+
+fn run_adjacency_tests(conn: &DbConnection, r: &mut TestResults) {
+    info!("");
+    info!("── Adjacency Tests (3x3 cell boundary) ───────────────────────");
+
+    // Resolve caller's region cell (cell_size = 50.0 per spawn_npc_internal).
+    let my_region = conn.db().my_region().iter().next();
+    let (my_rx, my_rz) = match my_region {
+        Some(ref reg) => (reg.region_x, reg.region_z),
+        None => {
+            r.fail("T6  cannot run adjacency tests — no my_region data");
+            return;
+        }
+    };
+
+    // Spawn NPC at +1 cell on X axis (adjacent — should be visible).
+    // Cell center: ((my_rx + 1) * 50 + 25, 0, my_rz * 50 + 25).
+    let adj_x = (my_rx + 1) as f32 * 50.0 + 25.0;
+    let adj_z = my_rz as f32 * 50.0 + 25.0;
+
+    info!("  T6: spawning adjacent NPC at ({adj_x}, 1, {adj_z}) — cell ({}, {my_rz})", my_rx + 1);
+    let adj_done = Arc::new(AtomicBool::new(false));
+    let adj_ok = Arc::new(AtomicBool::new(false));
+    let ad = Arc::clone(&adj_done);
+    let ao = Arc::clone(&adj_ok);
+    let _ = conn.reducers().spawn_npc_then(adj_x, 1.0, adj_z, 100.0, move |_ctx, result| {
+        if let Ok(Ok(())) = result { ao.store(true, Ordering::SeqCst); }
+        ad.store(true, Ordering::SeqCst);
+    });
+    wait_for(conn, 5000, || adj_done.load(Ordering::SeqCst));
+    if !adj_ok.load(Ordering::SeqCst) {
+        r.fail("T6  failed to spawn adjacent NPC");
+        return;
+    }
+
+    // Spawn NPC at +3 cells on X axis (outside 3x3 — should be invisible).
+    let far_x = (my_rx + 3) as f32 * 50.0 + 25.0;
+    let far_z = my_rz as f32 * 50.0 + 25.0;
+
+    info!("  T7: spawning distant NPC at ({far_x}, 1, {far_z}) — cell ({}, {my_rz})", my_rx + 3);
+    let far_done = Arc::new(AtomicBool::new(false));
+    let far_ok = Arc::new(AtomicBool::new(false));
+    let fd = Arc::clone(&far_done);
+    let fo = Arc::clone(&far_ok);
+    let _ = conn.reducers().spawn_npc_then(far_x, 1.0, far_z, 100.0, move |_ctx, result| {
+        if let Ok(Ok(())) = result { fo.store(true, Ordering::SeqCst); }
+        fd.store(true, Ordering::SeqCst);
+    });
+    wait_for(conn, 5000, || far_done.load(Ordering::SeqCst));
+    if !far_ok.load(Ordering::SeqCst) {
+        r.fail("T7  failed to spawn distant NPC");
+        return;
+    }
+
+    // Wait for view to update.
+    pump(conn, 600);
+
+    // T6: adjacent NPC visible in nearby_transforms.
+    let adj_visible = conn.db().nearby_transforms().iter()
+        .any(|t| (t.pos_x - adj_x).abs() < 1.0 && (t.pos_z - adj_z).abs() < 1.0);
+    if adj_visible {
+        r.pass("T6  adjacent cell entity visible in nearby_transforms");
+    } else {
+        r.fail("T6  adjacent cell entity NOT visible in nearby_transforms");
+    }
+
+    // T7: distant NPC invisible in nearby_transforms.
+    let far_visible = conn.db().nearby_transforms().iter()
+        .any(|t| (t.pos_x - far_x).abs() < 1.0 && (t.pos_z - far_z).abs() < 1.0);
+    if !far_visible {
+        r.pass("T7  distant cell entity correctly invisible in nearby_transforms");
+    } else {
+        r.fail("T7  distant cell entity VISIBLE in nearby_transforms — AOI boundary broken!");
+    }
+
+    // T8: diagonal adjacency — spawn NPC at (+1, +1) cell (corner of 3x3).
+    let diag_x = (my_rx + 1) as f32 * 50.0 + 25.0;
+    let diag_z = (my_rz + 1) as f32 * 50.0 + 25.0;
+
+    info!("  T8: spawning diagonal NPC at ({diag_x}, 1, {diag_z}) — cell ({}, {})", my_rx + 1, my_rz + 1);
+    let diag_done = Arc::new(AtomicBool::new(false));
+    let diag_ok = Arc::new(AtomicBool::new(false));
+    let dd = Arc::clone(&diag_done);
+    let dgo = Arc::clone(&diag_ok);
+    let _ = conn.reducers().spawn_npc_then(diag_x, 1.0, diag_z, 100.0, move |_ctx, result| {
+        if let Ok(Ok(())) = result { dgo.store(true, Ordering::SeqCst); }
+        dd.store(true, Ordering::SeqCst);
+    });
+    wait_for(conn, 5000, || diag_done.load(Ordering::SeqCst));
+    if !diag_ok.load(Ordering::SeqCst) {
+        r.fail("T8  failed to spawn diagonal NPC");
+        return;
+    }
+
+    pump(conn, 600);
+
+    let diag_visible = conn.db().nearby_transforms().iter()
+        .any(|t| (t.pos_x - diag_x).abs() < 1.0 && (t.pos_z - diag_z).abs() < 1.0);
+    if diag_visible {
+        r.pass("T8  diagonal cell (+1,+1) entity visible in nearby_transforms");
+    } else {
+        r.fail("T8  diagonal cell (+1,+1) entity NOT visible — corner of 3x3 broken!");
+    }
+
+    // Cleanup: remove spawned test NPCs.
+    for t in conn.db().nearby_transforms().iter() {
+        if ((t.pos_x - adj_x).abs() < 1.0 && (t.pos_z - adj_z).abs() < 1.0)
+            || ((t.pos_x - diag_x).abs() < 1.0 && (t.pos_z - diag_z).abs() < 1.0)
+        {
+            let _ = conn.reducers().debug_remove_entity(t.entity_id);
+        }
+    }
+    // Distant NPC won't be in nearby_transforms; find it via entity table.
+    for e in conn.db().entity().iter() {
+        if let Some(t) = conn.db().entity_transform().entity_id().find(&e.entity_id) {
+            if (t.pos_x - far_x).abs() < 1.0 && (t.pos_z - far_z).abs() < 1.0 {
+                let _ = conn.reducers().debug_remove_entity(e.entity_id);
+            }
+        }
+    }
+    pump(conn, 200);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Layer Isolation Tests — same cell, different layer → invisible
+// ═══════════════════════════════════════════════════════════════════════
+
+fn run_layer_tests(conn: &DbConnection, r: &mut TestResults) {
+    info!("");
+    info!("── Layer Isolation Tests ─────────────────────────────────────");
+
+    // Resolve caller's region.
+    let my_region = conn.db().my_region().iter().next();
+    let (my_rx, my_rz) = match my_region {
+        Some(ref reg) => (reg.region_x, reg.region_z),
+        None => {
+            r.fail("T9  cannot run layer tests — no my_region data");
+            return;
+        }
+    };
+
+    // Spawn NPC at same cell as player (layer 0 — should be visible initially).
+    let same_x = my_rx as f32 * 50.0 + 25.0;
+    let same_z = my_rz as f32 * 50.0 + 25.0;
+
+    info!("  T9: spawning NPC at ({same_x}, 1, {same_z}) in player's cell, layer 0");
+    let spawn_done = Arc::new(AtomicBool::new(false));
+    let spawn_ok = Arc::new(AtomicBool::new(false));
+    let sd = Arc::clone(&spawn_done);
+    let so = Arc::clone(&spawn_ok);
+    let _ = conn.reducers().spawn_npc_then(same_x, 1.0, same_z, 100.0, move |_ctx, result| {
+        if let Ok(Ok(())) = result { so.store(true, Ordering::SeqCst); }
+        sd.store(true, Ordering::SeqCst);
+    });
+    wait_for(conn, 5000, || spawn_done.load(Ordering::SeqCst));
+    if !spawn_ok.load(Ordering::SeqCst) {
+        r.fail("T9  failed to spawn layer test NPC");
+        return;
+    }
+
+    pump(conn, 600);
+
+    // Find the spawned NPC's entity_id.
+    let test_npc_id = conn.db().nearby_transforms().iter()
+        .filter(|t| (t.pos_x - same_x).abs() < 1.0 && (t.pos_z - same_z).abs() < 1.0)
+        .filter(|t| {
+            conn.db().entity().entity_id().find(&t.entity_id)
+                .is_some_and(|e| e.kind == EntityKind::Npc)
+        })
+        .map(|t| t.entity_id)
+        .max(); // latest spawned
+
+    let npc_eid = match test_npc_id {
+        Some(id) => {
+            r.pass("T9a  layer-test NPC visible in layer 0 (same cell)");
+            id
+        }
+        None => {
+            r.fail("T9a  layer-test NPC NOT visible in layer 0 — spawn or view broken");
+            return;
+        }
+    };
+
+    // T9b: Move NPC to layer 1 — should become invisible to player (layer 0).
+    info!("  T9b: moving NPC {npc_eid} to layer 1");
+    let layer_done = Arc::new(AtomicBool::new(false));
+    let layer_ok = Arc::new(AtomicBool::new(false));
+    let ld = Arc::clone(&layer_done);
+    let lo = Arc::clone(&layer_ok);
+    let _ = conn.reducers().debug_set_layer_then(npc_eid, 1, move |_ctx, result| {
+        if let Ok(Ok(())) = result { lo.store(true, Ordering::SeqCst); }
+        ld.store(true, Ordering::SeqCst);
+    });
+    wait_for(conn, 5000, || layer_done.load(Ordering::SeqCst));
+    if !layer_ok.load(Ordering::SeqCst) {
+        r.fail("T9b  debug_set_layer failed");
+        // Cleanup.
+        let _ = conn.reducers().debug_remove_entity(npc_eid);
+        pump(conn, 200);
+        return;
+    }
+
+    pump(conn, 600);
+
+    let visible_after_layer_change = conn.db().nearby_transforms().iter()
+        .any(|t| t.entity_id == npc_eid);
+    if !visible_after_layer_change {
+        r.pass("T9b  NPC in layer 1 correctly invisible to layer-0 player");
+    } else {
+        r.fail("T9b  NPC in layer 1 VISIBLE to layer-0 player — layer isolation broken!");
+    }
+
+    // T10: Move NPC back to layer 0 — should reappear.
+    info!("  T10: moving NPC {npc_eid} back to layer 0");
+    let back_done = Arc::new(AtomicBool::new(false));
+    let back_ok = Arc::new(AtomicBool::new(false));
+    let bd = Arc::clone(&back_done);
+    let bo = Arc::clone(&back_ok);
+    let _ = conn.reducers().debug_set_layer_then(npc_eid, 0, move |_ctx, result| {
+        if let Ok(Ok(())) = result { bo.store(true, Ordering::SeqCst); }
+        bd.store(true, Ordering::SeqCst);
+    });
+    wait_for(conn, 5000, || back_done.load(Ordering::SeqCst));
+    if !back_ok.load(Ordering::SeqCst) {
+        r.fail("T10  debug_set_layer back to 0 failed");
+        let _ = conn.reducers().debug_remove_entity(npc_eid);
+        pump(conn, 200);
+        return;
+    }
+
+    pump(conn, 600);
+
+    let visible_after_return = conn.db().nearby_transforms().iter()
+        .any(|t| t.entity_id == npc_eid);
+    if visible_after_return {
+        r.pass("T10  NPC returned to layer 0 correctly visible again");
+    } else {
+        r.fail("T10  NPC returned to layer 0 NOT visible — layer transition broken!");
+    }
+
+    // Cleanup.
+    let _ = conn.reducers().debug_remove_entity(npc_eid);
+    pump(conn, 200);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Stealth Visibility Tests — team-based filtering in nearby_transforms
+// ═══════════════════════════════════════════════════════════════════════
+
+fn run_stealth_tests(conn: &DbConnection, r: &mut TestResults) {
+    info!("");
+    info!("── Stealth Visibility Tests ─────────────────────────────────");
+
+    // Resolve player entity.
+    let my_entity_id = match conn.db().client_sequence().iter().next() {
+        Some(cs) => cs.entity_id,
+        None => {
+            r.fail("ST0  cannot run stealth tests — no client_sequence");
+            return;
+        }
+    };
+
+    let my_region = conn.db().my_region().iter().next();
+    let (my_rx, my_rz) = match my_region {
+        Some(ref reg) => (reg.region_x, reg.region_z),
+        None => {
+            r.fail("ST0  cannot run stealth tests — no my_region data");
+            return;
+        }
+    };
+
+    // Spawn NPC in player's cell.
+    let npc_x = my_rx as f32 * 50.0 + 25.0;
+    let npc_z = my_rz as f32 * 50.0 + 25.0;
+
+    info!("  ST1: spawning stealth-test NPC at ({npc_x}, 1, {npc_z})");
+    let spawn_done = Arc::new(AtomicBool::new(false));
+    let spawn_ok = Arc::new(AtomicBool::new(false));
+    let sd = Arc::clone(&spawn_done);
+    let so = Arc::clone(&spawn_ok);
+    let _ = conn.reducers().spawn_npc_then(npc_x, 1.0, npc_z, 100.0, move |_ctx, result| {
+        if let Ok(Ok(())) = result { so.store(true, Ordering::SeqCst); }
+        sd.store(true, Ordering::SeqCst);
+    });
+    wait_for(conn, 5000, || spawn_done.load(Ordering::SeqCst));
+    if !spawn_ok.load(Ordering::SeqCst) {
+        r.fail("ST1  failed to spawn stealth-test NPC");
+        return;
+    }
+
+    pump(conn, 600);
+
+    // Find the spawned NPC.
+    let npc_eid = conn.db().nearby_transforms().iter()
+        .filter(|t| (t.pos_x - npc_x).abs() < 1.0 && (t.pos_z - npc_z).abs() < 1.0)
+        .filter(|t| {
+            conn.db().entity().entity_id().find(&t.entity_id)
+                .is_some_and(|e| e.kind == EntityKind::Npc && e.state != EntityState::Removed)
+        })
+        .map(|t| t.entity_id)
+        .max();
+
+    let npc_eid = match npc_eid {
+        Some(id) => {
+            r.pass("ST1  stealth-test NPC visible before stealth");
+            id
+        }
+        None => {
+            r.fail("ST1  stealth-test NPC NOT visible — spawn or view broken");
+            return;
+        }
+    };
+
+    // ── ST2: assign different teams, apply stealth → NPC should vanish ──
+    info!("  ST2: set NPC team=1, player team=2, apply stealth");
+
+    // Set NPC to team 1.
+    let team_done = Arc::new(AtomicBool::new(false));
+    let team_ok = Arc::new(AtomicBool::new(false));
+    let td = Arc::clone(&team_done);
+    let to = Arc::clone(&team_ok);
+    let _ = conn.reducers().debug_set_team_then(npc_eid, 1, move |_ctx, result| {
+        if let Ok(Ok(())) = result { to.store(true, Ordering::SeqCst); }
+        td.store(true, Ordering::SeqCst);
+    });
+    wait_for(conn, 3000, || team_done.load(Ordering::SeqCst));
+    if !team_ok.load(Ordering::SeqCst) {
+        r.fail("ST2  debug_set_team(npc, 1) failed");
+        let _ = conn.reducers().debug_remove_entity(npc_eid);
+        pump(conn, 200);
+        return;
+    }
+
+    // Set player to team 2 (different from NPC).
+    let team_done2 = Arc::new(AtomicBool::new(false));
+    let team_ok2 = Arc::new(AtomicBool::new(false));
+    let td2 = Arc::clone(&team_done2);
+    let to2 = Arc::clone(&team_ok2);
+    let _ = conn.reducers().debug_set_team_then(my_entity_id, 2, move |_ctx, result| {
+        if let Ok(Ok(())) = result { to2.store(true, Ordering::SeqCst); }
+        td2.store(true, Ordering::SeqCst);
+    });
+    wait_for(conn, 3000, || team_done2.load(Ordering::SeqCst));
+    if !team_ok2.load(Ordering::SeqCst) {
+        r.fail("ST2  debug_set_team(player, 2) failed");
+        let _ = conn.reducers().debug_remove_entity(npc_eid);
+        pump(conn, 200);
+        return;
+    }
+
+    // Apply stealth buff (buff_id=700, 100 ticks, mod_stealth=true).
+    let buff_done = Arc::new(AtomicBool::new(false));
+    let buff_ok = Arc::new(AtomicBool::new(false));
+    let bd = Arc::clone(&buff_done);
+    let bo = Arc::clone(&buff_ok);
+    let _ = conn.reducers().debug_apply_buff_then(
+        npc_eid, 700, 1, 200, // long duration so it doesn't expire during test
+        None, None, None, None,
+        Some(true), // mod_stealth
+        move |_ctx, result| {
+            if let Ok(Ok(())) = result { bo.store(true, Ordering::SeqCst); }
+            bd.store(true, Ordering::SeqCst);
+        },
+    );
+    wait_for(conn, 3000, || buff_done.load(Ordering::SeqCst));
+    if !buff_ok.load(Ordering::SeqCst) {
+        r.fail("ST2  debug_apply_buff(stealth) failed");
+        let _ = conn.reducers().debug_remove_entity(npc_eid);
+        pump(conn, 200);
+        return;
+    }
+
+    pump(conn, 600);
+
+    // Verify NPC is invisible to player (different team).
+    let visible_stealthed = conn.db().nearby_transforms().iter()
+        .any(|t| t.entity_id == npc_eid);
+    if !visible_stealthed {
+        r.pass("ST2  stealthed NPC invisible to enemy team (view filter works)");
+    } else {
+        r.fail("ST2  stealthed NPC VISIBLE to enemy team — stealth filtering broken!");
+    }
+
+    // Verify active_buff contains mod_stealth.
+    let has_stealth_buff = conn.db().active_buff().iter()
+        .any(|b| b.entity_id == npc_eid && b.mod_stealth == Some(true));
+    if has_stealth_buff {
+        r.pass("ST2b active_buff has mod_stealth=true for NPC");
+    } else {
+        r.fail("ST2b active_buff missing mod_stealth=true for NPC");
+    }
+
+    // ── ST3: set player to same team → NPC reappears ──
+    info!("  ST3: set player to team 1 (same as NPC) — should see stealthed ally");
+
+    let team_done3 = Arc::new(AtomicBool::new(false));
+    let team_ok3 = Arc::new(AtomicBool::new(false));
+    let td3 = Arc::clone(&team_done3);
+    let to3 = Arc::clone(&team_ok3);
+    let _ = conn.reducers().debug_set_team_then(my_entity_id, 1, move |_ctx, result| {
+        if let Ok(Ok(())) = result { to3.store(true, Ordering::SeqCst); }
+        td3.store(true, Ordering::SeqCst);
+    });
+    wait_for(conn, 3000, || team_done3.load(Ordering::SeqCst));
+    if !team_ok3.load(Ordering::SeqCst) {
+        r.fail("ST3  debug_set_team(player, 1) failed");
+        let _ = conn.reducers().debug_remove_entity(npc_eid);
+        pump(conn, 200);
+        return;
+    }
+
+    pump(conn, 600);
+
+    let visible_ally = conn.db().nearby_transforms().iter()
+        .any(|t| t.entity_id == npc_eid);
+    if visible_ally {
+        r.pass("ST3  stealthed NPC visible to allied team (same team_id)");
+    } else {
+        r.fail("ST3  stealthed NPC NOT visible to allied team — ally visibility broken!");
+    }
+
+    // ── ST4: remove stealth (remove NPC buffs via cleanup & respawn without buff) ──
+    // We can't directly remove a buff, but we can remove the entity.
+    // Instead, test that after the NPC is removed, stealth tables are cleaned up.
+    info!("  ST4: verify entity_team populated for NPC");
+    let npc_team = conn.db().entity_team().entity_id().find(&npc_eid);
+    if let Some(team) = npc_team {
+        if team.team_id == 1 {
+            r.pass("ST4  entity_team correctly set (team_id=1) for NPC");
+        } else {
+            r.fail(&format!("ST4  entity_team wrong team_id={} (expected 1)", team.team_id));
+        }
+    } else {
+        r.fail("ST4  entity_team row missing for NPC");
+    }
+
+    // Cleanup: remove NPC and reset player team.
+    let _ = conn.reducers().debug_remove_entity(npc_eid);
+    // Reset player team to 0 (no team).
+    let _ = conn.reducers().debug_set_team(my_entity_id, 0);
+    pump(conn, 400);
+}
 
 fn run_smoke_tests(conn: &DbConnection, r: &mut TestResults) {
     info!("");
@@ -450,9 +903,10 @@ fn run_smoke_tests(conn: &DbConnection, r: &mut TestResults) {
     // S9: Combat path — Slash the seeded NPC, verify damage event.
     info!("  S9: combat path (Slash → NPC damage)");
 
-    // Find an existing NPC (seeded by dev-deploy.ps1 or a prior run).
+    // Find an existing live NPC (seeded by dev-deploy.ps1 or a prior run).
+    // Exclude Removed tombstones — entity rows are retained after despawn.
     let npc_id = conn.db().entity().iter()
-        .filter(|e| e.kind == EntityKind::Npc)
+        .filter(|e| e.kind == EntityKind::Npc && e.state != EntityState::Removed)
         .map(|e| e.entity_id)
         .max();
     let npc_id = match npc_id {
@@ -476,6 +930,7 @@ fn run_smoke_tests(conn: &DbConnection, r: &mut TestResults) {
         IntentAction::UseAbility(UseAbilityData {
             ability_id: 1,
             target: AbilityTarget::None,
+            target_hint: None,
         }),
         0,
     );
@@ -734,9 +1189,10 @@ fn run_f5_cooldown(conn: &DbConnection, r: &mut TestResults, entity_id: u64, seq
     info!("  F5: waiting 1200ms to clear existing cooldown...");
     pump(conn, 1200);
 
-    // Find existing NPC (seeded by dev-deploy.ps1 or a prior S9 run).
+    // Find existing live NPC (seeded by dev-deploy.ps1 or a prior S9 run).
+    // Exclude Removed tombstones — entity rows are retained after despawn.
     let npc_id = conn.db().entity().iter()
-        .filter(|e| e.kind == EntityKind::Npc)
+        .filter(|e| e.kind == EntityKind::Npc && e.state != EntityState::Removed)
         .map(|e| e.entity_id)
         .max();
     let npc_id = match npc_id {
@@ -761,6 +1217,7 @@ fn run_f5_cooldown(conn: &DbConnection, r: &mut TestResults, entity_id: u64, seq
         IntentAction::UseAbility(UseAbilityData {
             ability_id: 1,
             target: AbilityTarget::None,
+            target_hint: None,
         }),
         0,
     );
@@ -770,6 +1227,7 @@ fn run_f5_cooldown(conn: &DbConnection, r: &mut TestResults, entity_id: u64, seq
         IntentAction::UseAbility(UseAbilityData {
             ability_id: 1,
             target: AbilityTarget::None,
+            target_hint: None,
         }),
         0,
     );

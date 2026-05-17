@@ -30,7 +30,7 @@
 //! bool in O(1).  For ≤200 entities and ≤10 compensated hitboxes, the cost is
 //! negligible (~50 µs per tick).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use game_protocol::entity_id::EntityId;
 use game_protocol::tick::TickId;
@@ -56,6 +56,13 @@ pub const MAX_HISTORY_TICKS: usize = 8;
 pub const HURTBOX_HALF_HEIGHT: f32 = 0.5;
 pub const HURTBOX_RADIUS: f32 = 0.3;
 
+/// Spatial bucket size for historical broadphase candidate lookup.
+///
+/// Chosen to be comfortably larger than the horizontal extent of current
+/// compensated melee shapes while still keeping bucket occupancy low in crowd
+/// tests. Historical snapshots stay cheap to query even at very large entity counts.
+pub const SNAPSHOT_CELL_SIZE: f32 = 4.0;
+
 // ── Transform history ───────────────────────────────────────────
 
 /// Per-tick position snapshot stored in a ring buffer on `TickPipeline`.
@@ -65,6 +72,46 @@ pub const HURTBOX_RADIUS: f32 = 0.3;
 pub struct TransformSnapshot {
     pub tick: TickId,
     pub positions: Vec<(EntityId, Vec3f)>,
+    spatial_bins: HashMap<(i32, i32), Vec<usize>>,
+}
+
+impl TransformSnapshot {
+    fn cell_coord(value: f32) -> i32 {
+        (value / SNAPSHOT_CELL_SIZE).floor() as i32
+    }
+
+    fn new(tick: TickId, positions: Vec<(EntityId, Vec3f)>) -> Self {
+        let mut spatial_bins: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        for (index, (_, pos)) in positions.iter().enumerate() {
+            let cell = (Self::cell_coord(pos.x), Self::cell_coord(pos.z));
+            spatial_bins.entry(cell).or_default().push(index);
+        }
+
+        Self {
+            tick,
+            positions,
+            spatial_bins,
+        }
+    }
+
+    /// Return snapshot positions in buckets intersecting a horizontal query radius.
+    pub fn nearby_positions(&self, center: Vec3f, radius: f32) -> Vec<(EntityId, Vec3f)> {
+        let min_x = Self::cell_coord(center.x - radius);
+        let max_x = Self::cell_coord(center.x + radius);
+        let min_z = Self::cell_coord(center.z - radius);
+        let max_z = Self::cell_coord(center.z + radius);
+
+        let mut out = Vec::new();
+        for cell_x in min_x..=max_x {
+            for cell_z in min_z..=max_z {
+                let Some(indices) = self.spatial_bins.get(&(cell_x, cell_z)) else {
+                    continue;
+                };
+                out.extend(indices.iter().map(|&i| self.positions[i]));
+            }
+        }
+        out
+    }
 }
 
 /// Ring buffer of recent transform snapshots for lag compensation rewind.
@@ -83,10 +130,10 @@ impl TransformHistory {
     /// Record a snapshot of all entity positions at the given tick.
     /// Called at the end of Phase 10 (commit) before advancing the tick counter.
     pub fn record(&mut self, tick: TickId, positions: Vec<(EntityId, Vec3f)>) {
-        if self.buffer.len() >= MAX_HISTORY_TICKS {
+        if self.buffer.len() >= MAX_HISTORY_TICKS + 1 {
             self.buffer.pop_front();
         }
-        self.buffer.push_back(TransformSnapshot { tick, positions });
+        self.buffer.push_back(TransformSnapshot::new(tick, positions));
     }
 
     /// Look up the nearest snapshot at or before the requested tick.
@@ -126,12 +173,13 @@ impl Default for TransformHistory {
 /// (repurposed from wall-clock timestamp to tick number by the client).
 ///
 /// If `client_observed_tick == 0`, no rewind is applied (legacy or local client).
-pub fn compute_rewind_ticks(current_tick: TickId, client_observed_tick: u64) -> u32 {
+/// The result is clamped to `global_max` (from `TickConfig::global_max_rewind_ticks`).
+pub fn compute_rewind_ticks(current_tick: TickId, client_observed_tick: u64, global_max: u32) -> u32 {
     if client_observed_tick == 0 {
         return 0;
     }
     let delta = current_tick.0.saturating_sub(client_observed_tick);
-    (delta as u32).min(MAX_REWIND_TICKS)
+    (delta as u32).min(global_max)
 }
 
 // ── Shape intersection ──────────────────────────────────────────
@@ -153,7 +201,18 @@ pub fn hitbox_sensor_shape(shape: SkillShape) -> SensorShape {
         SkillShape::CapsuleSweep => SensorShape::Capsule { half_height: 1.0, radius: 0.75 },
         SkillShape::Projectile   => SensorShape::Sphere { radius: 0.5 },
         SkillShape::LineSweep    => SensorShape::Capsule { half_height: 3.0, radius: 0.5 },
-        SkillShape::HazardZone   => SensorShape::Sphere { radius: 5.0 },
+        SkillShape::HazardZone   => SensorShape::Sphere { radius: 2.0 },
+    }
+}
+
+/// Conservative horizontal candidate radius for lag-comp broadphase filtering.
+///
+/// This must be at least as large as the shape's horizontal extent plus the
+/// hurtbox radius so the spatial prefilter cannot exclude true hits.
+pub fn hitbox_candidate_radius(shape: SensorShape) -> f32 {
+    match shape {
+        SensorShape::Sphere { radius } => radius + HURTBOX_RADIUS,
+        SensorShape::Capsule { radius, .. } => radius + HURTBOX_RADIUS,
     }
 }
 
@@ -272,23 +331,29 @@ mod tests {
 
     #[test]
     fn compute_rewind_zero_observed() {
-        assert_eq!(compute_rewind_ticks(TickId(100), 0), 0);
+        assert_eq!(compute_rewind_ticks(TickId(100), 0, MAX_REWIND_TICKS), 0);
     }
 
     #[test]
     fn compute_rewind_normal_delta() {
-        assert_eq!(compute_rewind_ticks(TickId(100), 98), 2);
+        assert_eq!(compute_rewind_ticks(TickId(100), 98, MAX_REWIND_TICKS), 2);
     }
 
     #[test]
     fn compute_rewind_clamped_to_max() {
-        assert_eq!(compute_rewind_ticks(TickId(100), 90), MAX_REWIND_TICKS);
+        assert_eq!(compute_rewind_ticks(TickId(100), 90, MAX_REWIND_TICKS), MAX_REWIND_TICKS);
     }
 
     #[test]
     fn compute_rewind_future_observed_returns_zero() {
         // Client claims to have observed a future tick — impossible, return 0.
-        assert_eq!(compute_rewind_ticks(TickId(100), 105), 0);
+        assert_eq!(compute_rewind_ticks(TickId(100), 105, MAX_REWIND_TICKS), 0);
+    }
+
+    #[test]
+    fn compute_rewind_respects_custom_global_max() {
+        // With global_max=2, a delta of 3 should clamp to 2.
+        assert_eq!(compute_rewind_ticks(TickId(100), 97, 2), 2);
     }
 
     #[test]
@@ -321,14 +386,33 @@ mod tests {
     }
 
     #[test]
+    fn transform_snapshot_nearby_positions_filters_by_bucket() {
+        let snapshot = TransformSnapshot::new(
+            TickId(10),
+            vec![
+                (EntityId(1), Vec3f::new(0.0, 0.0, 0.0)),
+                (EntityId(2), Vec3f::new(1.5, 0.0, 0.0)),
+                (EntityId(3), Vec3f::new(20.0, 0.0, 0.0)),
+            ],
+        );
+
+        let nearby = snapshot.nearby_positions(Vec3f::new(0.0, 0.0, 0.0), 2.0);
+        assert!(nearby.iter().any(|(eid, _)| *eid == EntityId(1)));
+        assert!(nearby.iter().any(|(eid, _)| *eid == EntityId(2)));
+        assert!(!nearby.iter().any(|(eid, _)| *eid == EntityId(3)));
+    }
+
+    #[test]
     fn transform_history_evicts_oldest() {
         let mut history = TransformHistory::new();
         for t in 0..MAX_HISTORY_TICKS as u64 + 5 {
             history.record(TickId(t), vec![(EntityId(1), Vec3f::new(t as f32, 0.0, 0.0))]);
         }
-        assert!(history.len() <= MAX_HISTORY_TICKS);
-        // Oldest should be evicted — tick 0 should not be findable
+        assert!(history.len() <= MAX_HISTORY_TICKS + 1);
+        // Oldest snapshots should be evicted once the extra rewind headroom is exceeded.
         assert!(history.get_position(TickId(0), EntityId(1)).is_none());
+        assert!(history.get_position(TickId(3), EntityId(1)).is_none());
+        assert_eq!(history.get_position(TickId(4), EntityId(1)).unwrap().x, 4.0);
     }
 
     #[test]
@@ -395,6 +479,14 @@ mod tests {
         );
         assert!((pos.x - 2.0).abs() < 0.1, "x={}", pos.x);
         assert!((pos.z).abs() < 0.1, "z={}", pos.z);
+    }
+
+    #[test]
+    fn hazard_zone_shape_matches_tick_pipeline_radius() {
+        let SensorShape::Sphere { radius } = hitbox_sensor_shape(SkillShape::HazardZone) else {
+            panic!("hazard zone should map to a sphere sensor");
+        };
+        assert!((radius - 2.0).abs() < 1e-6, "radius={radius}");
     }
 
     // ── Swept projectile intersection tests ──────────────────────────

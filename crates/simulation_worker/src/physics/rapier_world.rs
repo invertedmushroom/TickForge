@@ -1,7 +1,7 @@
 use rapier3d::prelude::*;
-use rapier3d::control::KinematicCharacterController;
+use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
 use rapier3d::math::{Pose, Vector};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use game_protocol::entity_id::EntityId;
 use game_schema::EntityKind;
@@ -79,7 +79,7 @@ impl PhysicsWorld {
         let (collision_send, collision_recv) = mpsc::channel();
         let (contact_force_send, contact_force_recv) = mpsc::channel();
 
-        Self {
+        let mut world = Self {
             pipeline: PhysicsPipeline::new(),
             params,
             gravity: Vector::new(0.0, -9.81, 0.0),
@@ -101,7 +101,14 @@ impl PhysicsWorld {
             sensor_handle_counter: 0,
             sensor_handles: HashMap::new(),
             world_sensor_owners: HashMap::new(),
-        }
+        };
+
+        // Default ground plane — every world has a floor.
+        world.add_environment_collider(
+            SharedShape::cuboid(500.0, 0.1, 500.0),
+            Vector::new(0.0, 0.0, 0.0),
+        );
+        world
     }
 
     /// Advance the physics simulation by one fixed timestep.
@@ -188,28 +195,34 @@ impl PhysicsWorld {
         )
     }
 
-    // ── Body creation ───────────────────────────────────────────────
+    // ── Environment geometry ────────────────────────────────────────
+    //
+    // Static world geometry (ground, walls, dungeon structures, obstacles).
+    // These are NOT game entities — they have no EntityId, no body-to-entity
+    // mapping, and are invisible to `get_all_transforms` / region updates.
+    // In Rapier, parentless colliders act as fixed obstacles.
 
-    /// Add a static ground plane at y=0.
-    pub fn add_static_ground(&mut self, entity_id: EntityId) -> EntityId {
-
-        let body = RigidBodyBuilder::fixed()
-            .translation(Vector::new(0.0, 0.0, 0.0))
-            .build();
-        let body_handle = self.bodies.insert(body);
-
-        let collider = ColliderBuilder::cuboid(100.0, 0.1, 100.0)
+    /// Add static environment geometry at the given position.
+    /// Returns the collider handle for later removal if needed.
+    pub fn add_environment_collider(
+        &mut self,
+        shape: SharedShape,
+        position: Vector,
+    ) -> ColliderHandle {
+        let collider = ColliderBuilder::new(shape)
+            .translation(position)
             .collision_groups(collision_groups::environment_groups())
+            .active_collision_types(
+                ActiveCollisionTypes::default()
+                    | ActiveCollisionTypes::KINEMATIC_FIXED
+                    | ActiveCollisionTypes::DYNAMIC_FIXED,
+            )
             .build();
-        let ch = self.colliders
-            .insert_with_parent(collider, body_handle, &mut self.bodies);
-        self.collider_kinds.insert(ch, ColliderKind::Body);
-
-        self.entity_to_body.insert(entity_id, body_handle);
-        self.body_to_entity.insert(body_handle, entity_id);
-
-        entity_id
+        // Parentless collider — fixed in world space, no rigid body needed.
+        self.colliders.insert(collider)
     }
+
+    // ── Body creation ───────────────────────────────────────────────
 
     /// Add a dynamic sphere body at the given position.
     /// Also attaches a hurtbox sensor of the same radius.
@@ -350,7 +363,7 @@ impl PhysicsWorld {
     }
 
     /// Add a sensor collider attached to an existing body.
-    /// Used for: skill hitboxes, trigger zones, auras.
+    /// Used for: skill hitboxes, trigger zones.
     /// Sensors detect overlap but produce no physical contact forces.
     pub fn add_sensor_to_entity(
         &mut self,
@@ -412,6 +425,10 @@ impl PhysicsWorld {
             for ch in attached.iter() {
                 self.collider_kinds.remove(ch);
             }
+
+            // Clean up world-space sensor ownership entries for this entity so the
+            // map does not leak references to removed entities over long sessions.
+            self.world_sensor_owners.retain(|_, &mut owner| owner != entity_id);
             self.bodies.remove(
                 body_handle,
                 &mut self.islands,
@@ -446,6 +463,7 @@ impl PhysicsWorld {
     }
 
     /// Set the position of a kinematic body, preserving current rotation.
+    /// Clamps Y to prevent embedding characters below the ground surface.
     pub fn set_kinematic_position(
         &mut self,
         entity_id: EntityId,
@@ -453,9 +471,15 @@ impl PhysicsWorld {
     ) -> bool {
         if let Some(handle) = self.entity_to_body.get(&entity_id)
             && let Some(body) = self.bodies.get_mut(*handle) {
-                let rotation = *body.rotation();
+                let mut pos = position;
+                let min_y = game_core::physics_constants::MIN_CHARACTER_Y;
+                if pos.y < min_y {
+                    pos.y = min_y;
+                }
+                // Preserve any pending rotation set earlier in this tick.
+                let rotation = body.next_position().rotation;
                 body.set_next_kinematic_position(Pose::from_parts(
-                    position,
+                    pos,
                     rotation,
                 ));
                 return true;
@@ -463,7 +487,11 @@ impl PhysicsWorld {
         false
     }
 
-    /// Set the rotation of a kinematic body, preserving current position.
+    /// Set the rotation of a kinematic body, preserving the queued position.
+    ///
+    /// Uses `body.next_position()` so that a prior `set_next_kinematic_position`
+    /// from `move_character` (e.g. arc movement) is not overwritten by resetting
+    /// the position back to the last-committed `translation()`.
     pub fn set_kinematic_rotation(
         &mut self,
         entity_id: EntityId,
@@ -471,7 +499,7 @@ impl PhysicsWorld {
     ) -> bool {
         if let Some(handle) = self.entity_to_body.get(&entity_id)
             && let Some(body) = self.bodies.get_mut(*handle) {
-                let position = body.translation();
+                let position = body.next_position().translation;
                 body.set_next_kinematic_position(Pose::from_parts(
                     position,
                     rotation,
@@ -506,7 +534,7 @@ impl PhysicsWorld {
     }
 
     /// Find all colliders intersecting a sphere at the given position.
-    /// Useful for AoE abilities, aura pulses, proximity checks.
+    /// Useful for AoE abilities, proximity checks.
     pub fn intersections_with_sphere(
         &self,
         center: Vector,
@@ -694,6 +722,41 @@ impl PhysicsBackend for PhysicsWorld {
         false
     }
 
+    fn sensor_intersections(&self, handle: u64) -> Vec<EntityId> {
+        let Some(&sensor_handle) = self.sensor_handles.get(&handle) else {
+            return Vec::new();
+        };
+
+        let Some(sensor) = self.colliders.get(sensor_handle) else {
+            return Vec::new();
+        };
+
+        let sensor_pose = *sensor.position();
+        let sensor_shape = sensor.shape();
+        let query = self.query_pipeline();
+
+        // Use a direct shape query against the current scene instead of
+        // transition events so stationary occupants are still detected.
+        let mut entities = HashSet::new();
+        for (other, _) in query.intersect_shape(sensor_pose, sensor_shape) {
+            if other == sensor_handle {
+                continue;
+            }
+            match self.kind_for_collider(other) {
+                ColliderKind::Body | ColliderKind::Hurtbox => {
+                    if let Some(entity_id) = self.entity_for_collider(other) {
+                        entities.insert(entity_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut entities: Vec<_> = entities.into_iter().collect();
+        entities.sort_by_key(|entity_id| entity_id.0);
+        entities
+    }
+
     fn spawn_character_body(
         &mut self,
         entity_id: EntityId,
@@ -709,10 +772,57 @@ impl PhysicsBackend for PhysicsWorld {
         let groups = match kind {
             EntityKind::Player => collision_groups::player_body_groups(),
             EntityKind::Npc | EntityKind::Boss => collision_groups::npc_body_groups(),
-            // Projectile/Hazard bodies are not created via this path.
-            EntityKind::Projectile | EntityKind::Hazard => collision_groups::player_body_groups(),
+            // Projectile/Hazard/Prop bodies are not created via this path.
+            EntityKind::Projectile | EntityKind::Hazard | EntityKind::Prop => collision_groups::player_body_groups(),
         };
         self.add_kinematic_capsule(entity_id, pos, 0.5, 0.3, groups);
+        true
+    }
+
+    fn spawn_prop_body(
+        &mut self,
+        entity_id: EntityId,
+        position: game_protocol::types::Vec3f,
+        half_extents: game_protocol::types::Vec3f,
+        pushable: bool,
+    ) -> bool {
+        if self.entity_to_body.contains_key(&entity_id) {
+            return false;
+        }
+        let pos = Vector::new(position.x, position.y, position.z);
+
+        let body = if pushable {
+            RigidBodyBuilder::dynamic()
+                .translation(pos)
+                .ccd_enabled(true)
+                .linear_damping(0.5)
+                .angular_damping(0.8)
+                .build()
+        } else {
+            RigidBodyBuilder::fixed()
+                .translation(pos)
+                .ccd_enabled(true)
+                .build()
+        };
+        let body_handle = self.bodies.insert(body);
+
+        let collider = ColliderBuilder::cuboid(half_extents.x, half_extents.y, half_extents.z)
+            .density(2.0)
+            .restitution(0.1)
+            .friction(0.7)
+            .collision_groups(collision_groups::prop_body_groups())
+            .active_events(ActiveEvents::COLLISION_EVENTS)
+            .active_collision_types(
+                ActiveCollisionTypes::default()
+                    | ActiveCollisionTypes::DYNAMIC_KINEMATIC
+                    | ActiveCollisionTypes::DYNAMIC_FIXED,
+            )
+            .build();
+        let ch = self.colliders.insert_with_parent(collider, body_handle, &mut self.bodies);
+        self.collider_kinds.insert(ch, ColliderKind::Body);
+
+        self.entity_to_body.insert(entity_id, body_handle);
+        self.body_to_entity.insert(body_handle, entity_id);
         true
     }
 
@@ -722,39 +832,109 @@ impl PhysicsBackend for PhysicsWorld {
         desired_translation: game_protocol::types::Vec3f,
     ) -> Option<MoveResult> {
         let handle = *self.entity_to_body.get(&entity_id)?;
-        let body = self.bodies.get(handle)?;
-        let current_pos = *body.position();
+        let desired_vec = Vector::new(desired_translation.x, desired_translation.y, desired_translation.z);
 
-        // Use the entity's Body collider shape for the character controller sweep.
-        // The first collider attached to this body is always the Body capsule.
-        let body_collider_handle = body.colliders().first().copied()?;
-        let collider = self.colliders.get(body_collider_handle)?;
-        let shape = collider.shape();
+        // Extract position and collider handle up front so the subsequent block
+        // can borrow self freely without conflicting with these short-lived borrows.
+        // Uses `next_position()` so that multiple move_character calls within the
+        // same tick chain correctly (e.g. movement + repulsion). `position()` only
+        // reflects the last physics step, so a prior `set_next_kinematic_position`
+        // would be invisible and overwritten.
+        let (current_pos, body_collider_handle) = {
+            let body = self.bodies.get(handle)?;
+            let ch = body.colliders().first().copied()?;
+            (*body.next_position(), ch)
+        };
 
-        // Build a query pipeline that excludes this character's own rigid body.
-        let filter = QueryFilter::default().exclude_rigid_body(handle);
-        let queries = self.broad_phase.as_query_pipeline(
-            self.narrow_phase.query_dispatcher(),
-            &self.bodies,
-            &self.colliders,
-            filter,
-        );
+        // Run the character controller in its own block so the borrows on
+        // self.bodies / self.colliders (via `shape` and `queries`) are fully
+        // released before we mutate self.bodies to apply push impulses below.
+        let (movement, push_targets) = {
+            let collider = self.colliders.get(body_collider_handle)?;
+            let shape = collider.shape();
+            // Exclude the entity's own body AND restrict to environment/prop/flight-blocker
+            // geometry so characters never collide with other character capsules during
+            // movement.  This prevents capsule stacking, landing-on-heads after launch CC,
+            // and getting wedged between overlapping capsules.
+            let filter = QueryFilter::default()
+                .exclude_rigid_body(handle)
+                .groups(collision_groups::kcc_movement_groups());
+            let queries = self.broad_phase.as_query_pipeline(
+                self.narrow_phase.query_dispatcher(),
+                &self.bodies,
+                &self.colliders,
+                filter,
+            );
+            let controller = KinematicCharacterController {
+                offset: CharacterLength::Relative(0.02),
+                autostep: Some(CharacterAutostep {
+                    max_height: CharacterLength::Relative(0.15),
+                    min_width: CharacterLength::Relative(0.2),
+                    include_dynamic_bodies: false,
+                }),
+                snap_to_ground: Some(CharacterLength::Relative(0.2)),
+                ..Default::default()
+            };
+            let mut hits: Vec<ColliderHandle> = Vec::new();
+            let mv = controller.move_shape(
+                0.0, // dt=0: server controls Y; no gravity/slope friction needed
+                &queries,
+                shape,
+                &current_pos,
+                desired_vec,
+                |collision| hits.push(collision.handle),
+            );
+            (mv, hits)
+        }; // shape, queries, collider, controller all dropped here
 
-        let controller = KinematicCharacterController::default();
-        let movement = controller.move_shape(
-            0.0, // dt=0: no gravity / slope friction needed (server controls Y)
-            &queries,
-            shape,
-            &current_pos,
-            Vector::new(desired_translation.x, desired_translation.y, desired_translation.z),
-            |_collision| {}, // no event handling needed
-        );
+        // Apply push impulses to any dynamic body the character touched.
+        // Strength is tuned so a 2 kg prop reaches roughly player walk speed
+        // in a few ticks of contact, then coasts away.
+        const PUSH_STRENGTH: f32 = 2.0; // N·s per contact tick
+        if desired_vec.length_squared() > 1e-6 {
+            let push_dir = desired_vec.normalize();
+            for &ch in &push_targets {
+                let parent = match self.colliders.get(ch).and_then(|c| c.parent()) {
+                    Some(p) if p != handle => p,
+                    _ => continue,
+                };
+                if let Some(body) = self.bodies.get_mut(parent) {
+                    if body.is_dynamic() {
+                        body.apply_impulse(push_dir * PUSH_STRENGTH, true);
 
-        let new_pos = current_pos.translation + movement.translation;
+                        // Clamp horizontal speed so stacked players can't send
+                        // the box flying. Applied immediately after each impulse
+                        // so it self-limits regardless of how many players push
+                        // in a single tick. Y is left untouched (gravity/bounce).
+                        const MAX_PUSH_SPEED: f32 = 6.0; // m/s
+                        let v = body.linvel();
+                        let h = Vector::new(v.x, 0.0, v.z);
+                        if h.length() > MAX_PUSH_SPEED {
+                            let clamped = h.normalize() * MAX_PUSH_SPEED;
+                            body.set_linvel(Vector::new(clamped.x, v.y, clamped.z), false);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut new_pos = current_pos.translation + movement.translation;
+
+        // Ground clamp: prevent the character center from sinking below the
+        // floor surface.  The KCC offset + snap_to_ground handle normal cases,
+        // but a fast downward arc or edge-case penetration can still push the
+        // capsule below the surface. Clamp to the minimum valid Y.
+        let min_y = game_core::physics_constants::MIN_CHARACTER_Y;
+        if new_pos.y < min_y {
+            new_pos.y = min_y;
+        }
 
         // Apply the corrected position to the kinematic body.
+        // Use `next_position().rotation` so that a preceding
+        // `set_kinematic_rotation` (e.g. WASD-driven facing) is preserved
+        // rather than being overwritten by the stale committed rotation.
         let body = self.bodies.get_mut(handle)?;
-        let rotation = *body.rotation();
+        let rotation = body.next_position().rotation;
         body.set_next_kinematic_position(Pose::from_parts(new_pos, rotation));
 
         Some(MoveResult {
@@ -772,8 +952,20 @@ impl PhysicsBackend for PhysicsWorld {
         origin: game_protocol::types::Vec3f,
         direction: game_protocol::types::Vec3f,
         max_distance: f32,
+        ignore_entity: Option<EntityId>,
     ) -> Option<RayHit> {
-        let query = self.query_pipeline();
+        let mut filter = QueryFilter::new().groups(collision_groups::targeting_ray_groups());
+        if let Some(entity_id) = ignore_entity
+            && let Some(&body_handle) = self.entity_to_body.get(&entity_id)
+        {
+            filter = filter.exclude_rigid_body(body_handle);
+        }
+        let query = self.broad_phase.as_query_pipeline(
+            self.narrow_phase.query_dispatcher(),
+            &self.bodies,
+            &self.colliders,
+            filter,
+        );
         let ray = Ray::new(
             Vector::new(origin.x, origin.y, origin.z),
             Vector::new(direction.x, direction.y, direction.z),
@@ -801,6 +993,97 @@ impl PhysicsBackend for PhysicsWorld {
                 })
             })
     }
+
+    fn line_of_sight(
+        &self,
+        from: game_protocol::types::Vec3f,
+        to: game_protocol::types::Vec3f,
+    ) -> bool {
+        let dx = to.x - from.x;
+        let dy = to.y - from.y;
+        let dz = to.z - from.z;
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        if dist < 1e-6 {
+            return true; // same point — trivially clear
+        }
+        let inv = 1.0 / dist;
+        let dir = Vector::new(dx * inv, dy * inv, dz * inv);
+        let origin = Vector::new(from.x, from.y, from.z);
+        let ray = Ray::new(origin, dir);
+        // Build a query pipeline filtered to environment-only geometry so entity
+        // bodies, hurtboxes, and sensors are transparent to LoS checks.
+        let env_filter = QueryFilter::new().groups(collision_groups::kcc_movement_groups());
+        let query = self.broad_phase.as_query_pipeline(
+            self.narrow_phase.query_dispatcher(),
+            &self.bodies,
+            &self.colliders,
+            env_filter,
+        );
+        match query.cast_ray_and_get_normal(&ray, dist, true) {
+            None => true, // no hit = clear LoS
+            Some((_, hit)) => {
+                // A contact effectively at the destination is not an occluder.
+                // This keeps ground-target casts valid when the ray terminates on
+                // or just above the floor plane at long range.
+                hit.time_of_impact >= dist - 0.25
+            }
+        }
+    }
+
+    fn cast_to_wall(
+        &self,
+        from: game_protocol::types::Vec3f,
+        to: game_protocol::types::Vec3f,
+    ) -> game_protocol::types::Vec3f {
+        let dx = to.x - from.x;
+        let dy = to.y - from.y;
+        let dz = to.z - from.z;
+        let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        if dist < 1e-6 {
+            return to; // same point — nothing to cast
+        }
+        let inv = 1.0 / dist;
+        let dir = Vector::new(dx * inv, dy * inv, dz * inv);
+        let origin = Vector::new(from.x, from.y, from.z);
+        let ray = Ray::new(origin, dir);
+        let env_filter = QueryFilter::new().groups(collision_groups::kcc_movement_groups());
+        let query = self.broad_phase.as_query_pipeline(
+            self.narrow_phase.query_dispatcher(),
+            &self.bodies,
+            &self.colliders,
+            env_filter,
+        );
+        if let Some((_, hit)) = query.cast_ray_and_get_normal(&ray, dist, true) {
+            // Pull back 0.3 units from the contact so the entity doesn't clip geometry.
+            let safe_dist = (hit.time_of_impact - 0.3_f32).max(0.0);
+            game_protocol::types::Vec3f::new(
+                from.x + dir.x * safe_dist,
+                from.y + dir.y * safe_dist,
+                from.z + dir.z * safe_dist,
+            )
+        } else {
+            to // clear path — use full destination
+        }
+    }
+
+    fn teleport_entity(
+        &mut self,
+        entity_id: EntityId,
+        position: game_protocol::types::Vec3f,
+    ) -> bool {
+        let Some(&handle) = self.entity_to_body.get(&entity_id) else {
+            return false;
+        };
+        let Some(body) = self.bodies.get_mut(handle) else {
+            return false;
+        };
+        let rotation = *body.rotation();
+        body.set_next_kinematic_position(Pose::from_parts(
+            Vector::new(position.x, position.y, position.z),
+            rotation,
+        ));
+        true
+    }
 }
 
 #[cfg(test)]
@@ -810,9 +1093,9 @@ mod tests {
     #[test]
     fn ball_falls_onto_ground() {
         let mut world = PhysicsWorld::new(1.0 / 60.0);
-        world.add_static_ground(EntityId(1));
+        // Ground plane is created automatically by new().
         let ball = world.add_dynamic_sphere(
-            EntityId(2),
+            EntityId(1),
             Vector::new(0.0, 5.0, 0.0),
             0.5,
             1.0,
@@ -834,7 +1117,7 @@ mod tests {
     #[test]
     fn raycast_hits_ground() {
         let mut world = PhysicsWorld::new(1.0 / 60.0);
-        world.add_static_ground(EntityId(1));
+        // Ground plane is created automatically by new().
         world.step(); // need at least one step for broadphase
 
         let hit = world.raycast(
@@ -849,6 +1132,17 @@ mod tests {
         // Ray starts at y=10, so toi should be about 9.9
         assert!(hit.toi > 9.0, "Hit toi too small: {}", hit.toi);
         assert!(hit.toi < 10.5, "Hit toi too large: {}", hit.toi);
+    }
+
+    #[test]
+    fn line_of_sight_allows_ground_endpoint() {
+        let mut world = PhysicsWorld::new(1.0 / 60.0);
+        world.step();
+
+        assert!(world.line_of_sight(
+            game_protocol::types::Vec3f::new(0.0, 5.0, 0.0),
+            game_protocol::types::Vec3f::new(15.0, 0.1, 0.0),
+        ));
     }
 
     #[test]

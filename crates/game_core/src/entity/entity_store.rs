@@ -117,21 +117,42 @@ impl EntityStore {
 
     /// Transition an entity from Spawning to Active.
     pub fn activate(&mut self, idx: EntityIndex) {
-        self.states[idx.as_usize()] = EntityState::Active;
+        let slot = idx.as_usize();
+        debug_assert_eq!(
+            self.generations[slot], idx.generation(),
+            "activate called with stale EntityIndex (slot={} gen={} current={})",
+            slot, idx.generation(), self.generations[slot],
+        );
+        if self.generations[slot] != idx.generation() { return; }
+        self.states[slot] = EntityState::Active;
     }
 
     /// Mark an entity for removal at end of tick.
     pub fn mark_despawn(&mut self, idx: EntityIndex) {
-        self.states[idx.as_usize()] = EntityState::DespawnPending;
+        let slot = idx.as_usize();
+        debug_assert_eq!(
+            self.generations[slot], idx.generation(),
+            "mark_despawn called with stale EntityIndex (slot={} gen={} current={})",
+            slot, idx.generation(), self.generations[slot],
+        );
+        if self.generations[slot] != idx.generation() { return; }
+        self.states[slot] = EntityState::DespawnPending;
     }
 
     /// Tombstone: mark as Removed, drop the id→index mapping, and return
     /// the slot to the free list for reuse.
     pub fn mark_removed(&mut self, idx: EntityIndex) {
-        self.states[idx.as_usize()] = EntityState::Removed;
-        let id = self.index_to_id[idx.as_usize()];
+        let slot = idx.as_usize();
+        debug_assert_eq!(
+            self.generations[slot], idx.generation(),
+            "mark_removed called with stale EntityIndex (slot={} gen={} current={})",
+            slot, idx.generation(), self.generations[slot],
+        );
+        if self.generations[slot] != idx.generation() { return; }
+        self.states[slot] = EntityState::Removed;
+        let id = self.index_to_id[slot];
         self.id_to_index.remove(&id);
-        self.free_list.push(idx.as_usize() as u32);
+        self.free_list.push(slot as u32);
     }
 
     /// Build a generation-correct `EntityIndex` for a raw slot offset.

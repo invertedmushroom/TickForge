@@ -15,13 +15,9 @@ pub enum ColliderKind {
     Hitbox(u64),
     /// Directional block region. Carries a block id.
     BlockCone(u32),
-    /// Passive proximity region (aggro, buff pulse). Carries an aura id.
-    Aura(u32),
-    /// Environmental hazard zone. Carries a hazard id.
-    Hazard(u32),
 }
 
-/// Abstract shape for a sensor collider (hitbox, trigger zone, aura).
+/// Abstract shape for a sensor collider (hitbox, trigger zone).
 /// Maps to a physics engine shape without exposing engine-specific types.
 #[derive(Clone, Copy, Debug)]
 pub enum SensorShape {
@@ -109,6 +105,14 @@ pub trait PhysicsBackend: Send {
     /// No-op and returns false if the handle is unknown.
     fn set_sensor_position(&mut self, handle: u64, position: Vec3f) -> bool;
 
+    /// Return the entities currently intersecting the given sensor collider.
+    ///
+    /// Used by continuous hitboxes (auras, hazard zones) so damage can be based
+    /// on the authoritative overlap state instead of only Started/Stopped events.
+    fn sensor_intersections(&self, _handle: u64) -> Vec<EntityId> {
+        Vec::new()
+    }
+
     /// Remove a sensor collider previously created by spawn_sensor. No-op if handle unknown.
     fn remove_sensor(&mut self, handle: u64);
 
@@ -122,6 +126,14 @@ pub trait PhysicsBackend: Send {
     /// Returns true if the body was created; false if the entity already has a body.
     fn spawn_character_body(&mut self, entity_id: EntityId, position: Vec3f, kind: EntityKind) -> bool;
 
+    /// Spawn a dynamic box body for a prop entity.
+    ///
+    /// Creates a cuboid rigid body with the given half-extents that responds to
+    /// physics forces (gravity, collisions). Players and NPCs push it around via
+    /// kinematic contacts. Returns true if the body was created, false if the
+    /// entity already has a body.
+    fn spawn_prop_body(&mut self, entity_id: EntityId, position: Vec3f, half_extents: Vec3f, pushable: bool) -> bool;
+
     /// Move a kinematic character body by `desired_translation`, sliding along obstacles.
     ///
     /// Uses a character controller to resolve collisions against static geometry
@@ -129,12 +141,37 @@ pub trait PhysicsBackend: Send {
     /// and whether the character is touching the ground after the move.
     fn move_character(&mut self, entity_id: EntityId, desired_translation: Vec3f) -> Option<MoveResult>;
 
-    /// Cast a ray from `origin` along `direction` up to `max_distance`.
+    /// Cast a targeting ray from `origin` along `direction` up to `max_distance`.
     ///
-    /// Returns the first hit (closest by time-of-impact). Layer filtering is
-    /// backend-specific; the `solid` flag controls whether the ray stops at
-    /// the boundary of solid shapes (true) or can penetrate them (false).
-    fn raycast(&self, origin: Vec3f, direction: Vec3f, max_distance: f32) -> Option<RayHit>;
+    /// Returns the first hit (closest by time-of-impact) among hurtboxes and
+    /// blocking world geometry. Character body colliders and non-blocking
+    /// gameplay sensors are ignored so target acquisition cannot whiff on the
+    /// physical capsule in front of an entity's hurtbox. If `ignore_entity` is
+    /// provided, that entity's own rigid body and attached colliders are also
+    /// excluded from the query.
+    fn raycast(&self, origin: Vec3f, direction: Vec3f, max_distance: f32, ignore_entity: Option<EntityId>) -> Option<RayHit>;
+
+    /// Check line-of-sight between two world positions against environment geometry only.
+    ///
+    /// Returns `true` if the straight-line path is unobstructed (ray hits nothing).
+    /// Ignores character bodies, hurtboxes, and sensors — only static world
+    /// geometry (ENVIRONMENT + PROP_BODY + FLIGHT_BLOCKER) can block LoS.
+    /// Used for lock-on tagging validation and ground-target placement.
+    fn line_of_sight(&self, from: Vec3f, to: Vec3f) -> bool;
+
+    /// Cast from `from` toward `to` through environment-only geometry and return
+    /// the safe teleport destination. If no wall is hit, returns `to` unchanged.
+    /// If a wall is hit, returns the contact point pulled back 0.3 units toward `from`
+    /// so the traveller stops flush against the wall without overlapping it.
+    /// Used by `TeleportForward` and `TeleportBehindTarget` to prevent going through walls.
+    fn cast_to_wall(&self, from: Vec3f, to: Vec3f) -> Vec3f;
+
+    /// Teleport an entity's physics body to `position` immediately.
+    ///
+    /// Moves the kinematic body in world space (no contact resolution — teleports
+    /// through walls). Used by `TeleportBehindTarget` and `TeleportForward` abilities.
+    /// No-op and returns `false` if the entity has no physics body.
+    fn teleport_entity(&mut self, entity_id: EntityId, position: Vec3f) -> bool;
 }
 
 /// Result of a `move_character` call.

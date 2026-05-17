@@ -1,14 +1,7 @@
-//! Pipeline execution wrapper — SDK-free simulation lifecycle facade.
+//! SDK-free simulation lifecycle facade used by the coordinator.
 //!
-//! `SimulationRunner` owns the three previously-extracted seams
-//! (`TickPipeline`, `CommitAuthority`, `TickDriver`) and exposes a
-//! unified API for the coordinator.  The coordinator becomes a thin
-//! SpacetimeDB protocol adapter: intent gathering, wire marshalling
-//! (via `CommitBuilder`), and reducer calls remain there (and will
-//! move to `EntitySync` in a later seam extraction).
-//!
-//! This struct is not feature-gated and has no SpacetimeDB dependency,
-//! so all simulation lifecycle logic is testable offline.
+//! `SimulationRunner` groups `TickPipeline`, `CommitAuthority`, and
+//! `TickDriver` behind one API so coordinator code can focus on DB I/O.
 
 use std::collections::HashSet;
 
@@ -32,10 +25,7 @@ pub struct SimulationRunner {
     pipeline: TickPipeline,
     commit: CommitAuthority,
     tick_driver: TickDriver,
-    /// Entities whose equipment changed between ticks. Drained before
-    /// each `run_tick` call. The coordinator pushes entity IDs here
-    /// when it observes `player_equipment` DB changes. Step 4 (Stats
-    /// Pipeline) will use this set to recalculate cached stat blocks.
+    /// Entity IDs that need stat recomputation on the next tick.
     pending_stat_recalcs: HashSet<EntityId>,
 }
 
@@ -56,19 +46,13 @@ impl SimulationRunner {
         }
     }
 
-    // ── Tick lifecycle ──────────────────────────────────────────
-
     /// Attempt to process one simulation tick.
-    ///
-    /// Drains any pending stat recalculation requests (from equipment
-    /// changes observed between ticks), then delegates to `TickDriver`.
     pub fn run_tick(
         &mut self,
         canonical_tick: u64,
         intents: &[game_protocol::intent::PlayerIntent],
     ) -> Result<TickResult, TickSkipped> {
-        // Drain pending equipment-driven stat recalculations into the
-        // pipeline's stats_dirty set for Phase 1.5 recalculation.
+        // Apply deferred equipment-driven stat recomputes before tick execution.
         if !self.pending_stat_recalcs.is_empty() {
             log::info!(
                 "stat_recalc: draining {} pending equipment changes",
@@ -91,7 +75,8 @@ impl SimulationRunner {
     /// subscription snapshot.  Called once during `on_applied`.
     pub fn seed(&mut self, max_committed_tick: u64) {
         self.commit.seed(max_committed_tick);
-        self.pipeline.set_current_tick(TickId(max_committed_tick + 1));
+        self.pipeline
+            .set_current_tick(TickId(max_committed_tick + 1));
     }
 
     /// Record a successful commit acknowledgement.
@@ -107,25 +92,21 @@ impl SimulationRunner {
         self.commit.acknowledge_failure(tick, reason)
     }
 
-    // ── Equipment bridge ────────────────────────────────────────
-
-    /// Queue a stat recalculation for `entity_id`.
-    ///
-    /// Called by the coordinator when it observes a `player_equipment`
-    /// row change (insert, update, or delete). The recalculation is
-    /// applied at the start of the next `run_tick` call, before Phase 1.
+    /// Queue a stat recalculation for `entity_id` on the next `run_tick`.
     pub fn queue_stat_recalc(&mut self, entity_id: EntityId) {
         self.pending_stat_recalcs.insert(entity_id);
     }
 
     /// Update the aggregated equipment modifiers for an entity and
     /// mark its stats dirty for recalculation.
-    pub fn update_equipment(&mut self, entity_id: EntityId, modifiers: game_core::stats::EquipmentModifiers) {
+    pub fn update_equipment(
+        &mut self,
+        entity_id: EntityId,
+        modifiers: game_core::stats::EquipmentModifiers,
+    ) {
         self.pipeline.set_equipment_modifiers(entity_id, modifiers);
         self.pending_stat_recalcs.insert(entity_id);
     }
-
-    // ── Entity lifecycle ────────────────────────────────────────
 
     /// Ingest an entity from a DB snapshot row into the simulation.
     pub fn spawn_entity_from_snapshot(
@@ -136,7 +117,8 @@ impl SimulationRunner {
         max_hp: f32,
         position: Vec3f,
     ) {
-        self.pipeline.spawn_entity_from_snapshot(id, kind, tick, max_hp, position);
+        self.pipeline
+            .spawn_entity_from_snapshot(id, kind, tick, max_hp, position);
     }
 
     /// Restore buff, threat, and NPC AI state from DB rows after a worker restart.
@@ -156,6 +138,27 @@ impl SimulationRunner {
     /// Returns `true` if the entity was present and removed.
     pub fn force_remove_entity(&mut self, id: EntityId) -> bool {
         self.pipeline.force_remove_entity(id)
+    }
+
+    /// Apply NPC spawn configuration (passive, no_chase, ability list).
+    pub fn configure_npc(&mut self, id: EntityId, cfg: crate::entity_sync::NpcSpawnConfig) {
+        if let Some(idx) = self.pipeline.state.entities.lookup(id) {
+            if cfg.passive {
+                self.pipeline.state.ai.npc_passive.insert(idx, true);
+            }
+            if cfg.no_chase {
+                self.pipeline.state.ai.npc_no_chase.insert(idx, true);
+            }
+            if !cfg.ability_ids.is_empty() {
+                // Replace default NPC abilities assigned during spawn.
+                self.pipeline.state.ai.npc_ability_ids.remove(idx);
+                self.pipeline
+                    .state
+                    .ai
+                    .npc_ability_ids
+                    .insert(idx, cfg.ability_ids);
+            }
+        }
     }
 
     /// Whether the entity is in `Active` state.
@@ -183,13 +186,13 @@ impl SimulationRunner {
 mod tests {
     use super::*;
     use crate::commit_authority::FailureAction;
-    use std::collections::HashMap;
     use game_core::combat::skill::{
-        AbilityAction, AbilityData, AbilityRegistry, AbilityTimeline,
-        ScheduledAbilityAction, SkillShape,
+        AbilityAction, AbilityData, AbilityRegistry, AbilityTimeline, ScheduledAbilityAction,
+        SkillShape, TargetingMode,
     };
     use game_core::physics_backend::*;
-    use game_protocol::types::{Transform, Quatf};
+    use game_protocol::types::{Quatf, Transform};
+    use std::collections::HashMap;
 
     fn test_registry() -> AbilityRegistry {
         let mut reg = AbilityRegistry::new();
@@ -205,17 +208,50 @@ mod tests {
             allow_reentry: false,
             charge_tiers: None,
             damage_interval_ticks: 0,
+            pierce: false,
+            charge_roots_while_charging: false,
+            knockdown_ticks: 0,
+            stun_ticks: 0,
+            pull_force: 0.0,
+            launch_lift: 0.0,
+            launch_recovery_ticks: 0,
+            usable_while_cc: false,
+            fear_ticks: 0,
+            silence_ticks: 0,
+            sleep_ticks: 0,
+            targeting_mode: TargetingMode::DirectionTarget,
+            cast_facing_policy: game_core::combat::skill::CastFacingPolicy::FaceAimDirection,
+            projectile_speed: None,
+            max_range: None,
+            lock_on_timeout_ticks: None,
+            max_rewind_ticks: None,
         });
         reg.register_timeline(AbilityTimeline {
             ability_id: 1,
             actions: vec![
-                ScheduledAbilityAction { tick_offset: 0, action: AbilityAction::SpawnHitbox {
-                    shape: SkillShape::CapsuleSweep,
-                    offset: game_schema::Vec3f { x: 0.0, y: 0.0, z: 0.0 },
-                }},
-                ScheduledAbilityAction { tick_offset: 0, action: AbilityAction::CooldownStart { duration_ticks: 20 }},
-                ScheduledAbilityAction { tick_offset: 1, action: AbilityAction::ApplyDamageFrame },
-                ScheduledAbilityAction { tick_offset: 2, action: AbilityAction::RemoveHitbox },
+                ScheduledAbilityAction {
+                    tick_offset: 0,
+                    action: AbilityAction::SpawnHitbox {
+                        shape: SkillShape::CapsuleSweep,
+                        offset: game_schema::Vec3f {
+                            x: 0.0,
+                            y: 0.0,
+                            z: 0.0,
+                        },
+                    },
+                },
+                ScheduledAbilityAction {
+                    tick_offset: 0,
+                    action: AbilityAction::CooldownStart { duration_ticks: 20 },
+                },
+                ScheduledAbilityAction {
+                    tick_offset: 1,
+                    action: AbilityAction::ApplyDamageFrame,
+                },
+                ScheduledAbilityAction {
+                    tick_offset: 2,
+                    action: AbilityAction::RemoveHitbox,
+                },
             ],
         });
         reg
@@ -225,16 +261,25 @@ mod tests {
         transforms: HashMap<EntityId, Transform>,
     }
     impl PhysicsBackend for MockPhysics {
-        fn as_any(&self) -> &dyn std::any::Any { self }
-        fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
         fn step(&mut self, _dt: f32) {}
         fn get_transform(&self, id: EntityId) -> Option<Transform> {
             self.transforms.get(&id).cloned()
         }
         fn get_all_transforms(&self) -> Vec<(EntityId, Transform)> {
-            self.transforms.iter().map(|(id, t)| (*id, t.clone())).collect()
+            self.transforms
+                .iter()
+                .map(|(id, t)| (*id, t.clone()))
+                .collect()
         }
-        fn drain_collision_events(&mut self) -> Vec<CollisionEvent> { vec![] }
+        fn drain_collision_events(&mut self) -> Vec<CollisionEvent> {
+            vec![]
+        }
         fn remove_entity(&mut self, id: EntityId) -> bool {
             self.transforms.remove(&id).is_some()
         }
@@ -242,18 +287,52 @@ mod tests {
             if let Some(t) = self.transforms.get_mut(&id) {
                 t.position = pos;
                 true
-            } else { false }
+            } else {
+                false
+            }
         }
-        fn set_kinematic_rotation(&mut self, _id: EntityId, _rot: Quatf) -> bool { true }
-        fn set_linear_velocity(&mut self, _id: EntityId, _vel: Vec3f) -> bool { true }
-        fn spawn_sensor(&mut self, _id: EntityId, _shape: SensorShape, _offset: Vec3f, _kind: ColliderKind) -> Option<u64> {
+        fn set_kinematic_rotation(&mut self, _id: EntityId, _rot: Quatf) -> bool {
+            true
+        }
+        fn set_linear_velocity(&mut self, _id: EntityId, _vel: Vec3f) -> bool {
+            true
+        }
+        fn spawn_sensor(
+            &mut self,
+            _id: EntityId,
+            _shape: SensorShape,
+            _offset: Vec3f,
+            _kind: ColliderKind,
+        ) -> Option<u64> {
             Some(1)
         }
-        fn spawn_world_sensor(&mut self, _position: Vec3f, _shape: SensorShape, _kind: ColliderKind, _owner: EntityId) -> u64 { 0 }
-        fn set_sensor_position(&mut self, _handle: u64, _position: Vec3f) -> bool { false }
+        fn spawn_world_sensor(
+            &mut self,
+            _position: Vec3f,
+            _shape: SensorShape,
+            _kind: ColliderKind,
+            _owner: EntityId,
+        ) -> u64 {
+            0
+        }
+        fn set_sensor_position(&mut self, _handle: u64, _position: Vec3f) -> bool {
+            false
+        }
         fn remove_sensor(&mut self, _handle: u64) {}
         fn spawn_character_body(&mut self, id: EntityId, pos: Vec3f, _kind: EntityKind) -> bool {
-            self.transforms.insert(id, Transform::at_position(pos.x, pos.y, pos.z));
+            self.transforms
+                .insert(id, Transform::at_position(pos.x, pos.y, pos.z));
+            true
+        }
+        fn spawn_prop_body(
+            &mut self,
+            id: EntityId,
+            pos: Vec3f,
+            _half_extents: Vec3f,
+            _pushable: bool,
+        ) -> bool {
+            self.transforms
+                .insert(id, Transform::at_position(pos.x, pos.y, pos.z));
             true
         }
         fn move_character(&mut self, id: EntityId, desired: Vec3f) -> Option<MoveResult> {
@@ -261,15 +340,37 @@ mod tests {
             t.position.x += desired.x;
             t.position.y += desired.y;
             t.position.z += desired.z;
-            Some(MoveResult { position: t.position, grounded: true })
+            Some(MoveResult {
+                position: t.position,
+                grounded: true,
+            })
         }
-        fn raycast(&self, _origin: Vec3f, _direction: Vec3f, _max_distance: f32) -> Option<RayHit> { None }
+        fn raycast(
+            &self,
+            _origin: Vec3f,
+            _direction: Vec3f,
+            _max_distance: f32,
+            _ignore_entity: Option<EntityId>,
+        ) -> Option<RayHit> {
+            None
+        }
+        fn line_of_sight(&self, _from: Vec3f, _to: Vec3f) -> bool {
+            true
+        }
+        fn cast_to_wall(&self, _from: Vec3f, to: Vec3f) -> Vec3f {
+            to
+        }
+        fn teleport_entity(&mut self, id: EntityId, pos: Vec3f) -> bool {
+            self.set_kinematic_position(id, pos)
+        }
     }
 
     fn make_runner() -> SimulationRunner {
         SimulationRunner::new(
             TickId(1),
-            Box::new(MockPhysics { transforms: HashMap::new() }),
+            Box::new(MockPhysics {
+                transforms: HashMap::new(),
+            }),
             0.05,
             test_registry(),
             game_core::combat::status::BuffRegistry::new(),
@@ -283,14 +384,20 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap().tick_id, TickId(1));
 
-        // Commit is in-flight — second tick should be skipped.
+        // Pipeline depth=2: tick 2 proceeds even with tick 1 in-flight.
         let result2 = runner.run_tick(2, &[]);
-        assert!(matches!(result2, Err(TickSkipped::CommitPending(1))));
+        assert!(result2.is_ok());
+        assert_eq!(result2.unwrap().tick_id, TickId(2));
 
-        // Acknowledge → next tick proceeds.
+        // Pipeline full — tick 3 blocked until an ack arrives.
+        let result3 = runner.run_tick(3, &[]);
+        assert!(matches!(result3, Err(TickSkipped::CommitPending(1))));
+
+        // Acknowledge tick 1 → tick 3 proceeds.
         runner.acknowledge_success(1);
-        let result3 = runner.run_tick(2, &[]);
-        assert!(result3.is_ok());
+        let result4 = runner.run_tick(3, &[]);
+        assert!(result4.is_ok());
+        assert_eq!(result4.unwrap().tick_id, TickId(3));
     }
 
     #[test]
@@ -319,7 +426,11 @@ mod tests {
             EntityKind::Npc,
             TickId(1),
             100.0,
-            Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+            Vec3f {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
         );
         assert!(runner.contains(eid));
         assert!(runner.entity_exists(eid));
@@ -340,7 +451,11 @@ mod tests {
             EntityKind::Player,
             TickId(1),
             100.0,
-            Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+            Vec3f {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
         );
 
         // Activate the entity so is_active returns true.
@@ -358,16 +473,57 @@ mod tests {
         let mut runner = make_runner();
         let _ = runner.run_tick(1, &[]);
 
+        // Fill the pipeline so failure actually blocks.
+        let _ = runner.run_tick(2, &[]);
+
         let action = runner.acknowledge_failure(1, "reducer rejected");
         assert_eq!(action, FailureAction::Retry);
 
-        // Pending is kept set — next tick is blocked until retry succeeds.
-        let result = runner.run_tick(2, &[]);
+        // Pipeline full and oldest failed — tick 3 is blocked.
+        let result = runner.run_tick(3, &[]);
         assert!(matches!(result, Err(TickSkipped::CommitPending(1))));
 
-        // Retry succeeds — unblocks pipeline.
+        // Retry succeeds — frees a slot.
         runner.acknowledge_success(1);
-        let result = runner.run_tick(2, &[]);
+        let result = runner.run_tick(3, &[]);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn later_canonical_tick_catches_up_missing_tick_first() {
+        let mut runner = make_runner();
+
+        let intents = vec![
+            game_protocol::intent::PlayerIntent {
+                entity_id: EntityId(100),
+                sequence_id: 1,
+                target_tick: TickId(2),
+                client_observed_tick: 0,
+                action: game_protocol::intent::IntentAction::Jump,
+            },
+            game_protocol::intent::PlayerIntent {
+                entity_id: EntityId(100),
+                sequence_id: 2,
+                target_tick: TickId(3),
+                client_observed_tick: 0,
+                action: game_protocol::intent::IntentAction::Jump,
+            },
+        ];
+
+        // Tick 1 in-flight.
+        let first = runner.run_tick(1, &[]).unwrap();
+        assert_eq!(first.tick_id, TickId(1));
+
+        // Pipeline depth=2: tick 2 proceeds (catches up contiguously).
+        let second = runner.run_tick(3, &intents).unwrap();
+        assert_eq!(second.tick_id, TickId(2));
+        assert_eq!(second.summary.intents_processed, 1);
+
+        // Pipeline full — ack tick 1 to free a slot.
+        runner.acknowledge_success(1);
+
+        let third = runner.run_tick(4, &intents).unwrap();
+        assert_eq!(third.tick_id, TickId(3));
+        assert_eq!(third.summary.intents_processed, 1);
     }
 }

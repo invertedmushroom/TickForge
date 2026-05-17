@@ -9,15 +9,16 @@
 /// # Collision matrix
 ///
 /// ```text
-///                 Player  NPC  Projectile  Hitbox  Hurtbox  Env  Trigger  Flight
-/// Player body       -      X      X          X       -      X      X       X
-/// NPC body          X      -      X          X       -      X      -       X
-/// Projectile        X      X      -          -       -      X      -       -
-/// Skill hitbox      X      X      -          -       X      -      -       -
-/// Skill hurtbox     -      -      -          X       -      -      -       -
-/// Environment       X      X      X          -       -      -      -       -
-/// Trigger           X      -      -          -       -      -      -       -
-/// Flight blocker    X      X      -          -       -      -      -       -
+///                 Player  NPC  Projectile  Hitbox  Hurtbox  Env  Trigger  Flight  Prop
+/// Player body       -      X      X          X       -      X      X       X       X
+/// NPC body          X      -      X          X       -      X      -       X       X
+/// Projectile        X      X      -          -       -      X      -       -       X
+/// Skill hitbox      X      X      -          -       X      -      -       -       -
+/// Skill hurtbox     -      -      -          X       -      -      -       -       -
+/// Environment       X      X      X          -       -      -      -       -       X
+/// Trigger           X      -      -          -       -      -      -       -       -
+/// Flight blocker    X      X      -          -       -      -      -       -       -
+/// Prop body         X      X      X          -       -      X      -       -       X
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CollisionLayer(pub u32);
@@ -32,6 +33,7 @@ impl CollisionLayer {
     pub const ENVIRONMENT: Self = Self(1 << 5);
     pub const TRIGGER: Self = Self(1 << 6);
     pub const FLIGHT_BLOCKER: Self = Self(1 << 7);
+    pub const PROP_BODY: Self = Self(1 << 8);
 
     /// Combine multiple layers into a single mask.
     pub const fn combine(layers: &[CollisionLayer]) -> u32 {
@@ -60,6 +62,7 @@ impl CollisionMasks {
         CollisionLayer::ENVIRONMENT,
         CollisionLayer::TRIGGER,
         CollisionLayer::FLIGHT_BLOCKER,
+        CollisionLayer::PROP_BODY,
     ]);
 
     pub const NPC_BODY_FILTER: u32 = CollisionLayer::combine(&[
@@ -68,12 +71,14 @@ impl CollisionMasks {
         CollisionLayer::SKILL_HITBOX,
         CollisionLayer::ENVIRONMENT,
         CollisionLayer::FLIGHT_BLOCKER,
+        CollisionLayer::PROP_BODY,
     ]);
 
     pub const PROJECTILE_FILTER: u32 = CollisionLayer::combine(&[
         CollisionLayer::PLAYER_BODY,
         CollisionLayer::NPC_BODY,
         CollisionLayer::ENVIRONMENT,
+        CollisionLayer::PROP_BODY,
     ]);
 
     pub const SKILL_HITBOX_FILTER: u32 = CollisionLayer::combine(&[
@@ -90,6 +95,7 @@ impl CollisionMasks {
         CollisionLayer::PLAYER_BODY,
         CollisionLayer::NPC_BODY,
         CollisionLayer::PROJECTILE,
+        CollisionLayer::PROP_BODY,
     ]);
 
     pub const TRIGGER_FILTER: u32 = CollisionLayer::combine(&[
@@ -99,6 +105,28 @@ impl CollisionMasks {
     pub const FLIGHT_BLOCKER_FILTER: u32 = CollisionLayer::combine(&[
         CollisionLayer::PLAYER_BODY,
         CollisionLayer::NPC_BODY,
+    ]);
+
+    pub const PROP_BODY_FILTER: u32 = CollisionLayer::combine(&[
+        CollisionLayer::PLAYER_BODY,
+        CollisionLayer::NPC_BODY,
+        CollisionLayer::PROJECTILE,
+        CollisionLayer::ENVIRONMENT,
+        CollisionLayer::PROP_BODY,
+    ]);
+
+    /// KCC movement filter: character controllers only collide with static/prop
+    /// geometry during movement, preventing capsule stacking and landing-on-heads.
+    /// Membership is PLAYER_BODY | NPC_BODY so environment/prop filters still match.
+    pub const KCC_MOVEMENT_MEMBERSHIP: u32 = CollisionLayer::combine(&[
+        CollisionLayer::PLAYER_BODY,
+        CollisionLayer::NPC_BODY,
+    ]);
+
+    pub const KCC_MOVEMENT_FILTER: u32 = CollisionLayer::combine(&[
+        CollisionLayer::ENVIRONMENT,
+        CollisionLayer::PROP_BODY,
+        CollisionLayer::FLIGHT_BLOCKER,
     ]);
 }
 
@@ -117,6 +145,7 @@ mod tests {
             CollisionLayer::ENVIRONMENT,
             CollisionLayer::TRIGGER,
             CollisionLayer::FLIGHT_BLOCKER,
+            CollisionLayer::PROP_BODY,
         ];
 
         // Each layer should be a single bit

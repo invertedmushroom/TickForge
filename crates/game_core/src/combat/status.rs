@@ -1,8 +1,30 @@
 use std::collections::HashMap;
 
 use game_protocol::entity_id::EntityId;
+use game_protocol::event::DamageType;
 use game_protocol::tick::TickId;
 use serde::{Deserialize, Serialize};
+
+// ── Buff categorization ─────────────────────────────────────────
+
+/// Whether a buff is a beneficial effect (Boon) or a harmful one (Condition).
+///
+/// Cleanse removes Conditions; Dispel removes Boons from enemies.
+/// Default is `Boon` for backwards compatibility with existing buff definitions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BuffKind {
+    Boon,
+    Condition,
+}
+
+impl Default for BuffKind {
+    fn default() -> Self {
+        BuffKind::Boon
+    }
+}
+
+// Re-export from game_schema so all existing `status::CCEffect` imports keep working.
+pub use game_schema::CCEffect;
 
 /// AI behavior override carried by a buff.
 ///
@@ -44,6 +66,28 @@ pub struct BuffModifiers {
     pub ai_override: Option<AiOverride>,
     /// Root: prevents all movement. Checked in Phase 2 (player) and Phase 7 (NPC).
     pub root: Option<bool>,
+    /// Stability: absorbs one incoming CC application per buff stack.
+    /// When CC would be applied (Phase 6), if the target has any buff with
+    /// `stability: Some(true)`, one stack is consumed and the CC is negated.
+    pub stability: Option<bool>,
+    /// CC effect type this buff represents (Stun, Knockdown, etc.).
+    /// Present on Condition debuffs that track a CC timer, enabling
+    /// cleanse/dispel to find and remove the matching debuff.
+    pub cc_effect: Option<CCEffect>,
+    /// CC duration reduction percentage. Summed with equipment into
+    /// `StatBlock::cc_duration_reduce`, clamped to [0.0, 0.75].
+    pub cc_duration_reduce_pct: Option<f32>,
+    /// Damage per tick for damage-over-time effects (poison, burn, bleed).
+    /// When present, Phase 8b applies this damage at `dot_interval_ticks` intervals.
+    pub dot_damage: Option<f32>,
+    /// Tick interval between DoT damage applications. Defaults to 20 (~1s at 20 Hz).
+    /// Only meaningful when `dot_damage` is `Some`.
+    pub dot_interval_ticks: Option<u32>,
+    /// Damage type for DoT ticks. Defaults to `Physical` if unset.
+    pub dot_damage_type: Option<DamageType>,
+    /// Stealth: hides entity from enemy teams in the nearby_transforms view.
+    /// Allied entities (same team_id) still see the stealthed entity.
+    pub stealth: Option<bool>,
 }
 
 /// Data-only buff definition for ability timelines and on-hit effects.
@@ -55,6 +99,9 @@ pub struct BuffTemplate {
     pub buff_id: u32,
     #[serde(default)]
     pub name: String,
+    /// Whether this buff is a Boon or Condition. Defaults to Boon.
+    #[serde(default)]
+    pub buff_kind: BuffKind,
     /// Duration in ticks. `None` = permanent until explicitly removed.
     pub duration_ticks: Option<u32>,
     pub max_stacks: u32,
@@ -92,6 +139,9 @@ pub struct ActiveBuff {
     pub buff_id: u32,
     pub source: EntityId,
     pub target: EntityId,
+    /// Whether this buff is a Boon or Condition. Copied from template.
+    #[serde(default)]
+    pub buff_kind: BuffKind,
     pub stacks: u32,
     pub max_stacks: u32,
     /// Tick when this buff expires. None = permanent until removed.
@@ -99,6 +149,10 @@ pub struct ActiveBuff {
     /// Structured per-phase modifier fields. Default = no modifiers (passive buff).
     #[serde(default)]
     pub modifiers: BuffModifiers,
+    /// Tick when DoT damage was last applied. Initialised to the application tick
+    /// so the first pulse fires after `dot_interval_ticks` elapse.
+    #[serde(default)]
+    pub last_dot_tick: Option<TickId>,
 }
 
 impl ActiveBuff {
@@ -113,10 +167,16 @@ impl ActiveBuff {
             buff_id: template.buff_id,
             source,
             target,
+            buff_kind: template.buff_kind,
             stacks: 1,
             max_stacks: template.max_stacks,
             expires_at: template.duration_ticks.map(|d| TickId(current_tick.0 + d as u64)),
             modifiers: template.modifiers,
+            last_dot_tick: if template.modifiers.dot_damage.is_some() {
+                Some(current_tick)
+            } else {
+                None
+            },
         }
     }
 }
@@ -162,4 +222,10 @@ impl ThreatTable {
             .max_by(|a, b| a.threat.total_cmp(&b.threat))
             .map(|e| e.source)
     }
+}
+
+/// On-disk serialization format for `data/buffs.ron`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct BuffFile {
+    pub buffs: Vec<BuffTemplate>,
 }

@@ -5,6 +5,7 @@ use game_protocol::types::Vec3f;
 use game_schema::{EntityKind, EntityState, NpcAiState};
 
 use crate::combat::hitbox::HitboxStore;
+use crate::combat::loadout::WeaponLoadout;
 use crate::combat::skill::AbilityExecutionStore;
 use crate::combat::status::{ActiveBuff, ThreatTable};
 use crate::combat::tactical::TacticalState;
@@ -179,7 +180,10 @@ impl MutationAudit {
 #[cfg(any(debug_assertions, test))]
 pub fn is_ownership_allowed(domain: AuditDomain, subsystem: AuditSubsystem, phase: u8) -> bool {
     match domain {
-        AuditDomain::Health => subsystem == AuditSubsystem::Combat && phase == 6,
+        AuditDomain::Health => {
+            (subsystem == AuditSubsystem::Combat && phase == 6)
+                || (subsystem == AuditSubsystem::StatusEffects && phase == 8)
+        }
         AuditDomain::Threat => {
             (subsystem == AuditSubsystem::Combat && phase == 6)
                 || (subsystem == AuditSubsystem::AiDecisions && phase == 7)
@@ -212,11 +216,14 @@ pub fn is_ownership_allowed(domain: AuditDomain, subsystem: AuditSubsystem, phas
                 || (subsystem == AuditSubsystem::CooldownTracker && phase == 8)
         }
         // Tactical: Controller sets blocking in phase 2, AbilityTimeline writes in phase 3,
-        // CooldownTracker clears in phase 8.
+        // Combat applies CC conditions in phase 6, CooldownTracker clears in phase 8,
+        // StatusEffects clears CC flags on natural buff expiry in phase 8.
         AuditDomain::Tactical => {
             (subsystem == AuditSubsystem::Controller && phase == 2)
                 || (subsystem == AuditSubsystem::AbilityTimeline && phase == 3)
+                || (subsystem == AuditSubsystem::Combat && phase == 6)
                 || (subsystem == AuditSubsystem::CooldownTracker && phase == 8)
+                || (subsystem == AuditSubsystem::StatusEffects && phase == 8)
         }
     }
 }
@@ -327,6 +334,10 @@ pub struct CombatState {
     /// Consumed by Phase 2 on ReleaseAbility or auto-release at max tier.
     /// Cleaned up in `force_remove_entity`.
     pub charging: HashMap<EntityId, crate::combat::skill::ChargingState>,
+    /// Weapon loadouts — player-only. Maps entity → two weapon sets + active index.
+    /// Written by Phase 2 `WeaponSwap` intent. Read by Phase 2 `UseAbility` to
+    /// validate the ability is in the active weapon set.
+    pub loadouts: SparseSet<WeaponLoadout>,
 }
 
 /// Buff/debuff status data.
@@ -401,6 +412,23 @@ impl StatusState {
         }
     }
 
+    /// Consume one stack of a buff by `buff_id`. If the buff reaches 0 stacks,
+    /// it is removed entirely and this returns `true`. Returns `false` if the
+    /// buff still has stacks remaining. No-op if the buff is not found.
+    pub fn consume_stack(&mut self, idx: EntityIndex, buff_id: u32) -> bool {
+        let buffs = &mut self.buffs[idx.as_usize()];
+        let pos = buffs.iter().position(|b| b.buff_id == buff_id);
+        let Some(pos) = pos else { return false };
+        self.dirty_entities.insert(idx.as_usize());
+        if buffs[pos].stacks <= 1 {
+            buffs.swap_remove(pos);
+            true
+        } else {
+            buffs[pos].stacks -= 1;
+            false
+        }
+    }
+
     /// Replace an entity's entire buff array, marking dirty.
     pub fn replace_buffs(&mut self, idx: EntityIndex, buffs: Vec<ActiveBuff>) {
         self.buffs[idx.as_usize()] = buffs;
@@ -419,9 +447,10 @@ impl StatusState {
     }
 
     /// Expire buffs that have passed their expiration tick.
-    /// Returns (entity_id, buff_id) pairs for expired buffs.
-    /// Only marks entities dirty when at least one buff was actually removed.
-    pub(crate) fn expire(&mut self, entities: &EntityStore, current_tick: TickId) -> Vec<(EntityId, u32)> {
+    /// Returns (entity_id, expired_buff) pairs so callers can inspect modifiers
+    /// (e.g. `cc_effect`) for cleanup. Only marks entities dirty when at least
+    /// one buff was actually removed.
+    pub(crate) fn expire(&mut self, entities: &EntityStore, current_tick: TickId) -> Vec<(EntityId, ActiveBuff)> {
         let mut expired = Vec::new();
         for i in 0..entities.len() {
             if entities.states[i] == EntityState::Removed {
@@ -432,7 +461,7 @@ impl StatusState {
             self.buffs[i].retain(|b| {
                 if let Some(expires_at) = b.expires_at
                     && expires_at <= current_tick {
-                        expired.push((entity_id, b.buff_id));
+                        expired.push((entity_id, b.clone()));
                         return false;
                     }
                 true
@@ -443,6 +472,32 @@ impl StatusState {
         }
         expired
     }
+
+    /// Remove up to `count` Condition debuffs (oldest first), returning the removed buffs.
+    pub fn cleanse_conditions(&mut self, idx: EntityIndex, count: u32) -> Vec<ActiveBuff> {
+        let buffs = &mut self.buffs[idx.as_usize()];
+        let mut removed = Vec::new();
+        let mut i = 0;
+        while i < buffs.len() && (removed.len() as u32) < count {
+            if buffs[i].buff_kind == crate::combat::status::BuffKind::Condition {
+                removed.push(buffs.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        if !removed.is_empty() {
+            self.dirty_entities.insert(idx.as_usize());
+        }
+        removed
+    }
+
+    /// Remove the first debuff whose `cc_effect` matches, returning it if found.
+    pub fn remove_cc_debuff(&mut self, idx: EntityIndex, cc_effect: game_schema::CCEffect) -> Option<ActiveBuff> {
+        let buffs = &mut self.buffs[idx.as_usize()];
+        let pos = buffs.iter().position(|b| b.modifiers.cc_effect == Some(cc_effect))?;
+        self.dirty_entities.insert(idx.as_usize());
+        Some(buffs.swap_remove(pos))
+    }
 }
 
 /// NPC AI data.
@@ -451,6 +506,12 @@ pub struct AiState {
     pub npc_ai: SparseSet<NpcAiState>,
     /// Spawn position used as the patrol home point for NPCs/bosses.
     pub home_positions: SparseSet<Vec3f>,
+    /// Ability IDs this NPC can use in combat. Empty = no attacks.
+    pub npc_ability_ids: SparseSet<Vec<u32>>,
+    /// Passive NPCs never enter Combat state (training dummies).
+    pub npc_passive: SparseSet<bool>,
+    /// No-chase NPCs fight back but don’t move toward the target.
+    pub npc_no_chase: SparseSet<bool>,
 }
 
 /// Runtime simulation state for one region.
@@ -493,9 +554,10 @@ impl SimState {
                 active_windows: HashMap::new(),
                 tactical: Vec::new(),
                 charging: HashMap::new(),
+                loadouts: SparseSet::new(),
             },
             status: StatusState::new(),
-            ai: AiState { npc_ai: SparseSet::new(), home_positions: SparseSet::new() },
+            ai: AiState { npc_ai: SparseSet::new(), home_positions: SparseSet::new(), npc_ability_ids: SparseSet::new(), npc_passive: SparseSet::new(), npc_no_chase: SparseSet::new() },
             stats: StatsStore::new(),
             #[cfg(any(debug_assertions, test))]
             audit: MutationAudit::new(),
@@ -514,6 +576,10 @@ impl SimState {
         debug_assert_eq!(self.status.len(), n, "buffs desync");
         debug_assert_eq!(self.ai.npc_ai.sparse_len(), n, "npc_ai desync");
         debug_assert_eq!(self.ai.home_positions.sparse_len(), n, "home_positions desync");
+        debug_assert_eq!(self.ai.npc_ability_ids.sparse_len(), n, "npc_ability_ids desync");
+        debug_assert_eq!(self.ai.npc_passive.sparse_len(), n, "npc_passive desync");
+        debug_assert_eq!(self.ai.npc_no_chase.sparse_len(), n, "npc_no_chase desync");
+        debug_assert_eq!(self.combat.loadouts.sparse_len(), n, "loadouts desync");
         debug_assert_eq!(self.stats.len(), n, "stats desync");
     }
 
@@ -535,8 +601,14 @@ impl SimState {
             if kind == EntityKind::Npc || kind == EntityKind::Boss {
                 self.combat.threat_tables.insert(idx, ThreatTable::default());
                 self.ai.npc_ai.insert(idx, NpcAiState::Idle);
+                self.ai.npc_ability_ids.insert(idx, vec![1]);
             }
+            // Remove stale loadout on slot reuse (player will re-assign).
+            self.combat.loadouts.remove(idx);
             self.combat.tactical[idx.as_usize()] = TacticalState::default();
+            if kind == EntityKind::Boss {
+                self.combat.tactical[idx.as_usize()].dr_immune = true;
+            }
             self.stats.set(idx, StatBlock::compute(kind, max_hp, &[], &EquipmentModifiers::default()));
         } else {
             // Push new component slots in lockstep with the entity store.
@@ -547,13 +619,22 @@ impl SimState {
             // never committed).
             self.status.mark_dirty(idx);
             self.combat.threat_tables.push_slot();
+            self.combat.loadouts.push_slot();
             self.ai.npc_ai.push_slot();
             self.ai.home_positions.push_slot();
+            self.ai.npc_ability_ids.push_slot();
+            self.ai.npc_passive.push_slot();
+            self.ai.npc_no_chase.push_slot();
             if kind == EntityKind::Npc || kind == EntityKind::Boss {
                 self.combat.threat_tables.insert(idx, ThreatTable::default());
                 self.ai.npc_ai.insert(idx, NpcAiState::Idle);
+                // Default ability: Slash (ability_id 1).
+                self.ai.npc_ability_ids.insert(idx, vec![1]);
             }
             self.combat.tactical.push(TacticalState::default());
+            if kind == EntityKind::Boss {
+                self.combat.tactical.last_mut().unwrap().dr_immune = true;
+            }
             self.stats.push(StatBlock::compute(kind, max_hp, &[], &EquipmentModifiers::default()));
         }
         idx
@@ -573,17 +654,21 @@ impl SimState {
         }
     }
 
-    /// Tombstone-remove: mark Removed, drop id mapping, clean up hitboxes.
+    /// Tombstone-remove: mark Removed, drop id mapping, clean up sparse components.    
+    /// Hitbox and execution cleanup is owned by `force_remove_entity`    
+    /// (which has physics access for sensor teardown) — not duplicated here.    
     /// Returns true if the entity existed.
     pub fn remove_entity(&mut self, id: EntityId) -> bool {
         if let Some(idx) = self.entities.lookup(id) {
             self.entities.mark_removed(idx);
-            self.combat.hitboxes.remove_all_for_entity(id);
-            self.combat.executions.remove_all_for_caster(id);
             // Clean up sparse components so their dense arrays stay compact.
             self.combat.threat_tables.remove(idx);
+            self.combat.loadouts.remove(idx);
             self.ai.npc_ai.remove(idx);
             self.ai.home_positions.remove(idx);
+            self.ai.npc_ability_ids.remove(idx);
+            self.ai.npc_passive.remove(idx);
+            self.ai.npc_no_chase.remove(idx);
             true
         } else {
             false
@@ -618,7 +703,7 @@ impl SimState {
     }
 
     /// Expire buffs that have passed their expiration tick.
-    pub fn expire_buffs(&mut self, current_tick: TickId) -> Vec<(EntityId, u32)> {
+    pub fn expire_buffs(&mut self, current_tick: TickId) -> Vec<(EntityId, crate::combat::status::ActiveBuff)> {
         self.status.expire(&self.entities, current_tick)
     }
 
@@ -780,6 +865,17 @@ mod tests {
     }
 
     #[test]
+    fn remove_entity_clears_loadout_component() {
+        let mut state = SimState::new();
+        let idx = state.spawn_entity(eid(1), EntityKind::Player, TickId(0), 100.0);
+        state.combat.loadouts.insert(idx, WeaponLoadout::new(vec![1, 2], vec![3, 4]));
+
+        assert!(state.combat.loadouts.get(idx).is_some(), "loadout should exist before removal");
+        assert!(state.remove_entity(eid(1)), "entity should be removable");
+        assert!(state.combat.loadouts.get(idx).is_none(), "loadout should be cleared during removal");
+    }
+
+    #[test]
     fn expire_buffs_by_tick() {
         let mut state = SimState::new();
         let idx = state.spawn_entity(eid(1), EntityKind::Player, TickId(0), 100.0);
@@ -787,23 +883,29 @@ mod tests {
             buff_id: 42,
             source: eid(99),
             target: eid(1),
+            buff_kind: Default::default(),
             stacks: 1,
             max_stacks: 1,
             expires_at: Some(TickId(10)),
             modifiers: Default::default(),
+            last_dot_tick: None,
         }));
         state.status.modify_buffs(idx, |buffs| buffs.push(ActiveBuff {
             buff_id: 43,
             source: eid(99),
             target: eid(1),
+            buff_kind: Default::default(),
             stacks: 1,
             max_stacks: 1,
             expires_at: None, // permanent
             modifiers: Default::default(),
+            last_dot_tick: None,
         }));
 
         let expired = state.expire_buffs(TickId(10));
-        assert_eq!(expired, vec![(eid(1), 42)]);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, eid(1));
+        assert_eq!(expired[0].1.buff_id, 42);
         // Permanent buff remains
         assert_eq!(state.status.get_buffs(idx).len(), 1);
         assert_eq!(state.status.get_buffs(idx)[0].buff_id, 43);
@@ -829,6 +931,8 @@ mod tests {
         assert!(is_ownership_allowed(AuditDomain::Buff, AuditSubsystem::StatusEffects, 8));
         assert!(is_ownership_allowed(AuditDomain::Ai, AuditSubsystem::AiDecisions, 7));
         assert!(is_ownership_allowed(AuditDomain::Tactical, AuditSubsystem::Controller, 2));
+        assert!(is_ownership_allowed(AuditDomain::Tactical, AuditSubsystem::Combat, 6));
+        assert!(is_ownership_allowed(AuditDomain::Tactical, AuditSubsystem::StatusEffects, 8));
     }
 
     #[test]

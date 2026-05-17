@@ -2,9 +2,14 @@
 name = "server_module"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [lib]
 crate-type = ["cdylib"]
+
+[features]
+default = ["debug"]
+debug = []
 
 [dependencies]
 game_schema = { workspace = true, features = ["spacetimedb"] }

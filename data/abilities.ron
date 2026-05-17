@@ -1,20 +1,43 @@
-// Ability definitions for Jump.
+// Ability definitions.
 // Loaded at coordinator startup via AbilityRegistry::load_abilities().
 // Edit this file to tune damage, cooldowns, and hitbox shapes without recompiling.
 //
-// Field reference:
-//   ability_id      — must be unique; matched by UseAbility intent and CooldownExpire
-//   base_damage     — raw damage before any multipliers
-//   damage_type     — Physical | Magical | True
-//   shape           — Sphere | Cone | CapsuleSweep | Projectile | LineSweep | HazardZone
-//   threat_multiplier — 1.0 = threat equals damage dealt
+// Optional ability fields (all default to 0 / false / None if omitted):
+//   ability_id                   — must be unique; matched by UseAbility intent and CooldownExpire
+//   base_damage                  — raw damage before any multipliers
+//   damage_type                  — Physical | Magical | True
+//   shape                        — Sphere | Cone | CapsuleSweep | Projectile | LineSweep | HazardZone
+//   threat_multiplier            — 1.0 = threat equals damage dealt
+//   on_hit_buffs                 — list of buff IDs applied to target on each hit (default: [])
+//   knockback_force              — impulse magnitude away from attacker on hit (default: 0.0)
+//   allow_reentry                — true = target can be hit again after leaving hitbox (default: false)
+//   charge_tiers                 — list of (min_ticks, damage_mult) for hold-to-release abilities (default: None)
+//   charge_roots_while_charging  — false = caster may move freely during charge (default: true)
+//   damage_interval_ticks        — periodic re-damage interval in ticks; 0 = single-hit (default: 0)
+//   pierce                       — true = projectile passes through all targets (default: false)
+//   pull_force                   — pull impulse toward attacker on hit (default: 0.0)
+//   launch_lift                  — upward launch lift + FLOATING arc (default: 0.0)
+//   launch_recovery_ticks        — KNOCKED_DOWN recovery ticks after launch landing (default: 0)
+//   stun_ticks                   — stun duration in ticks; applied on landing if combined with arc CC (default: 0)
+//   knockdown_ticks              — knockdown duration in ticks; applied on landing if combined with arc CC (default: 0)
+//   targeting_mode               — DirectionTarget (default) | EntityTarget | GroundTarget | RaycastStrict | AimAssist | LockOn(max_targets: N) | SelfOnly | CasterOffset
+//   cast_facing_policy           — PreserveBody (default) | FaceAimDirection | FaceResolvedTarget
+//   projectile_speed             — units per tick; None = default 1.0 (20 units/sec at 20 Hz)
+//   max_range                    — max range in units; None = default 30.0
 //
 // Timeline actions (tick_offset is relative to cast tick):
-//   SpawnHitbox(shape, offset)     — spawn sensor collider in entity-local space
-//   CooldownStart(duration_ticks)  — start cooldown; 20 ticks = 1 second at 20 Hz
-//   ApplyDamageFrame               — mark contacts from this tick as authoritative damage frame
-//   RemoveHitbox                   — despawn the skill sensor collider
-//   OpenFollowUpWindow(d, id) — open a combo window for d ticks; next press casts ability id
+//   SpawnHitbox(shape, offset)             — logical hitbox; no Rapier sensor until ApplyDamageFrame
+//   ApplyDamageFrame                       — materialise sensor; contacts this tick deal damage
+//   RemoveHitbox                           — despawn sensor, clear hitbox record
+//   CooldownStart(duration_ticks)          — start cooldown; 20 ticks = 1 second at 20 Hz
+//   OpenFollowUpWindow(duration_ticks, id) — combo window: next press of same ability casts id
+//   ApplyBuff(buff_id)                     — self-buff from BuffRegistry template
+//   StanceBegin(dodge_active, rooted)      — iframe window and/or root; rooted + airborne injects fall arc
+//   StanceEnd                              — end iframe, clear root; preserves gravity-only fall arcs
+//   ArcMovement(speed, lift, gravity)      — kinematic vault/leap; entity rooted during arc
+//   RootForTicks(ticks)                    — timed root composable with other root sources
+//   SetMovement(movement)                  — Free | InputLocked | Rooted
+//   Telegraph(impact_delay)               — emit TelegraphWarning to Entity/LockOn targets
 (
     abilities: [
         (
@@ -24,6 +47,8 @@
             damage_type: Physical,
             shape: CapsuleSweep,
             threat_multiplier: 1.0,
+            targeting_mode: DirectionTarget,
+            cast_facing_policy: FaceAimDirection,
         ),
         (
             ability_id: 2,
@@ -32,6 +57,10 @@
             damage_type: Magical,
             shape: Projectile,
             threat_multiplier: 1.5,
+            pierce: true,
+            targeting_mode: AimAssist,  // soft-lock assist: direction + optional target hint
+            cast_facing_policy: FaceAimDirection,
+            projectile_speed: Some(0.6),  // slow-moving — entities can sidestep or walk into it
         ),
         (
             ability_id: 3,
@@ -40,6 +69,8 @@
             damage_type: Physical,
             shape: LineSweep,
             threat_multiplier: 2.0,
+            targeting_mode: DirectionTarget,
+            cast_facing_policy: FaceAimDirection,
             charge_tiers: Some([
                 (min_ticks: 0,  damage_mult: 1.0),  // Tier 0: base (~0-1s)
                 (min_ticks: 20, damage_mult: 1.5),   // Tier 1: enhanced (~1-2s)
@@ -54,6 +85,196 @@
             damage_type: Physical,
             shape: CapsuleSweep,
             threat_multiplier: 1.2,
+            targeting_mode: DirectionTarget,
+            cast_facing_policy: FaceAimDirection,
+        ),
+        // CC abilities
+        (
+            ability_id: 10,
+            name: "Shield Bash",
+            base_damage: 15.0,
+            damage_type: Physical,
+            shape: CapsuleSweep,
+            knockback_force: 5.0,
+            threat_multiplier: 1.5,
+            targeting_mode: DirectionTarget,
+            cast_facing_policy: FaceAimDirection,
+            stun_ticks: 40,  // 2 second stun
+        ),
+        (
+            ability_id: 11,
+            name: "Uppercut",
+            base_damage: 30.0,
+            damage_type: Physical,
+            shape: CapsuleSweep,
+            threat_multiplier: 1.0,
+            targeting_mode: DirectionTarget,
+            cast_facing_policy: FaceAimDirection,
+            launch_lift: 12.0,
+            launch_recovery_ticks: 20,  // 1 second knockdown after landing
+        ),
+        (
+            ability_id: 12,
+            name: "Grapple",
+            base_damage: 10.0,
+            damage_type: Physical,
+            shape: Projectile,
+            threat_multiplier: 1.0,
+            pull_force: 15.0,
+            targeting_mode: EntityTarget,
+            cast_facing_policy: FaceResolvedTarget,
+            max_range: Some(20.0),            // shorter range than default
+        ),
+        (
+            ability_id: 13,
+            name: "Leg Sweep",
+            base_damage: 20.0,
+            damage_type: Physical,
+            shape: CapsuleSweep,
+            threat_multiplier: 1.0,
+            targeting_mode: DirectionTarget,
+            cast_facing_policy: FaceAimDirection,
+            knockdown_ticks: 30,  // 1.5 second knockdown
+        ),
+        // Lock-on / teleport abilities
+        (
+            ability_id: 20,
+            name: "Chain Lightning",
+            base_damage: 30.0,
+            damage_type: Magical,
+            shape: Sphere,
+            threat_multiplier: 1.5,
+            targeting_mode: LockOn(max_targets: 5),
+            cast_facing_policy: FaceResolvedTarget,
+            max_range: Some(15.0),
+            lock_on_timeout_ticks: Some(200),  // 10 seconds at 20 Hz
+        ),
+        (
+            ability_id: 21,
+            name: "Backstab",
+            base_damage: 50.0,
+            damage_type: Physical,
+            shape: CapsuleSweep,
+            threat_multiplier: 1.0,
+            targeting_mode: RaycastStrict,  // crosshair must hit hurtbox or ability whiffs
+            cast_facing_policy: FaceResolvedTarget,
+        ),
+        (
+            ability_id: 22,
+            name: "Blink",
+            base_damage: 0.0,
+            damage_type: Magical,
+            shape: Sphere,
+            threat_multiplier: 0.0,
+            targeting_mode: SelfOnly,
+            cast_facing_policy: PreserveBody,
+        ),
+        // Caster-attached aura — PBAoE sphere that follows the caster
+        (
+            ability_id: 23,
+            name: "Flame Aura",
+            base_damage: 10.0,
+            damage_type: Magical,
+            shape: Sphere,
+            threat_multiplier: 1.0,
+            targeting_mode: SelfOnly,
+            allow_reentry: true,
+            damage_interval_ticks: 20,  // re-damage every 1 second
+        ),
+        // Hazard zone — persistent ground AoE placed at a target location
+        (
+            ability_id: 24,
+            name: "Fire Patch",
+            base_damage: 15.0,
+            damage_type: Magical,
+            shape: HazardZone,
+            threat_multiplier: 1.5,
+            targeting_mode: GroundTarget,
+            cast_facing_policy: PreserveBody,
+            allow_reentry: true,
+            damage_interval_ticks: 10,  // re-damage every 0.5 seconds
+            max_range: Some(30.0),
+        ),
+        // Lava Pool — hazard zone spawned 2 m in front of caster (no aiming needed)
+        (
+            ability_id: 25,
+            name: "Lava Pool",
+            base_damage: 12.0,
+            damage_type: Magical,
+            shape: HazardZone,
+            threat_multiplier: 1.2,
+            targeting_mode: CasterOffset,
+            allow_reentry: true,
+            damage_interval_ticks: 10,  // re-damage every 0.5 seconds
+        ),
+
+        (
+            ability_id: 60,
+            name: "Cleanse",
+            base_damage: 0.0,
+            damage_type: Physical,
+            shape: Sphere,
+            threat_multiplier: 0.0,
+            targeting_mode: DirectionTarget,
+            cast_facing_policy: PreserveBody,
+        ),
+        (
+            ability_id: 61,
+            name: "Clear CC",
+            base_damage: 0.0,
+            damage_type: Physical,
+            shape: Sphere,
+            threat_multiplier: 0.0,
+            usable_while_cc: true,
+            targeting_mode: DirectionTarget,
+            cast_facing_policy: PreserveBody,
+        ),
+        (
+            ability_id: 62,
+            name: "Stunbreak",
+            base_damage: 0.0,
+            damage_type: Physical,
+            shape: Sphere,
+            threat_multiplier: 0.0,
+            usable_while_cc: true,
+            targeting_mode: DirectionTarget,
+            cast_facing_policy: PreserveBody,
+        ),
+        (
+            ability_id: 70,
+            name: "Sleep Dart",
+            base_damage: 5.0,
+            damage_type: Physical,
+            shape: Sphere,
+            threat_multiplier: 1.0,
+            sleep_ticks: 90,
+            on_hit_buffs: [600],  // Poison DoT applied on hit — showcases buff-on-hit system
+            targeting_mode: DirectionTarget,
+            cast_facing_policy: PreserveBody,
+        ),
+        (
+            ability_id: 90,
+            name: "Vault",
+            base_damage: 0.0,
+            damage_type: Physical,
+            shape: Sphere,
+            threat_multiplier: 0.0,
+            targeting_mode: DirectionTarget,
+            cast_facing_policy: PreserveBody,
+        ),
+        (
+            ability_id: 99,
+                name: "Pinning Shot",
+                base_damage: 18.0,
+                damage_type: Physical,
+                shape: Projectile,
+                threat_multiplier: 1.0,
+                on_hit_buffs: [301],  // Snare on hit for an obvious live-test outcome
+                pierce: false,
+                targeting_mode: RaycastStrict,
+                cast_facing_policy: FaceResolvedTarget,
+                projectile_speed: Some(1.0),
+                max_range: Some(25.0),
         ),
     ],
     timelines: [
@@ -84,7 +305,8 @@
         (
             ability_id: 3,
             actions: [
-                // Smash: heavy close-range frontal sweep
+                // Smash: heavy close-range frontal sweep; self-buff on windup
+                (tick_offset: 0, action: ApplyBuff(buff_id: 200)),  // PowerUp self-buff while charging
                 (tick_offset: 0, action: SpawnHitbox(shape: LineSweep, offset: (x: 0.0, y: 0.0, z: 0.0))),
                 (tick_offset: 0, action: CooldownStart(duration_ticks: 50)),
                 (tick_offset: 1, action: ApplyDamageFrame),
@@ -99,6 +321,158 @@
                 (tick_offset: 0, action: CooldownStart(duration_ticks: 20)),
                 (tick_offset: 1, action: ApplyDamageFrame),
                 (tick_offset: 2, action: RemoveHitbox),
+            ],
+        ),
+        (
+            ability_id: 10,
+            actions: [
+                // Shield Bash: melee stun
+                (tick_offset: 0, action: SpawnHitbox(shape: CapsuleSweep, offset: (x: 0.0, y: 0.0, z: 0.0))),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 60)),
+                (tick_offset: 1, action: ApplyDamageFrame),
+                (tick_offset: 2, action: RemoveHitbox),
+            ],
+        ),
+        (
+            ability_id: 11,
+            actions: [
+                // Uppercut: launch
+                (tick_offset: 0, action: SpawnHitbox(shape: CapsuleSweep, offset: (x: 0.0, y: 0.0, z: 0.0))),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 80)),
+                (tick_offset: 1, action: ApplyDamageFrame),
+                (tick_offset: 2, action: RemoveHitbox),
+            ],
+        ),
+        (
+            ability_id: 12,
+            actions: [
+                // Grapple: projectile pull
+                (tick_offset: 0, action: SpawnHitbox(shape: Projectile, offset: (x: 0.0, y: 1.0, z: 0.0))),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 100)),
+                (tick_offset: 0, action: ApplyDamageFrame),
+            ],
+        ),
+        (
+            ability_id: 13,
+            actions: [
+                // Leg Sweep: knockdown
+                (tick_offset: 0, action: SpawnHitbox(shape: CapsuleSweep, offset: (x: 0.0, y: 0.0, z: 0.0))),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 40)),
+                (tick_offset: 1, action: ApplyDamageFrame),
+                (tick_offset: 2, action: RemoveHitbox),
+            ],
+        ),
+        (
+            ability_id: 20,
+            actions: [
+                // Chain Lightning: lock-on multi-target — telegraph warns targets before strike
+                (tick_offset: 0, action: Telegraph(impact_delay: 20)),  // warn locked targets 1 s before hit
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 60)),
+                (tick_offset: 0, action: RootForTicks(ticks: 20)),  // caster channels during telegraph
+                (tick_offset: 20, action: ApplyDamageFrame),  // delayed strike after telegraph
+            ],
+        ),
+        (
+            ability_id: 21,
+            actions: [
+                // Backstab: teleport behind target, then melee hit
+                (tick_offset: 0, action: TeleportBehindTarget(distance: 1.5)),
+                (tick_offset: 0, action: SpawnHitbox(shape: CapsuleSweep, offset: (x: 0.0, y: 0.0, z: 0.0))),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 80)),
+                (tick_offset: 1, action: ApplyDamageFrame),
+                (tick_offset: 2, action: RemoveHitbox),
+            ],
+        ),
+        (
+            ability_id: 22,
+            actions: [
+                // Blink: forward teleport dash
+                (tick_offset: 0, action: StanceBegin(dodge_active: true, rooted: true)),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 40)),
+                (tick_offset: 10, action: TeleportForward(distance: 10.0)),
+                (tick_offset: 10, action: StanceEnd),
+            ],
+        ),
+        (
+            ability_id: 23,
+            actions: [
+                // Flame Aura: caster-attached sphere, lingers for 100 ticks (5 s)
+                (tick_offset: 0, action: SpawnHitbox(shape: Sphere, offset: (x: 0.0, y: 0.0, z: 0.0))),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 200)),
+                (tick_offset: 1, action: ApplyDamageFrame),
+                // Hitbox stays armed for 100 ticks; periodic re-damage fires every 20 ticks
+                (tick_offset: 100, action: RemoveHitbox),
+            ],
+        ),
+        (
+            ability_id: 24,
+            actions: [
+                // Fire Patch: ground-targeted hazard zone, lingers for 120 ticks (6 s)
+                (tick_offset: 0, action: SpawnHitbox(shape: HazardZone, offset: (x: 0.0, y: 0.0, z: 0.0))),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 160)),
+                (tick_offset: 1, action: ApplyDamageFrame),
+                // Hazard zone stays armed for 120 ticks; periodic re-damage fires every 10 ticks
+                (tick_offset: 120, action: RemoveHitbox),
+            ],
+        ),
+        (
+            ability_id: 25,
+            actions: [
+                // Lava Pool: spawned 6 m in front of caster via CasterOffset, lingers 100 ticks (5 s)
+                (tick_offset: 0, action: SpawnHitbox(shape: HazardZone, offset: (x: 0.0, y: 0.0, z: 6.0))),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 100)),
+                (tick_offset: 1, action: ApplyDamageFrame),
+                // Hazard zone stays armed for 100 ticks; periodic re-damage fires every 10 ticks
+                (tick_offset: 500, action: RemoveHitbox),
+            ],
+        ),
+
+        (
+            ability_id: 60,
+            actions: [
+                (tick_offset: 0, action: Cleanse(count: 1)),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 20)),
+            ],
+        ),
+        (
+            ability_id: 61,
+            actions: [
+                (tick_offset: 0, action: ClearCC(cc_effect: Stun)),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 20)),
+            ],
+        ),
+        (
+            ability_id: 62,
+            actions: [
+                (tick_offset: 0, action: Stunbreak),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 30)),
+            ],
+        ),
+        (
+            ability_id: 70,
+            actions: [
+                (tick_offset: 0, action: SpawnHitbox(shape: Sphere, offset: (x: 0.0, y: 0.0, z: 0.0))),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 20)),
+                (tick_offset: 1, action: ApplyDamageFrame),
+                (tick_offset: 2, action: RemoveHitbox),
+            ],
+        ),
+
+        (
+            ability_id: 90,
+            actions: [
+                (tick_offset: 0, action: ArcMovement(speed: 8.0, lift: 6.0, gravity: 20.0)),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 40)),
+                (tick_offset: 20, action: StanceEnd),
+            ],
+        ),
+        (
+            ability_id: 99,
+            actions: [
+                // Pinning Shot: strict raycast lock first, then launch a non-piercing projectile.
+                (tick_offset: 0, action: SpawnHitbox(shape: Projectile, offset: (x: 0.0, y: 1.0, z: 0.0))),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 30)),
+                (tick_offset: 0, action: ApplyDamageFrame),
             ],
         ),
     ],

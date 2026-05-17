@@ -4,7 +4,7 @@ use crate::entity_id::EntityId;
 use crate::tick::TickId;
 
 // Shared intent types from game_schema.
-pub use game_schema::{IntentAction, AbilityTarget, MoveDir, UseAbilityData};
+pub use game_schema::{AbilityTarget, BlockData, IntentAction, MoveDir, UseAbilityData};
 
 /// Client input bound to a specific simulation tick.
 ///

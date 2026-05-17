@@ -35,9 +35,6 @@ fn main() {
         let mut world = PhysicsWorld::new(tick_config.dt);
         info!("Physics world initialized");
 
-        // Demo: create a ground plane and a falling ball
-        let ground_id = world.add_static_ground(EntityId(1));
-        info!("Ground plane created: {:?}", ground_id);
 
         let ball_id = world.add_dynamic_sphere(
             EntityId(2),

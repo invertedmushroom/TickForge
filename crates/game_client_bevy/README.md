@@ -3,8 +3,10 @@ The design:
 - `SpacetimePlugin` — connects, subscribes, pumps `frame_tick()` each Bevy frame
 - Entity sync — maps SpacetimeDB `nearby_transforms` rows → Bevy entities with 3D mesh representations
 - Camera — orbiting 3D camera following the player
-- Input — WASD movement → `submit_intent` reducer calls
-- HUD — minimal health/position text overlay 
+- Input — WASD movement, tab target selection, lock-on tagging, and ability submission via reducer calls
+- HUD — debug overlay with health, position, facing, target state, and intent ack stats
+- Crosshair — reticle with soft-target / lock-on color feedback
+- Facing indicator — visible local-player forward marker for testing body-facing-dependent skills like Blink and block
 
 *Build and test*
 
@@ -18,10 +20,10 @@ Summary:
 - Cargo.toml — Bevy 0.15 + SpacetimeDB SDK 2.0, reuses `game_client` module_bindings
 - main.rs — App bootstrap with ground plane, directional light, ambient light
 - spacetime.rs — `SpacetimePlugin`: connects to SpacetimeDB, subscribes to `nearby_transforms`/`entity`/`entity_health`/`sim_tick`/`combat_event`, calls `spawn_player`, pumps `frame_tick()` each Bevy frame
-- sync.rs — `SyncPlugin`: maps server entities → Bevy capsule meshes (green = local player, blue = other players, red = NPCs, purple = bosses), smooth position interpolation, health sync, auto-despawn on leave
-- input.rs — `InputPlugin`: WASD movement → `submit_intent(Move)`, 1/2/3 keys → `UseAbility(Slash/Fireball/Smash)`, release → `Stop`
+- sync.rs — `SyncPlugin`: maps server entities → Bevy capsule meshes (green = local player, blue = other players, red = NPCs, purple = bosses), smooth position interpolation, health sync, auto-despawn on leave, and a local facing indicator mesh for manual testing
+- input.rs — `InputPlugin`: WASD movement, tab targeting, ground targeting, lock-on tagging, block look direction, and ability submission via reducer intents
 - camera.rs — `CameraPlugin`: orbiting follow camera with smooth lerp
-- hud.rs — `HudPlugin`: debug text overlay showing position
+- hud.rs — `HudPlugin`: debug text overlay showing position, facing, health, current target state, and intent ack counts
 
 ### To run:
 ```powershell

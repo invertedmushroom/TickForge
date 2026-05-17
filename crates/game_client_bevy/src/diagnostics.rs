@@ -143,7 +143,6 @@ fn update_diagnostics(
     let mut entity_count: usize = 0;
     let mut connected = false;
     let mut last_committed: u64 = 0;
-    let mut total_entities: usize = 0;
     let mut worker_count: usize = 0;
     #[cfg(feature = "connected")]
     {
@@ -151,8 +150,7 @@ fn update_diagnostics(
         use game_client::module_bindings::*;
         if let Some(stdb) = stdb {
             connected = stdb.connected.load(std::sync::atomic::Ordering::Relaxed);
-            entity_count = stdb.conn.db.nearby_transforms().count() as usize;
-            total_entities = stdb.conn.db.entity().count() as usize;
+            entity_count = stdb.conn.db.nearby_entities().count() as usize;
             worker_count = stdb.conn.db.trusted_worker().count() as usize;
             if let Some(cfg) = stdb.conn.db.module_config().key().find(&0) {
                 last_committed = cfg.last_committed_tick;
@@ -169,8 +167,7 @@ fn update_diagnostics(
          Connected: {connected}\n\
          Tick: {tick_id}\n\
          Tick rate: {tick_rate}/s\n\
-         Nearby: {entities}\n\
-         Total entities: {total}\n\
+         Nearby entities: {entities}\n\
          Intent rate: {intent_rate}/s\n\
          Last committed: {last_committed}\n\
          Backlog: {backlog}\n\
@@ -178,7 +175,6 @@ fn update_diagnostics(
         tick_id = state.last_tick_id,
         tick_rate = state.ticks_per_second,
         entities = entity_count,
-        total = total_entities,
         intent_rate = state.intents_per_second,
         workers = worker_count,
     );

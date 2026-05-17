@@ -37,6 +37,10 @@ pub enum SyncUpdateResult {
     Removed,
     /// Removal was a no-op (entity not present).
     RemoveNoop,
+    /// Entity transitioned to Spawning — coordinator must read companion
+    /// rows from the SDK cache and call `sync_insert` to re-create the
+    /// physics body and runtime state (player respawn, NPC re-spawn).
+    Respawn,
     /// Transition was ignored (handled internally by the pipeline).
     Ignored,
 }
@@ -59,6 +63,16 @@ pub struct RuntimeSnapshot {
     pub buffs: Vec<ActiveBuff>,
     pub threats: Vec<ThreatEntry>,
     pub npc_state: Option<(NpcAiState, Option<EntityId>)>,
+    /// NPC spawn config: (passive, no_chase, ability_ids).
+    pub npc_config: Option<NpcSpawnConfig>,
+}
+
+/// Lightweight NPC configuration read from the DB at spawn time.
+#[derive(Clone, Debug, Default)]
+pub struct NpcSpawnConfig {
+    pub passive: bool,
+    pub no_chase: bool,
+    pub ability_ids: Vec<u32>,
 }
 
 /// SDK-free entity lifecycle mirroring logic.
@@ -109,14 +123,35 @@ impl EntitySync {
 
         sim.spawn_entity_from_snapshot(id, kind, tick, max_hp, position);
 
+        let RuntimeSnapshot {
+            buffs,
+            mut threats,
+            npc_state,
+            npc_config,
+        } = snapshot;
+
+        // `npc_state.target_entity` is the exported aggro view. When no persisted
+        // threat rows are provided, reconstruct a minimal in-memory threat table so
+        // restart recovery preserves the current aggro holder without subscribing to
+        // `threat_entry`.
+        if threats.is_empty()
+            && let Some((_, Some(target))) = npc_state.as_ref() {
+                threats.push(ThreatEntry { source: *target, threat: 1.0 });
+            }
+
         // Restore runtime state from DB rows (noops if slices are empty).
-        let buff_pairs = if snapshot.buffs.is_empty() { vec![] } else { vec![(id, snapshot.buffs)] };
-        let threat_pairs = if snapshot.threats.is_empty() { vec![] } else { vec![(id, snapshot.threats)] };
-        let npc_pairs: Vec<(EntityId, NpcAiState, Option<EntityId>)> = snapshot.npc_state
+        let buff_pairs = if buffs.is_empty() { vec![] } else { vec![(id, buffs)] };
+        let threat_pairs = if threats.is_empty() { vec![] } else { vec![(id, threats)] };
+        let npc_pairs: Vec<(EntityId, NpcAiState, Option<EntityId>)> = npc_state
             .map(|(ai, tgt)| vec![(id, ai, tgt)])
             .unwrap_or_default();
         if !buff_pairs.is_empty() || !threat_pairs.is_empty() || !npc_pairs.is_empty() {
             sim.seed_runtime_state(&buff_pairs, &threat_pairs, &npc_pairs);
+        }
+
+        // Apply NPC spawn config (passive, no_chase, custom abilities).
+        if let Some(cfg) = npc_config {
+            sim.configure_npc(id, cfg);
         }
 
         info!(
@@ -173,6 +208,16 @@ impl EntitySync {
                 } else {
                     SyncUpdateResult::RemoveNoop
                 }
+            }
+            // Respawn: entity returned to Spawning from a terminal state.
+            // Clean up any stale simulation state then signal the coordinator
+            // to read companion rows and call sync_insert.
+            (_, EntityState::Spawning) => {
+                if sim.entity_exists(id) {
+                    sim.force_remove_entity(id);
+                    info!("Entity {} respawning — cleaned up stale simulation state", id.0);
+                }
+                SyncUpdateResult::Respawn
             }
             // Spawning→Active handled by pipeline Phase 8; other transitions ignored.
             _ => SyncUpdateResult::Ignored,
@@ -250,12 +295,19 @@ mod tests {
             self.transforms.insert(id, pos);
             true
         }
+        fn spawn_prop_body(&mut self, id: EntityId, pos: Vec3f, _half_extents: Vec3f, _pushable: bool) -> bool {
+            self.transforms.insert(id, pos);
+            true
+        }
         fn move_character(&mut self, id: EntityId, desired: Vec3f) -> Option<MoveResult> {
             let p = self.transforms.get_mut(&id)?;
             *p = Vec3f { x: p.x + desired.x, y: p.y + desired.y, z: p.z + desired.z };
             Some(MoveResult { position: *p, grounded: true })
         }
-        fn raycast(&self, _origin: Vec3f, _direction: Vec3f, _max_distance: f32) -> Option<RayHit> { None }
+        fn raycast(&self, _origin: Vec3f, _direction: Vec3f, _max_distance: f32, _ignore_entity: Option<EntityId>) -> Option<RayHit> { None }
+        fn line_of_sight(&self, _from: Vec3f, _to: Vec3f) -> bool { true }
+        fn cast_to_wall(&self, _from: Vec3f, to: Vec3f) -> Vec3f { to }
+        fn teleport_entity(&mut self, id: EntityId, pos: Vec3f) -> bool { self.set_kinematic_position(id, pos) }
     }
 
     fn test_runner() -> SimulationRunner {
@@ -326,6 +378,34 @@ mod tests {
             Default::default(),
         );
         assert_eq!(second, SyncInsertResult::SkippedDuplicate);
+    }
+
+    #[test]
+    fn insert_restores_aggro_from_npc_state_target_when_threat_rows_are_absent() {
+        let mut sim = test_runner();
+        let npc = EntityId(301);
+        let target = EntityId(302);
+        let result = EntitySync::sync_insert(
+            &mut sim,
+            npc,
+            EntityKind::Npc,
+            EntityState::Active,
+            TickId(1),
+            80.0,
+            Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            RuntimeSnapshot {
+                npc_state: Some((NpcAiState::Combat, Some(target))),
+                ..Default::default()
+            },
+        );
+        assert_eq!(result, SyncInsertResult::Spawned);
+
+        let tick = sim.run_tick(1, &[]).expect("first tick should run");
+        assert!(tick.npc_state_updates.iter().any(|(eid, ai_state, target_entity)| {
+            *eid == npc
+                && *ai_state == NpcAiState::Combat
+                && *target_entity == Some(target)
+        }));
     }
 
     // ── sync_update tests ───────────────────────────────────────

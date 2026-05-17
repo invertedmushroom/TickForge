@@ -70,13 +70,15 @@ fn connect(mut commands: Commands) {
             info!("Connected as {identity}");
             connected_flag.store(true, Ordering::SeqCst);
 
-            // Subscribe to nearby transforms, entities, and health.
+            // Subscribe to AOI-filtered transforms, entities, and health, plus
+            // the small global tables the UI currently needs.
             ctx.subscription_builder()
                 .on_applied(|ctx| {
                     info!(
-                        "Subscription applied — nearby: {} entities: {}",
+                        "Subscription applied — nearby_transforms: {} nearby_entities: {} nearby_health: {}",
                         ctx.db.nearby_transforms().count(),
-                        ctx.db.entity().count(),
+                        ctx.db.nearby_entities().count(),
+                        ctx.db.nearby_health().count(),
                     );
                 })
                 .on_error(|_ctx, err| {
@@ -85,15 +87,14 @@ fn connect(mut commands: Commands) {
                 .subscribe([
                     "SELECT * FROM my_region",
                     "SELECT * FROM nearby_transforms",
-                    "SELECT * FROM entity",
+                    "SELECT * FROM nearby_entities",
                     "SELECT * FROM client_sequence",
-                    "SELECT * FROM entity_health",
+                    "SELECT * FROM nearby_health",
                     "SELECT * FROM sim_tick",
                     "SELECT * FROM combat_event",
                     "SELECT * FROM active_buff",
                     "SELECT * FROM npc_state",
                     "SELECT * FROM world_event",
-                    "SELECT * FROM threat_entry",
                     "SELECT * FROM player_inventory",
                     "SELECT * FROM player_equipment",
                     "SELECT * FROM module_config",

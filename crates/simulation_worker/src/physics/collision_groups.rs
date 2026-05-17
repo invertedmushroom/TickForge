@@ -46,6 +46,47 @@ pub fn trigger_groups() -> InteractionGroups {
     interaction_groups(CollisionLayer::TRIGGER, CollisionMasks::TRIGGER_FILTER)
 }
 
+pub fn prop_body_groups() -> InteractionGroups {
+    interaction_groups(CollisionLayer::PROP_BODY, CollisionMasks::PROP_BODY_FILTER)
+}
+
+/// Collision groups for KCC movement queries.  Characters only collide with
+/// environment, props, and flight blockers during movement — not other character
+/// bodies — preventing capsule stacking and landing-on-heads after launch CC.
+pub fn kcc_movement_groups() -> InteractionGroups {
+    InteractionGroups::new(
+        Group::from_bits_retain(CollisionMasks::KCC_MOVEMENT_MEMBERSHIP),
+        Group::from_bits_retain(CollisionMasks::KCC_MOVEMENT_FILTER),
+        InteractionTestMode::And,
+    )
+}
+
+/// Query groups for combat target acquisition rays.
+///
+/// The ray must see:
+/// - SKILL_HURTBOX so aimed NPCs/players can be acquired
+/// - ENVIRONMENT / PROP_BODY / FLIGHT_BLOCKER so walls and solid world props block aim
+///
+/// The ray must ignore:
+/// - PLAYER_BODY / NPC_BODY so it doesn't stop on the physical capsule in front of the hurtbox
+/// - SKILL_HITBOX / TRIGGER / other gameplay sensors
+pub fn targeting_ray_groups() -> InteractionGroups {
+    interaction_groups(
+        CollisionLayer(CollisionLayer::combine(&[
+            CollisionLayer::PLAYER_BODY,
+            CollisionLayer::NPC_BODY,
+            CollisionLayer::PROJECTILE,
+            CollisionLayer::SKILL_HITBOX,
+        ])),
+        CollisionLayer::combine(&[
+            CollisionLayer::SKILL_HURTBOX,
+            CollisionLayer::ENVIRONMENT,
+            CollisionLayer::FLIGHT_BLOCKER,
+            CollisionLayer::PROP_BODY,
+        ]),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,5 +135,20 @@ mod tests {
 
         assert!(proj_player, "Projectile should hit players");
         assert!(proj_npc, "Projectile should hit NPCs");
+    }
+
+    #[test]
+    fn targeting_ray_hits_hurtbox_but_not_character_body() {
+        let ray = targeting_ray_groups();
+        let hurtbox = skill_hurtbox_groups();
+        let npc_body = npc_body_groups();
+
+        let ray_hits_hurtbox = (ray.memberships & hurtbox.filter).bits() != 0
+            && (hurtbox.memberships & ray.filter).bits() != 0;
+        let ray_hits_npc_body = (ray.memberships & npc_body.filter).bits() != 0
+            && (npc_body.memberships & ray.filter).bits() != 0;
+
+        assert!(ray_hits_hurtbox, "Targeting ray should interact with hurtboxes");
+        assert!(!ray_hits_npc_body, "Targeting ray must ignore character body colliders");
     }
 }

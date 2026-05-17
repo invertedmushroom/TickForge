@@ -1,6 +1,7 @@
 use bevy::prelude::*;
 use bevy::utils::HashMap;
 use game_client::module_bindings::*;
+use game_client::module_bindings::Entity as RemoteEntity;
 use spacetimedb_sdk::{DbContext, Table};
 
 use crate::camera::LocalPlayer;
@@ -22,8 +23,35 @@ impl Plugin for SyncPlugin {
     }
 }
 
+/// Visible child mesh that makes the local player's body facing obvious in third-person tests.
+#[derive(Component)]
+pub struct FacingIndicator;
+
+fn spawn_facing_indicator(
+    commands: &mut Commands,
+    parent: bevy::ecs::entity::Entity,
+    meshes: &EntityMeshes,
+) {
+    commands.entity(parent).with_children(|child| {
+        child.spawn((
+            Mesh3d(meshes.hazard_mesh.clone()),
+            MeshMaterial3d(meshes.projectile_mat.clone()),
+            Transform::from_xyz(0.0, 0.05, -0.6)
+                .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2))
+                .with_scale(Vec3::new(0.2, 1.6, 0.2)),
+            FacingIndicator,
+        ));
+        child.spawn((
+            Mesh3d(meshes.projectile_mesh.clone()),
+            MeshMaterial3d(meshes.projectile_mat.clone()),
+            Transform::from_xyz(0.0, 0.2, -1.15).with_scale(Vec3::splat(1.6)),
+            FacingIndicator,
+        ));
+    });
+}
+
 /// Interpolation speed (units per second). Higher = snappier.
-const INTERP_SPEED: f32 = 12.0;
+const INTERP_SPEED: f32 = 20.0;
 
 /// Maps SpacetimeDB entity_id → Bevy Entity.
 #[derive(Resource, Default)]
@@ -53,6 +81,7 @@ struct EntityMeshes {
     boss_mesh: Handle<Mesh>,
     projectile_mesh: Handle<Mesh>,
     hazard_mesh: Handle<Mesh>,
+    prop_mesh: Handle<Mesh>,
     player_mat: Handle<StandardMaterial>,
     npc_mat: Handle<StandardMaterial>,
     boss_mat: Handle<StandardMaterial>,
@@ -61,6 +90,7 @@ struct EntityMeshes {
     npc_flee_mat: Handle<StandardMaterial>,
     projectile_mat: Handle<StandardMaterial>,
     hazard_mat: Handle<StandardMaterial>,
+    prop_mat: Handle<StandardMaterial>,
 }
 
 impl FromWorld for EntityMeshes {
@@ -71,6 +101,7 @@ impl FromWorld for EntityMeshes {
         let boss_mesh = meshes.add(Capsule3d::new(0.5, 1.5));
         let projectile_mesh = meshes.add(Sphere::new(0.15));
         let hazard_mesh = meshes.add(Cylinder::new(0.4, 0.1));
+        let prop_mesh = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
 
         let mut materials = world.resource_mut::<Assets<StandardMaterial>>();
         let player_mat = materials.add(StandardMaterial {
@@ -108,6 +139,10 @@ impl FromWorld for EntityMeshes {
             alpha_mode: AlphaMode::Blend,
             ..default()
         });
+        let prop_mat = materials.add(StandardMaterial {
+            base_color: Color::srgb(0.6, 0.4, 0.2),
+            ..default()
+        });
 
         EntityMeshes {
             player_mesh,
@@ -115,6 +150,7 @@ impl FromWorld for EntityMeshes {
             boss_mesh,
             projectile_mesh,
             hazard_mesh,
+            prop_mesh,
             player_mat,
             npc_mat,
             boss_mat,
@@ -123,11 +159,13 @@ impl FromWorld for EntityMeshes {
             npc_flee_mat,
             projectile_mat,
             hazard_mat,
+            prop_mat,
         }
     }
 }
 
-/// Detect which entity belongs to the local player (by checking entity table for our identity).
+/// Detect which entity belongs to the local player (by checking the nearby_entities
+/// view for our identity).
 /// When detected, retroactively add LocalPlayer + green material to the already-spawned Bevy entity.
 fn detect_local_player(
     stdb: Option<Res<StdbConnection>>,
@@ -146,7 +184,7 @@ fn detect_local_player(
 
     // Find our entity by matching owner_identity to our connection identity.
     let our_identity = stdb.conn.identity();
-    for entity in stdb.conn.db.entity().iter() {
+    for entity in stdb.conn.db.nearby_entities().iter() {
         if entity.owner_identity.as_ref() == Some(&our_identity) {
             log::info!("Local player entity detected: {}", entity.entity_id);
             local_player.entity_id = Some(entity.entity_id);
@@ -159,6 +197,7 @@ fn detect_local_player(
                     commands.entity(bevy_entity).insert(
                         MeshMaterial3d(meshes.local_player_mat.clone()),
                     );
+                    spawn_facing_indicator(&mut commands, bevy_entity, &meshes);
                 }
             }
             return;
@@ -188,16 +227,21 @@ fn sync_entities(
     // Collect current server entity IDs.
     let mut live_ids: bevy::utils::HashSet<u64> = bevy::utils::HashSet::new();
 
+    let nearby_entities: HashMap<u64, RemoteEntity> = stdb.conn.db.nearby_entities()
+        .iter()
+        .map(|entity| (entity.entity_id, entity))
+        .collect();
+
     for row in stdb.conn.db.nearby_transforms().iter() {
         // Skip entities in terminal states (death cleanup may lag one frame).
-        let entity_row = stdb.conn.db.entity().entity_id().find(&row.entity_id);
+        let entity_row = nearby_entities.get(&row.entity_id);
         if entity_row.as_ref().is_some_and(|e| matches!(e.state, EntityState::DespawnPending | EntityState::Removed)) {
             continue;
         }
 
         live_ids.insert(row.entity_id);
 
-        // Look up entity kind from entity table.
+        // Look up entity kind from the nearby_entities view.
         let kind = entity_row
             .map(|e| e.kind)
             .unwrap_or(EntityKind::Player);
@@ -223,6 +267,7 @@ fn sync_entities(
                 EntityKind::Boss => (meshes.boss_mesh.clone(), meshes.boss_mat.clone()),
                 EntityKind::Projectile => (meshes.projectile_mesh.clone(), meshes.projectile_mat.clone()),
                 EntityKind::Hazard => (meshes.hazard_mesh.clone(), meshes.hazard_mat.clone()),
+                EntityKind::Prop => (meshes.prop_mesh.clone(), meshes.prop_mat.clone()),
             };
 
             let mut entity_cmd = commands.spawn((
@@ -239,6 +284,10 @@ fn sync_entities(
 
             let bevy_entity = entity_cmd.id();
             entity_map.map.insert(row.entity_id, bevy_entity);
+
+            if is_local {
+                spawn_facing_indicator(&mut commands, bevy_entity, &meshes);
+            }
         }
     }
 
@@ -254,7 +303,7 @@ fn sync_entities(
     }
 }
 
-/// Sync health from entity_health table to Bevy Health component.
+/// Sync health from the nearby_health view to Bevy Health components.
 fn sync_health(
     stdb: Option<Res<StdbConnection>>,
     entity_map: Res<EntityMap>,
@@ -262,7 +311,7 @@ fn sync_health(
 ) {
     let Some(stdb) = stdb else { return };
 
-    for row in stdb.conn.db.entity_health().iter() {
+    for row in stdb.conn.db.nearby_health().iter() {
         if let Some(&bevy_entity) = entity_map.map.get(&row.entity_id) {
             if let Ok(mut hp) = query.get_mut(bevy_entity) {
                 hp.hp = row.hp;
@@ -401,14 +450,19 @@ fn sync_npc_state_color(
 ) {
     let Some(stdb) = stdb else { return };
     let Some(meshes) = entity_meshes else { return };
+    let nearby_entity_kinds: HashMap<u64, EntityKind> = stdb.conn.db.nearby_entities()
+        .iter()
+        .map(|entity| (entity.entity_id, entity.kind))
+        .collect();
 
     for npc in stdb.conn.db.npc_state().iter() {
         let Some(&bevy_entity) = entity_map.map.get(&npc.entity_id) else { continue };
 
         // Only recolor NPC/Boss entities — skip players.
         let Ok(se) = entity_table.get(bevy_entity) else { continue };
-        let entity_row = stdb.conn.db.entity().entity_id().find(&se.entity_id);
-        let is_npc = entity_row.as_ref().is_some_and(|e| matches!(e.kind, EntityKind::Npc | EntityKind::Boss));
+        let is_npc = nearby_entity_kinds
+            .get(&se.entity_id)
+            .is_some_and(|kind| matches!(kind, EntityKind::Npc | EntityKind::Boss));
         if !is_npc { continue; }
 
         let mat = match npc.ai_state {

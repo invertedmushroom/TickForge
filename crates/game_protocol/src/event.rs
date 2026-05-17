@@ -47,10 +47,10 @@ pub enum EventPayload {
         damage_taken: f32,
         perfect: bool,
     },
-    /// Warning that a telegraphed/lock-on attack is incoming.
+    /// Warning that a telegraphed attack is incoming.
     /// Emitted when the ability timeline fires a `Telegraph` action,
     /// giving the target advance notice to dodge or counter.
-    LockOnWarning {
+    TelegraphWarning {
         source: EntityId,
         target: EntityId,
         /// Tick when the damage frame will land.
@@ -117,13 +117,77 @@ pub enum EventPayload {
         speed: f32,
         max_range: f32,
     },
-    /// A projectile was removed (hit a target or exceeded max range).
-    /// Clients kill the predicted visual for this `execution_id`.
-    ProjectileRemoved {
+    /// A world-space hazard zone was spawned (ground-target or fixed-world-offset).
+    /// Clients use this to render a persistent ground indicator at the given position.
+    HazardSpawned {
+        execution_id: u64,
+        ability_id: u32,
+        position: crate::types::Vec3f,
+        radius: f32,
+    },
+    /// A detached skill object (projectile or hazard) was removed.
+    /// Clients kill the predicted/placed visual for this `execution_id`.
+    SkillObjectRemoved {
         execution_id: u64,
     },
     CooldownReady {
         ability_id: u32,
+    },
+
+    /// Entity took falling damage.
+    FallDamage {
+        damage: f32,
+        impact_speed: f32,
+    },
+
+    /// Entity left the ground by jumping. Clients use this to trigger jump
+    /// animations and sound. Paired with landing detection on the client side
+    /// (arc cleared on `drive_arc_movement` grounded detection).
+    Jumped,
+
+    // ── CC events ──────────────────────────────────────────
+    /// Entity was knocked back by an attacker (horizontal arc + STUNNED until landing).
+    Knockback {
+        source: EntityId,
+        force: f32,
+    },
+    /// Entity was launched upward (FLOATING until landing, then KNOCKED_DOWN recovery).
+    Launched {
+        source: EntityId,
+    },
+    /// Entity was stunned (cannot act for duration_ticks).
+    Stunned {
+        source: EntityId,
+        duration_ticks: u32,
+    },
+    /// Entity was knocked down (on ground, cannot act for duration_ticks).
+    KnockedDown {
+        source: EntityId,
+        duration_ticks: u32,
+    },
+    /// Entity was pulled toward attacker (arc toward source + STUNNED until landing).
+    Pulled {
+        source: EntityId,
+    },
+    /// Entity was put to sleep (cannot act; broken by damage).
+    Slept {
+        source: EntityId,
+        duration_ticks: u32,
+    },
+    /// Entity was silenced (cannot cast abilities; can move/jump/block).
+    Silenced {
+        source: EntityId,
+        duration_ticks: u32,
+    },
+    /// Entity was feared (forced movement away from source at 50% speed).
+    Feared {
+        source: EntityId,
+        duration_ticks: u32,
+    },
+    /// Stability absorbed a CC application (one stack consumed).
+    StabilityConsumed {
+        /// The buff_id of the stability buff that absorbed the CC.
+        buff_id: u32,
     },
 
     // ── World events ───────────────────────────────────
@@ -140,7 +204,80 @@ pub enum EventPayload {
         target: EntityId,
     },
 
+    // ── Equipment events ────────────────────────────────
+    /// Entity swapped to a different weapon set.
+    WeaponSwapped {
+        new_set: u8,
+    },
+
+    // ── CC counterplay events ──────────────────────────
+    /// A specific CC effect was cleared from the entity (e.g. by ClearCC or Stunbreak).
+    CCCleared {
+        /// Which CC type was removed.
+        cc_effect: game_schema::CCEffect,
+        /// Entity that caused the clear (self for self-cleanse).
+        source: EntityId,
+    },
+    /// One or more Condition debuffs were cleansed from the entity.
+    Cleansed {
+        /// Number of Conditions actually removed.
+        count: u32,
+        /// Entity that performed the cleanse.
+        source: EntityId,
+    },
+    /// Entity broke free of all CC via stunbreak.
+    Stunbreak,
+    /// Diminishing returns made the entity fully immune to a CC application.
+    CCImmune {
+        /// The CC type that was resisted.
+        cc_effect: game_schema::CCEffect,
+        /// Entity that attempted the CC.
+        source: EntityId,
+    },
+
+    /// A lag-compensated hit was confirmed against this entity.
+    /// Emitted alongside `SkillHit`/`Damage` for observability — clients can
+    /// use this to display a "rewound" indicator or log latency diagnostics.
+    CompensationApplied {
+        source: EntityId,
+        ability_id: u32,
+        /// How many ticks the target position was rewound.
+        rewind_ticks: u32,
+    },
+
     // ── System events ──────────────────────────────────
     TickBoundary,
+
+    // ── Lock-on events ─────────────────────────────────
+    /// A TERA-style lock-on selection session started. Client should enter crosshair tagging mode.
+    LockOnSessionStarted {
+        source: EntityId,
+        ability_id: u32,
+    },
+    /// A tagged target's lock-on was cancelled (session cancelled, caster died, or target
+    /// moved out of range at fire time). Client clears the "targeted" indicator.
+    LockOnCanceled {
+        source: EntityId,
+        target: EntityId,
+    },
+    /// A tagged entity was selected in a lock-on session. Client shows "targeted" indicator.
+    LockOnWarning {
+        source: EntityId,
+        target: EntityId,
+    },
+    /// Lock-on ability fired. Lists all attempted targets (valid and invalid).
+    LockOnFired {
+        source: EntityId,
+        /// All targets that were in the session at fire time (both hit and skipped).
+        targets: Vec<EntityId>,
+    },
+
+    // ── Teleport events ────────────────────────────────
+    /// An entity was teleported (backstab, blink).
+    Teleported {
+        entity: EntityId,
+        from: crate::types::Vec3f,
+        to: crate::types::Vec3f,
+    },
 }
 

@@ -77,7 +77,7 @@ fn update_inspector(
     let mut lines = vec![format!("--- Inspector (F4) ---\nEntity #{target_id}")];
 
     // Entity row
-    if let Some(entity) = stdb.conn.db.entity().entity_id().find(&target_id) {
+    if let Some(entity) = stdb.conn.db.nearby_entities().iter().find(|entity| entity.entity_id == target_id) {
         lines.push(format!("Kind: {:?}", entity.kind));
         lines.push(format!("State: {:?}", entity.state));
         lines.push(format!("Spawned tick: {}", entity.spawned_at_tick));
@@ -87,7 +87,7 @@ fn update_inspector(
             lines.push(format!("Owner: {short}.."));
         }
     } else {
-        lines.push("(no entity row)".into());
+        lines.push("(no nearby entity row)".into());
     }
 
     // Transform
@@ -103,7 +103,7 @@ fn update_inspector(
     }
 
     // Health
-    if let Some(hp) = stdb.conn.db.entity_health().entity_id().find(&target_id) {
+    if let Some(hp) = stdb.conn.db.nearby_health().iter().find(|hp| hp.entity_id == target_id) {
         lines.push(format!("HP: {:.0}/{:.0}", hp.hp, hp.max_hp));
     }
 
@@ -111,7 +111,7 @@ fn update_inspector(
     if let Some(npc) = stdb.conn.db.npc_state().entity_id().find(&target_id) {
         lines.push(format!("AI: {:?}", npc.ai_state));
         if let Some(npc_target) = npc.target_entity {
-            lines.push(format!("AI target: #{npc_target}"));
+            lines.push(format!("Aggro target: #{npc_target}"));
         }
     }
 
@@ -127,17 +127,6 @@ fn update_inspector(
                 None => "permanent".into(),
             };
             lines.push(format!("  #{} x{} ({exp})", b.buff_id, b.stacks));
-        }
-    }
-
-    // Threat (entries where this entity is the NPC)
-    let threats: Vec<_> = stdb.conn.db.threat_entry().iter()
-        .filter(|t| t.npc_entity == target_id)
-        .collect();
-    if !threats.is_empty() {
-        lines.push(format!("Threat table ({} entries)", threats.len()));
-        for t in &threats {
-            lines.push(format!("  from #{}: {:.0}", t.source_entity, t.threat));
         }
     }
 

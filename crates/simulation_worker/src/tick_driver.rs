@@ -1,16 +1,8 @@
-//! Tick intake and scheduling orchestration.
+//! SDK-free tick scheduling/execution orchestration.
 //!
-//! `TickDriver` owns the per-tick decision loop:
-//!   1. Check eligibility via `CommitAuthority`.
-//!   2. Realign pipeline tick counter if desynced.
-//!   3. Run the pipeline and produce a `TickResult`.
-//!   4. Mark the tick as in-flight.
-//!   5. Emit summary logging.
-//!
-//! The coordinator delegates to `TickDriver::process_tick()` inside the
-//! locked section.  Intent gathering (SDK-specific) and the async commit
-//! call remain in the coordinator — TickDriver is SDK-free and always
-//! testable.
+//! `TickDriver` gates tick eligibility through `CommitAuthority`, keeps
+//! pipeline tick counters aligned, runs one tick, marks it in-flight, and
+//! emits summary logs.
 
 use std::time::Instant;
 
@@ -26,7 +18,7 @@ use game_protocol::tick::TickId;
 pub enum TickSkipped {
     /// Tick already committed — harmless duplicate.
     AlreadyProcessed,
-    /// A prior commit is still in-flight.
+    /// A prior commit is still in-flight (or pipeline depth is full).
     CommitPending(u64),
 }
 
@@ -53,14 +45,9 @@ impl TickDriver {
         }
     }
 
-    /// Attempt to process one tick.
+    /// Process one eligible tick and mark it in-flight.
     ///
-    /// Returns `Ok(TickResult)` on success or `Err(TickSkipped)` if the tick
-    /// should not run (already processed or commit pending).
-    ///
-    /// On success the tick is marked in-flight on `commit` — the caller
-    /// must eventually call `commit.acknowledge_success` or
-    /// `commit.acknowledge_failure`.
+    /// Returns `Err(TickSkipped)` for duplicates or backpressure conditions.
     pub fn process_tick(
         &self,
         canonical_tick: u64,
@@ -68,42 +55,48 @@ impl TickDriver {
         pipeline: &mut TickPipeline,
         commit: &mut CommitAuthority,
     ) -> Result<TickResult, TickSkipped> {
-        // ── Eligibility ─────────────────────────────────────────────
         match commit.can_process_tick(canonical_tick) {
             CanProcessResult::AlreadyProcessed => {
                 debug!("Tick {canonical_tick} already processed, skipping");
                 return Err(TickSkipped::AlreadyProcessed);
             }
             CanProcessResult::CommitPending(pending) => {
-                warn!(
-                    "tick={canonical_tick} skipped — commit for tick={pending} still in-flight"
-                );
+                warn!("tick={canonical_tick} skipped — commit for tick={pending} still in-flight");
                 return Err(TickSkipped::CommitPending(pending));
+            }
+            CanProcessResult::PipelineFull(oldest) => {
+                warn!(
+                    "tick={canonical_tick} skipped — pipeline full, oldest in-flight tick={oldest}"
+                );
+                return Err(TickSkipped::CommitPending(oldest));
             }
             CanProcessResult::Proceed => {}
         }
 
-        // ── Desync guard ────────────────────────────────────────────
-        let pipeline_tick = pipeline.current_tick();
-        if pipeline_tick != TickId(canonical_tick) {
+        let tick_to_process = commit.next_expected_tick();
+        if canonical_tick > tick_to_process {
             warn!(
-                "tick desync: canonical={canonical_tick} pipeline={} — advancing pipeline to match",
-                pipeline_tick.0
+                "tick backlog: canonical={canonical_tick} processing_contiguous_tick={tick_to_process}"
             );
-            pipeline.set_current_tick(TickId(canonical_tick));
         }
 
-        // ── Run pipeline ────────────────────────────────────────────
+        let pipeline_tick = pipeline.current_tick();
+        if pipeline_tick != TickId(tick_to_process) {
+            warn!(
+                "tick desync: canonical={canonical_tick} executing={tick_to_process} pipeline={} — advancing pipeline to match",
+                pipeline_tick.0,
+            );
+            pipeline.set_current_tick(TickId(tick_to_process));
+        }
+
         let tick_start = Instant::now();
         let mut result = pipeline.run_tick(intents);
         result.summary.tick_duration_us = tick_start.elapsed().as_micros() as u64;
         result.summary.commit_retries = commit.retry_count();
 
-        // ── Mark in-flight ──────────────────────────────────────────
-        commit.mark_in_flight(canonical_tick);
+        commit.mark_in_flight(tick_to_process);
 
-        // ── Summary logging ─────────────────────────────────────────
-        self.log_summary(canonical_tick, &result.summary);
+        self.log_summary(tick_to_process, &result.summary);
 
         Ok(result)
     }
@@ -117,10 +110,11 @@ impl TickDriver {
             || summary.intents_processed > 0
         {
             info!(
-                "tick={tick} intents={} contacts={} damage={} deaths={} despawns={} entities={} hitboxes={} actions={} tick_us={} retries={}",
+                "tick={tick} intents={} contacts={} damage={} deaths={} despawns={} entities={} hitboxes={} transforms={} region_updates={} actions={} tick_us={} retries={}",
                 summary.intents_processed, summary.contacts, summary.damage_events,
                 summary.deaths, summary.despawns, summary.active_entities, summary.active_hitboxes,
-                summary.scheduled_actions_len, summary.tick_duration_us, summary.commit_retries,
+                summary.transform_updates, summary.region_updates, summary.scheduled_actions_len,
+                summary.tick_duration_us, summary.commit_retries,
             );
         }
     }
@@ -132,8 +126,8 @@ mod tests {
     use crate::commit_authority::CommitAuthority;
     use crate::tick_pipeline::TickPipeline;
     use game_core::combat::skill::{
-        AbilityAction, AbilityData, AbilityRegistry, AbilityTimeline,
-        ScheduledAbilityAction, SkillShape,
+        AbilityAction, AbilityData, AbilityRegistry, AbilityTimeline, ScheduledAbilityAction,
+        SkillShape, TargetingMode,
     };
     use game_protocol::tick::TickId;
 
@@ -151,76 +145,207 @@ mod tests {
             allow_reentry: false,
             charge_tiers: None,
             damage_interval_ticks: 0,
+            pierce: false,
+            charge_roots_while_charging: false,
+            knockdown_ticks: 0,
+            stun_ticks: 0,
+            pull_force: 0.0,
+            launch_lift: 0.0,
+            launch_recovery_ticks: 0,
+            usable_while_cc: false,
+            fear_ticks: 0,
+            silence_ticks: 0,
+            sleep_ticks: 0,
+            targeting_mode: TargetingMode::DirectionTarget,
+            cast_facing_policy: game_core::combat::skill::CastFacingPolicy::FaceAimDirection,
+            projectile_speed: None,
+            max_range: None,
+            lock_on_timeout_ticks: None,
+            max_rewind_ticks: None,
         });
         reg.register_timeline(AbilityTimeline {
             ability_id: 1,
             actions: vec![
-                ScheduledAbilityAction { tick_offset: 0, action: AbilityAction::SpawnHitbox {
-                    shape: SkillShape::CapsuleSweep,
-                    offset: game_schema::Vec3f { x: 0.0, y: 0.0, z: 0.0 },
-                }},
-                ScheduledAbilityAction { tick_offset: 0, action: AbilityAction::CooldownStart { duration_ticks: 20 }},
-                ScheduledAbilityAction { tick_offset: 1, action: AbilityAction::ApplyDamageFrame },
-                ScheduledAbilityAction { tick_offset: 2, action: AbilityAction::RemoveHitbox },
+                ScheduledAbilityAction {
+                    tick_offset: 0,
+                    action: AbilityAction::SpawnHitbox {
+                        shape: SkillShape::CapsuleSweep,
+                        offset: game_schema::Vec3f {
+                            x: 0.0,
+                            y: 0.0,
+                            z: 0.0,
+                        },
+                    },
+                },
+                ScheduledAbilityAction {
+                    tick_offset: 0,
+                    action: AbilityAction::CooldownStart { duration_ticks: 20 },
+                },
+                ScheduledAbilityAction {
+                    tick_offset: 1,
+                    action: AbilityAction::ApplyDamageFrame,
+                },
+                ScheduledAbilityAction {
+                    tick_offset: 2,
+                    action: AbilityAction::RemoveHitbox,
+                },
             ],
         });
         reg
     }
 
     fn mock_pipeline() -> TickPipeline {
-        use std::collections::HashMap;
         use game_core::physics_backend::*;
         use game_protocol::entity_id::EntityId;
         use game_protocol::types::Transform;
+        use std::collections::HashMap;
 
         struct MockPhysics {
             transforms: HashMap<EntityId, Transform>,
         }
         impl PhysicsBackend for MockPhysics {
-            fn as_any(&self) -> &dyn std::any::Any { self }
-            fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
             fn step(&mut self, _dt: f32) {}
             fn get_transform(&self, id: EntityId) -> Option<Transform> {
                 self.transforms.get(&id).cloned()
             }
             fn get_all_transforms(&self) -> Vec<(EntityId, Transform)> {
-                self.transforms.iter().map(|(id, t)| (*id, t.clone())).collect()
+                self.transforms
+                    .iter()
+                    .map(|(id, t)| (*id, t.clone()))
+                    .collect()
             }
-            fn drain_collision_events(&mut self) -> Vec<CollisionEvent> { vec![] }
+            fn drain_collision_events(&mut self) -> Vec<CollisionEvent> {
+                vec![]
+            }
             fn remove_entity(&mut self, id: EntityId) -> bool {
                 self.transforms.remove(&id).is_some()
             }
-            fn set_kinematic_position(&mut self, id: EntityId, pos: game_protocol::types::Vec3f) -> bool {
+            fn set_kinematic_position(
+                &mut self,
+                id: EntityId,
+                pos: game_protocol::types::Vec3f,
+            ) -> bool {
                 if let Some(t) = self.transforms.get_mut(&id) {
                     t.position = pos;
                     true
-                } else { false }
+                } else {
+                    false
+                }
             }
-            fn set_kinematic_rotation(&mut self, _id: EntityId, _rot: game_protocol::types::Quatf) -> bool { true }
-            fn set_linear_velocity(&mut self, _id: EntityId, _vel: game_protocol::types::Vec3f) -> bool { true }
-            fn spawn_sensor(&mut self, _id: EntityId, _shape: SensorShape, _offset: game_protocol::types::Vec3f, _kind: ColliderKind) -> Option<u64> {
-                Some(1)
-            }
-            fn spawn_world_sensor(&mut self, _position: game_protocol::types::Vec3f, _shape: SensorShape, _kind: ColliderKind, _owner: EntityId) -> u64 { 0 }
-            fn set_sensor_position(&mut self, _handle: u64, _position: game_protocol::types::Vec3f) -> bool { false }
-            fn remove_sensor(&mut self, _handle: u64) {}
-            fn spawn_character_body(&mut self, id: EntityId, pos: game_protocol::types::Vec3f, _kind: game_schema::EntityKind) -> bool {
-                self.transforms.insert(id, Transform::at_position(pos.x, pos.y, pos.z));
+            fn set_kinematic_rotation(
+                &mut self,
+                _id: EntityId,
+                _rot: game_protocol::types::Quatf,
+            ) -> bool {
                 true
             }
-            fn move_character(&mut self, id: EntityId, desired: game_protocol::types::Vec3f) -> Option<MoveResult> {
+            fn set_linear_velocity(
+                &mut self,
+                _id: EntityId,
+                _vel: game_protocol::types::Vec3f,
+            ) -> bool {
+                true
+            }
+            fn spawn_sensor(
+                &mut self,
+                _id: EntityId,
+                _shape: SensorShape,
+                _offset: game_protocol::types::Vec3f,
+                _kind: ColliderKind,
+            ) -> Option<u64> {
+                Some(1)
+            }
+            fn spawn_world_sensor(
+                &mut self,
+                _position: game_protocol::types::Vec3f,
+                _shape: SensorShape,
+                _kind: ColliderKind,
+                _owner: EntityId,
+            ) -> u64 {
+                0
+            }
+            fn set_sensor_position(
+                &mut self,
+                _handle: u64,
+                _position: game_protocol::types::Vec3f,
+            ) -> bool {
+                false
+            }
+            fn remove_sensor(&mut self, _handle: u64) {}
+            fn spawn_character_body(
+                &mut self,
+                id: EntityId,
+                pos: game_protocol::types::Vec3f,
+                _kind: game_schema::EntityKind,
+            ) -> bool {
+                self.transforms
+                    .insert(id, Transform::at_position(pos.x, pos.y, pos.z));
+                true
+            }
+            fn spawn_prop_body(
+                &mut self,
+                id: EntityId,
+                pos: game_protocol::types::Vec3f,
+                _half_extents: game_protocol::types::Vec3f,
+                _pushable: bool,
+            ) -> bool {
+                self.transforms
+                    .insert(id, Transform::at_position(pos.x, pos.y, pos.z));
+                true
+            }
+            fn move_character(
+                &mut self,
+                id: EntityId,
+                desired: game_protocol::types::Vec3f,
+            ) -> Option<MoveResult> {
                 let t = self.transforms.get_mut(&id)?;
                 t.position.x += desired.x;
                 t.position.y += desired.y;
                 t.position.z += desired.z;
-                Some(MoveResult { position: t.position, grounded: true })
+                Some(MoveResult {
+                    position: t.position,
+                    grounded: true,
+                })
             }
-            fn raycast(&self, _origin: game_protocol::types::Vec3f, _direction: game_protocol::types::Vec3f, _max_distance: f32) -> Option<RayHit> { None }
+            fn raycast(
+                &self,
+                _origin: game_protocol::types::Vec3f,
+                _direction: game_protocol::types::Vec3f,
+                _max_distance: f32,
+                _ignore_entity: Option<EntityId>,
+            ) -> Option<RayHit> {
+                None
+            }
+            fn line_of_sight(
+                &self,
+                _from: game_protocol::types::Vec3f,
+                _to: game_protocol::types::Vec3f,
+            ) -> bool {
+                true
+            }
+            fn cast_to_wall(
+                &self,
+                _from: game_protocol::types::Vec3f,
+                to: game_protocol::types::Vec3f,
+            ) -> game_protocol::types::Vec3f {
+                to
+            }
+            fn teleport_entity(&mut self, id: EntityId, pos: game_protocol::types::Vec3f) -> bool {
+                self.set_kinematic_position(id, pos)
+            }
         }
 
         TickPipeline::new(
             TickId(1),
-            Box::new(MockPhysics { transforms: HashMap::new() }),
+            Box::new(MockPhysics {
+                transforms: HashMap::new(),
+            }),
             0.05,
             test_registry(),
             game_core::combat::status::BuffRegistry::new(),
@@ -253,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_pending_tick_is_skipped() {
+    fn pipeline_full_skips_tick() {
         let driver = TickDriver::new();
         let mut pipeline = mock_pipeline();
         let mut commit = CommitAuthority::new();
@@ -262,8 +387,13 @@ mod tests {
         let _ = driver.process_tick(1, &[], &mut pipeline, &mut commit);
         assert_eq!(commit.pending_tick(), Some(1));
 
-        // Tick 2 should be skipped while tick 1 is pending.
-        let result = driver.process_tick(2, &[], &mut pipeline, &mut commit);
+        // Process tick 2 — second in-flight (depth=2 allows it).
+        let r2 = driver.process_tick(2, &[], &mut pipeline, &mut commit);
+        assert!(r2.is_ok());
+        assert_eq!(commit.in_flight_count(), 2);
+
+        // Tick 3 should be skipped — pipeline full at depth 2.
+        let result = driver.process_tick(3, &[], &mut pipeline, &mut commit);
         assert!(matches!(result, Err(TickSkipped::CommitPending(1))));
     }
 
@@ -273,11 +403,25 @@ mod tests {
         let mut pipeline = mock_pipeline(); // starts at tick 1
         let mut commit = CommitAuthority::new();
 
-        // Force pipeline to tick 1 but ask to process tick 5.
-        // TickDriver should realign the pipeline.
+        // Ask to process a later canonical tick while the next contiguous tick is 1.
+        // TickDriver should keep the pipeline on the next expected tick.
         let result = driver.process_tick(5, &[], &mut pipeline, &mut commit);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().tick_id, TickId(5));
+        assert_eq!(result.unwrap().tick_id, TickId(1));
+    }
+
+    #[test]
+    fn backlog_processes_next_expected_tick() {
+        let driver = TickDriver::new();
+        let mut pipeline = mock_pipeline();
+        let mut commit = CommitAuthority::new();
+        commit.seed(3);
+
+        let result = driver.process_tick(5, &[], &mut pipeline, &mut commit);
+        assert!(result.is_ok());
+        let tick_result = result.unwrap();
+        assert_eq!(tick_result.tick_id, TickId(4));
+        assert_eq!(commit.pending_tick(), Some(4));
     }
 
     #[test]
@@ -286,13 +430,46 @@ mod tests {
         let mut pipeline = mock_pipeline();
         let mut commit = CommitAuthority::new();
 
-        let r1 = driver.process_tick(1, &[], &mut pipeline, &mut commit).unwrap();
+        let r1 = driver
+            .process_tick(1, &[], &mut pipeline, &mut commit)
+            .unwrap();
         assert_eq!(r1.tick_id, TickId(1));
 
         commit.acknowledge_success(1);
 
-        let r2 = driver.process_tick(2, &[], &mut pipeline, &mut commit).unwrap();
+        let r2 = driver
+            .process_tick(2, &[], &mut pipeline, &mut commit)
+            .unwrap();
         assert_eq!(r2.tick_id, TickId(2));
         assert_eq!(commit.pending_tick(), Some(2));
+    }
+
+    #[test]
+    fn pipelined_ticks_without_intermediate_ack() {
+        let driver = TickDriver::new();
+        let mut pipeline = mock_pipeline();
+        let mut commit = CommitAuthority::new();
+
+        // Process two ticks without any ack in between.
+        let r1 = driver
+            .process_tick(1, &[], &mut pipeline, &mut commit)
+            .unwrap();
+        assert_eq!(r1.tick_id, TickId(1));
+
+        let r2 = driver
+            .process_tick(2, &[], &mut pipeline, &mut commit)
+            .unwrap();
+        assert_eq!(r2.tick_id, TickId(2));
+        assert_eq!(commit.in_flight_count(), 2);
+
+        // Ack tick 1 — frees a slot.
+        commit.acknowledge_success(1);
+        assert_eq!(commit.in_flight_count(), 1);
+
+        // Tick 3 can now proceed.
+        let r3 = driver
+            .process_tick(3, &[], &mut pipeline, &mut commit)
+            .unwrap();
+        assert_eq!(r3.tick_id, TickId(3));
     }
 }

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 /// Skill shape taxonomy per spec.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SkillShape {
-    /// Point-blank AoE, auras.
+    /// Point-blank AoE.
     Sphere,
     /// Frontal attacks, blocks.
     Cone,
@@ -20,6 +20,58 @@ pub enum SkillShape {
     LineSweep,
     /// Persistent ground effects.
     HazardZone,
+}
+
+/// How the server validates and resolves the client's targeting intent.
+///
+/// Controls which `AbilityTarget` variants are accepted and what server-side
+/// validation is applied before the cast proceeds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TargetingMode {
+    /// Directional cast. Client should send `Direction(Vec3f)`; `None` falls
+    /// back to the caster's current body facing for non-client callers/tests.
+    #[default]
+    DirectionTarget,
+    /// Explicit single-entity target. Client must send `Entity(u64)`.
+    /// Server validates existence, active state, range, and line of sight.
+    EntityTarget,
+    /// Ground-target reticle. Client must send `Position(Vec3f)`. Server
+    /// validates the position is within `max_range` of the caster and spawns
+    /// the effect at that world position (not entity-parented).
+    GroundTarget,
+    /// Raycast skill-shot — server raycasts from caster along the client's aim
+    /// direction. Must hit a hurtbox within `max_range` or the ability whiffs
+    /// (cooldown not consumed). For backstab, grapple hooks, precise skill-shots.
+    RaycastStrict,
+    /// Aim-assist — soft-lock with cone fallback. Client sends a Direction plus
+    /// optional `target_hint`; server raycasts along the aim direction and, on
+    /// miss, falls back to the nearest valid entity within a soft-lock cone.
+    /// `target_hint` narrows the cone angle and breaks ties, but is never an
+    /// authoritative target override.
+    AimAssist,
+    /// TERA-style lock-on. Activating the ability starts a selection session.
+    /// The client sends `IntentAction::TagTarget` to tag up to `max_targets`
+    /// entities (server validates range + LoS each tag). Re-activating the
+    /// ability fires at all tagged targets; `ReleaseAbility` cancels the session.
+    LockOn { max_targets: u32 },
+    /// Self-cast only — no external target accepted. Used for self-buffs,
+    /// PBAoE centred on caster, stunbreaks.
+    SelfOnly,
+    /// Stationary world placement resolved relative to the caster's cast-time
+    /// origin and facing. Used for front-of-caster hazards without a reticle.
+    CasterOffset,
+}
+
+/// How an accepted cast should orient the caster and snapshot `ctx.facing`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CastFacingPolicy {
+    /// Keep the caster's current body rotation as-is.
+    #[default]
+    PreserveBody,
+    /// Rotate the body toward the resolved aim direction before snapshotting.
+    FaceAimDirection,
+    /// Rotate the body toward the resolved entity/point target before snapshotting.
+    FaceResolvedTarget,
 }
 
 /// Runtime parameters for a single ability cast.
@@ -75,9 +127,9 @@ pub struct ScheduledAbilityAction {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AbilityAction {
     /// Spawn a sensor hitbox on the entity.
-    ///
-    /// `offset` is in entity-local space (forward = +Z). Use Vec3f::ZERO for
-    /// centred effects; use a forward offset for melee/directional attacks.
+    /// `offset` is interpreted in entity-local space (forward = +Z). Whether the
+    /// resulting sensor is entity-parented or stationary in world space depends
+    /// on the resolved targeting mode for the cast.
     SpawnHitbox { shape: SkillShape, offset: game_schema::Vec3f },
     ApplyDamageFrame,
     RemoveHitbox,
@@ -110,6 +162,15 @@ pub enum AbilityAction {
     /// Paired with `StanceBegin` to define a fixed-duration iframe window.
     /// Phase 3 clears `dodge_active` when this action fires.
     StanceEnd,
+    /// Root the caster for an exact number of ticks from this frame.
+    ///
+    /// Implemented by scheduling a `SetMovement` to `Rooted` now and a
+    /// `SetMovement` back to `empty()` at expiry so it composes with other
+    /// root sources without clobbering them.
+    RootForTicks { ticks: u32 },
+    /// Explicitly replace the caster's movement conditions for the remainder of this window.
+    /// Pass `MovementConditions::empty()` to fully clear all conditions.
+    SetMovement { conditions: crate::combat::tactical::MovementConditions },
     /// Launch the caster in a kinematic arc (vault / leap).
     ///
     /// Phase 3 sets `TacticalState::arc_velocity` and roots the caster.
@@ -117,12 +178,70 @@ pub enum AbilityAction {
     /// `move_character`. The arc ends automatically when `MoveResult::grounded`
     /// is true (after the launch tick) or when a `StanceEnd` fires.
     ArcMovement { speed: f32, lift: f32, gravity: f32 },
-    /// Emit a `LockOnWarning` event to the resolved target.
+    /// Emit a `TelegraphWarning` event to the resolved target.
     ///
     /// `impact_delay` is the number of ticks from now until the damage frame lands.
     /// Phase 3 reads the execution context's `ResolvedTargeting` to determine the
     /// target entity — only `Entity` and `LockOn` targeting produce a warning.
     Telegraph { impact_delay: u32 },
+    /// Remove up to `count` oldest Condition debuffs from the caster.
+    ///
+    /// Phase 3 iterates the caster's buffs, collects up to `count` entries with
+    /// `buff_kind == Condition`, removes them, and emits `BuffExpired` for each.
+    /// If any removed debuff had a `cc_effect`, the matching CC timer/bitflag
+    /// is also cleared via `clear_cc_by_effect`.
+    Cleanse { count: u32 },
+    /// Remove a specific CC type from the caster (e.g. Arise = ClearCC { Knockdown }).
+    ///
+    /// Phase 3 finds the first debuff with matching `cc_effect`, removes it,
+    /// and clears the corresponding CC timer/bitflag.
+    ClearCC { cc_effect: game_schema::CCEffect },
+    /// Break free of ALL active CC effects on the caster (self-only).
+    ///
+    /// Phase 3 clears every CC timer/bitflag + matching debuffs,
+    /// then applies a short stability buff (buff 401).
+    Stunbreak,
+    /// Teleport the caster directly behind the resolved entity target.
+    ///
+    /// Reads `ResolvedTargeting::Entity { target }` from the execution context.
+    /// Destination: `target_position - target_facing * distance`.
+    /// No-op if the execution context has no entity target.
+    TeleportBehindTarget { distance: f32 },
+    /// Teleport the caster forward along their cast-time facing.
+    ///
+    /// Raycasts from the caster's current position along `ctx.facing` up to
+    /// `distance` against environment-only geometry (entities are ignored).
+    /// If a wall is hit, stops at `hit_point - facing * 0.3`; otherwise
+    /// travels the full distance. Emits `Teleported` event.
+    TeleportForward { distance: f32 },
+}
+
+impl AbilityAction {
+    /// Short label used in logs and audit traces. Zero-cost: the compiler
+    /// replaces each call with the appropriate string literal.
+    /// Add one arm here whenever a new variant is introduced — this is the only
+    /// place that needs updating for logging to stay accurate.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::SpawnHitbox { .. }        => "SpawnHitbox",
+            Self::ApplyDamageFrame          => "ApplyDamageFrame",
+            Self::RemoveHitbox              => "RemoveHitbox",
+            Self::CooldownStart { .. }      => "CooldownStart",
+            Self::OpenFollowUpWindow { .. } => "OpenFollowUpWindow",
+            Self::ApplyBuff { .. }          => "ApplyBuff",
+            Self::StanceBegin { .. }        => "StanceBegin",
+            Self::StanceEnd                 => "StanceEnd",
+            Self::RootForTicks { .. }       => "RootForTicks",
+            Self::SetMovement { .. }        => "SetMovement",
+            Self::Telegraph { .. }          => "Telegraph",
+            Self::ArcMovement { .. }        => "ArcMovement",
+            Self::Cleanse { .. }            => "Cleanse",
+            Self::ClearCC { .. }            => "ClearCC",
+            Self::Stunbreak                 => "Stunbreak",
+            Self::TeleportBehindTarget { .. } => "TeleportBehindTarget",
+            Self::TeleportForward { .. }    => "TeleportForward",
+        }
+    }
 }
 
 /// Per-entity scheduled action for the ability scheduler.
@@ -207,10 +326,91 @@ pub struct AbilityData {
     /// The last tier's `min_ticks` is the auto-release threshold.
     #[serde(default)]
     pub charge_tiers: Option<Vec<ChargeTierDef>>,
+    /// If true (default), charging roots the caster until release.
+    /// If false, the caster can move while charging.
+    #[serde(default = "default_charge_roots_while_charging")]
+    pub charge_roots_while_charging: bool,
     /// Tick interval between periodic re-damage for lingering area effects (HazardZone).
     /// 0 = single-hit only (default). e.g. 20 = re-damage every 20 ticks (1 second at 20 Hz).
     #[serde(default)]
     pub damage_interval_ticks: u32,
+    /// If true, projectiles pass through targets and can hit multiple entities.
+    /// Default false (single-target: removed on first hit).
+    #[serde(default)]
+    pub pierce: bool,
+    /// Pull impulse toward the attacker on hit. 0.0 = none.
+    /// Direction is computed as target→attacker at hit time.
+    /// Injects a displacement arc; any stun/knockdown on the same ability
+    /// is stored as arc recovery (applied on landing).
+    #[serde(default)]
+    pub pull_force: f32,
+    /// Upward launch lift applied to target on hit. 0.0 = none.
+    /// Injects an upward arc with FLOATING condition; on landing,
+    /// applies recovery CC from `launch_recovery_ticks` (as knockdown)
+    /// or from `stun_ticks`/`knockdown_ticks` if present.
+    #[serde(default)]
+    pub launch_lift: f32,
+    /// Recovery ticks of KNOCKED_DOWN after landing from a launch.
+    /// Only meaningful when `launch_lift > 0`. Default: 0.
+    #[serde(default)]
+    pub launch_recovery_ticks: u32,
+    /// Stun duration in ticks. When combined with an arc CC (knockback,
+    /// pull, launch), becomes arc-recovery stun applied on landing.
+    /// Standalone: sets STUNNED condition immediately for the duration.
+    #[serde(default)]
+    pub stun_ticks: u32,
+    /// Knockdown duration in ticks. When combined with an arc CC,
+    /// becomes arc-recovery knockdown applied on landing.
+    /// Standalone: sets KNOCKED_DOWN condition immediately.
+    #[serde(default)]
+    pub knockdown_ticks: u32,
+    /// Sleep duration in ticks applied to target on hit. 0 = none.
+    /// Sets SLEEPING condition; broken by incoming damage.
+    /// Stability does NOT absorb sleep.
+    #[serde(default)]
+    pub sleep_ticks: u32,
+    /// Silence duration in ticks applied to target on hit. 0 = none.
+    /// Sets SILENCED condition; entity can move/jump/block but not cast abilities.
+    #[serde(default)]
+    pub silence_ticks: u32,
+    /// Fear duration in ticks applied to target on hit. 0 = none.
+    /// Sets FEARED condition; entity is forced to move away from the attacker.
+    #[serde(default)]
+    pub fear_ticks: u32,
+    /// If true, this ability can be used while the caster is CC-disabled
+    /// (stunned, knocked down, floating). Enables stunbreak and future
+    /// downed-state abilities.
+    #[serde(default)]
+    pub usable_while_cc: bool,
+    /// Server-side targeting validation mode. Determines which `AbilityTarget`
+    /// variants are accepted and what validation is applied before the cast.
+    /// Default: `DirectionTarget`.
+    #[serde(default)]
+    pub targeting_mode: TargetingMode,
+    /// Cast-time facing policy. Controls whether the worker rotates the caster
+    /// internally before capturing `AbilityExecutionContext::facing`.
+    #[serde(default)]
+    pub cast_facing_policy: CastFacingPolicy,
+    /// Projectile speed in units per tick. `None` = default 1.0 (20 units/sec at 20 Hz).
+    /// Lower values create slow-moving projectiles entities can sidestep or walk into.
+    #[serde(default)]
+    pub projectile_speed: Option<f32>,
+    /// Maximum range for ground-target placement, raycast validation, and projectile
+    /// travel distance. `None` = default 30.0 units.
+    #[serde(default)]
+    pub max_range: Option<f32>,
+    /// Lock-on session timeout in ticks. Applies to `TargetingMode::LockOn` only.
+    /// If the player does not re-activate the ability within this many ticks after
+    /// starting a session, the session is automatically cancelled (no cooldown).
+    /// `None` = default 400 ticks (20 s at 20 Hz).
+    #[serde(default)]
+    pub lock_on_timeout_ticks: Option<u32>,
+    /// Per-ability cap on lag compensation rewind depth.
+    /// `None` = use the global `TickConfig::global_max_rewind_ticks` (default 4).
+    /// Lower values reduce the compensation window for skills that don't need it
+    /// (e.g. melee AoE). Higher values extend it for precise skill-shots (capped by global).
+    #[serde(default)]
+    pub max_rewind_ticks: Option<u32>,
 }
 
 /// Registry of all known abilities, keyed by ability_id.
@@ -218,6 +418,10 @@ pub struct AbilityData {
 pub struct AbilityRegistry {
     abilities: HashMap<u32, AbilityData>,
     timelines: HashMap<u32, AbilityTimeline>,
+}
+
+fn default_charge_roots_while_charging() -> bool {
+    true
 }
 
 impl AbilityRegistry {
@@ -268,8 +472,12 @@ pub enum ResolvedTargeting {
     Position { point: Vec3f },
     /// Normalised direction (cones, line sweeps).
     Direction { dir: Vec3f },
-    /// Lock-on acquired target — re-validated at execution time.
-    LockOn { target: EntityId },
+    /// Stationary caster-relative placement resolved from cast-time origin/facing.
+    CasterOffset,
+    /// Multi-target lock-on: list of targets validated at tag time, re-validated at fire time.
+    /// Replaces the old single-target `LockOn` variant. At fire time, invalid targets
+    /// (out of range or LoS) are skipped and emit `LockOnCanceled`; valid ones are damaged.
+    MultiLockOn { targets: Vec<EntityId> },
 }
 
 /// Runtime record for one specific cast of an ability.
@@ -291,7 +499,7 @@ pub struct AbilityExecutionContext {
     pub targeting: ResolvedTargeting,
     /// Caster world position at cast time.
     pub origin: Vec3f,
-    /// Caster facing direction (XZ-plane, unit length) at cast time.
+    /// Cast snapshot direction at cast time.
     pub facing: Vec3f,
     /// Runtime parameters for this cast (charge tier, etc.).
     /// Resolved in Phase 2 from intent data.
@@ -359,4 +567,19 @@ impl AbilityExecutionStore {
     pub fn is_empty(&self) -> bool {
         self.active.is_empty()
     }
+}
+
+// ── On-disk format ──────────────────────────────────────────
+
+/// On-disk serialization format for `data/abilities.ron`.
+///
+/// Both `AbilityData` and `AbilityTimeline` already derive `serde::Deserialize`,
+/// so any crate with `ron` in its deps can parse the file directly:
+/// ```ignore
+/// let file = ron::from_str::<AbilityFile>(include_str!("../../../../data/abilities.ron"))?;
+/// ```
+#[derive(serde::Deserialize)]
+pub struct AbilityFile {
+    pub abilities: Vec<AbilityData>,
+    pub timelines: Vec<AbilityTimeline>,
 }

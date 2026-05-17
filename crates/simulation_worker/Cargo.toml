@@ -2,6 +2,7 @@
 name = "simulation_worker"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [features]
 # Enable the "connected" feature to build the coordinator.

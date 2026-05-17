@@ -109,7 +109,8 @@ fn subscribe(ctx: &DbConnection) {
         .subscribe([
             "SELECT * FROM my_region",
             "SELECT * FROM nearby_transforms",
-            "SELECT * FROM entity",
+            "SELECT * FROM nearby_health",
+            "SELECT * FROM nearby_entities",
         ]);
 }
 

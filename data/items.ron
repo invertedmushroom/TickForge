@@ -24,6 +24,7 @@
                 damage_out: 0.0,
                 damage_in: 0.0,
                 cooldown_reduce: 0.0,
+                cc_duration_reduce: 0.0,
             ),
         ),
         (
@@ -36,6 +37,7 @@
                 damage_out: 0.0,
                 damage_in: -0.05,
                 cooldown_reduce: 0.0,
+                cc_duration_reduce: 0.0,
             ),
         ),
         (
@@ -48,6 +50,7 @@
                 damage_out: 0.0,
                 damage_in: -0.10,
                 cooldown_reduce: 0.0,
+                cc_duration_reduce: 0.0,
             ),
         ),
         (
@@ -60,6 +63,7 @@
                 damage_out: 0.0,
                 damage_in: 0.0,
                 cooldown_reduce: 0.0,
+                cc_duration_reduce: 0.0,
             ),
         ),
         (
@@ -72,6 +76,7 @@
                 damage_out: 0.10,
                 damage_in: 0.0,
                 cooldown_reduce: 0.0,
+                cc_duration_reduce: 0.0,
             ),
         ),
     ],

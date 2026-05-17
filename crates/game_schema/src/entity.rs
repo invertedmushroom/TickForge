@@ -9,6 +9,7 @@ pub enum EntityKind {
     Projectile,
     Hazard,
     Boss,
+    Prop,
 }
 
 /// Entity lifecycle state in the simulation.
