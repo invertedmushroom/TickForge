@@ -25,6 +25,8 @@ impl Plugin for VfxPlugin {
         app.add_event::<BuffAppliedVfxEvent>();
         app.add_event::<TeleportVfxEvent>();
         app.add_event::<TelegraphVfxEvent>();
+        app.add_event::<AreaTelegraphVfxEvent>();
+        app.add_event::<EncounterCueVfxEvent>();
         app.add_systems(
             Update,
             (
@@ -60,6 +62,10 @@ impl Plugin for VfxPlugin {
                 update_teleport_effects,
                 spawn_telegraph_visuals,
                 update_telegraph_visuals,
+                spawn_area_telegraph_visuals,
+                update_area_telegraph_visuals,
+                spawn_encounter_cue_visuals,
+                update_encounter_cue_visuals,
             ),
         );
     }
@@ -1454,5 +1460,171 @@ fn update_telegraph_visuals(
                 Color::srgba(1.0, 0.1, 0.1, alpha),
             );
         }
+    }
+}
+
+#[derive(Event)]
+pub struct AreaTelegraphVfxEvent {
+    pub position: Vec3,
+    pub radius: f32,
+    pub shape: String,
+    pub impact_tick: u64,
+}
+
+#[derive(Component)]
+struct AreaTelegraphVisual {
+    position: Vec3,
+    radius: f32,
+    #[allow(dead_code)]
+    shape: String,
+    impact_tick: u64,
+}
+
+fn spawn_area_telegraph_visuals(
+    mut commands: Commands,
+    mut events: EventReader<AreaTelegraphVfxEvent>,
+) {
+    for ev in events.read() {
+        commands.spawn(AreaTelegraphVisual {
+            position: ev.position,
+            radius: ev.radius,
+            shape: ev.shape.clone(),
+            impact_tick: ev.impact_tick,
+        });
+    }
+}
+
+fn update_area_telegraph_visuals(
+    mut commands: Commands,
+    mut gizmos: Gizmos,
+    tick_counter: Option<Res<crate::spacetime::TickCounter>>,
+    query: Query<(bevy::ecs::entity::Entity, &AreaTelegraphVisual)>,
+) {
+    let current_tick = tick_counter.map(|tc| tc.last_tick).unwrap_or(0);
+
+    for (entity, visual) in query.iter() {
+        if current_tick >= visual.impact_tick {
+            commands.entity(entity).despawn();
+            continue;
+        }
+
+        let ticks_left = visual.impact_tick - current_tick;
+        // Assume 2s (40 ticks) max for standard visual scaling
+        let progress = 1.0 - (ticks_left as f32 / 40.0).clamp(0.0, 1.0);
+
+        let pos = visual.position + Vec3::Y * 0.1;
+        // Draw a ground circle that grows inward (warning ring)
+        let ring_radius = visual.radius * (1.0 + (1.0 - progress) * 0.5);
+        let alpha = 0.3 + progress * 0.7;
+
+        gizmos.circle(
+            Isometry3d::new(pos, Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+            visual.radius,
+            Color::srgba(1.0, 0.2, 0.2, alpha * 0.2), // Faint fill area
+        );
+
+        gizmos.circle(
+            Isometry3d::new(pos, Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+            ring_radius,
+            Color::srgba(1.0, 0.1, 0.1, alpha), // Bright warning ring
+        );
+    }
+}
+
+// ── Encounter Cue Ring Visuals ─────────────────────────────────────────────────
+//
+// EncounterCue shapes are persistent spatial overlays anchored to a boss entity.
+// They follow the anchor entity each frame and expire at a server tick boundary.
+// Used for mechanics like alternating ring buffs where players must track zone
+// boundaries over multiple ticks.
+
+/// Emitted from the combat event poll when an EncounterCue arrives.
+#[derive(Event)]
+pub struct EncounterCueVfxEvent {
+    pub cue_id: String,
+    pub anchor_entity: Option<u64>,
+    pub position: Vec3,
+    pub inner_radius: f32,
+    pub outer_radius: f32,
+    pub expires_at_tick: u64,
+}
+
+/// Marks a live encounter cue ring visual in the world.
+#[derive(Component)]
+struct EncounterCueVisual {
+    cue_id: String,
+    anchor_entity: Option<u64>,
+    position: Vec3,
+    inner_radius: f32,
+    outer_radius: f32,
+    expires_at_tick: u64,
+}
+
+fn spawn_encounter_cue_visuals(
+    mut commands: Commands,
+    mut events: EventReader<EncounterCueVfxEvent>,
+    // Despawn any old visual with the same cue_id before respawning.
+    existing: Query<(bevy::ecs::entity::Entity, &EncounterCueVisual)>,
+) {
+    for ev in events.read() {
+        // Replace any stale visual for the same cue_id.
+        for (entity, vis) in existing.iter() {
+            if vis.cue_id == ev.cue_id {
+                commands.entity(entity).despawn();
+            }
+        }
+        commands.spawn(EncounterCueVisual {
+            cue_id: ev.cue_id.clone(),
+            anchor_entity: ev.anchor_entity,
+            position: ev.position,
+            inner_radius: ev.inner_radius,
+            outer_radius: ev.outer_radius,
+            expires_at_tick: ev.expires_at_tick,
+        });
+    }
+}
+
+fn update_encounter_cue_visuals(
+    mut commands: Commands,
+    mut gizmos: Gizmos,
+    tick_counter: Option<Res<crate::spacetime::TickCounter>>,
+    mut query: Query<(bevy::ecs::entity::Entity, &mut EncounterCueVisual)>,
+    server_entities: Query<(&ServerEntity, &Transform)>,
+) {
+    let current_tick = tick_counter.map(|tc| tc.last_tick).unwrap_or(0);
+
+    for (entity, mut visual) in query.iter_mut() {
+        // Expire when the server tick passes the cue's end.
+        if current_tick > 0 && current_tick >= visual.expires_at_tick {
+            commands.entity(entity).despawn();
+            continue;
+        }
+
+        // Track anchor entity position if present.
+        if let Some(anchor_id) = visual.anchor_entity {
+            if let Some((_, tf)) = server_entities
+                .iter()
+                .find(|(se, _)| se.entity_id == anchor_id)
+            {
+                // Only update XZ; keep Y from the cue's spawn position.
+                visual.position.x = tf.translation.x;
+                visual.position.z = tf.translation.z;
+            }
+        }
+
+        // Fade out during last 20 ticks of lifetime.
+        let ticks_left = visual.expires_at_tick.saturating_sub(current_tick);
+        let alpha = (ticks_left as f32 / 20.0).clamp(0.0, 1.0);
+        // Gold color distinguishes these from red combat telegraphs.
+        let color = Color::srgba(1.0, 0.85, 0.15, 0.7 * alpha.max(0.25));
+
+        let base_pos = visual.position + Vec3::Y * 0.15;
+        let iso = Isometry3d::new(base_pos, Quat::from_rotation_x(std::f32::consts::FRAC_PI_2));
+
+        // Draw inner boundary (if non-zero) and outer boundary.
+        if visual.inner_radius > 0.01 {
+            gizmos.circle(iso, visual.inner_radius, color);
+        }
+        gizmos.circle(iso, visual.outer_radius, color);
     }
 }

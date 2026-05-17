@@ -11,6 +11,8 @@ mod diagnostics;
 #[cfg(feature = "connected")]
 mod dungeon_geometry;
 #[cfg(feature = "connected")]
+mod encounter_cues;
+#[cfg(feature = "connected")]
 mod encounter_panel;
 mod hud;
 #[cfg(feature = "connected")]
@@ -63,6 +65,7 @@ fn main() {
         app.add_plugins(admin::AdminPlugin);
         app.add_plugins(inventory::InventoryPlugin);
         app.add_plugins(instance_panel::InstancePanelPlugin);
+        app.add_plugins(encounter_cues::EncounterCuesPlugin);
         app.add_plugins(encounter_panel::EncounterPanelPlugin);
         app.add_plugins(dungeon_geometry::DungeonGeometryPlugin);
         app.add_plugins(terrain::TerrainPlugin);

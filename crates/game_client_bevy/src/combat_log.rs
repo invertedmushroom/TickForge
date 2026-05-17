@@ -3,18 +3,23 @@ use std::collections::VecDeque;
 
 pub struct CombatLogPlugin;
 
+/// Scheduling label so other plugins can order after the log pollers.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+enum CombatLogSet {
+    Poll,
+}
+
 impl Plugin for CombatLogPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CombatLog>();
         app.add_systems(Startup, spawn_combat_log_panel);
+        // Register the pollers individually (tuple would exceed Bevy's
+        // 16-param SystemParam impl limit for poll_combat_events).
+        app.add_systems(Update, poll_combat_events.in_set(CombatLogSet::Poll));
+        app.add_systems(Update, poll_world_events.in_set(CombatLogSet::Poll));
         app.add_systems(
             Update,
-            (
-                poll_combat_events,
-                poll_world_events,
-                update_combat_log_text,
-            )
-                .chain(),
+            update_combat_log_text.after(CombatLogSet::Poll),
         );
     }
 }
@@ -92,7 +97,14 @@ fn poll_combat_events(
     ),
     mut buff_applied: EventWriter<crate::vfx::BuffAppliedVfxEvent>,
     mut teleported: EventWriter<crate::vfx::TeleportVfxEvent>,
-    mut telegraph: EventWriter<crate::vfx::TelegraphVfxEvent>,
+    mut telegraph_args: (
+        EventWriter<'_, crate::vfx::TelegraphVfxEvent>,
+        EventWriter<'_, crate::vfx::AreaTelegraphVfxEvent>,
+    ),
+    mut encounter_cue_args: (
+        EventWriter<'_, crate::vfx::EncounterCueVfxEvent>,
+        ResMut<'_, crate::encounter_cues::ActiveEncounterCues>,
+    ),
 ) {
     use game_client::module_bindings::*;
 
@@ -288,9 +300,40 @@ fn poll_combat_events(
                 });
             }
             CombatEventKind::TelegraphWarning(w) => {
-                telegraph.send(crate::vfx::TelegraphVfxEvent {
+                telegraph_args.0.send(crate::vfx::TelegraphVfxEvent {
                     target: w.target,
                     impact_tick: w.impact_tick,
+                });
+            }
+            CombatEventKind::AreaTelegraph(a) => {
+                telegraph_args.1.send(crate::vfx::AreaTelegraphVfxEvent {
+                    position: Vec3::new(a.pos_x, a.pos_y, a.pos_z),
+                    radius: a.radius,
+                    shape: a.shape.clone(),
+                    impact_tick: a.impact_tick,
+                });
+            }
+            CombatEventKind::EncounterCue(c) => {
+                let (ref mut encounter_cue, ref mut active_cues) = encounter_cue_args;
+                // Populate the shared resource so the F8 panel can list it.
+                active_cues.insert(crate::encounter_cues::ActiveCueEntry {
+                    cue_id: c.cue_id.clone(),
+                    anchor_entity: c.anchor_entity,
+                    pos: Vec3::new(c.pos_x, c.pos_y, c.pos_z),
+                    inner_radius: c.inner_radius,
+                    outer_radius: c.outer_radius,
+                    half_height: c.half_height,
+                    starts_at_tick: c.starts_at_tick,
+                    expires_at_tick: c.expires_at_tick,
+                });
+                // Send the VFX event for the gizmo ring.
+                encounter_cue.send(crate::vfx::EncounterCueVfxEvent {
+                    cue_id: c.cue_id.clone(),
+                    anchor_entity: c.anchor_entity,
+                    position: Vec3::new(c.pos_x, c.pos_y, c.pos_z),
+                    inner_radius: c.inner_radius,
+                    outer_radius: c.outer_radius,
+                    expires_at_tick: c.expires_at_tick,
                 });
             }
             _ => {}
@@ -588,6 +631,21 @@ fn format_combat_event(
             Color::srgb(0.5, 0.5, 0.5),
         ),
         CombatEventKind::ContactHitboxSpawned(_) => (String::new(), Color::WHITE),
+        CombatEventKind::AreaTelegraph(a) => (
+            format!(
+                "⚠ Ground telegraph at ({:.1}, {:.1}, {:.1}) - radius {:.1}",
+                a.pos_x, a.pos_y, a.pos_z, a.radius
+            ),
+            Color::srgb(1.0, 0.4, 0.0),
+        ),
+        CombatEventKind::EncounterCue(c) => {
+            // Ticks remaining gives a quick sense of the cue's duration.
+            let duration = c.expires_at_tick.saturating_sub(c.starts_at_tick);
+            (
+                format!("✧ Cue active: {} ({}t)", c.cue_id, duration),
+                Color::srgb(1.0, 0.85, 0.15),
+            )
+        }
     }
 }
 

@@ -12,8 +12,9 @@
 //   - VolumeAnchor::FollowBoss tracks the boss every tick.
 //   - Effect::Telegraph emits a real EventPayload::TelegraphWarning event.
 //
-// Built-in mechanic names: "marker" (placeholder; auto-finishes one tick
-// after start).
+// Built-in mechanic names:
+//   "marker" (placeholder; auto-finishes one tick after start)
+//   "timed_volume_pulse" (spawns tagged volumes and emits authored pulse events)
 //
 // Built-in archetype names (data/spawn_rules.ron-adjacent worker registry):
 //   "trash" / "elite" — see crates/simulation_worker/src/tick_pipeline/archetype.rs
@@ -91,7 +92,7 @@
                     id: "swap_kit",
                     when: OnAfter(ticks: 65),
                     cond: Always,
-                    effects: [ReplaceAbilityList(ability_ids: [24, 31])],
+                    effects: [ReplaceAbilityList(ability_ids: [124, 31])],
                     repeat: Once,
                 ),
                 (
@@ -99,8 +100,8 @@
                     when: OnAfter(ticks: 70),
                     cond: Always,
                     effects: [
-                        Telegraph(skill_id: 24, target: TopThreat, lead_ticks: 40),
-                        CastSkill(skill_id: 24, target: TopThreat),
+                        Telegraph(skill_id: 124, target: TopThreat, lead_ticks: 40),
+                        CastSkill(skill_id: 124, target: TopThreat),
                     ],
                     repeat: Once,
                 ),
@@ -139,7 +140,7 @@
         //   • Enrage — HP 0.2 swaps the ability list and pulses an event
         //     every 20 ticks; OnEvent reacts with a CastSkill.
         //
-        // Skill ids: 24 (Fire Patch — single target), 25 (Lava Pool — area).
+        // Skill ids: 124 (Warden Fire Patch), 125 (Warden Lava Pool).
         //
         // Add tagging for OnEntityDied is wired by the worker when
         // `apply_spawn_adds` runs through the SpawnAdds output: every
@@ -172,9 +173,9 @@
                     cond: PhaseIs(phase: Phase1),
                     effects: [
                         Sequence(steps: [
-                            Telegraph(skill_id: 24, target: TopThreat, lead_ticks: 20),
+                            Telegraph(skill_id: 124, target: TopThreat, lead_ticks: 20),
                             Wait(ticks: 20),
-                            CastSkill(skill_id: 24, target: TopThreat),
+                            CastSkill(skill_id: 124, target: TopThreat),
                         ]),
                     ],
                     repeat: EveryNTicks(interval: 180, max_fires: None),
@@ -227,10 +228,10 @@
                     cond: PhaseIs(phase: Phase3),
                     effects: [
                         Sequence(steps: [
-                            Telegraph(skill_id: 25, target: AllPlayers, lead_ticks: 30),
+                            Telegraph(skill_id: 125, target: AllPlayers, lead_ticks: 30),
                             Wait(ticks: 30),
                             Parallel(steps: [
-                                CastSkill(skill_id: 25, target: TopThreat),
+                                CastSkill(skill_id: 125, target: TopThreat),
                                 EmitEncounterEvent(name: "p3_transition_done"),
                             ]),
                         ]),
@@ -251,7 +252,7 @@
                     cond: Always,
                     effects: [
                         ChangePhase(phase: Enrage),
-                        ReplaceAbilityList(ability_ids: [24, 25]),
+                        ReplaceAbilityList(ability_ids: [124, 125]),
                         DespawnVolume(tag: "warden_aura"),
                     ],
                     repeat: Once,
@@ -267,8 +268,264 @@
                     id: "enrage_react",
                     when: OnEvent(event_name: "enrage_pulse"),
                     cond: PhaseIs(phase: Enrage),
-                    effects: [CastSkill(skill_id: 24, target: TopThreat)],
+                    effects: [CastSkill(skill_id: 124, target: TopThreat)],
                     repeat: EveryNTicks(interval: 20, max_fires: None),
+                ),
+            ],
+        ),
+        // ── Manaya's Core composition example ──────────────────
+        //
+        // `timed_volume_pulse` owns only the arena + distance-band volumes
+        // and emits pulse events. Rules below own the boss lock, cue timing,
+        // mark assignment, strict swap validation, failure emission, cleanup,
+        // and wipe composition.
+        //
+        // This demo is tuned for 3 players: one in near, one in mid, one in
+        // far. A solo smoke run should fail the placement rule and enter the
+        // authored wipe path.
+        (
+            name: "manayas_core_demo",
+            rules: [
+                (
+                    id: "trigger_core_phase",
+                    when: OnHpBelow(percent: 0.95),
+                    cond: PhaseIs(phase: Phase1),
+                    effects: [ChangePhase(phase: Phase2)],
+                    repeat: Once,
+                ),
+                (
+                    id: "start_core",
+                    when: OnEvery(ticks: 600),
+                    cond: PhaseIs(phase: Phase2),
+                    effects: [
+                        // Lock the boss and show the rings before the pulse.
+                        // `initial_delay_ticks` below is the positioning
+                        // window; the pulse itself is the resolution point.
+                        ApplyBuff(
+                            target: Boss,
+                            buff_id: 802,
+                            mode: ReplaceAny([802]),
+                        ),
+                        EncounterCue(
+                            target: Boss,
+                            cue_id: "manaya_core_near_ring",
+                            anchor: Boss,
+                            shape: Ring(inner_radius: 0.0, outer_radius: 5.0, half_height: 3.0),
+                            duration_ticks: 120,
+                        ),
+                        EncounterCue(
+                            target: Boss,
+                            cue_id: "manaya_core_mid_ring",
+                            anchor: Boss,
+                            shape: Ring(inner_radius: 5.0, outer_radius: 10.0, half_height: 3.0),
+                            duration_ticks: 120,
+                        ),
+                        EncounterCue(
+                            target: Boss,
+                            cue_id: "manaya_core_far_ring",
+                            anchor: Boss,
+                            shape: Ring(inner_radius: 10.0, outer_radius: 15.0, half_height: 3.0),
+                            duration_ticks: 120,
+                        ),
+                        StartMechanic(
+                            name: "timed_volume_pulse",
+                            params: (
+                                ints: {
+                                    "initial_delay_ticks": 120,
+                                    "pulse_interval_ticks": 120,
+                                },
+                                strings: {
+                                    "first_pulse_event": "core_pulse",
+                                    "pulse_event": "core_pulse",
+                                },
+                                zones: [
+                                    (
+                                        tag: "manaya_core_arena",
+                                        shape: Sphere(radius: 18.0),
+                                        anchor: FollowBoss,
+                                        priority: 0,
+                                        lifetime_ticks: None,
+                                    ),
+                                    (
+                                        tag: "manaya_core_near",
+                                        shape: Ring(inner_radius: 0.0, outer_radius: 5.0, half_height: 3.0),
+                                        anchor: FollowBoss,
+                                        priority: 10,
+                                        lifetime_ticks: None,
+                                    ),
+                                    (
+                                        tag: "manaya_core_mid",
+                                        shape: Ring(inner_radius: 5.0, outer_radius: 10.0, half_height: 3.0),
+                                        anchor: FollowBoss,
+                                        priority: 20,
+                                        lifetime_ticks: None,
+                                    ),
+                                    (
+                                        tag: "manaya_core_far",
+                                        shape: Ring(inner_radius: 10.0, outer_radius: 15.0, half_height: 3.0),
+                                        anchor: FollowBoss,
+                                        priority: 30,
+                                        lifetime_ticks: None,
+                                    ),
+                                ],
+                            ),
+                        ),
+                    ],
+                    repeat: EveryNTicks(interval: 600, max_fires: None),
+                ),
+                (
+                    id: "core_pulse_cleanup",
+                    when: OnEvent(event_name: "core_pulse"),
+                    cond: Always,
+                    effects: [
+                        // The shipped demo uses one pulse per core window.
+                        // Remove this stop rule for continuous pulses driven
+                        // by `pulse_interval_ticks`.
+                        StopMechanic(name: "timed_volume_pulse"),
+                        RemoveBuffs(target: Boss, buff_ids: [802], force: true),
+                    ],
+                    repeat: EveryNTicks(interval: 1, max_fires: None),
+                ),
+                (
+                    id: "core_swap_failed",
+                    when: OnEvent(event_name: "core_pulse"),
+                    cond: Not(cond: Any(conds: [
+                        All(conds: [
+                            CounterCmp(name: "core_mechanic_count", op: Eq, value: 0),
+                            OccupancyCmp(tag: "manaya_core_near", op: Eq, count: 1),
+                            OccupancyCmp(tag: "manaya_core_mid", op: Eq, count: 1),
+                            OccupancyCmp(tag: "manaya_core_far", op: Eq, count: 1),
+                            VolumeOccupantsExactlyOneOf(
+                                source_tag: "manaya_core_arena",
+                                member_tags: ["manaya_core_near", "manaya_core_mid", "manaya_core_far"],
+                            ),
+                        ]),
+                        All(conds: [
+                            CounterCmp(name: "core_mechanic_count", op: Ge, value: 1),
+                            OccupancyCmp(tag: "manaya_core_near", op: Eq, count: 1),
+                            OccupancyCmp(tag: "manaya_core_mid", op: Eq, count: 1),
+                            OccupancyCmp(tag: "manaya_core_far", op: Eq, count: 1),
+                            VolumeOccupantsExactlyOneOf(
+                                source_tag: "manaya_core_arena",
+                                member_tags: ["manaya_core_near", "manaya_core_mid", "manaya_core_far"],
+                            ),
+                            Any(conds: [
+                                AllVolumeOccupantsHaveBuff(tag: "manaya_core_near", buff_id: 803),
+                                AllVolumeOccupantsHaveBuff(tag: "manaya_core_near", buff_id: 801),
+                            ]),
+                            Any(conds: [
+                                AllVolumeOccupantsHaveBuff(tag: "manaya_core_mid", buff_id: 800),
+                                AllVolumeOccupantsHaveBuff(tag: "manaya_core_mid", buff_id: 801),
+                            ]),
+                            Any(conds: [
+                                AllVolumeOccupantsHaveBuff(tag: "manaya_core_far", buff_id: 800),
+                                AllVolumeOccupantsHaveBuff(tag: "manaya_core_far", buff_id: 803),
+                            ]),
+                        ]),
+                    ])),
+                    effects: [EmitEncounterEvent(name: "manaya_core_failed")],
+                    repeat: EveryNTicks(interval: 1, max_fires: None),
+                ),
+                (
+                    id: "core_first_application",
+                    when: OnEvent(event_name: "core_pulse"),
+                    cond: All(conds: [
+                        CounterCmp(name: "core_mechanic_count", op: Eq, value: 0),
+                        OccupancyCmp(tag: "manaya_core_near", op: Eq, count: 1),
+                        OccupancyCmp(tag: "manaya_core_mid", op: Eq, count: 1),
+                        OccupancyCmp(tag: "manaya_core_far", op: Eq, count: 1),
+                        VolumeOccupantsExactlyOneOf(
+                            source_tag: "manaya_core_arena",
+                            member_tags: ["manaya_core_near", "manaya_core_mid", "manaya_core_far"],
+                        ),
+                    ]),
+                    effects: [
+                        ApplyBuff(
+                            target: VolumeOccupants(tag: "manaya_core_near"),
+                            buff_id: 800,
+                            mode: ReplaceAny([800, 801, 803]),
+                        ),
+                        ApplyBuff(
+                            target: VolumeOccupants(tag: "manaya_core_mid"),
+                            buff_id: 803,
+                            mode: ReplaceAny([800, 801, 803]),
+                        ),
+                        ApplyBuff(
+                            target: VolumeOccupants(tag: "manaya_core_far"),
+                            buff_id: 801,
+                            mode: ReplaceAny([800, 801, 803]),
+                        ),
+                        IncrementCounter(name: "core_mechanic_count", delta: 1),
+                    ],
+                    repeat: EveryNTicks(interval: 1, max_fires: None),
+                ),
+                (
+                    id: "core_swap_success",
+                    when: OnEvent(event_name: "core_pulse"),
+                    cond: All(conds: [
+                        CounterCmp(name: "core_mechanic_count", op: Ge, value: 1),
+                        OccupancyCmp(tag: "manaya_core_near", op: Eq, count: 1),
+                        OccupancyCmp(tag: "manaya_core_mid", op: Eq, count: 1),
+                        OccupancyCmp(tag: "manaya_core_far", op: Eq, count: 1),
+                        VolumeOccupantsExactlyOneOf(
+                            source_tag: "manaya_core_arena",
+                            member_tags: ["manaya_core_near", "manaya_core_mid", "manaya_core_far"],
+                        ),
+                        Any(conds: [
+                            AllVolumeOccupantsHaveBuff(tag: "manaya_core_near", buff_id: 803),
+                            AllVolumeOccupantsHaveBuff(tag: "manaya_core_near", buff_id: 801),
+                        ]),
+                        Any(conds: [
+                            AllVolumeOccupantsHaveBuff(tag: "manaya_core_mid", buff_id: 800),
+                            AllVolumeOccupantsHaveBuff(tag: "manaya_core_mid", buff_id: 801),
+                        ]),
+                        Any(conds: [
+                            AllVolumeOccupantsHaveBuff(tag: "manaya_core_far", buff_id: 800),
+                            AllVolumeOccupantsHaveBuff(tag: "manaya_core_far", buff_id: 803),
+                        ]),
+                    ]),
+                    effects: [
+                        ApplyBuff(
+                            target: VolumeOccupants(tag: "manaya_core_near"),
+                            buff_id: 800,
+                            mode: ReplaceAny([800, 801, 803]),
+                        ),
+                        ApplyBuff(
+                            target: VolumeOccupants(tag: "manaya_core_mid"),
+                            buff_id: 803,
+                            mode: ReplaceAny([800, 801, 803]),
+                        ),
+                        ApplyBuff(
+                            target: VolumeOccupants(tag: "manaya_core_far"),
+                            buff_id: 801,
+                            mode: ReplaceAny([800, 801, 803]),
+                        ),
+                        IncrementCounter(name: "core_mechanic_count", delta: 1),
+                    ],
+                    repeat: EveryNTicks(interval: 1, max_fires: None),
+                ),
+                (
+                    id: "core_failed_wipe",
+                    when: OnEvent(event_name: "manaya_core_failed"),
+                    cond: Always,
+                    effects: [
+                        ChangePhase(phase: Custom("Wipe")),
+                        RemoveBuffs(target: AllPlayers, buff_ids: [800, 801, 803], force: true),
+                        EncounterCue(
+                            target: Boss,
+                            cue_id: "manaya_core_failed",
+                            anchor: Boss,
+                            shape: Ring(inner_radius: 0.0, outer_radius: 15.0, half_height: 3.0),
+                            duration_ticks: 30,
+                        ),
+                        Sequence(steps: [
+                            Telegraph(skill_id: 125, target: AllPlayers, lead_ticks: 30),
+                            Wait(ticks: 30),
+                            CastSkill(skill_id: 125, target: AllPlayers),
+                            RemoveBuffs(target: Boss, buff_ids: [802], force: true),
+                        ]),
+                    ],
+                    repeat: Once,
                 ),
             ],
         ),

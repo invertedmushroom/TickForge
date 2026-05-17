@@ -173,5 +173,44 @@
                 stealth: Some(true),
             ),
         ),
+
+        // ── Manaya's Core mechanic-locked marks (ids 800+) ─────────────
+
+        (
+            buff_id: 800,
+            name: "Core Near Mark",
+            buff_kind: Condition,
+            duration_ticks: None,
+            max_stacks: 1,
+            removal_policy: MechanicLocked,
+        ),
+        (
+            buff_id: 801,
+            name: "Core Far Mark",
+            buff_kind: Condition,
+            duration_ticks: None,
+            max_stacks: 1,
+            removal_policy: MechanicLocked,
+        ),
+        (
+            buff_id: 802,
+            name: "Core Boss Lock",
+            buff_kind: Boon,
+            duration_ticks: None,
+            max_stacks: 1,
+            removal_policy: MechanicLocked,
+            modifiers: (
+                ai_override: Some(ForceIdle),
+                root: Some(true),
+            ),
+        ),
+        (
+            buff_id: 803,
+            name: "Core Mid Mark",
+            buff_kind: Condition,
+            duration_ticks: None,
+            max_stacks: 1,
+            removal_policy: MechanicLocked,
+        ),
     ],
 )

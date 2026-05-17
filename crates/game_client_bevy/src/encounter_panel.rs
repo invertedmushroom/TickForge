@@ -2,7 +2,8 @@ use bevy::prelude::*;
 use game_client::module_bindings::*;
 use spacetimedb_sdk::Table;
 
-use crate::spacetime::{LocalPlayerEntity, StdbConnection};
+use crate::spacetime::{LocalPlayerEntity, StdbConnection, TickCounter};
+use crate::encounter_cues::ActiveEncounterCues;
 
 /// Legacy F8 debug panel for boss/encounter visibility.
 ///
@@ -66,6 +67,8 @@ fn update_encounter_panel(
     vis_state: Res<EncounterPanelVisible>,
     stdb: Option<Res<StdbConnection>>,
     local_player: Res<LocalPlayerEntity>,
+    active_cues: Res<ActiveEncounterCues>,
+    tick_counter: Option<Res<TickCounter>>,
     mut query: Query<&mut Text, With<EncounterPanel>>,
 ) {
     if !vis_state.0 {
@@ -247,6 +250,30 @@ fn update_encounter_panel(
                     zc.layer, zc.region_x, zc.region_z, zc.counter_name, zc.value
                 ));
             }
+        }
+    }
+
+    // ── Active encounter cues ──────────────────────────────
+    let current_tick = tick_counter.map(|tc| tc.last_tick).unwrap_or(0);
+    if !active_cues.cues.is_empty() {
+        lines.push(String::new());
+        lines.push(format!("Encounter Cues ({}):", active_cues.cues.len()));
+        let mut sorted: Vec<_> = active_cues.cues.values().collect();
+        sorted.sort_by(|a, b| a.cue_id.cmp(&b.cue_id));
+        for cue in sorted {
+            let ticks_left = cue.expires_at_tick.saturating_sub(current_tick);
+            let anchor_str = match cue.anchor_entity {
+                Some(id) => format!("#{id}"),
+                None => "fixed".to_string(),
+            };
+            lines.push(format!(
+                "  ✧ {} r={:.0}-{:.0}m anch={} -{:.1}s",
+                cue.cue_id,
+                cue.inner_radius,
+                cue.outer_radius,
+                anchor_str,
+                ticks_left as f32 / 20.0,
+            ));
         }
     }
 

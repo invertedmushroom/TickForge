@@ -214,6 +214,29 @@
             threat_multiplier: 1.2,
             targeting_mode: CasterOffset,
         ),
+        // Boss-only version of Fire Patch; uses the same shape/timeline idea
+        // as ability 24 but is balanced and reserved for encounter scripts.
+        (
+            ability_id: 124,
+            name: "Warden Fire Patch",
+            base_damage: 18.0,
+            damage_type: Magical,
+            shape: HazardZone,
+            threat_multiplier: 1.5,
+            targeting_mode: GroundTarget,
+            cast_facing_policy: PreserveBody,
+            max_range: Some(30.0),
+        ),
+        // Boss-only version of Lava Pool, placed in front of the caster.
+        (
+            ability_id: 125,
+            name: "Warden Lava Pool",
+            base_damage: 14.0,
+            damage_type: Magical,
+            shape: HazardZone,
+            threat_multiplier: 1.2,
+            targeting_mode: CasterOffset,
+        ),
 
         (
             ability_id: 60,
@@ -523,6 +546,42 @@
                 (tick_offset: 1, action: ApplyDamageFrame),
                 // Hazard zone stays armed for 100 ticks; periodic re-damage fires every 10 ticks
                 (tick_offset: 500, action: RemoveHitbox),
+            ],
+        ),
+        (
+            ability_id: 124,
+            actions: [
+                // Warden Fire Patch: ground-targeted hazard zone, lingers for 120 ticks (6 s)
+                (tick_offset: 0, action: SpawnConfiguredHitbox(
+                    shape: HazardZone,
+                    offset: (x: 0.0, y: 0.0, z: 0.0),
+                    effect: None,
+                    rules: Some((
+                        allow_reentry: true,
+                        damage_interval_ticks: 10,
+                    )),
+                )),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 160)),
+                (tick_offset: 1, action: ApplyDamageFrame),
+                (tick_offset: 120, action: RemoveHitbox),
+            ],
+        ),
+        (
+            ability_id: 125,
+            actions: [
+                // Warden Lava Pool: spawned 6 m in front of caster via CasterOffset.
+                (tick_offset: 0, action: SpawnConfiguredHitbox(
+                    shape: HazardZone,
+                    offset: (x: 0.0, y: 0.0, z: 6.0),
+                    effect: None,
+                    rules: Some((
+                        allow_reentry: true,
+                        damage_interval_ticks: 10,
+                    )),
+                )),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 100)),
+                (tick_offset: 1, action: ApplyDamageFrame),
+                (tick_offset: 100, action: RemoveHitbox),
             ],
         ),
 

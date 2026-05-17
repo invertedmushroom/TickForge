@@ -31,6 +31,7 @@ impl Plugin for SyncPlugin {
                 sync_health_bars,
                 sync_name_tags,
                 sync_target_lock_indicator,
+                sync_aggro_indicator,
                 sync_npc_state_color,
                 sync_interactables,
             )
@@ -915,6 +916,64 @@ fn sync_target_lock_indicator(
             TargetLockRing,
         ));
     });
+}
+
+// ── Aggro indicator ──────────────────────────────────────────────────
+
+#[derive(Component)]
+pub struct AggroIndicator;
+
+fn sync_aggro_indicator(
+    stdb: Option<Res<StdbConnection>>,
+    mut commands: Commands,
+    entity_map: Res<EntityMap>,
+    existing_indicators: Query<bevy::ecs::entity::Entity, With<AggroIndicator>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let Some(stdb) = stdb else { return };
+
+    // Clean up old indicators.
+    for indicator in existing_indicators.iter() {
+        commands.entity(indicator).despawn();
+    }
+
+    // Collect unique entities currently targeted by any NPC in combat.
+    let mut aggroed_ids = bevy::utils::HashSet::new();
+    for npc in stdb.conn.db.npc_state().iter() {
+        if npc.ai_state == NpcAiState::Combat {
+            if let Some(target_id) = npc.target_entity {
+                aggroed_ids.insert(target_id);
+            }
+        }
+    }
+
+    if aggroed_ids.is_empty() {
+        return;
+    }
+
+    // Reuse ring assets logic.
+    let ring_mesh = meshes.add(Torus::new(0.4, 0.55));
+    let ring_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(1.0, 0.8, 0.0, 0.5), // Yellow-orange
+        emissive: LinearRgba::new(2.5, 1.5, 0.0, 1.0), // Bright glow
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        ..default()
+    });
+
+    for &target_id in aggroed_ids.iter() {
+        if let Some(&bevy_entity) = entity_map.map.get(&target_id) {
+            commands.entity(bevy_entity).with_children(|parent| {
+                parent.spawn((
+                    Mesh3d(ring_mesh.clone()),
+                    MeshMaterial3d(ring_mat.clone()),
+                    Transform::from_xyz(0.0, -0.45, 0.0), // Slightly lower than TargetLockRing
+                    AggroIndicator,
+                ));
+            });
+        }
+    }
 }
 
 // ── NPC AI state color ──────────────────────────────────────────────

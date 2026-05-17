@@ -119,6 +119,73 @@ fn ud_stamp(user_data: u128, entity_id: EntityId, kind: &ColliderKind) -> u128 {
     ud_set_entity_id(ud_set_kind(user_data, kind), entity_id)
 }
 
+/// Active-hooks flag bundle stamped on every entity/environment collider so
+/// the layer-aware `PhysicsHooks` impl below is invoked for both solid
+/// contacts and sensor intersections.
+const LAYER_HOOKS: ActiveHooks = ActiveHooks::FILTER_CONTACT_PAIRS
+    .union(ActiveHooks::FILTER_INTERSECTION_PAIR);
+
+/// `PhysicsHooks` impl that enforces strict same-layer contact/intersection
+/// at the solver level.
+///
+/// Layer isolation is encoded in the low 32 bits of each collider's
+/// `user_data` via `ud_set_layer` / `ud_layer`. KCC scene queries already
+/// filter on this via a `QueryFilter` predicate, but the Rapier solver
+/// (broad-phase → narrow-phase → impulse resolution) does **not** consult
+/// `user_data` on its own. Without this hook, a layer-101 kinematic
+/// capsule would still resolve contacts against a layer-100 dynamic prop
+/// box and push it around / rest on top of it.
+///
+/// Strict equality matches the layer-isolation contract: layer 0 is the
+/// shared open-world layer (entities authored on layer 0 only see layer-0
+/// geometry), and layer N>0 instances are local. There is no "shared
+/// across all layers" entity.
+///
+/// For the hook to fire, both colliders involved in a pair must opt in
+/// via `ActiveHooks::FILTER_CONTACT_PAIRS` (solid pairs) and/or
+/// `ActiveHooks::FILTER_INTERSECTION_PAIR` (sensor pairs). Every entity
+/// body, environment collider, hurtbox, hitbox, volume, and world sensor
+/// built below stamps `LAYER_HOOKS` (both flags) so the filter applies
+/// uniformly.
+struct LayerContactFilter;
+
+impl PhysicsHooks for LayerContactFilter {
+    fn filter_contact_pair(&self, ctx: &PairFilterContext) -> Option<SolverFlags> {
+        let l1 = ctx
+            .colliders
+            .get(ctx.collider1)
+            .map(|c| ud_layer(c.user_data))
+            .unwrap_or(0);
+        let l2 = ctx
+            .colliders
+            .get(ctx.collider2)
+            .map(|c| ud_layer(c.user_data))
+            .unwrap_or(0);
+        if l1 == l2 {
+            Some(SolverFlags::COMPUTE_IMPULSES)
+        } else {
+            None
+        }
+    }
+
+    fn filter_intersection_pair(&self, ctx: &PairFilterContext) -> bool {
+        let l1 = ctx
+            .colliders
+            .get(ctx.collider1)
+            .map(|c| ud_layer(c.user_data))
+            .unwrap_or(0);
+        let l2 = ctx
+            .colliders
+            .get(ctx.collider2)
+            .map(|c| ud_layer(c.user_data))
+            .unwrap_or(0);
+        l1 == l2
+    }
+}
+
+/// Stateless singleton — no per-frame state, safe to construct on each step.
+const LAYER_CONTACT_FILTER: LayerContactFilter = LayerContactFilter;
+
 /// Wraps the full Rapier physics simulation state.
 ///
 /// This is the long-lived physics world owned by the simulation worker.
@@ -276,7 +343,7 @@ impl PhysicsWorld {
             &mut self.impulse_joints,
             &mut self.multibody_joints,
             &mut self.ccd_solver,
-            &(),
+            &LAYER_CONTACT_FILTER,
             &event_handler,
         );
     }
@@ -373,6 +440,7 @@ impl PhysicsWorld {
                     | ActiveCollisionTypes::KINEMATIC_FIXED
                     | ActiveCollisionTypes::DYNAMIC_FIXED,
             )
+            .active_hooks(LAYER_HOOKS)
             .build();
         // Parentless collider — fixed in world space, no rigid body needed.
         self.colliders.insert(collider)
@@ -401,6 +469,7 @@ impl PhysicsWorld {
             .restitution(0.3)
             .collision_groups(groups)
             .active_events(ActiveEvents::COLLISION_EVENTS)
+            .active_hooks(LAYER_HOOKS)
             .user_data(ud_stamp(0, entity_id, &ColliderKind::Body))
             .build();
         let ch = self
@@ -413,6 +482,7 @@ impl PhysicsWorld {
             .sensor(true)
             .collision_groups(collision_groups::skill_hurtbox_groups())
             .active_events(ActiveEvents::COLLISION_EVENTS)
+            .active_hooks(LAYER_HOOKS)
             .user_data(ud_stamp(0, entity_id, &ColliderKind::Hurtbox))
             .build();
         let hch = self
@@ -446,6 +516,7 @@ impl PhysicsWorld {
             .density(density)
             .collision_groups(groups)
             .active_events(ActiveEvents::COLLISION_EVENTS)
+            .active_hooks(LAYER_HOOKS)
             .user_data(ud_stamp(0, entity_id, &ColliderKind::Body))
             .build();
         let ch = self
@@ -458,6 +529,7 @@ impl PhysicsWorld {
             .sensor(true)
             .collision_groups(collision_groups::skill_hurtbox_groups())
             .active_events(ActiveEvents::COLLISION_EVENTS)
+            .active_hooks(LAYER_HOOKS)
             .user_data(ud_stamp(0, entity_id, &ColliderKind::Hurtbox))
             .build();
         let hch = self
@@ -498,6 +570,7 @@ impl PhysicsWorld {
             .collision_groups(groups)
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .active_collision_types(active_types)
+            .active_hooks(LAYER_HOOKS)
             .user_data(ud_stamp(0, entity_id, &ColliderKind::Body))
             .build();
         let ch = self
@@ -512,6 +585,7 @@ impl PhysicsWorld {
             .collision_groups(collision_groups::skill_hurtbox_groups())
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .active_collision_types(active_types)
+            .active_hooks(LAYER_HOOKS)
             .user_data(ud_stamp(0, entity_id, &ColliderKind::Hurtbox))
             .build();
         let hch = self
@@ -551,6 +625,7 @@ impl PhysicsWorld {
             .collision_groups(groups)
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .active_collision_types(active_types)
+            .active_hooks(LAYER_HOOKS)
             .user_data(ud_stamp(base, entity_id, &kind))
             .build();
         let handle = self
@@ -1000,6 +1075,7 @@ impl PhysicsBackend for PhysicsWorld {
             .collision_groups(groups)
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .active_collision_types(active_types)
+            .active_hooks(LAYER_HOOKS)
             .user_data(ud_stamp(base, owner, &kind))
             .build();
         // Insert without a parent body — collider is free-standing in world space.
@@ -1133,6 +1209,7 @@ impl PhysicsBackend for PhysicsWorld {
                     | ActiveCollisionTypes::DYNAMIC_KINEMATIC
                     | ActiveCollisionTypes::DYNAMIC_FIXED,
             )
+            .active_hooks(LAYER_HOOKS)
             .user_data(ud_stamp(0, entity_id, &ColliderKind::Body))
             .build();
         let ch = self
@@ -2468,5 +2545,100 @@ mod tests {
         world.remove_environment_colliders_by_layer(7);
         assert!(world.env_colliders_by_layer.get(&7).is_none());
         assert!(!world.env_collider_handles.contains_key(&h_b));
+    }
+
+    /// Regression test for the cross-layer prop collision bug.
+    ///
+    /// Setup: two props P (layer 100) and Q (layer 101) at the same XZ, plus
+    /// a player kinematic body on layer 101 dropped just above Q. Without
+    /// `LayerContactFilter`, the Rapier solver would resolve player↔P contacts
+    /// (P would be pushed up to rest on top of Q, and the player could feel
+    /// P's surface) even though KCC scene queries hid P. With the hook in
+    /// place, the player only interacts with Q and P stays put.
+    #[test]
+    fn cross_layer_props_do_not_collide() {
+        use game_core::physics_backend::PhysicsBackend;
+        use game_protocol::types::Vec3f;
+
+        let mut world = PhysicsWorld::new(1.0 / 60.0);
+
+        // Per-instance floor at the same XZ for each layer.
+        world.add_environment_collider_on_layer(
+            EnvironmentShape::Cuboid {
+                half_x: 10.0,
+                half_y: 0.1,
+                half_z: 10.0,
+            },
+            Vec3f::new(0.0, 0.0, 0.0),
+            100,
+        );
+        world.add_environment_collider_on_layer(
+            EnvironmentShape::Cuboid {
+                half_x: 10.0,
+                half_y: 0.1,
+                half_z: 10.0,
+            },
+            Vec3f::new(0.0, 0.0, 0.0),
+            101,
+        );
+
+        // Prop P on layer 100 at (0, 1, 0).
+        let p = EntityId(1);
+        assert!(world.spawn_prop_body(
+            p,
+            Vec3f::new(0.0, 1.0, 0.0),
+            Vec3f::new(0.5, 0.5, 0.5),
+            true,
+        ));
+        world.set_entity_layer(p, 100);
+
+        // Prop Q on layer 101 at the same spot.
+        let q = EntityId(2);
+        assert!(world.spawn_prop_body(
+            q,
+            Vec3f::new(0.0, 1.0, 0.0),
+            Vec3f::new(0.5, 0.5, 0.5),
+            true,
+        ));
+        world.set_entity_layer(q, 101);
+
+        // Player on layer 101 just above Q.
+        let player = EntityId(3);
+        world.reuse_or_spawn_character(
+            player,
+            Vector::new(0.0, 3.0, 0.0),
+            EntityKind::Player,
+        );
+        world.set_entity_layer(player, 101);
+
+        // Step long enough for gravity to settle everything.
+        for _ in 0..120 {
+            world.step();
+        }
+
+        let p_pos = world.get_body_position(p).expect("prop P present");
+        let q_pos = world.get_body_position(q).expect("prop Q present");
+
+        // P (layer 100) must rest on its own layer-100 floor: y ≈ 0.1 + 0.5 = 0.6.
+        // Without the filter, P would have been pushed up by the layer-101
+        // player + Q stack to roughly y ≥ 1.5.
+        assert!(
+            p_pos.y < 1.0,
+            "layer-100 prop P should rest on layer-100 floor, got y={}",
+            p_pos.y
+        );
+        // Q (layer 101) must also rest on its own layer-101 floor.
+        assert!(
+            q_pos.y < 1.0,
+            "layer-101 prop Q should rest on layer-101 floor, got y={}",
+            q_pos.y
+        );
+        // Sanity: both props settled near floor height.
+        assert!(
+            (p_pos.y - q_pos.y).abs() < 0.05,
+            "props on isolated layers should settle to the same height (P={}, Q={})",
+            p_pos.y,
+            q_pos.y
+        );
     }
 }
