@@ -305,6 +305,10 @@ pub struct TickPipeline {
     /// Interactable state changes accumulated this tick.
     /// Each entry is (entity_id, new_state). Drained in Phase 10 commit.
     pub(super) pending_interactable_updates: Vec<(EntityId, game_core::sim_state::SimInteractState)>,
+    /// Deferred heals queued during Phase 7 (AI decisions) and drained in Phase 8b.
+    /// Keeps Health mutations centralised in combat/finalization phases.
+    /// Each entry is (entity_id, heal_amount, heal_source).
+    pub(super) pending_heals: Vec<(EntityId, f32, EntityId)>,
 }
 
 impl TickPipeline {
@@ -496,6 +500,7 @@ impl TickPipeline {
             cover_blockers: Vec::new(),
             global_max_rewind_ticks: lag_compensation::MAX_REWIND_TICKS,
             pending_interactable_updates: Vec::new(),
+            pending_heals: Vec::new(),
         }
     }
 
@@ -1127,6 +1132,7 @@ impl TickPipeline {
         self.state.audit.reset();
         self.event_sequence = 0;
         self.pending_events.clear();
+        self.pending_heals.clear();
         self.summary = TickSummary::default();
 
         // Phase 1: Input ingestion — filter intents for this tick

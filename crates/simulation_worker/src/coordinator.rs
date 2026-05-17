@@ -43,6 +43,21 @@ struct CoordinatorState {
     items: game_core::stats::ItemRegistry,
     dungeons: game_core::dungeon::DungeonRegistry,
     encounters: game_core::encounter::EncounterRegistry,
+    /// Failed secondary reducer calls (boss_phase, zone_counter) that will be
+    /// retried on the next successful commit. Prevents "acknowledged then
+    /// forgotten" holes in progression tables.
+    pending_secondary: Vec<SecondaryWrite>,
+}
+
+/// If more than this many secondary writes accumulate without being delivered,
+/// the connection is likely broken and we should crash for a clean reseed.
+const MAX_PENDING_SECONDARY: usize = 50;
+
+/// A secondary reducer call that failed and should be retried.
+#[derive(Clone)]
+enum SecondaryWrite {
+    BossPhase { boss_entity_id: u64, phase: u32, entered_at_tick: u64 },
+    ZoneCounter { layer: u32, region_x: i32, region_z: i32, counter_name: String, delta: f64 },
 }
 
 /// Send (or re-send) a commit payload to SpacetimeDB.
@@ -92,19 +107,51 @@ fn send_commit(reducers: &RemoteReducers, pkg: CommitPackage, state: Arc<Mutex<C
                     let mut guard = state_for_ack.lock().unwrap_or_else(|p| p.into_inner());
                     guard.sim.acknowledge_success(tick_id);
 
-                    // Fire-and-forget Tier 1/2 reducer calls after main commit succeeds.
-                    // These are separate reducers so they don't bloat the commit_tick_results
-                    // signature. Failure is logged but does not crash — these are eventually
-                    // consistent diagnostic/progression tables.
+                    // Retry any previously failed secondary writes first.
+                    let backlog = std::mem::take(&mut guard.pending_secondary);
+                    drop(guard); // release lock before reducer calls
+
+                    let mut failures = Vec::new();
+                    for item in backlog {
+                        if let Err(e) = send_secondary(&rctx.reducers, &item) {
+                            warn!("secondary retry failed: {e}");
+                            failures.push(item);
+                        }
+                    }
+
+                    // Attempt this tick's secondary writes.
                     for (boss_eid, phase, entered_tick) in &boss_phase_updates {
-                        if let Err(e) = rctx.reducers.commit_boss_phase(*boss_eid, *phase, *entered_tick) {
+                        let item = SecondaryWrite::BossPhase {
+                            boss_entity_id: *boss_eid, phase: *phase, entered_at_tick: *entered_tick,
+                        };
+                        if let Err(e) = send_secondary(&rctx.reducers, &item) {
                             warn!("commit_boss_phase failed: {e}");
+                            failures.push(item);
                         }
                     }
                     for (layer, rx, rz, name, delta) in &zone_counter_deltas {
-                        if let Err(e) = rctx.reducers.increment_zone_counter(*layer, *rx, *rz, name.clone(), *delta) {
+                        let item = SecondaryWrite::ZoneCounter {
+                            layer: *layer, region_x: *rx, region_z: *rz,
+                            counter_name: name.clone(), delta: *delta,
+                        };
+                        if let Err(e) = send_secondary(&rctx.reducers, &item) {
                             warn!("increment_zone_counter failed: {e}");
+                            failures.push(item);
                         }
+                    }
+
+                    if !failures.is_empty() {
+                        let mut guard = state_for_ack.lock().unwrap_or_else(|p| p.into_inner());
+                        guard.pending_secondary.extend(failures);
+                        let total = guard.pending_secondary.len();
+                        if total > MAX_PENDING_SECONDARY {
+                            error!(
+                                "tick={tick_id} {total} secondary writes backlogged \
+                                 (cap={MAX_PENDING_SECONDARY}) — crashing for clean reseed"
+                            );
+                            std::process::exit(1);
+                        }
+                        warn!("tick={tick_id} {total} secondary write(s) pending retry");
                     }
 
                     return;
@@ -166,6 +213,20 @@ fn send_commit(reducers: &RemoteReducers, pkg: CommitPackage, state: Arc<Mutex<C
     }
 }
 
+/// Dispatch a single secondary reducer call. Returns the error string on failure.
+fn send_secondary(reducers: &RemoteReducers, write: &SecondaryWrite) -> Result<(), String> {
+    match write {
+        SecondaryWrite::BossPhase { boss_entity_id, phase, entered_at_tick } => {
+            reducers.commit_boss_phase(*boss_entity_id, *phase, *entered_at_tick)
+                .map_err(|e| format!("commit_boss_phase: {e}"))
+        }
+        SecondaryWrite::ZoneCounter { layer, region_x, region_z, counter_name, delta } => {
+            reducers.increment_zone_counter(*layer, *region_x, *region_z, counter_name.clone(), *delta)
+                .map_err(|e| format!("increment_zone_counter: {e}"))
+        }
+    }
+}
+
 const TOKEN_FILE: &str = ".worker_token";
 
 /// Load a previously-saved auth token from disk.
@@ -200,6 +261,7 @@ pub fn run(config: CoordinatorConfig) {
         items,
         dungeons,
         encounters,
+        pending_secondary: Vec::new(),
     }));
 
     let state_for_connect = Arc::clone(&state);

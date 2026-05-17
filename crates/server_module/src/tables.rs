@@ -62,6 +62,10 @@ pub struct Entity {
     pub state: EntityState,
     pub spawned_at_tick: u64,
     pub owner_identity: Option<spacetimedb::Identity>,
+    /// RLS join key — always 0. Enables equi-join with trusted_worker for
+    /// client_visibility_filter (cross-joins unsupported by subscription engine).
+    #[index(btree)]
+    pub rls_group: u8,
 }
 
 // ── Team Assignment ─────────────────────────────────────────────────
@@ -122,6 +126,8 @@ pub struct EntityTransform {
     pub angvel_y: f32,
     pub angvel_z: f32,
     pub last_tick: u64,
+    #[index(btree)]
+    pub rls_group: u8,
 }
 
 // ── Health ──────────────────────────────────────────────────────────
@@ -133,6 +139,8 @@ pub struct EntityHealth {
     pub entity_id: u64,
     pub hp: f32,
     pub max_hp: f32,
+    #[index(btree)]
+    pub rls_group: u8,
 }
 
 // ── Player Intents ──────────────────────────────────────────────────
@@ -500,6 +508,8 @@ pub struct EntityRegion {
 pub struct TrustedWorker {
     #[primary_key]
     pub worker_identity: spacetimedb::Identity,
+    #[index(btree)]
+    pub rls_group: u8,
 }
 
 // ── Inventory & Equipment ───────────────────────────────────────────

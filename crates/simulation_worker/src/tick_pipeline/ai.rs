@@ -278,16 +278,12 @@ impl TickPipeline {
                                 if let Some(table) = self.state.combat.threat_tables.get_mut(*idx) {
                                     table.entries.clear();
                                 }
+                                // Queue full heal — applied in Phase 8b so Health
+                                // mutations stay centralised in combat/finalization.
                                 let max_hp = self.state.combat.health.max_hp[idx.as_usize()];
                                 let current_hp = self.state.combat.health.hp[idx.as_usize()];
                                 if current_hp < max_hp {
-                                    let healed = self.state.combat.health.apply_healing(*idx, max_hp - current_hp);
-                                    if healed > 0.0 {
-                                        self.emit_event(npc_id, EventPayload::Healed {
-                                            amount: healed,
-                                            source: npc_id,
-                                        });
-                                    }
+                                    self.pending_heals.push((npc_id, max_hp - current_hp, npc_id));
                                 }
                                 if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) { *ai = NpcAiState::Idle; }
                                 audit!(self.state, Ai, AiDecisions, 7, Some(npc_id), "evade_home");

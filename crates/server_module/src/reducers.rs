@@ -402,6 +402,7 @@ pub fn spawn_player(ctx: &ReducerContext) -> Result<(), String> {
         state: EntityState::Spawning,
         spawned_at_tick: current_tick,
         owner_identity: Some(caller),
+        rls_group: 0,
     });
 
     let eid = entity.entity_id;
@@ -413,12 +414,14 @@ pub fn spawn_player(ctx: &ReducerContext) -> Result<(), String> {
         vel_x: 0.0, vel_y: 0.0, vel_z: 0.0,
         angvel_x: 0.0, angvel_y: 0.0, angvel_z: 0.0,
         last_tick: current_tick,
+        rls_group: 0,
     });
 
     ctx.db.entity_health().insert(EntityHealth {
         entity_id: eid,
         hp: 1000.0,
         max_hp: 1000.0,
+        rls_group: 0,
     });
 
     ctx.db.entity_region().insert(EntityRegion {
@@ -467,6 +470,7 @@ fn spawn_npc_internal(
         state: EntityState::Spawning,
         spawned_at_tick: current_tick,
         owner_identity: None,
+        rls_group: 0,
     });
     let eid = entity.entity_id;
 
@@ -477,12 +481,14 @@ fn spawn_npc_internal(
         vel_x: 0.0, vel_y: 0.0, vel_z: 0.0,
         angvel_x: 0.0, angvel_y: 0.0, angvel_z: 0.0,
         last_tick: current_tick,
+        rls_group: 0,
     });
 
     ctx.db.entity_health().insert(EntityHealth {
         entity_id: eid,
         hp: max_hp,
         max_hp,
+        rls_group: 0,
     });
 
     ctx.db.entity_region().insert(EntityRegion {
@@ -613,6 +619,7 @@ pub fn commit_tick_results(
             vel_x: t.vel_x, vel_y: t.vel_y, vel_z: t.vel_z,
             angvel_x: t.angvel_x, angvel_y: t.angvel_y, angvel_z: t.angvel_z,
             last_tick: tick_id,
+            rls_group: 0,
         });
     }
 
@@ -629,6 +636,7 @@ pub fn commit_tick_results(
             entity_id: h.entity_id,
             hp: h.hp,
             max_hp: h.max_hp,
+            rls_group: 0,
         });
     }
 
@@ -669,6 +677,7 @@ pub fn commit_tick_results(
                 state: u.new_state,
                 spawned_at_tick: existing.spawned_at_tick,
                 owner_identity: existing.owner_identity,
+                rls_group: 0,
             });
 
             // Create death state for player entities transitioning to DespawnPending.
@@ -823,6 +832,7 @@ pub fn commit_tick_results(
             state: EntityState::Spawning,
             spawned_at_tick: tick_id,
             owner_identity: None,
+            rls_group: 0,
         });
         let eid = entity.entity_id;
 
@@ -833,12 +843,14 @@ pub fn commit_tick_results(
             vel_x: 0.0, vel_y: 0.0, vel_z: 0.0,
             angvel_x: 0.0, angvel_y: 0.0, angvel_z: 0.0,
             last_tick: tick_id,
+            rls_group: 0,
         });
 
         ctx.db.entity_health().insert(EntityHealth {
             entity_id: eid,
             hp: s.max_hp,
             max_hp: s.max_hp,
+            rls_group: 0,
         });
 
         ctx.db.entity_region().insert(EntityRegion {
@@ -972,7 +984,7 @@ pub fn register_worker(ctx: &ReducerContext, worker_identity: spacetimedb::Ident
     if ctx.db.trusted_worker().worker_identity().find(&worker_identity).is_some() {
         return Err("Worker already registered".into());
     }
-    ctx.db.trusted_worker().insert(TrustedWorker { worker_identity });
+    ctx.db.trusted_worker().insert(TrustedWorker { worker_identity, rls_group: 0 });
     log::info!("Registered trusted worker: {:?}", worker_identity);
     Ok(())
 }
@@ -1307,6 +1319,7 @@ pub fn respawn_player(ctx: &ReducerContext) -> Result<(), String> {
         state: EntityState::Spawning,
         spawned_at_tick: current_tick,
         owner_identity: entity.owner_identity,
+        rls_group: 0,
     });
 
     // Upsert companion rows: on DespawnPending the old rows still exist
@@ -1319,6 +1332,7 @@ pub fn respawn_player(ctx: &ReducerContext) -> Result<(), String> {
         vel_x: 0.0, vel_y: 0.0, vel_z: 0.0,
         angvel_x: 0.0, angvel_y: 0.0, angvel_z: 0.0,
         last_tick: current_tick,
+        rls_group: 0,
     };
     if ctx.db.entity_transform().entity_id().find(&entity_id).is_some() {
         ctx.db.entity_transform().entity_id().update(transform_row);
@@ -1330,6 +1344,7 @@ pub fn respawn_player(ctx: &ReducerContext) -> Result<(), String> {
         entity_id,
         hp: 1000.0,
         max_hp: 1000.0,
+        rls_group: 0,
     };
     if ctx.db.entity_health().entity_id().find(&entity_id).is_some() {
         ctx.db.entity_health().entity_id().update(health_row);
@@ -1781,6 +1796,7 @@ pub fn create_instance(
             state: EntityState::Spawning,
             spawned_at_tick: current_tick,
             owner_identity: None,
+            rls_group: 0,
         });
         let eid = entity.entity_id;
         local_to_entity.insert(def.local_id, eid);
@@ -1794,12 +1810,14 @@ pub fn create_instance(
             vel_x: 0.0, vel_y: 0.0, vel_z: 0.0,
             angvel_x: 0.0, angvel_y: 0.0, angvel_z: 0.0,
             last_tick: current_tick,
+            rls_group: 0,
         });
 
         ctx.db.entity_health().insert(EntityHealth {
             entity_id: eid,
             hp,
             max_hp,
+            rls_group: 0,
         });
 
         ctx.db.entity_region().insert(EntityRegion {
@@ -2040,6 +2058,7 @@ pub fn expire_instances(ctx: &ReducerContext) -> Result<(), String> {
                         state: EntityState::DespawnPending,
                         spawned_at_tick: entity.spawned_at_tick,
                         owner_identity: entity.owner_identity,
+                        rls_group: 0,
                     });
                 }
             }
@@ -2113,6 +2132,7 @@ mod debug_reducers {
             entity_id,
             hp,
             max_hp,
+            rls_group: 0,
         });
         log::info!("debug_set_hp: entity={entity_id} hp={hp} max_hp={max_hp}");
         Ok(())
@@ -2209,6 +2229,7 @@ mod debug_reducers {
             vel_x: 0.0, vel_y: 0.0, vel_z: 0.0,
             angvel_x: 0.0, angvel_y: 0.0, angvel_z: 0.0,
             last_tick: tf.last_tick,
+            rls_group: 0,
         });
 
         // Update region assignment.
@@ -2283,6 +2304,7 @@ mod debug_reducers {
             state: EntityState::Removed,
             spawned_at_tick: entity.spawned_at_tick,
             owner_identity: entity.owner_identity,
+            rls_group: 0,
         });
 
         // Clean companion rows.
@@ -2585,6 +2607,7 @@ mod debug_reducers {
             state: EntityState::Spawning,
             spawned_at_tick: current_tick,
             owner_identity: None,
+            rls_group: 0,
         });
         let eid = entity.entity_id;
 
@@ -2595,12 +2618,14 @@ mod debug_reducers {
             vel_x: 0.0, vel_y: 0.0, vel_z: 0.0,
             angvel_x: 0.0, angvel_y: 0.0, angvel_z: 0.0,
             last_tick: current_tick,
+            rls_group: 0,
         });
 
         ctx.db.entity_health().insert(EntityHealth {
             entity_id: eid,
             hp: 1.0,
             max_hp: 1.0,
+            rls_group: 0,
         });
 
         ctx.db.entity_region().insert(EntityRegion {

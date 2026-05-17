@@ -94,6 +94,23 @@ impl TickPipeline {
 
         let mut state_updates: Vec<(EntityId, game_schema::EntityState)> = Vec::new();
 
+        // ── Drain deferred heals queued in Phase 7 (evade-home) ─────────
+        let heals = std::mem::take(&mut self.pending_heals);
+        let mut deferred_heal_entities: HashSet<EntityId> = HashSet::new();
+        for (entity_id, amount, source) in heals {
+            if let Some(idx) = self.state.entities.lookup(entity_id) {
+                let healed = self.state.combat.health.apply_healing(idx, amount);
+                if healed > 0.0 {
+                    audit!(self.state, Health, StatusEffects, 8, Some(entity_id), "evade_heal");
+                    self.emit_event(entity_id, EventPayload::Healed {
+                        amount: healed,
+                        source,
+                    });
+                    deferred_heal_entities.insert(entity_id);
+                }
+            }
+        }
+
         // Check for newly dead entities and mark them for despawn.
         let dead_indices: Vec<EntityIndex> = (0..self.state.entities.len())
             .map(|i| self.state.entities.index_at(i))
@@ -224,10 +241,11 @@ impl TickPipeline {
             }
         }
 
-        // Snapshot health for DoT-damaged entities before the second death check
-        // removes killed entities. The main collect_health_updates ran before Phase 8b
-        // and missed these changes.
-        let dot_health_updates: Vec<(EntityId, f32, f32)> = dot_damaged_entities.iter()
+        // Snapshot health for entities changed in Phase 8b (DoT damage, deferred heals)
+        // before the second death check removes killed entities. The main
+        // collect_health_updates ran before Phase 8b and missed these changes.
+        let phase8b_entities = dot_damaged_entities.union(&deferred_heal_entities);
+        let dot_health_updates: Vec<(EntityId, f32, f32)> = phase8b_entities
             .filter_map(|&eid| {
                 let idx = self.state.entities.lookup(eid)?;
                 let i = idx.as_usize();
