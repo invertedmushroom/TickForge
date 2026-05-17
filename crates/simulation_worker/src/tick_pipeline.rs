@@ -73,10 +73,6 @@ pub struct TickPipeline {
     abilities: AbilityRegistry,
     /// Runtime entity state — lifecycle, health, buffs, threat, AI, contacts.
     pub state: SimState,
-    /// Opaque sensor handles for active hitbox colliders: execution_id → physics handle.
-    /// Keyed by `AbilityExecutionId` so each cast instance has its own entry;
-    /// two casts of the same ability by the same entity are tracked independently.
-    sensor_handles: HashMap<AbilityExecutionId, u64>,
     /// Explicit cooldown state — maps (EntityId, ability_id) → tick when the cooldown expires.
     ///
     /// The HashMap owns cooldown truth: O(1) lookup in Phase 2, drained in Phase 8 to emit
@@ -91,6 +87,67 @@ pub struct TickPipeline {
 }
 
 impl TickPipeline {
+    /// Hard teardown for an entity from *all* runtime stores and the physics backend.
+    /// Returns `true` if an entity was actually removed from `SimState`, `false` if it
+    /// was not present.
+    pub fn force_remove_entity(&mut self, id: EntityId) -> bool {
+        use std::collections::HashSet;
+
+        // 1) Determine all execution IDs owned by this caster so we can fully
+        //    remove any dependent runtime objects (scheduled actions, sensors, hitboxes).
+        let execs_to_remove: HashSet<AbilityExecutionId> = self
+            .state
+            .combat
+            .executions
+            .active_ids()
+            .into_iter()
+            .filter(|&eid| {
+                self.state
+                    .combat
+                    .executions
+                    .get(eid)
+                    .map(|ctx| ctx.caster == id)
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        // 2) Remove any future actions that target this entity OR are sourced from
+        //    an execution owned by this entity (prevents orphaned actions referencing
+        //    dead executions). Use retain to keep only actions that are unrelated.
+        self.scheduled_actions.retain(|a| {
+            if a.entity == id {
+                return false;
+            }
+            match a.source {
+                Some(src) => !execs_to_remove.contains(&src),
+                None => true,
+            }
+        });
+
+        // 3) Remove cooldown entries for this entity
+        self.cooldowns.retain(|&(eid, _), _| eid != id);
+
+        // 4) Remove hitbox sensors and execution contexts owned by this entity
+        for exec_id in execs_to_remove.iter().copied() {
+            if let Some(handle) = self
+                .state
+                .combat
+                .hitboxes
+                .get(exec_id)
+                .and_then(|hb| hb.sensor_handle)
+            {
+                self.physics.remove_sensor(handle);
+            }
+            self.state.combat.hitboxes.remove(exec_id);
+            self.state.combat.executions.remove(exec_id);
+        }
+
+        // 5) Finally, remove entity from SimState and physics world
+        let removed = self.state.remove_entity(id);
+        // Always attempt to remove physics body; remove_entity is idempotent there.
+        self.physics.remove_entity(id);
+        removed
+    }
     pub fn new(
         start_tick: TickId,
         physics: Box<dyn PhysicsBackend>,
@@ -106,7 +163,6 @@ impl TickPipeline {
             scheduled_actions: Vec::new(),
             abilities,
             state: SimState::new(),
-            sensor_handles: HashMap::new(),
             cooldowns: HashMap::new(),
             next_scheduled_id: 0,
             summary: TickSummary::default(),
@@ -239,6 +295,33 @@ impl TickPipeline {
             .map_or(false, |&ready_at| self.current_tick < ready_at)
     }
 
+    /// Test-visible alias for `is_on_cooldown`. Production code uses the private method
+    /// directly; tests need it to assert post-cast cooldown state without going through
+    /// a UseAbility intent.
+    #[cfg(test)]
+    pub fn is_on_cooldown_pub(&self, entity: EntityId, ability_id: u32) -> bool {
+        self.is_on_cooldown(entity, ability_id)
+    }
+
+    /// Returns true if this execution still owns any **runtime effect** that must be
+    /// resolved before the context can be freed.
+    ///
+    /// Right now a "runtime effect" is either:
+    ///   - a pending scheduled action that cites this execution as its source, or
+    ///   - a live hitbox entry (armed or not yet on its damage frame).
+    ///
+    /// When new effect types are added, extend the predicate here so that culling
+    /// remains correct without touching `phase_skill_scheduling`:
+    ///
+    /// ```text
+    ///   || self.state.combat.projectiles.contains(exec_id)
+    ///   || self.state.combat.buffs.contains(exec_id)
+    /// ```
+    fn execution_is_alive(&self, exec_id: AbilityExecutionId) -> bool {
+        self.scheduled_actions.iter().any(|a| a.source == Some(exec_id))
+            || self.state.combat.hitboxes.get(exec_id).is_some()
+    }
+
     /// Execute one full simulation tick, returning results for commit.
     pub fn run_tick(&mut self, intents: &[PlayerIntent]) -> TickResult {
         self.state.debug_assert_coherent();
@@ -287,8 +370,9 @@ impl TickPipeline {
         // Events have been accumulated during phases above.
 
         // Invariant checks — only active in debug builds (debug_assert! is a no-op in release).
-        // Catches parallel-structure divergence between sensor_handles, HitboxStore, and
-        // entity component arrays. Called here (post-all-phases) to catch mid-tick corruption.
+        // Catches parallel-structure divergence between hitbox arming and sensor-handle
+        // ownership plus entity component arrays. Called here (post-all-phases) to catch
+        // mid-tick corruption.
         #[cfg(debug_assertions)]
         self.verify_invariants();
 
@@ -317,9 +401,9 @@ impl TickPipeline {
 
     /// Cross-structure invariant checks for parallel state systems.
     ///
-    /// The key invariant: `sensor_handles`, `HitboxStore`, and Rapier sensors are three
-    /// separate representations of the same set of active hitbox colliders. Silent divergence
-    /// between them causes ghost hits or missing hit registration that are very hard to reproduce.
+    /// The key invariant: for each active hitbox, `armed` and `sensor_handle.is_some()`
+    /// must describe the same lifecycle state. Silent divergence causes ghost hits or
+    /// missing hit registration that are very hard to reproduce.
     ///
     /// Also re-asserts that all SoA component arrays have the same length as the entity store.
     ///
@@ -329,16 +413,15 @@ impl TickPipeline {
         // All parallel component arrays must agree on entity count.
         self.state.debug_assert_coherent();
 
-        // sensor_handles and HitboxStore must agree exactly on which armed execution IDs exist.
-        // A count-only check hides identity bugs where two different entries swap handles;
-        // the key-set diff catches silent divergence that the count check misses.
-        let sensor_keys: std::collections::HashSet<AbilityExecutionId> =
-            self.sensor_handles.keys().copied().collect();
+        // HitboxStore must agree internally on which execution IDs are armed and which
+        // execution IDs own a live sensor handle. A count-only check hides identity bugs;
+        // key-set diff catches silent divergence.
+        let sensor_keys = self.state.combat.hitboxes.sensor_backed_execution_ids();
         let armed_keys = self.state.combat.hitboxes.armed_execution_ids();
         debug_assert_eq!(
             sensor_keys,
             armed_keys,
-            "sensor_handles key-set and armed HitboxStore key-set diverged — hitbox lifecycle bug\n  sensor_handles: {:?}\n  armed hitboxes: {:?}",
+            "sensor-backed key-set and armed HitboxStore key-set diverged — hitbox lifecycle bug\n  sensor-backed: {:?}\n  armed hitboxes: {:?}",
             sensor_keys,
             armed_keys,
         );
@@ -451,14 +534,17 @@ impl TickPipeline {
         // Normalize direction and scale by a base movement speed.
         // TODO: Per-entity movement speed from a stats component.
         const BASE_SPEED: f32 = 5.0;
-        let len_sq = dir.dir_x * dir.dir_x + dir.dir_y * dir.dir_y + dir.dir_z * dir.dir_z;
+        // Grounded movement: ignore vertical component to prevent client "flight".
+        let x = dir.dir_x;
+        let z = dir.dir_z;
+        let len_sq = x * x + z * z;
         if len_sq < 1e-6 {
             return;
         }
         let inv_len = 1.0 / len_sq.sqrt();
-        let vx = dir.dir_x * inv_len * BASE_SPEED;
-        let vy = dir.dir_y * inv_len * BASE_SPEED;
-        let vz = dir.dir_z * inv_len * BASE_SPEED;
+        let vx = x * inv_len * BASE_SPEED;
+        let vy = 0.0;
+        let vz = z * inv_len * BASE_SPEED;
 
         // Character bodies are kinematic_position_based — velocity calls have no effect.
         // Integrate one timestep of desired velocity and set the explicit next position.
@@ -515,6 +601,27 @@ impl TickPipeline {
                 }
             }
         }
+
+        // Cull execution contexts for casts that no longer own any runtime effect.
+        //
+        // This covers abilities whose timeline has no RemoveHitbox (pure cooldown,
+        // buff-apply) — without this pass their AbilityExecutionContext would leak
+        // for the lifetime of the session.
+        //
+        // The `execution_is_alive` predicate defines what "still owning an effect"
+        // means.  Extend that method when new effect types (projectiles, buffs) are
+        // introduced — no changes here are needed.
+        let dead: Vec<AbilityExecutionId> = self
+            .state
+            .combat
+            .executions
+            .active_ids()
+            .into_iter()
+            .filter(|&id| !self.execution_is_alive(id))
+            .collect();
+        for id in dead {
+            self.state.combat.executions.remove(id);
+        }
     }
 
     fn execute_ability_action(
@@ -548,24 +655,28 @@ impl TickPipeline {
                     .get(execution_id)
                     .map(|hb| (hb.shape, hb.offset));
                 if let Some((shape, offset)) = stored {
-                    if self.state.combat.hitboxes.arm(execution_id) {
-                        let sensor_shape = skill_shape_to_sensor(shape);
-                        if let Some(handle) = self.physics.spawn_sensor(
-                            entity,
-                            sensor_shape,
-                            offset,
-                            ColliderKind::Hitbox(execution_id.0),
-                        ) {
-                            self.sensor_handles.insert(execution_id, handle);
+                    let sensor_shape = skill_shape_to_sensor(shape);
+                    if let Some(handle) = self.physics.spawn_sensor(
+                        entity,
+                        sensor_shape,
+                        offset,
+                        ColliderKind::Hitbox(execution_id.0),
+                    ) {
+                        // Only mark armed if the hitbox state transitions successfully.
+                        if self.state.combat.hitboxes.arm(execution_id, handle) {
+                        } else {
+                            // If arm failed, remove the sensor we just created to avoid leaks.
+                            self.physics.remove_sensor(handle);
                         }
                     }
                 }
                 self.emit_event(entity, EventPayload::DamageFrame { ability_id });
             }
             AbilityAction::RemoveHitbox => {
-                self.state.combat.hitboxes.remove(execution_id);
-                if let Some(handle) = self.sensor_handles.remove(&execution_id) {
-                    self.physics.remove_sensor(handle);
+                if let Some(removed) = self.state.combat.hitboxes.remove(execution_id) {
+                    if let Some(handle) = removed.sensor_handle {
+                        self.physics.remove_sensor(handle);
+                    }
                 }
                 // Cast complete — remove the execution context now that its last
                 // physics action has run and no dependent runtime object remains.
@@ -614,15 +725,23 @@ impl TickPipeline {
             .collect();
 
         for contact in &contacts {
-            // Determine attacker/target using collider kinds.
-            let (exec_id, attacker, target) = match (contact.kind1, contact.kind2) {
+            // Normalise the pair: acting collider (Hitbox, future: Projectile) first.
+            // Eliminates duplicate match arms — each interaction rule is stated once.
+            let (acting, receiving, attacker, target) = normalize_contact_pair(
+                contact.kind1, contact.entity1,
+                contact.kind2, contact.entity2,
+            );
+
+            // Dispatch on interaction type. Today only (Hitbox → Hurtbox/Body) deals damage.
+            // Future slots have a clean insertion point:
+            //   (Hitbox(_), Shield(_))  => apply_block(...)
+            //   (Hitbox(_), Hitbox(_))  => apply_clash(...)
+            //   (Projectile(_), Hazard) => destroy_projectile(...)
+            let (exec_id, attacker, target) = match (acting, receiving) {
                 (ColliderKind::Hitbox(eid_raw), ColliderKind::Body | ColliderKind::Hurtbox) => {
-                    (AbilityExecutionId(eid_raw), contact.entity1, contact.entity2)
+                    (AbilityExecutionId(eid_raw), attacker, target)
                 }
-                (ColliderKind::Body | ColliderKind::Hurtbox, ColliderKind::Hitbox(eid_raw)) => {
-                    (AbilityExecutionId(eid_raw), contact.entity2, contact.entity1)
-                }
-                _ => continue, // Not a hitbox-vs-target contact.
+                _ => continue,
             };
 
             // Skip self-hits.
@@ -812,20 +931,9 @@ impl TickPipeline {
         for id in despawning {
             self.summary.despawns += 1;
             self.emit_event(id, EventPayload::EntityDespawned);
-            // Clear our sensor tracking before body removal (body removal cascades to colliders).
-            let hitbox_exec_ids: Vec<AbilityExecutionId> = self.state.combat.hitboxes
-                .hitboxes_for(id)
-                .iter()
-                .map(|hb| hb.execution_id)
-                .collect();
-            for exec_id in hitbox_exec_ids {
-                self.sensor_handles.remove(&exec_id);
-            }
-            // Remove any in-flight cooldowns for this entity so the map doesn't grow
-            // unboundedly if entities are frequently spawned and killed.
-            self.cooldowns.retain(|&(eid, _), _| eid != id);
-            self.state.remove_entity(id);
-            self.physics.remove_entity(id);
+            // Hard teardown for this entity from all runtime stores and the physics backend.
+            // Centralised here so external removal paths can call the same behaviour.
+            self.force_remove_entity(id);
             state_updates.push((id, EntityState::Removed));
         }
 
@@ -895,6 +1003,42 @@ fn skill_shape_to_sensor(shape: SkillShape) -> SensorShape {
         SkillShape::Projectile   => SensorShape::Sphere { radius: 0.3 },
         SkillShape::LineSweep    => SensorShape::Capsule { half_height: 3.0, radius: 0.5 },
         SkillShape::HazardZone   => SensorShape::Sphere { radius: 5.0 },
+    }
+}
+
+/// Returns true if this collider kind is the **initiating** side of an interaction —
+/// i.e. the thing that acts on something else, rather than receiving the action.
+///
+/// This is the single extension point for normalization precedence.
+/// When `Projectile`, `BlockCone`, or `Aura` arrive, add them here.
+/// `normalize_contact_pair` and `resolve_hits` need no changes.
+fn is_acting_collider(kind: ColliderKind) -> bool {
+    use game_core::physics_backend::ColliderKind::*;
+    matches!(kind, Hitbox(_))
+    // future: | Projectile(_) | BlockCone(_) | Aura(_)
+}
+
+/// Normalise a contact pair so that the **acting** collider is always in position 0.
+///
+/// Reduces `(Hitbox, Hurtbox)` and `(Hurtbox, Hitbox)` to the same canonical form,
+/// eliminating duplicated match arms in `resolve_hits`.  When more collider types
+/// are added (6–8 variants), every interaction rule is expressed once, not twice.
+///
+/// To extend: add new acting kinds to `is_acting_collider` — do not touch this function.
+///
+/// Returns `(acting_kind, receiving_kind, acting_entity, receiving_entity)`.
+fn normalize_contact_pair(
+    kind1: ColliderKind,
+    entity1: EntityId,
+    kind2: ColliderKind,
+    entity2: EntityId,
+) -> (ColliderKind, ColliderKind, EntityId, EntityId) {
+    if is_acting_collider(kind1) {
+        (kind1, kind2, entity1, entity2)
+    } else if is_acting_collider(kind2) {
+        (kind2, kind1, entity2, entity1)
+    } else {
+        (kind1, kind2, entity1, entity2)
     }
 }
 
@@ -974,8 +1118,8 @@ mod tests {
         assert!(pipeline.state.is_active(target_id));
 
         // NOW add the hitbox sensor (after entities are Active).
-        // Use spawn_sensor (the trait method) so PhysicsWorld.sensor_handles and
-        // TickPipeline.sensor_handles are both populated — matching what execute_ability_action does.
+        // Use spawn_sensor (the trait method) and store the returned handle on
+        // ActiveHitbox so lifecycle ownership matches the production path.
         let exec_id = AbilityExecutionId(1);
         let sensor = pipeline.physics.spawn_sensor(
             attacker_id,
@@ -983,8 +1127,7 @@ mod tests {
             Vec3f { x: 0.0, y: 0.0, z: 0.0 },
             ColliderKind::Hitbox(exec_id.0),
         ).expect("attacker has a body — spawn_sensor must succeed");
-        pipeline.sensor_handles.insert(exec_id, sensor);
-        pipeline.state.combat.hitboxes.spawn_armed(exec_id, attacker_id, 1, TickId(1), SkillShape::Sphere, Vec3f { x: 0.0, y: 0.0, z: 0.0 });
+        pipeline.state.combat.hitboxes.spawn_armed(exec_id, attacker_id, 1, TickId(1), SkillShape::Sphere, Vec3f { x: 0.0, y: 0.0, z: 0.0 }, sensor);
 
         // Tick 1: physics step detects hitbox↔hurtbox overlap,
         // combat resolution applies damage.
@@ -1075,8 +1218,7 @@ mod tests {
             Vec3f { x: 0.0, y: 0.0, z: 0.0 },
             ColliderKind::Hitbox(exec_id.0),
         ).expect("attacker has a body — spawn_sensor must succeed");
-        pipeline.sensor_handles.insert(exec_id, sensor);
-        pipeline.state.combat.hitboxes.spawn_armed(exec_id, attacker, 10, TickId(1), SkillShape::Sphere, Vec3f { x: 0.0, y: 0.0, z: 0.0 });
+        pipeline.state.combat.hitboxes.spawn_armed(exec_id, attacker, 10, TickId(1), SkillShape::Sphere, Vec3f { x: 0.0, y: 0.0, z: 0.0 }, sensor);
 
         // Tick 1: damage kills victim in same tick (entities already Active).
         let result1 = pipeline.run_tick(&[]);
@@ -1195,8 +1337,7 @@ mod tests {
             Vec3f { x: 0.0, y: 0.0, z: 0.0 },
             ColliderKind::Hitbox(exec_id.0),
         ).expect("attacker has a body — spawn_sensor must succeed");
-        pipeline.sensor_handles.insert(exec_id, sensor);
-        pipeline.state.combat.hitboxes.spawn_armed(exec_id, attacker_id, 1, TickId(1), SkillShape::Sphere, Vec3f { x: 0.0, y: 0.0, z: 0.0 });
+        pipeline.state.combat.hitboxes.spawn_armed(exec_id, attacker_id, 1, TickId(1), SkillShape::Sphere, Vec3f { x: 0.0, y: 0.0, z: 0.0 }, sensor);
 
         // Tick 1: hitbox overlaps hurtbox — damage fires, health_updates should be populated.
         let result1 = pipeline.run_tick(&[]);
@@ -1249,8 +1390,7 @@ mod tests {
             Vec3f { x: 0.0, y: 0.0, z: 0.0 },
             ColliderKind::Hitbox(exec_id.0),
         ).expect("attacker has a body — spawn_sensor must succeed");
-        pipeline.sensor_handles.insert(exec_id, sensor);
-        pipeline.state.combat.hitboxes.spawn_armed(exec_id, attacker, 10, TickId(1), SkillShape::Sphere, Vec3f { x: 0.0, y: 0.0, z: 0.0 });
+        pipeline.state.combat.hitboxes.spawn_armed(exec_id, attacker, 10, TickId(1), SkillShape::Sphere, Vec3f { x: 0.0, y: 0.0, z: 0.0 }, sensor);
 
         let result = pipeline.run_tick(&[]);
 
@@ -1596,8 +1736,7 @@ mod tests {
             Vec3f { x: 0.0, y: 0.0, z: 0.0 },
             ColliderKind::Hitbox(exec_id.0),
         ).expect("attacker has a body");
-        pipeline.sensor_handles.insert(exec_id, sensor);
-        pipeline.state.combat.hitboxes.spawn_armed(exec_id, attacker, 10, TickId(1), SkillShape::Sphere, Vec3f { x: 0.0, y: 0.0, z: 0.0 });
+        pipeline.state.combat.hitboxes.spawn_armed(exec_id, attacker, 10, TickId(1), SkillShape::Sphere, Vec3f { x: 0.0, y: 0.0, z: 0.0 }, sensor);
 
         // Tick 1: one-shot kills victim.
         let result = pipeline.run_tick(&[]);
@@ -1623,4 +1762,173 @@ mod tests {
             "Single victim state update must be Removed, not DespawnPending"
         );
     }
+
+    /// Regression test for the ExecutionContext leak fix (#27).
+    ///
+    /// An ability whose timeline contains only `CooldownStart` (no hitbox — no
+    /// `SpawnHitbox`, no `ApplyDamageFrame`, no `RemoveHitbox`) previously leaked its
+    /// `AbilityExecutionContext` for the lifetime of the session because the context
+    /// was only removed in `execute_ability_action` on the `RemoveHitbox` arm.
+    ///
+    /// After the fix, `phase_skill_scheduling` runs a culling pass at the end of each
+    /// tick: any execution whose `execution_is_alive` predicate returns false is
+    /// removed from `executions`. A cooldown-only cast has no pending scheduled actions
+    /// and no live hitbox immediately after its `CooldownStart` fires — so it must be
+    /// culled in the same tick it was cast.
+    #[test]
+    fn cooldown_only_ability_does_not_leak_execution_context() {
+        let mut reg = AbilityRegistry::new();
+        // Ability with only a CooldownStart action — no hitbox at all.
+        reg.register(AbilityData {
+            ability_id: 99,
+            name: "Taunt".to_string(),
+            base_damage: 0.0,
+            damage_type: DamageType::True,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 0.0,
+        });
+        reg.register_timeline(AbilityTimeline {
+            ability_id: 99,
+            actions: vec![
+                ScheduledAbilityAction {
+                    tick_offset: 0,
+                    action: AbilityAction::CooldownStart { duration_ticks: 10 },
+                },
+            ],
+        });
+
+        let mut pipeline = make_pipeline(reg);
+        let player = EntityId(1);
+
+        pipeline.spawn_entity_from_snapshot(
+            player,
+            EntityKind::Player,
+            TickId(0),
+            100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+        );
+
+        // Tick 0: warm-up — entity transitions Spawning → Active.
+        pipeline.run_tick(&[]);
+        assert!(pipeline.state.is_active(player));
+        assert!(
+            pipeline.state.combat.executions.is_empty(),
+            "No casts yet — executions must be empty after warm-up"
+        );
+
+        // Tick 1: cast the cooldown-only ability.
+        // Phase 2 creates an AbilityExecutionContext and schedules CooldownStart (offset 0).
+        // Phase 3 fires CooldownStart — inserts into cooldowns map. No hitbox is touched.
+        // Culling pass at end of Phase 3: execution_is_alive() returns false (no scheduled
+        // actions remain, no hitbox exists) → context is removed.
+        let cast_intent = PlayerIntent {
+            client_id: player,
+            sequence_id: 1,
+            target_tick: TickId(1),
+            client_time_ms: 0,
+            action: IntentAction::UseAbility(game_schema::UseAbilityData {
+                ability_id: 99,
+                target: game_schema::AbilityTarget::None,
+            }),
+        };
+        pipeline.run_tick(&[cast_intent]);
+
+        assert!(
+            pipeline.state.combat.executions.is_empty(),
+            "Cooldown-only ability must not leak its AbilityExecutionContext — \
+             executions should be empty after the cast tick"
+        );
+
+        // Cooldown must still be active (the map entry outlives the context).
+        assert!(
+            pipeline.is_on_cooldown_pub(player, 99),
+            "Cooldown must be registered even though the execution context was culled"
+        );
+    }
+
+    /// Regression test for the Interaction Resolution Layer (#29).
+    ///
+    /// Two hitbox sensors at the same position produce a `(Hitbox, Hitbox)` contact.
+    /// Before the explicit dispatch table in `resolve_hits`, this pair fell through an
+    /// implicit path that could produce unintended behaviour in future. After the
+    /// refactor, only `(Hitbox, Body|Hurtbox)` deals damage; `(Hitbox, Hitbox)` falls
+    /// through to `_ => continue` and must produce no damage events.
+    ///
+    /// Unit tests for the contact-pair normalizer and acting-collider predicate (#29).
+    ///
+    /// Why unit not integration:
+    ///   The `SKILL_HITBOX` collision group filter does not include `SKILL_HITBOX`, so
+    ///   Rapier's broadphase will never generate a `(Hitbox, Hitbox)` contact pair in
+    ///   the physics simulation. The collision-group tests in
+    ///   `physics::collision_groups::tests` already verify this at the layer level.
+    ///
+    ///   The correct way to pin down the dispatch logic for pairs that can't naturally
+    ///   occur in physics is to test `is_acting_collider` and `normalize_contact_pair`
+    ///   directly — both are visible here via `use super::*`.
+    ///
+    /// What is covered:
+    ///   1. `is_acting_collider` classification for every relevant variant
+    ///   2. `normalize_contact_pair` reorders `(Hurtbox, Hitbox)` to `(Hitbox, Hurtbox)`
+    ///   3. `(Hitbox, Hitbox)` normalizes with hitbox first — and the first element does
+    ///      NOT match `Body | Hurtbox` in the dispatch arm, proving the `_ => continue`
+    ///      path for intra-role contacts is explicit, not accidental.
+    #[test]
+    fn contact_normalization_and_dispatch_classification() {
+        let e1 = EntityId(1);
+        let e2 = EntityId(2);
+
+        // is_acting_collider
+        assert!( is_acting_collider(ColliderKind::Hitbox(99)));
+        assert!(!is_acting_collider(ColliderKind::Hurtbox));
+        assert!(!is_acting_collider(ColliderKind::Body));
+        assert!(!is_acting_collider(ColliderKind::Aura(1)));
+        assert!(!is_acting_collider(ColliderKind::BlockCone(1)));
+        assert!(!is_acting_collider(ColliderKind::Hazard(1)));
+
+        // (Hitbox, Hurtbox) — already in canonical order
+        let (a, b, ea, eb) = normalize_contact_pair(
+            ColliderKind::Hitbox(1), e1, ColliderKind::Hurtbox, e2,
+        );
+        assert!(matches!(a, ColliderKind::Hitbox(1)));
+        assert_eq!(b, ColliderKind::Hurtbox);
+        assert_eq!(ea, e1);
+        assert_eq!(eb, e2);
+
+        // (Hurtbox, Hitbox) — reversed; must be swapped to canonical
+        let (a, b, ea, eb) = normalize_contact_pair(
+            ColliderKind::Hurtbox, e1, ColliderKind::Hitbox(1), e2,
+        );
+        assert!(matches!(a, ColliderKind::Hitbox(1)));
+        assert_eq!(b, ColliderKind::Hurtbox);
+        assert_eq!(ea, e2); // entity that owned the Hitbox
+        assert_eq!(eb, e1);
+
+        // (Hitbox, Hitbox) — intra-role: first stays first (both acting; no swap)
+        let (a, b, ea, eb) = normalize_contact_pair(
+            ColliderKind::Hitbox(1), e1, ColliderKind::Hitbox(2), e2,
+        );
+        assert!(matches!(a, ColliderKind::Hitbox(1)));
+        assert!(matches!(b, ColliderKind::Hitbox(2)));
+        assert_eq!(ea, e1);
+        assert_eq!(eb, e2);
+
+        // Verify the receiving side of a (Hitbox, Hitbox) pair does NOT match the
+        // damage-dispatch arm `Body | Hurtbox`. This is the explicit proof that the
+        // dispatch table falls through to `_ => continue` for intra-role contacts.
+        let does_match_damage_arm = matches!(b, ColliderKind::Body | ColliderKind::Hurtbox);
+        assert!(
+            !does_match_damage_arm,
+            "(Hitbox, Hitbox): receiving side must not match the damage dispatch arm"
+        );
+
+        // (Body, Hurtbox) — neither side is acting: unchanged order, both pass through dispatch
+        let (a, b, ea, eb) = normalize_contact_pair(
+            ColliderKind::Body, e1, ColliderKind::Hurtbox, e2,
+        );
+        assert_eq!(a, ColliderKind::Body);
+        assert_eq!(b, ColliderKind::Hurtbox);
+        assert_eq!(ea, e1);
+        assert_eq!(eb, e2);
+    }
 }
+

@@ -52,7 +52,7 @@ impl ThreatTable {
     pub fn top_threat(&self) -> Option<EntityId> {
         self.entries
             .iter()
-            .max_by(|a, b| a.threat.partial_cmp(&b.threat).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| a.threat.total_cmp(&b.threat))
             .map(|e| e.source)
     }
 }

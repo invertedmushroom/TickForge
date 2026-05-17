@@ -374,31 +374,27 @@ pub fn commit_tick_results(
         });
     }
 
-    // Insert combat events
-    let mut seq: u32 = 0;
+    // Insert combat events (use worker-provided event_sequence to preserve total ordering)
     for e in combat_events {
         ctx.db.combat_event().insert(CombatEvent {
             event_id: 0,
             tick_id,
-            event_sequence: seq,
+            event_sequence: e.event_sequence,
             source_entity: e.source_entity,
             target_entity: e.target_entity,
             event_kind: e.event_kind,
         });
-        seq += 1;
     }
 
-    // Insert world events
-    let mut wseq: u32 = 0;
+    // Insert world events (preserve worker-provided event_sequence)
     for e in world_events {
         ctx.db.world_event().insert(WorldEvent {
             event_id: 0,
             tick_id,
-            event_sequence: wseq,
+            event_sequence: e.event_sequence,
             entity_id: e.entity_id,
             event_kind: e.event_kind,
         });
-        wseq += 1;
     }
 
     // Delete consumed intents
@@ -467,12 +463,14 @@ pub struct HealthUpdate {
 pub struct CombatEventInput {
     pub source_entity: u64,
     pub target_entity: u64,
+    pub event_sequence: u32,
     pub event_kind: CombatEventKind,
 }
 
 #[derive(spacetimedb::SpacetimeType, Clone, Debug)]
 pub struct WorldEventInput {
     pub entity_id: u64,
+    pub event_sequence: u32,
     pub event_kind: WorldEventKind,
 }
 

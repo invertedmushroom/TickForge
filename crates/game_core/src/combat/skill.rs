@@ -235,6 +235,12 @@ impl AbilityExecutionStore {
         self.active.retain(|_, ctx| ctx.caster != caster);
     }
 
+    /// Returns a snapshot of all currently active execution IDs.
+    /// Used by the culling pass in `phase_skill_scheduling` to find leaking contexts.
+    pub fn active_ids(&self) -> Vec<AbilityExecutionId> {
+        self.active.keys().copied().collect()
+    }
+
     pub fn len(&self) -> usize {
         self.active.len()
     }

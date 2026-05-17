@@ -204,73 +204,7 @@ pub fn run(config: CoordinatorConfig) {
             .collect();
 
         // Classify pipeline events into typed wire types for the commit reducer.
-        let mut combat_events: Vec<CombatEventInput> = Vec::new();
-        let mut world_events: Vec<WorldEventInput> = Vec::new();
-
-        for e in &result.events {
-            match &e.payload {
-                EventPayload::Damage { source, amount, damage_type } => {
-                    combat_events.push(CombatEventInput {
-                        source_entity: source.0,
-                        target_entity: e.entity_id.0,
-                        event_kind: CombatEventKind::Damage(DamageData {
-                            amount: *amount,
-                            damage_type: convert_damage_type(*damage_type),
-                        }),
-                    });
-                }
-                EventPayload::SkillHit { skill_id, source } => {
-                    combat_events.push(CombatEventInput {
-                        source_entity: source.0,
-                        target_entity: e.entity_id.0,
-                        event_kind: CombatEventKind::SkillHit(*skill_id),
-                    });
-                }
-                EventPayload::BuffApplied { buff_id, source, duration_ticks } => {
-                    combat_events.push(CombatEventInput {
-                        source_entity: source.0,
-                        target_entity: e.entity_id.0,
-                        event_kind: CombatEventKind::BuffApplied(BuffAppliedData {
-                            buff_id: *buff_id,
-                            duration_ticks: *duration_ticks,
-                        }),
-                    });
-                }
-                EventPayload::BuffExpired { buff_id } => {
-                    combat_events.push(CombatEventInput {
-                        source_entity: e.entity_id.0,
-                        target_entity: e.entity_id.0,
-                        event_kind: CombatEventKind::BuffExpired(*buff_id),
-                    });
-                }
-                EventPayload::EntityDied { killer } => {
-                    combat_events.push(CombatEventInput {
-                        source_entity: killer.map(|k| k.0).unwrap_or(0),
-                        target_entity: e.entity_id.0,
-                        event_kind: CombatEventKind::EntityDied(killer.map(|k| k.0)),
-                    });
-                }
-                EventPayload::EntityDespawned => {
-                    world_events.push(WorldEventInput {
-                        entity_id: e.entity_id.0,
-                        event_kind: WorldEventKind::EntityDespawned,
-                    });
-                }
-                EventPayload::PickupCollected { item_id } => {
-                    world_events.push(WorldEventInput {
-                        entity_id: e.entity_id.0,
-                        event_kind: WorldEventKind::PickupCollected(*item_id),
-                    });
-                }
-                // Internal pipeline events — not committed to DB.
-                EventPayload::EntitySpawned
-                | EventPayload::HitboxSpawned { .. }
-                | EventPayload::DamageFrame { .. }
-                | EventPayload::HitboxRemoved { .. }
-                | EventPayload::CooldownReady { .. }
-                | EventPayload::TickBoundary => {}
-            }
-        }
+        let (combat_events, world_events) = classify_events(&result.events);
 
         // Marshal entity lifecycle transitions captured by Phase 8.
         let entity_state_updates: Vec<EntityStateUpdate> = result.entity_state_updates
@@ -412,9 +346,12 @@ pub fn run(config: CoordinatorConfig) {
             // Hard removal by a server-side reducer; skip if already cleaned up.
             (_, EntityState::Removed) => {
                 if guard.pipeline.state.entities.lookup(eid).is_some() {
-                    guard.pipeline.state.remove_entity(eid);
-                    guard.pipeline.physics_mut().remove_entity(eid);
-                    info!("Entity {} externally set Removed — cleaned up from simulation", eid.0);
+                    let removed = guard.pipeline.force_remove_entity(eid);
+                    if removed {
+                        info!("Entity {} externally set Removed — cleaned up from simulation", eid.0);
+                    } else {
+                        info!("Entity {} externally set Removed — no-op (not present)", eid.0);
+                    }
                 }
             }
             _ => {} // Spawning→Active handled by pipeline Phase 8; other transitions ignored.
@@ -428,9 +365,8 @@ pub fn run(config: CoordinatorConfig) {
     conn.db.entity().on_delete(move |_ctx, deleted_entity| {
         let eid = EntityId(deleted_entity.entity_id);
         let mut guard = state_for_entity_delete.lock().unwrap();
-        let removed = guard.pipeline.state.remove_entity(eid);
+        let removed = guard.pipeline.force_remove_entity(eid);
         if removed {
-            guard.pipeline.physics_mut().remove_entity(eid);
             warn!("Entity {} row deleted while still in simulation — forced cleanup", eid.0);
         }
     });
@@ -649,4 +585,87 @@ fn convert_entity_state(state: game_schema::EntityState) -> EntityState {
         game_schema::EntityState::DespawnPending => EntityState::DespawnPending,
         game_schema::EntityState::Removed => EntityState::Removed,
     }
+}
+
+/// Convert pipeline `SimEvent`s into wire `CombatEventInput` and `WorldEventInput`.
+///
+/// Made `pub` so integration tests can exercise end-to-end preservation of
+/// `event_sequence` during marshalling.
+pub fn classify_events(events: &[game_protocol::event::SimEvent]) -> (Vec<CombatEventInput>, Vec<WorldEventInput>) {
+    let mut combat_events: Vec<CombatEventInput> = Vec::new();
+    let mut world_events: Vec<WorldEventInput> = Vec::new();
+
+    for e in events {
+        match &e.payload {
+            EventPayload::Damage { source, amount, damage_type } => {
+                combat_events.push(CombatEventInput {
+                    source_entity: source.0,
+                    target_entity: e.entity_id.0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CombatEventKind::Damage(DamageData {
+                        amount: *amount,
+                        damage_type: convert_damage_type(*damage_type),
+                    }),
+                });
+            }
+            EventPayload::SkillHit { skill_id, source } => {
+                combat_events.push(CombatEventInput {
+                    source_entity: source.0,
+                    target_entity: e.entity_id.0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CombatEventKind::SkillHit(*skill_id),
+                });
+            }
+            EventPayload::BuffApplied { buff_id, source, duration_ticks } => {
+                combat_events.push(CombatEventInput {
+                    source_entity: source.0,
+                    target_entity: e.entity_id.0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CombatEventKind::BuffApplied(BuffAppliedData {
+                        buff_id: *buff_id,
+                        duration_ticks: *duration_ticks,
+                    }),
+                });
+            }
+            EventPayload::BuffExpired { buff_id } => {
+                combat_events.push(CombatEventInput {
+                    source_entity: e.entity_id.0,
+                    target_entity: e.entity_id.0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CombatEventKind::BuffExpired(*buff_id),
+                });
+            }
+            EventPayload::EntityDied { killer } => {
+                combat_events.push(CombatEventInput {
+                    source_entity: killer.map(|k| k.0).unwrap_or(0),
+                    target_entity: e.entity_id.0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CombatEventKind::EntityDied(killer.map(|k| k.0)),
+                });
+            }
+            EventPayload::EntityDespawned => {
+                world_events.push(WorldEventInput {
+                    entity_id: e.entity_id.0,
+                    event_sequence: e.event_sequence,
+                    event_kind: WorldEventKind::EntityDespawned,
+                });
+            }
+            EventPayload::PickupCollected { item_id } => {
+                world_events.push(WorldEventInput {
+                    entity_id: e.entity_id.0,
+                    event_sequence: e.event_sequence,
+                    event_kind: WorldEventKind::PickupCollected(*item_id),
+                });
+            }
+            // Internal pipeline events — not committed to DB.
+            EventPayload::EntitySpawned
+            | EventPayload::HitboxSpawned { .. }
+            | EventPayload::DamageFrame { .. }
+            | EventPayload::HitboxRemoved { .. }
+            | EventPayload::CooldownReady { .. }
+            | EventPayload::TickBoundary => {}
+        }
+    }
+
+    (combat_events, world_events)
 }

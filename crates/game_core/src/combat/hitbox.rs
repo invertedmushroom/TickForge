@@ -35,6 +35,12 @@ pub struct ActiveHitbox {
     /// True once `ApplyDamageFrame` has spawned the live Rapier sensor.
     /// Until armed, the hitbox is a logical declaration only — no physics collision.
     pub armed: bool,
+    /// Opaque physics backend sensor handle for the live collider, if armed.
+    ///
+    /// Ownership is local to the hitbox record so lifecycle transitions are symmetric:
+    /// - arm: set `armed=true` and `sensor_handle=Some(handle)`
+    /// - remove/despawn: take handle from this record and call `physics.remove_sensor`
+    pub sensor_handle: Option<u64>,
     /// Entities already hit by this hitbox instance (single-hit dedup).
     pub already_hit: HashSet<EntityId>,
 }
@@ -65,13 +71,14 @@ impl HitboxStore {
             shape,
             offset,
             armed: false,
+            sensor_handle: None,
             already_hit: HashSet::new(),
         });
     }
 
     /// Register a hitbox that is already armed (Rapier sensor already live).
     /// Use this in tests that bypass the timeline and inject sensors directly.
-    pub fn spawn_armed(&mut self, execution_id: AbilityExecutionId, owner: EntityId, ability_id: u32, tick: TickId, shape: SkillShape, offset: Vec3f) {
+    pub fn spawn_armed(&mut self, execution_id: AbilityExecutionId, owner: EntityId, ability_id: u32, tick: TickId, shape: SkillShape, offset: Vec3f, sensor_handle: u64) {
         self.active.insert(execution_id, ActiveHitbox {
             execution_id,
             owner,
@@ -80,16 +87,18 @@ impl HitboxStore {
             shape,
             offset,
             armed: true,
+            sensor_handle: Some(sensor_handle),
             already_hit: HashSet::new(),
         });
     }
 
     /// Mark a hitbox as armed (Rapier sensor now live). Returns `true` if the hitbox
     /// existed and was not already armed, `false` otherwise.
-    pub fn arm(&mut self, execution_id: AbilityExecutionId) -> bool {
+    pub fn arm(&mut self, execution_id: AbilityExecutionId, sensor_handle: u64) -> bool {
         match self.active.get_mut(&execution_id) {
             Some(hb) if !hb.armed => {
                 hb.armed = true;
+                hb.sensor_handle = Some(sensor_handle);
                 true
             }
             _ => false,
@@ -101,9 +110,9 @@ impl HitboxStore {
         self.active.values().filter(|hb| hb.armed).count()
     }
 
-    /// Remove a hitbox. Returns true if it existed.
-    pub fn remove(&mut self, execution_id: AbilityExecutionId) -> bool {
-        self.active.remove(&execution_id).is_some()
+    /// Remove a hitbox and return its record if it existed.
+    pub fn remove(&mut self, execution_id: AbilityExecutionId) -> Option<ActiveHitbox> {
+        self.active.remove(&execution_id)
     }
 
     /// Look up an active hitbox by execution ID.
@@ -175,6 +184,15 @@ impl HitboxStore {
             .map(|(k, _)| *k)
             .collect()
     }
+
+    /// Returns the set of execution IDs that currently own a physics sensor handle.
+    pub fn sensor_backed_execution_ids(&self) -> HashSet<AbilityExecutionId> {
+        self.active
+            .iter()
+            .filter(|(_, hb)| hb.sensor_handle.is_some())
+            .map(|(k, _)| *k)
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -196,9 +214,9 @@ mod tests {
         assert_eq!(store.len(), 1);
         assert!(store.get(exec(1)).is_some());
 
-        assert!(store.remove(exec(1)));
+        assert!(store.remove(exec(1)).is_some());
         assert!(store.is_empty());
-        assert!(!store.remove(exec(1))); // already gone
+        assert!(store.remove(exec(1)).is_none()); // already gone
     }
 
     #[test]
@@ -257,13 +275,13 @@ mod tests {
         store.spawn(e1, eid(1), 5, TickId(0), SkillShape::Sphere, Vec3f::ZERO);
         assert_eq!(store.armed_count(), 0, "freshly spawned hitbox must not be armed");
 
-        assert!(store.arm(e1), "arm() must return true when hitbox exists and is unarmed");
+        assert!(store.arm(e1, 100), "arm() must return true when hitbox exists and is unarmed");
         assert_eq!(store.armed_count(), 1, "armed_count must reflect the armed hitbox");
-        assert!(!store.arm(e1), "arm() on an already-armed hitbox must return false");
+        assert!(!store.arm(e1, 101), "arm() on an already-armed hitbox must return false");
 
         // spawn_armed() starts armed immediately.
         let e2 = exec(7);
-        store.spawn_armed(e2, eid(2), 7, TickId(1), SkillShape::CapsuleSweep, Vec3f::ZERO);
+        store.spawn_armed(e2, eid(2), 7, TickId(1), SkillShape::CapsuleSweep, Vec3f::ZERO, 200);
         assert_eq!(store.armed_count(), 2, "spawn_armed() must count as armed");
 
         // armed_execution_ids must match both armed entries.
@@ -271,5 +289,8 @@ mod tests {
         assert!(armed_ids.contains(&e1));
         assert!(armed_ids.contains(&e2));
         assert_eq!(armed_ids.len(), 2);
+
+        let sensor_ids = store.sensor_backed_execution_ids();
+        assert_eq!(armed_ids, sensor_ids, "armed and sensor-backed key sets must match");
     }
 }

@@ -381,7 +381,7 @@ impl PhysicsWorld {
             self.body_to_entity.remove(&body_handle);
             // Clean up collider metadata for all colliders attached to this body.
             // Rapier's body removal cascades to colliders, so we mirror that.
-            let attached: Vec<ColliderHandle> = self.collider_kinds
+            let attached: std::collections::HashSet<ColliderHandle> = self.collider_kinds
                 .keys()
                 .filter(|ch| {
                     self.colliders.get(**ch)
@@ -390,7 +390,12 @@ impl PhysicsWorld {
                 })
                 .copied()
                 .collect();
-            for ch in attached {
+
+            // Remove any opaque sensor handles pointing at colliders attached to this body
+            // so the internal `sensor_handles` map does not grow unbounded.
+            self.sensor_handles.retain(|_, ch| !attached.contains(ch));
+
+            for ch in attached.iter().copied() {
                 self.collider_kinds.remove(&ch);
             }
             self.bodies.remove(
