@@ -499,18 +499,11 @@ pub fn spawn_player(ctx: &ReducerContext) -> Result<(), String> {
 
     let eid = entity.entity_id;
 
-    // Resolve the open-world spawn position via the unified resolver
-    // (RespawnPoint table → layers.ron → fallback). Layer 0 is the
-    // open world; alt starting layers would be a separate reducer.
-    let spawn_pos = resolve_layer_spawn(ctx, 0, None);
-    let region_x = (spawn_pos[0] / 50.0).floor() as i32;
-    let region_z = (spawn_pos[2] / 50.0).floor() as i32;
-
     ctx.db.entity_transform().insert(EntityTransform {
         entity_id: eid,
-        pos_x: spawn_pos[0],
-        pos_y: spawn_pos[1],
-        pos_z: spawn_pos[2],
+        pos_x: 0.0,
+        pos_y: 1.0,
+        pos_z: 0.0,
         rot_x: 0.0,
         rot_y: 0.0,
         rot_z: 0.0,
@@ -534,8 +527,8 @@ pub fn spawn_player(ctx: &ReducerContext) -> Result<(), String> {
 
     ctx.db.entity_region().insert(EntityRegion {
         entity_id: eid,
-        region_x,
-        region_z,
+        region_x: 0,
+        region_z: 0,
         layer: 0,
     });
 
@@ -550,14 +543,7 @@ pub fn spawn_player(ctx: &ReducerContext) -> Result<(), String> {
         entity_id: eid,
     });
 
-    log::info!(
-        "Player spawned: entity_id={}, identity={:?}, pos=({:.1},{:.1},{:.1})",
-        eid,
-        caller,
-        spawn_pos[0],
-        spawn_pos[1],
-        spawn_pos[2]
-    );
+    log::info!("Player spawned: entity_id={}, identity={:?}", eid, caller);
     Ok(())
 }
 // ── NPC Spawning ────────────────────────────────────────────────
@@ -716,7 +702,6 @@ pub fn commit_tick_results(
     npc_state_updates: Vec<NpcStateUpdate>,
     director_spawns: Vec<DirectorSpawnInput>,
     interactable_updates: Vec<InteractableUpdate>,
-    death_state_inserts: Vec<DeathStateInsertInput>,
 ) -> Result<(), String> {
     // Accept only trusted worker identities (or module identity in internal calls).
     if !is_trusted_caller(ctx) {
@@ -854,11 +839,42 @@ pub fn commit_tick_results(
                 rls_group: 0,
             });
 
-            // Create death state for player deaths from authoritative
-            // worker-emitted rows (see `death_state_inserts` below). The
-            // reducer no longer derives death state from observed lifecycle
-            // transitions — doing so loses killer attribution and silently
-            // fabricates fallbacks for missing position/layer.
+            // Create death state for player entities transitioning to DespawnPending.
+            // This records the death position and starts the respawn timer.
+            if u.new_state == EntityState::DespawnPending && existing.kind == EntityKind::Player {
+                if ctx
+                    .db
+                    .death_state()
+                    .entity_id()
+                    .find(&u.entity_id)
+                    .is_none()
+                {
+                    let (dx, dy, dz) = ctx
+                        .db
+                        .entity_transform()
+                        .entity_id()
+                        .find(&u.entity_id)
+                        .map(|t| (t.pos_x, t.pos_y, t.pos_z))
+                        .unwrap_or((0.0, 1.0, 0.0));
+                    let layer = ctx
+                        .db
+                        .entity_region()
+                        .entity_id()
+                        .find(&u.entity_id)
+                        .map(|r| r.layer)
+                        .unwrap_or(0);
+                    ctx.db.death_state().insert(DeathState {
+                        entity_id: u.entity_id,
+                        died_at_tick: tick_id,
+                        respawn_at_tick: tick_id + RESPAWN_DELAY_TICKS,
+                        killer_entity: None,
+                        layer,
+                        death_pos_x: dx,
+                        death_pos_y: dy,
+                        death_pos_z: dz,
+                    });
+                }
+            }
 
             // Clean up companion rows for entities reaching terminal Removed state
             // so they disappear from nearby_transforms and other views.
@@ -898,39 +914,6 @@ pub fn commit_tick_results(
                 u.entity_id
             );
         }
-    }
-
-    // Insert authoritative death-state rows produced by the worker.
-    // The reducer applies respawn-timing policy (`RESPAWN_DELAY_TICKS`) but
-    // does not derive the row contents — killer attribution, layer, and
-    // death position come from worker simulation state.
-    for d in death_state_inserts {
-        if ctx
-            .db
-            .death_state()
-            .entity_id()
-            .find(&d.entity_id)
-            .is_some()
-        {
-            // Idempotent by design: a player keeps a single `death_state` row
-            // for the duration of their respawn cycle (the row is deleted when
-            // they actually respawn). If a duplicate insert arrives for the
-            // same player within that window — e.g. resurrected by a buff and
-            // killed again before the respawn timer elapses — the original
-            // row's `respawn_at_tick` is preserved. This is intentional: the
-            // first death's respawn schedule wins until the cycle completes.
-            continue;
-        }
-        ctx.db.death_state().insert(DeathState {
-            entity_id: d.entity_id,
-            died_at_tick: tick_id,
-            respawn_at_tick: tick_id + RESPAWN_DELAY_TICKS,
-            killer_entity: d.killer_entity,
-            layer: d.layer,
-            death_pos_x: d.death_pos_x,
-            death_pos_y: d.death_pos_y,
-            death_pos_z: d.death_pos_z,
-        });
     }
 
     // Apply region updates.
@@ -1200,22 +1183,6 @@ pub struct DirectorSpawnInput {
     pub pos_y: f32,
     pub pos_z: f32,
     pub layer: u32,
-}
-
-/// Authoritative death-state row produced by the simulation worker.
-///
-/// Per Phase 8b finalization the worker emits one entry per dying player
-/// with killer attribution, layer, and death position resolved from
-/// authoritative simulation state. The reducer inserts the row verbatim;
-/// it must not derive death state from observed lifecycle transitions.
-#[derive(spacetimedb::SpacetimeType, Clone, Debug)]
-pub struct DeathStateInsertInput {
-    pub entity_id: u64,
-    pub killer_entity: Option<u64>,
-    pub layer: u32,
-    pub death_pos_x: f32,
-    pub death_pos_y: f32,
-    pub death_pos_z: f32,
 }
 
 // ── Worker Registration ─────────────────────────────────────────────
@@ -1552,109 +1519,30 @@ pub fn trade_accept(ctx: &ReducerContext, _trade_id: u64) -> Result<(), String> 
 // Death state is created automatically by commit_tick_results when
 // a player entity transitions to DespawnPending.
 
-/// Default fallback used as a last resort when no authored spawn /
-/// respawn point is configured for a layer. Kept as a single named
-/// constant so future audits can find every "we gave up" path easily.
-const FALLBACK_SPAWN: [f32; 3] = [0.0, 1.0, 0.0];
-
-/// Pick a spawn position from a candidate list.
-///
-/// * `hint = Some(pos)` → return the candidate with smallest XZ distance
-///   to `pos` (used by death → respawn so the player drops at the
-///   nearest authored point to where they died).
-/// * `hint = None` → return the first entry (deterministic, used by
-///   initial spawn / dungeon entry / dungeon exit).
-///
-/// Returns `None` when `points` is empty so callers can chain into the
-/// next layer of the resolver.
-fn pick_spawn_from(points: &[[f32; 3]], hint: Option<(f32, f32, f32)>) -> Option<[f32; 3]> {
-    if points.is_empty() {
-        return None;
-    }
-    if let Some((hx, _, hz)) = hint {
-        return points
-            .iter()
-            .min_by(|a, b| {
-                let da = (a[0] - hx).powi(2) + (a[2] - hz).powi(2);
-                let db = (b[0] - hx).powi(2) + (b[2] - hz).powi(2);
-                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .copied();
-    }
-    points.first().copied()
-}
-
-/// Parse `data/layers.ron` and return the matching `WorldLayerDef`.
-/// Mirrors `load_dungeon_template`'s embedded-RON pattern; called only
-/// on the cold path (spawn / respawn / leave_instance).
-fn load_world_layer(layer_id: u32) -> Result<game_schema::dungeon::WorldLayerDef, String> {
-    use game_schema::dungeon::WorldLayersFile;
-    const SRC: &str = include_str!("../../../data/layers.ron");
-    let file: WorldLayersFile =
-        ron::from_str(SRC).map_err(|e| format!("layers.ron parse error: {e}"))?;
-    file.layers
-        .into_iter()
-        .find(|l| l.layer_id == layer_id)
-        .ok_or_else(|| format!("unknown layer_id {layer_id}"))
-}
-
-/// Unified spawn resolver for a static layer.
-///
-/// Resolution order:
-/// 1. `RespawnPoint` rows for `layer` (DB-backed, admin-managed).
-/// 2. `WorldLayerDef.spawn_points` from `data/layers.ron`.
-/// 3. `FALLBACK_SPAWN` (with a warn).
-///
-/// `hint` carries the player's last known position (death pos, exit
-/// origin, …); it influences (1) and (2) via `pick_spawn_from` so the
-/// player lands near where they were rather than at a random point.
-fn resolve_layer_spawn(
-    ctx: &ReducerContext,
-    layer: u32,
-    hint: Option<(f32, f32, f32)>,
-) -> [f32; 3] {
-    // Tier 1: DB-backed respawn points.
-    let db_points: Vec<[f32; 3]> = ctx
-        .db
-        .respawn_point()
-        .layer()
-        .filter(&layer)
-        .map(|p| [p.pos_x, p.pos_y, p.pos_z])
-        .collect();
-    if let Some(pos) = pick_spawn_from(&db_points, hint) {
-        return pos;
-    }
-
-    // Tier 2: static `WorldLayerDef.spawn_points` from RON.
-    match load_world_layer(layer) {
-        Ok(def) => {
-            if let Some(pos) = pick_spawn_from(&def.spawn_points, hint) {
-                return pos;
-            }
-        }
-        Err(e) => {
-            log::warn!("resolve_layer_spawn: load_world_layer({layer}) failed: {e}");
-        }
-    }
-
-    // Tier 3: hardcoded last-resort.
-    log::warn!(
-        "resolve_layer_spawn: no respawn_point rows or layers.ron spawn_points \
-         for layer {layer}; falling back to {:?}",
-        FALLBACK_SPAWN
-    );
-    FALLBACK_SPAWN
-}
-
-/// Backwards-compatible wrapper kept so existing call sites do not
-/// need to translate the `(f32, f32, f32)` return shape inline.
+/// Find the nearest respawn point on the given layer. Falls back to origin.
 fn find_nearest_respawn_point(
     ctx: &ReducerContext,
     layer: u32,
     death_pos: Option<(f32, f32, f32)>,
 ) -> (f32, f32, f32) {
-    let pos = resolve_layer_spawn(ctx, layer, death_pos);
-    (pos[0], pos[1], pos[2])
+    let points: Vec<_> = ctx.db.respawn_point().layer().filter(&layer).collect();
+    if points.is_empty() {
+        return (0.0, 1.0, 0.0);
+    }
+    if let Some((dx, _, dz)) = death_pos {
+        points
+            .iter()
+            .min_by(|a, b| {
+                let da = (a.pos_x - dx).powi(2) + (a.pos_z - dz).powi(2);
+                let db = (b.pos_x - dx).powi(2) + (b.pos_z - dz).powi(2);
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|p| (p.pos_x, p.pos_y, p.pos_z))
+            .unwrap_or((0.0, 1.0, 0.0))
+    } else {
+        let p = &points[0];
+        (p.pos_x, p.pos_y, p.pos_z)
+    }
 }
 
 #[reducer]
@@ -2169,12 +2057,6 @@ pub fn disband_party(ctx: &ReducerContext) -> Result<(), String> {
 // Admin reducers for respawn points and trusted-worker reducers for
 // boss phase / zone counter updates (ADR-0002 Tier 1).
 
-/// Insert a `RespawnPoint` row that the unified spawn resolver
-/// (`resolve_layer_spawn`) will pick up for the given layer. Intended
-/// for live admin / CLI use (e.g. `spacetime call ... add_respawn_point
-/// 0 10 1 -5 "town_north"`); the module itself does not invoke this —
-/// when no DB rows exist the resolver falls back to
-/// `WorldLayerDef.spawn_points` from `data/layers.ron`.
 #[reducer]
 pub fn add_respawn_point(
     ctx: &ReducerContext,
@@ -2330,93 +2212,6 @@ fn load_dungeon_template(
         .into_iter()
         .find(|t| t.template_id == template_id)
         .ok_or_else(|| format!("unknown template_id '{template_id}'"))
-}
-
-/// Atomically reposition an already-existing entity to `(spawn_point, layer)`.
-///
-/// Overwrites `EntityTransform` (pos, zeroed velocities), `EntityRegion`
-/// (recomputed from spawn_point XZ) and `EntityLayer`. `Entity` row is
-/// left alone — this is used for live entities, not first-time spawn.
-/// The Y written here is advisory: the sim_worker coordinator snaps the
-/// character to terrain via `raycast_surface` on the new layer before the
-/// next physics tick (see `crates/simulation_worker/src/coordinator.rs`
-/// `entity_layer.on_update`).
-fn reposition_entity_to_spawn(
-    ctx: &ReducerContext,
-    entity_id: u64,
-    spawn_point: [f32; 3],
-    layer: u32,
-) {
-    // `next_tick_id` names the upcoming tick the worker will commit. Other
-    // writers of `EntityTransform.last_tick` stamp the tick the snapshot
-    // belongs to (i.e. the last *completed* tick), so mirror that here:
-    // otherwise this row looks one tick fresher than any worker-produced
-    // transform and stale-gate comparisons ("is this input newer than the
-    // last committed transform?") flip their ordering.
-    let last_committed_tick = ctx
-        .db
-        .module_config()
-        .key()
-        .find(0)
-        .map(|c| c.next_tick_id.saturating_sub(1))
-        .unwrap_or(0);
-
-    let transform_row = EntityTransform {
-        entity_id,
-        pos_x: spawn_point[0],
-        pos_y: spawn_point[1],
-        pos_z: spawn_point[2],
-        rot_x: 0.0,
-        rot_y: 0.0,
-        rot_z: 0.0,
-        rot_w: 1.0,
-        vel_x: 0.0,
-        vel_y: 0.0,
-        vel_z: 0.0,
-        angvel_x: 0.0,
-        angvel_y: 0.0,
-        angvel_z: 0.0,
-        last_tick: last_committed_tick,
-        rls_group: 0,
-    };
-    if ctx
-        .db
-        .entity_transform()
-        .entity_id()
-        .find(&entity_id)
-        .is_some()
-    {
-        ctx.db.entity_transform().entity_id().update(transform_row);
-    } else {
-        ctx.db.entity_transform().insert(transform_row);
-    }
-
-    let region_x = (spawn_point[0] / 50.0).floor() as i32;
-    let region_z = (spawn_point[2] / 50.0).floor() as i32;
-    let region_row = EntityRegion {
-        entity_id,
-        region_x,
-        region_z,
-        layer,
-    };
-    if ctx
-        .db
-        .entity_region()
-        .entity_id()
-        .find(&entity_id)
-        .is_some()
-    {
-        ctx.db.entity_region().entity_id().update(region_row);
-    } else {
-        ctx.db.entity_region().insert(region_row);
-    }
-
-    let layer_row = EntityLayer { entity_id, layer };
-    if ctx.db.entity_layer().entity_id().find(&entity_id).is_some() {
-        ctx.db.entity_layer().entity_id().update(layer_row);
-    } else {
-        ctx.db.entity_layer().insert(layer_row);
-    }
 }
 
 #[reducer]
@@ -2642,32 +2437,25 @@ pub fn join_instance(ctx: &ReducerContext, instance_id: u64) -> Result<(), Strin
         disconnect_at: None,
     });
 
-    // Atomically move entity to instance layer + spawn point. Without the
-    // transform write the character would stay at its open-world XZ on the
-    // new layer (see the worker-side reconcile in coordinator.rs which
-    // raycast-snaps the Y to the instance's terrain).
-    let spawn_point = match load_dungeon_template(&instance.template_id) {
-        Ok(t) => pick_spawn_from(&t.spawn_points, None).unwrap_or(FALLBACK_SPAWN),
-        Err(e) => {
-            log::warn!(
-                "join_instance: could not load template '{}' for spawn_points: {e}; \
-                 falling back to {:?}",
-                instance.template_id,
-                FALLBACK_SPAWN
-            );
-            FALLBACK_SPAWN
-        }
-    };
-    reposition_entity_to_spawn(ctx, entity_id, spawn_point, instance.layer);
+    // Move entity to instance layer.
+    if let Some(er) = ctx.db.entity_region().entity_id().find(&entity_id) {
+        ctx.db.entity_region().entity_id().update(EntityRegion {
+            entity_id,
+            region_x: er.region_x,
+            region_z: er.region_z,
+            layer: instance.layer,
+        });
+    }
+    ctx.db.entity_layer().entity_id().update(EntityLayer {
+        entity_id,
+        layer: instance.layer,
+    });
 
     log::info!(
-        "Instance join: entity {} joined instance {} (layer {}) at spawn ({:.1},{:.1},{:.1})",
+        "Instance join: entity {} joined instance {} (layer {})",
         entity_id,
         instance_id,
-        instance.layer,
-        spawn_point[0],
-        spawn_point[1],
-        spawn_point[2]
+        instance.layer
     );
     Ok(())
 }
@@ -2689,47 +2477,28 @@ pub fn leave_instance(ctx: &ReducerContext) -> Result<(), String> {
         .entity_id()
         .find(&entity_id)
         .ok_or("Not in an instance")?;
-    let instance_id = membership.instance_id;
-
-    // Capture template_id before deleting the membership row (we still
-    // want to honour the dungeon's authored exit_points even though the
-    // player is no longer a member).
-    let template_id = ctx
-        .db
-        .instance()
-        .instance_id()
-        .find(&instance_id)
-        .map(|i| i.template_id);
+    let _instance_id = membership.instance_id;
 
     // Remove membership.
     ctx.db.instance_membership().entity_id().delete(&entity_id);
 
-    // Resolve exit destination on layer 0:
-    //   1. `DungeonTemplate.exit_points` (designer-authored), if any.
-    //   2. Open-world layer's spawn points / RespawnPoint rows via
-    //      `resolve_layer_spawn`.
-    //   3. `FALLBACK_SPAWN` (logged inside the resolver).
-    let exit_pos = template_id
-        .as_deref()
-        .and_then(|tid| match load_dungeon_template(tid) {
-            Ok(t) => pick_spawn_from(&t.exit_points, None),
-            Err(e) => {
-                log::warn!(
-                    "leave_instance: could not load template '{tid}' for exit_points: {e}"
-                );
-                None
-            }
-        })
-        .unwrap_or_else(|| resolve_layer_spawn(ctx, 0, None));
-
-    reposition_entity_to_spawn(ctx, entity_id, exit_pos, 0);
+    // Return entity to open world (layer 0).
+    if let Some(er) = ctx.db.entity_region().entity_id().find(&entity_id) {
+        ctx.db.entity_region().entity_id().update(EntityRegion {
+            entity_id,
+            region_x: er.region_x,
+            region_z: er.region_z,
+            layer: 0,
+        });
+    }
+    ctx.db.entity_layer().entity_id().update(EntityLayer {
+        entity_id,
+        layer: 0,
+    });
 
     log::info!(
-        "Instance leave: entity {} returned to open world at ({:.1},{:.1},{:.1})",
-        entity_id,
-        exit_pos[0],
-        exit_pos[1],
-        exit_pos[2]
+        "Instance leave: entity {} returned to open world",
+        entity_id
     );
     Ok(())
 }
@@ -2853,41 +2622,10 @@ pub fn expire_instances(ctx: &ReducerContext) -> Result<(), String> {
             }
         }
 
-        // Delete zone_counter rows for this instance layer so world_clock
-        // stops evaluating stale counters and the counter won't pollute a
-        // future instance that happens to reuse the same layer number.
-        let stale_counters: Vec<u64> = ctx
-            .db
-            .zone_counter()
-            .iter()
-            .filter(|zc| zc.layer == instance_layer)
-            .map(|zc| zc.counter_id)
-            .collect();
-        let counter_count = stale_counters.len();
-        for counter_id in stale_counters {
-            ctx.db.zone_counter().counter_id().delete(&counter_id);
-        }
-
-        // Delete world_phase rows for this instance layer.  zone_id encodes
-        // layer in the top bits: layer = zone_id / 1_000_000.
-        let stale_phases: Vec<u32> = ctx
-            .db
-            .world_phase()
-            .iter()
-            .filter(|wp| wp.zone_id / 1_000_000 == instance_layer)
-            .map(|wp| wp.zone_id)
-            .collect();
-        let phase_count = stale_phases.len();
-        for zone_id in stale_phases {
-            ctx.db.world_phase().zone_id().delete(&zone_id);
-        }
-
         log::info!(
-            "Instance expired: id={} layer={} (cleared {} counters, {} phases)",
+            "Instance expired: id={} layer={}",
             instance_id,
-            instance_layer,
-            counter_count,
-            phase_count,
+            instance_layer
         );
     }
 
@@ -2937,166 +2675,6 @@ pub fn expire_instances(ctx: &ReducerContext) -> Result<(), String> {
 pub struct InteractableUpdate {
     pub entity_id: u64,
     pub state: InteractState,
-}
-
-// ── Voxel Terrain Editor Reducers (§4.8b Phase 1) ───────────────────
-// Admin/debug-gated upserts for the offline editor pipeline. The worker
-// (Phase 5) only READS these tables; nobody mutates terrain at runtime.
-//
-// Logical uniqueness on `(terrain_set_id, chunk_morton[, voxel_idx])` is
-// enforced here (read-then-update or insert) since SpacetimeDB v2 has no
-// multi-column `#[unique]`. The `terrain_set` name is unique at the
-// storage layer.
-//
-// `terrain_core_upsert` is intentionally deferred until the voxel editor
-// lands — payload is per-voxel and large; no caller exists yet.
-
-/// Insert or update a terrain set by name. Returns the resulting
-/// `terrain_set_id` indirectly via the `name` unique index.
-#[reducer]
-pub fn terrain_set_upsert(
-    ctx: &ReducerContext,
-    name: String,
-    content_hash: String,
-    version: u32,
-) -> Result<(), String> {
-    if !is_module_admin(ctx) && !is_debug_caller(ctx) {
-        return Err("terrain_set_upsert: admin only".into());
-    }
-    if name.is_empty() {
-        return Err("terrain_set_upsert: name must not be empty".into());
-    }
-    if let Some(existing) = ctx.db.terrain_set().name().find(&name) {
-        ctx.db.terrain_set().terrain_set_id().update(TerrainSet {
-            terrain_set_id: existing.terrain_set_id,
-            name,
-            content_hash,
-            version,
-        });
-    } else {
-        ctx.db.terrain_set().insert(TerrainSet {
-            terrain_set_id: 0,
-            name,
-            content_hash,
-            version,
-        });
-    }
-    Ok(())
-}
-
-/// Insert or replace one baked terrain chunk. Worker (Phase 5) will
-/// react to `on_update` to swap the matching Rapier collider.
-#[reducer]
-pub fn terrain_chunk_upsert(
-    ctx: &ReducerContext,
-    terrain_set_id: u32,
-    chunk_morton: u64,
-    vertices: Vec<f32>,
-    indices: Vec<u32>,
-    lod: u8,
-) -> Result<(), String> {
-    if !is_module_admin(ctx) && !is_debug_caller(ctx) {
-        return Err("terrain_chunk_upsert: admin only".into());
-    }
-    if vertices.len() % 3 != 0 {
-        return Err("terrain_chunk_upsert: vertices length must be a multiple of 3".into());
-    }
-    if indices.len() % 3 != 0 {
-        return Err("terrain_chunk_upsert: indices length must be a multiple of 3".into());
-    }
-    let n_verts = (vertices.len() / 3) as u32;
-    if let Some(bad) = indices.iter().find(|&&i| i >= n_verts) {
-        return Err(format!(
-            "terrain_chunk_upsert: index {bad} out of range for {n_verts} vertices",
-        ));
-    }
-    if ctx
-        .db
-        .terrain_set()
-        .terrain_set_id()
-        .find(&terrain_set_id)
-        .is_none()
-    {
-        return Err(format!(
-            "terrain_chunk_upsert: unknown terrain_set_id {terrain_set_id}",
-        ));
-    }
-    let existing = ctx
-        .db
-        .terrain_chunk()
-        .by_set_chunk()
-        .filter((terrain_set_id, chunk_morton..=chunk_morton))
-        .next();
-    if let Some(row) = existing {
-        ctx.db.terrain_chunk().row_id().update(TerrainChunk {
-            row_id: row.row_id,
-            terrain_set_id,
-            chunk_morton,
-            vertices,
-            indices,
-            lod,
-        });
-    } else {
-        ctx.db.terrain_chunk().insert(TerrainChunk {
-            row_id: 0,
-            terrain_set_id,
-            chunk_morton,
-            vertices,
-            indices,
-            lod,
-        });
-    }
-    Ok(())
-}
-
-/// Insert or update one chunk's manifest entry (content hash for client
-/// cache validation). Bumped by the editor whenever a chunk is rebaked.
-#[reducer]
-pub fn terrain_manifest_upsert(
-    ctx: &ReducerContext,
-    terrain_set_id: u32,
-    chunk_morton: u64,
-    content_hash: String,
-    version: u32,
-) -> Result<(), String> {
-    if !is_module_admin(ctx) && !is_debug_caller(ctx) {
-        return Err("terrain_manifest_upsert: admin only".into());
-    }
-    if ctx
-        .db
-        .terrain_set()
-        .terrain_set_id()
-        .find(&terrain_set_id)
-        .is_none()
-    {
-        return Err(format!(
-            "terrain_manifest_upsert: unknown terrain_set_id {terrain_set_id}",
-        ));
-    }
-    let existing = ctx
-        .db
-        .terrain_manifest()
-        .by_set_chunk()
-        .filter((terrain_set_id, chunk_morton..=chunk_morton))
-        .next();
-    if let Some(row) = existing {
-        ctx.db.terrain_manifest().row_id().update(TerrainManifest {
-            row_id: row.row_id,
-            terrain_set_id,
-            chunk_morton,
-            content_hash,
-            version,
-        });
-    } else {
-        ctx.db.terrain_manifest().insert(TerrainManifest {
-            row_id: 0,
-            terrain_set_id,
-            chunk_morton,
-            content_hash,
-            version,
-        });
-    }
-    Ok(())
 }
 
 // ── Debug Reducers ──────────────────────────────────────────────────
@@ -3885,28 +3463,24 @@ mod debug_reducers {
             disconnect_at: None,
         });
 
-        let spawn_point = match load_dungeon_template(&instance.template_id) {
-            Ok(t) => pick_spawn_from(&t.spawn_points, None).unwrap_or(FALLBACK_SPAWN),
-            Err(e) => {
-                log::warn!(
-                    "debug_join_instance: could not load template '{}' for spawn_points: {e}; \
-                     falling back to {:?}",
-                    instance.template_id,
-                    FALLBACK_SPAWN
-                );
-                FALLBACK_SPAWN
-            }
-        };
-        reposition_entity_to_spawn(ctx, entity_id, spawn_point, instance.layer);
+        if let Some(er) = ctx.db.entity_region().entity_id().find(&entity_id) {
+            ctx.db.entity_region().entity_id().update(EntityRegion {
+                entity_id,
+                region_x: er.region_x,
+                region_z: er.region_z,
+                layer: instance.layer,
+            });
+        }
+        ctx.db.entity_layer().entity_id().update(EntityLayer {
+            entity_id,
+            layer: instance.layer,
+        });
 
         log::info!(
-            "debug_join_instance: entity {} joined instance {} (layer {}) at spawn ({:.1},{:.1},{:.1}) — party check skipped",
+            "debug_join_instance: entity {} joined instance {} (layer {}) — party check skipped",
             entity_id,
             instance_id,
-            instance.layer,
-            spawn_point[0],
-            spawn_point[1],
-            spawn_point[2]
+            instance.layer
         );
         Ok(())
     }

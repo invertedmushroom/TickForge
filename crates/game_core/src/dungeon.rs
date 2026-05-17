@@ -1,52 +1,6 @@
 // Re-export shared dungeon types from game_schema.
 pub use game_schema::dungeon::*;
 
-use crate::physics_backend::EnvironmentShape;
-
-/// Convert an authoring-side `ShapeDef` into the runtime
-/// `EnvironmentShape` consumed by `PhysicsBackend`. Centralises the
-/// match arms so call sites (worker startup, instance spawn, future
-/// terrain materialiser) stay in sync as new shapes are added.
-pub fn shape_def_to_environment(shape: &ShapeDef) -> EnvironmentShape {
-    match shape {
-        ShapeDef::Cuboid {
-            half_x,
-            half_y,
-            half_z,
-        } => EnvironmentShape::Cuboid {
-            half_x: *half_x,
-            half_y: *half_y,
-            half_z: *half_z,
-        },
-        ShapeDef::Cylinder {
-            half_height,
-            radius,
-        } => EnvironmentShape::Cylinder {
-            half_height: *half_height,
-            radius: *radius,
-        },
-        ShapeDef::Heightfield {
-            nrows,
-            ncols,
-            scale_x,
-            scale_y,
-            scale_z,
-            heights,
-        } => EnvironmentShape::Heightfield {
-            nrows: *nrows,
-            ncols: *ncols,
-            scale_x: *scale_x,
-            scale_y: *scale_y,
-            scale_z: *scale_z,
-            heights: heights.clone(),
-        },
-        ShapeDef::TriMesh { vertices, indices } => EnvironmentShape::TriMesh {
-            vertices: vertices.clone(),
-            indices: indices.clone(),
-        },
-    }
-}
-
 /// Registry of parsed dungeon templates, keyed by template_id.
 pub struct DungeonRegistry {
     templates: std::collections::HashMap<String, DungeonTemplate>,
@@ -122,7 +76,7 @@ mod tests {
                 template_id: "arena_01",
                 name: "Test Arena",
                 max_players: 4,
-                spawn_points: [(0.0, 1.0, 0.0)],
+                spawn_point: (0.0, 1.0, 0.0),
                 geometry: [
                     (shape: Cuboid(half_x: 10.0, half_y: 0.5, half_z: 10.0), position: (0.0, -0.5, 0.0)),
                     (shape: Cylinder(half_height: 3.0, radius: 1.0), position: (5.0, 3.0, 0.0)),
@@ -147,7 +101,7 @@ mod tests {
         assert_eq!(t.template_id, "arena_01");
         assert_eq!(t.name, "Test Arena");
         assert_eq!(t.max_players, 4);
-        assert_eq!(t.spawn_points, vec![[0.0, 1.0, 0.0]]);
+        assert_eq!(t.spawn_point, [0.0, 1.0, 0.0]);
     }
 
     #[test]

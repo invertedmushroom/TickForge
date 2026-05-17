@@ -53,11 +53,7 @@ impl TickPipeline {
                     if self.is_cc_disabled(idx) {
                         // Allow UseAbility if the ability is marked usable_while_cc.
                         if let IntentAction::UseAbility(data) = &intent.action {
-                            if self.ability_prop(
-                                data.ability_id,
-                                |ad| ad.cast_requirements().usable_while_cc,
-                                false,
-                            ) {
+                            if self.ability_prop(data.ability_id, |ad| ad.usable_while_cc, false) {
                                 self.handle_use_ability(intent, &mut cast_this_tick);
                             }
                         }
@@ -1112,44 +1108,13 @@ impl TickPipeline {
                 if dx * dx + dz * dz > max_range * max_range {
                     return; // out of horizontal range
                 }
-                // Resolve authoritative ground Y by raycasting straight down
-                // from high above the client's (x, z). The client's Y is
-                // advisory only — on uneven terrain it would be stale or
-                // spoofed. If the ray misses (hole in terrain, off the
-                // heightfield, or — with strict layer filtering — no
-                // environment for this caster's layer at that XZ), reject
-                // the cast: trusting the client-supplied Y here would let
-                // a spoofed client place AoEs at arbitrary heights, and
-                // the subsequent LoS check only catches blockers, not
-                // empty sky above the caster.
-                const SKY_LIFT: f32 = 200.0;
-                const MAX_DROP: f32 = 400.0;
-                let layer = self.layer_of(entity_id);
-                let Some(resolved_point) = self.physics.raycast_surface(
-                    Vec3f {
-                        x: point.x,
-                        y: point.y + SKY_LIFT,
-                        z: point.z,
-                    },
-                    Vec3f {
-                        x: 0.0,
-                        y: -1.0,
-                        z: 0.0,
-                    },
-                    MAX_DROP,
-                    layer,
-                ) else {
-                    return; // no terrain at requested XZ on this layer
-                };
                 if !self
                     .physics
-                    .line_of_sight_on_layer(caster_pos, resolved_point, layer)
+                    .line_of_sight_on_layer(caster_pos, point, self.layer_of(entity_id))
                 {
                     return; // blocked by environment
                 }
-                ResolvedTargeting::Position {
-                    point: resolved_point,
-                }
+                ResolvedTargeting::Position { point }
             }
             TargetingMode::RaycastStrict => {
                 // Server raycasts from caster along client aim direction.

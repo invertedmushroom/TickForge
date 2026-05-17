@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::combat::skill::{AbilityExecutionId, HitEffectSpec, HitboxRules, SkillShape};
+use crate::combat::skill::{AbilityExecutionId, SkillShape};
 use game_protocol::entity_id::EntityId;
 use game_protocol::tick::TickId;
 use game_schema::Vec3f;
@@ -32,10 +32,6 @@ pub struct ActiveHitbox {
     pub shape: SkillShape,
     /// Entity-local offset for the sensor origin — see `SpawnHitbox` action.
     pub offset: Vec3f,
-    /// Flattened hit payload resolved at hitbox spawn time.
-    pub effect: Option<HitEffectSpec>,
-    /// Flattened hitbox behavior resolved at hitbox spawn time.
-    pub rules: HitboxRules,
     /// True once `ApplyDamageFrame` has spawned the live Rapier sensor.
     /// Until armed, the hitbox is a logical declaration only — no physics collision.
     pub armed: bool,
@@ -51,6 +47,12 @@ pub struct ActiveHitbox {
     /// for overlap. Copied from the `AbilityExecutionContext` in Phase 3.
     /// 0 means no compensation.
     pub rewind_ticks: u32,
+    /// If true, targets are removed from `already_hit` when they leave overlap
+    /// (Stopped event), allowing re-entry to deal damage again.
+    pub allow_reentry: bool,
+    /// Tick interval for periodic re-damage while targets remain inside.
+    /// 0 = single-hit only (no periodic damage). Copied from `AbilityData`.
+    pub damage_interval_ticks: u32,
     /// Entities currently overlapping this hitbox sensor.
     ///
     /// Kept in sync from Started/Stopped events and from live sensor-overlap
@@ -68,6 +70,13 @@ pub struct ActiveHitbox {
     /// units per tick along `direction`. Updated each tick in the projectile
     /// movement sub-phase. `None` for entity-parented hitboxes.
     pub projectile: Option<ProjectileState>,
+    /// If true, this projectile passes through targets (hits all in path).
+    /// False = removed on first hit (single-target).
+    pub pierce: bool,
+    /// Per-ability cap on lag compensation rewind depth.
+    /// When the compensated hit pass runs, the effective rewind is
+    /// `min(rewind_ticks, max_rewind_ticks.unwrap_or(global_max))`.
+    pub max_rewind_ticks: Option<u32>,
 }
 
 /// Runtime state for a travelling world-space projectile hitbox.
@@ -119,62 +128,6 @@ impl HitboxStore {
         pierce: bool,
         max_rewind_ticks: Option<u32>,
     ) {
-        self.spawn_with_optional_payload(
-            execution_id,
-            owner,
-            ability_id,
-            tick,
-            shape,
-            offset,
-            rewind_ticks,
-            None,
-            HitboxRules {
-                allow_reentry,
-                damage_interval_ticks,
-                pierce,
-                max_rewind_ticks,
-                target_filter: crate::combat::skill::TargetFilter::Hostile,
-            },
-        );
-    }
-
-    pub fn spawn_with_payload(
-        &mut self,
-        execution_id: AbilityExecutionId,
-        owner: EntityId,
-        ability_id: u32,
-        tick: TickId,
-        shape: SkillShape,
-        offset: Vec3f,
-        rewind_ticks: u32,
-        effect: Option<HitEffectSpec>,
-        rules: HitboxRules,
-    ) {
-        self.spawn_with_optional_payload(
-            execution_id,
-            owner,
-            ability_id,
-            tick,
-            shape,
-            offset,
-            rewind_ticks,
-            effect,
-            rules,
-        );
-    }
-
-    fn spawn_with_optional_payload(
-        &mut self,
-        execution_id: AbilityExecutionId,
-        owner: EntityId,
-        ability_id: u32,
-        tick: TickId,
-        shape: SkillShape,
-        offset: Vec3f,
-        rewind_ticks: u32,
-        effect: Option<HitEffectSpec>,
-        rules: HitboxRules,
-    ) {
         self.active.insert(
             execution_id,
             ActiveHitbox {
@@ -184,16 +137,18 @@ impl HitboxStore {
                 spawned_at: tick,
                 shape,
                 offset,
-                effect,
-                rules,
                 armed: false,
                 sensor_handle: None,
                 already_hit: HashSet::new(),
                 rewind_ticks,
+                allow_reentry,
+                damage_interval_ticks,
                 overlapping: HashSet::new(),
                 last_damage_tick: tick,
                 world_sensor: false,
                 projectile: None,
+                pierce,
+                max_rewind_ticks,
             },
         );
     }
@@ -297,7 +252,7 @@ impl HitboxStore {
     /// Only effective on hitboxes with `allow_reentry == true`.
     pub fn clear_hit(&mut self, execution_id: AbilityExecutionId, target: EntityId) {
         if let Some(hb) = self.active.get_mut(&execution_id) {
-            if hb.rules.allow_reentry {
+            if hb.allow_reentry {
                 hb.already_hit.remove(&target);
             }
         }
@@ -325,10 +280,10 @@ impl HitboxStore {
     ) -> Vec<(AbilityExecutionId, EntityId, u32, Vec<EntityId>)> {
         self.active
             .values()
-            .filter(|hb| hb.armed && hb.rules.damage_interval_ticks > 0)
+            .filter(|hb| hb.armed && hb.damage_interval_ticks > 0)
             .filter(|hb| {
                 current_tick.0.saturating_sub(hb.last_damage_tick.0)
-                    >= hb.rules.damage_interval_ticks as u64
+                    >= hb.damage_interval_ticks as u64
             })
             .map(|hb| {
                 let targets: Vec<EntityId> = hb.overlapping.iter().copied().collect();
@@ -393,7 +348,7 @@ impl HitboxStore {
     pub fn armed_periodic_ids(&self) -> Vec<AbilityExecutionId> {
         self.active
             .values()
-            .filter(|hb| hb.armed && hb.rules.damage_interval_ticks > 0 && hb.projectile.is_none())
+            .filter(|hb| hb.armed && hb.damage_interval_ticks > 0 && hb.projectile.is_none())
             .map(|hb| hb.execution_id)
             .collect()
     }

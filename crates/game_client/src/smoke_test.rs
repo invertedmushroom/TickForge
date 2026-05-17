@@ -1614,7 +1614,6 @@ fn run_f6_unauthorized_commit(conn: &DbConnection, r: &mut TestResults) {
         vec![],     // npc_state_updates
         vec![],     // director_spawns
         vec![],     // interactable_updates
-        vec![],     // death_state_inserts
         move |_ctx, result: Result<Result<(), String>, spacetimedb_sdk::__codegen::InternalError>| {
             if let Ok(Err(e)) = &result {
                 if e.contains("trusted worker") || e.contains("unauthorized") || e.contains("rejected") {
@@ -1666,7 +1665,6 @@ fn run_f7_cursor_safety(conn: &DbConnection, r: &mut TestResults) {
         vec![],
         vec![], // director_spawns
         vec![], // interactable_updates
-        vec![], // death_state_inserts
         move |_ctx, _result| {
             d.store(true, Ordering::SeqCst);
         },

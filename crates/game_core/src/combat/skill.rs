@@ -138,107 +138,6 @@ pub struct ScheduledAbilityAction {
     pub action: AbilityAction,
 }
 
-/// Cast gating flags checked before an ability execution is accepted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CastRequirements {
-    /// Most abilities are grounded by default. Air skills opt out.
-    #[serde(default = "default_require_grounded")]
-    pub require_grounded: bool,
-    /// Allows stunbreak-style abilities while hard-CC disabled.
-    #[serde(default)]
-    pub usable_while_cc: bool,
-}
-
-impl Default for CastRequirements {
-    fn default() -> Self {
-        Self {
-            require_grounded: true,
-            usable_while_cc: false,
-        }
-    }
-}
-
-/// Runtime hit payload copied into an `ActiveHitbox` at spawn time.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct HitEffectSpec {
-    pub base_damage: f32,
-    pub damage_type: DamageType,
-    pub threat_multiplier: f32,
-    /// Healing applied to friendly targets (`TargetFilter::Friendly`). 0.0 = no heal.
-    /// When > 0, Phase 6 routes the hit through `HealthStore::apply_healing`
-    /// instead of `apply_damage` and skips defensive routing, CC, and threat.
-    #[serde(default)]
-    pub heal_amount: f32,
-    #[serde(default)]
-    pub on_hit_buffs: Vec<u32>,
-    #[serde(default)]
-    pub knockback_force: f32,
-    #[serde(default)]
-    pub pull_force: f32,
-    #[serde(default)]
-    pub launch_lift: f32,
-    #[serde(default)]
-    pub launch_recovery_ticks: u32,
-    #[serde(default)]
-    pub stun_ticks: u32,
-    #[serde(default)]
-    pub knockdown_ticks: u32,
-    #[serde(default)]
-    pub sleep_ticks: u32,
-    #[serde(default)]
-    pub silence_ticks: u32,
-    #[serde(default)]
-    pub fear_ticks: u32,
-    #[serde(default)]
-    pub on_contact: Vec<HitEffectAction>,
-}
-
-/// Runtime hitbox behavior copied into an `ActiveHitbox` at spawn time.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct HitboxRules {
-    #[serde(default)]
-    pub allow_reentry: bool,
-    #[serde(default)]
-    pub damage_interval_ticks: u32,
-    #[serde(default)]
-    pub pierce: bool,
-    #[serde(default)]
-    pub max_rewind_ticks: Option<u32>,
-    #[serde(default)]
-    pub target_filter: TargetFilter,
-}
-
-impl Default for HitboxRules {
-    fn default() -> Self {
-        Self {
-            allow_reentry: false,
-            damage_interval_ticks: 0,
-            pierce: false,
-            max_rewind_ticks: None,
-            target_filter: TargetFilter::Hostile,
-        }
-    }
-}
-
-/// Secondary effects queued when a hitbox successfully contacts a target.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum HitEffectAction {
-    /// Queue a detached world-space hitbox at the contacted target's position.
-    SpawnHitbox {
-        #[serde(default)]
-        delay_ticks: u32,
-        #[serde(default = "default_contact_hitbox_duration_ticks")]
-        duration_ticks: u32,
-        shape: SkillShape,
-        #[serde(default = "default_vec3f_zero")]
-        offset: Vec3f,
-        #[serde(default)]
-        effect: Option<Box<HitEffectSpec>>,
-        #[serde(default)]
-        rules: Option<HitboxRules>,
-    },
-}
-
 /// Actions that occur at specific frames during an ability.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AbilityAction {
@@ -249,21 +148,6 @@ pub enum AbilityAction {
     SpawnHitbox {
         shape: SkillShape,
         offset: game_schema::Vec3f,
-    },
-    /// Spawn a hitbox with per-hitbox effect/rule overrides.
-    ///
-    /// `effect` is boxed so this variant doesn't bloat `AbilityAction` (and
-    /// therefore every entry in the sorted `scheduled_actions` queue). With
-    /// the inline `HitEffectSpec` (~100 B incl. two `Vec`s), the queue's
-    /// `partition_point + Vec::insert` memmove cost dominated heavy action
-    /// ticks — boxing keeps the variant ~24 B.
-    SpawnConfiguredHitbox {
-        shape: SkillShape,
-        offset: game_schema::Vec3f,
-        #[serde(default)]
-        effect: Option<Box<HitEffectSpec>>,
-        #[serde(default)]
-        rules: Option<HitboxRules>,
     },
     ApplyDamageFrame,
     RemoveHitbox,
@@ -388,7 +272,6 @@ impl AbilityAction {
     pub const fn label(&self) -> &'static str {
         match self {
             Self::SpawnHitbox { .. } => "SpawnHitbox",
-            Self::SpawnConfiguredHitbox { .. } => "SpawnConfiguredHitbox",
             Self::ApplyDamageFrame => "ApplyDamageFrame",
             Self::RemoveHitbox => "RemoveHitbox",
             Self::CooldownStart { .. } => "CooldownStart",
@@ -441,30 +324,12 @@ pub enum ScheduledActionType {
         ability_id: u32,
         action: AbilityAction,
     },
-    /// Boxed payload — see `ContactSpawnHitboxPayload`. Boxing keeps
-    /// `ScheduledActionType` (and therefore `ScheduledAction`) compact even
-    /// though contact-spawn data is heavy. The sorted `scheduled_actions`
-    /// queue uses `partition_point + Vec::insert`, so per-element size
-    /// directly drives memmove cost on action-storm ticks.
-    ContactSpawnHitbox(Box<ContactSpawnHitboxPayload>),
     BuffExpire {
         buff_id: u32,
     },
     // CooldownExpire removed — cooldown expiry is now owned by TickPipeline::cooldowns.
     // Phase 8 drains the HashMap each tick and emits CooldownReady events directly,
     // making this variant unnecessary and eliminating the O(n) queue scan in is_on_cooldown.
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ContactSpawnHitboxPayload {
-    pub parent_execution_id: AbilityExecutionId,
-    pub ability_id: u32,
-    pub shape: SkillShape,
-    pub position: Vec3f,
-    pub offset: Vec3f,
-    pub effect: HitEffectSpec,
-    pub rules: HitboxRules,
-    pub duration_ticks: u32,
 }
 
 /// Discrete charge tier definition (TERA / Monster Hunter style).
@@ -567,10 +432,6 @@ pub struct AbilityData {
     /// downed-state abilities.
     #[serde(default)]
     pub usable_while_cc: bool,
-    /// If true (default), the caster must be grounded to start this ability.
-    /// Airborne abilities set this false.
-    #[serde(default = "default_require_grounded")]
-    pub require_grounded: bool,
     /// Server-side targeting validation mode. Determines which `AbilityTarget`
     /// variants are accepted and what validation is applied before the cast.
     /// Default: `DirectionTarget`.
@@ -604,12 +465,6 @@ pub struct AbilityData {
     /// `Hostile` (default) = only enemies. `Friendly` = only allies. `All` = everything.
     #[serde(default)]
     pub target_filter: TargetFilter,
-    /// Healing applied per hit when `target_filter == Friendly`. 0.0 = no heal
-    /// (default). Heal scales with `charge_tiers[tier].damage_mult` and clamps
-    /// to max_hp via `HealthStore::apply_healing`. Healing bypasses dodge,
-    /// block, cover, CC, and generates no threat.
-    #[serde(default)]
-    pub heal_amount: f32,
 }
 
 /// Registry of all known abilities, keyed by ability_id.
@@ -621,57 +476,6 @@ pub struct AbilityRegistry {
 
 fn default_charge_roots_while_charging() -> bool {
     true
-}
-
-fn default_require_grounded() -> bool {
-    true
-}
-
-fn default_contact_hitbox_duration_ticks() -> u32 {
-    1
-}
-
-fn default_vec3f_zero() -> Vec3f {
-    Vec3f::ZERO
-}
-
-impl AbilityData {
-    pub fn cast_requirements(&self) -> CastRequirements {
-        CastRequirements {
-            require_grounded: self.require_grounded,
-            usable_while_cc: self.usable_while_cc,
-        }
-    }
-
-    pub fn default_hit_effect(&self) -> HitEffectSpec {
-        HitEffectSpec {
-            base_damage: self.base_damage,
-            damage_type: self.damage_type,
-            threat_multiplier: self.threat_multiplier,
-            heal_amount: self.heal_amount,
-            on_hit_buffs: self.on_hit_buffs.clone(),
-            knockback_force: self.knockback_force,
-            pull_force: self.pull_force,
-            launch_lift: self.launch_lift,
-            launch_recovery_ticks: self.launch_recovery_ticks,
-            stun_ticks: self.stun_ticks,
-            knockdown_ticks: self.knockdown_ticks,
-            sleep_ticks: self.sleep_ticks,
-            silence_ticks: self.silence_ticks,
-            fear_ticks: self.fear_ticks,
-            on_contact: Vec::new(),
-        }
-    }
-
-    pub fn default_hitbox_rules(&self) -> HitboxRules {
-        HitboxRules {
-            allow_reentry: self.allow_reentry,
-            damage_interval_ticks: self.damage_interval_ticks,
-            pierce: self.pierce,
-            max_rewind_ticks: self.max_rewind_ticks,
-            target_filter: self.target_filter,
-        }
-    }
 }
 
 impl AbilityRegistry {

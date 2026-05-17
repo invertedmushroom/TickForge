@@ -125,18 +125,6 @@ pub enum EventPayload {
         position: crate::types::Vec3f,
         radius: f32,
     },
-    /// A short-lived world-space hitbox spawned by another hitbox's `on_contact`
-    /// follow-up. Clients render a brief flash at `position` that fades over
-    /// `duration_ticks`. `parent_execution_id` is the cast that triggered the
-    /// follow-up (useful for grouping/attribution on the client).
-    ContactHitboxSpawned {
-        execution_id: u64,
-        parent_execution_id: u64,
-        ability_id: u32,
-        position: crate::types::Vec3f,
-        radius: f32,
-        duration_ticks: u32,
-    },
     /// A detached skill object (projectile or hazard) was removed.
     /// Clients kill the predicted/placed visual for this `execution_id`.
     SkillObjectRemoved {

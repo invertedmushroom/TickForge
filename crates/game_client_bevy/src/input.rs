@@ -256,6 +256,7 @@ impl Plugin for InputPlugin {
             )
                 .in_set(InputSet::DriveInput),
         );
+        app.add_systems(Update, handle_debug_keys.in_set(InputSet::DriveInput));
     }
 }
 
@@ -578,7 +579,6 @@ fn update_crosshair(
     player_q: Query<&Transform, (With<LocalPlayer>, Without<GameCamera>)>,
     entity_q: Query<(&Transform, &crate::sync::ServerEntity), Without<GameCamera>>,
     local_player: Res<LocalPlayerEntity>,
-    active_dungeon: Option<Res<crate::dungeon_geometry::ActiveDungeon>>,
     mut crosshair: ResMut<CrosshairAim>,
 ) {
     let Ok((cam_gtf, camera)) = cam_q.get_single() else {
@@ -608,25 +608,6 @@ fn update_crosshair(
             .map(|(tf, se)| (se.entity_id, tf.translation)),
         local_player.entity_id.unwrap_or(u64::MAX),
     );
-
-    // When the player is inside a dungeon, refine ground Y from the
-    // embedded heightfield. The plane-intersect above gave XZ at
-    // `GROUND_Y`; we re-sample the true surface at that XZ so AoE rings,
-    // ground-target reticles, and HUD debug lines stop floating through
-    // uneven terrain. The server re-validates GroundTarget placement
-    // regardless, so a miss here is cosmetic.
-    if let Some(active) = active_dungeon.as_deref() {
-        if let Some(g) = &mut crosshair.ground_position {
-            if let Some(y) = crate::dungeon_geometry::sample_terrain_y(active.template, g.x, g.z) {
-                g.y = y;
-                if matches!(crosshair.aim_source, AimPointSource::WorldHit) {
-                    if let Some(w) = &mut crosshair.world_aim_point {
-                        w.y = y;
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// Lock-on input: ability key presses (open/fire), left-click to tag,
@@ -782,6 +763,22 @@ fn handle_lock_on_input(
         } else {
             log::info!("Lock-on tag: no target under crosshair");
         }
+    }
+}
+
+/// Debug: F9 triggers fake local-player death to test the death overlay.
+fn handle_debug_keys(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    local_player: Res<LocalPlayerEntity>,
+    mut death_events: EventWriter<crate::vfx::DeathNotification>,
+) {
+    if keyboard.just_pressed(KeyCode::F9) {
+        let entity_id = local_player.entity_id.unwrap_or(0);
+        death_events.send(crate::vfx::DeathNotification {
+            entity_id,
+            is_local_player: true,
+        });
+        log::info!("Debug: F9 — fake death triggered");
     }
 }
 

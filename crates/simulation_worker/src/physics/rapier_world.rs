@@ -7,8 +7,6 @@ use game_protocol::entity_id::EntityId;
 use game_schema::EntityKind;
 use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
 use rapier3d::math::{Pose, Vector};
-use rapier3d::parry::shape::{TriMesh, TriMeshFlags};
-use rapier3d::parry::utils::Array2;
 use rapier3d::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
@@ -31,18 +29,13 @@ use std::sync::mpsc;
 // not in user_data.  A 1-bit stealth flag can be added to the flags field
 // when that feature is implemented.
 //
-// Layer semantics (strict — no shared layer):
-//   Every collider belongs to exactly one layer. Layer 0 is the open-world
-//   layer; layers 1..=N are dungeon instances (or future open-world maps).
-//   There is NO cross-layer visibility — environment authored on layer A is
-//   invisible to scene queries issued by an entity on layer B.
+// Layer semantics:
+//   layer 0 = shared world geometry (ground plane, open-world props).
+//             Visible to ALL layers.
+//   layer N (N>0) = dungeon-instance geometry. Only visible to entities
+//                   whose own colliders are stamped with the same layer.
 //
-//   Each layer must author its own floor. The placeholder open-world floor
-//   lives on layer 0 and is visible only to layer-0 entities; once the voxel
-//   terrain pipeline lands it will be replaced by per-layer baked TriMesh
-//   chunks loaded from `terrain_chunk` rows.
-//
-// Predicate: `col_layer == caller_layer`
+// Predicate: `col_layer == 0 || col_layer == caller_layer`
 //
 // ColliderKind discriminant:
 //   Body and Hurtbox (discriminant 0, 1) are fully decoded from user_data.
@@ -230,28 +223,10 @@ impl PhysicsWorld {
             layer_policies: HashMap::new(),
         };
 
-        // Default placeholder floor on layer 0. This is a *convenience
-        // default* so test fixtures (`PhysicsWorld::new()` followed by
-        // ad-hoc collider inserts) and out-of-the-box worker startup
-        // both have a sane ground plane to fall onto. Production worker
-        // startup overrides this by calling
-        // `replace_layer_geometry(0, …)` from `materialize_layer` whenever
-        // `data/layers.ron` declares a `WorldLayerDef` for layer 0
-        // (see `crates/simulation_worker/src/coordinator.rs`). Strict
-        // same-layer scene queries still apply: this floor is invisible
-        // to entities on any layer ≠ 0.
-        world.add_environment_collider_on_layer(
-            EnvironmentShape::Cuboid {
-                half_x: 500.0,
-                half_y: 0.1,
-                half_z: 500.0,
-            },
-            game_protocol::types::Vec3f {
-                x: 0.0,
-                y: 0.0,
-                z: 0.0,
-            },
-            0,
+        // Default ground plane — every world has a floor.
+        world.add_environment_collider(
+            SharedShape::cuboid(500.0, 0.1, 500.0),
+            Vector::new(0.0, 0.0, 0.0),
         );
         world
     }
@@ -773,13 +748,19 @@ impl PhysicsWorld {
     }
 
     /// Set the position of a kinematic body, preserving current rotation.
+    /// Clamps Y to prevent embedding characters below the ground surface.
     pub fn set_kinematic_position(&mut self, entity_id: EntityId, position: Vector) -> bool {
         if let Some(handle) = self.entity_to_body.get(&entity_id)
             && let Some(body) = self.bodies.get_mut(*handle)
         {
+            let mut pos = position;
+            let min_y = game_core::physics_constants::MIN_CHARACTER_Y;
+            if pos.y < min_y {
+                pos.y = min_y;
+            }
             // Preserve any pending rotation set earlier in this tick.
             let rotation = body.next_position().rotation;
-            body.set_next_kinematic_position(Pose::from_parts(position, rotation));
+            body.set_next_kinematic_position(Pose::from_parts(pos, rotation));
             return true;
         }
         false
@@ -1031,13 +1012,6 @@ impl PhysicsBackend for PhysicsWorld {
 
         let sensor_pose = *sensor.position();
         let sensor_shape = sensor.shape();
-        // Layer isolation: only include candidate bodies/hurtboxes whose
-        // stamped layer exactly matches the sensor's owner layer. Strict
-        // same-layer means a sensor on layer N never sees entities on any
-        // other layer (open world or otherwise). Combined with the strict
-        // environment-query predicates, this gives full per-layer isolation
-        // without any layer-0 fallthrough.
-        let sensor_layer = ud_layer(sensor.user_data);
         let query = self.query_pipeline();
 
         // Use a direct shape query against the current scene instead of
@@ -1045,13 +1019,6 @@ impl PhysicsBackend for PhysicsWorld {
         let mut entities = HashSet::new();
         for (other, _) in query.intersect_shape(sensor_pose, sensor_shape) {
             if other == sensor_handle {
-                continue;
-            }
-            // Strict same-layer match on candidate collider.
-            let Some(other_col) = self.colliders.get(other) else {
-                continue;
-            };
-            if ud_layer(other_col.user_data) != sensor_layer {
                 continue;
             }
             match self.kind_for_collider(other) {
@@ -1147,8 +1114,6 @@ impl PhysicsBackend for PhysicsWorld {
         entity_id: EntityId,
         desired_translation: game_protocol::types::Vec3f,
     ) -> Option<MoveResult> {
-        const KCC_OFFSET_REL: f32 = 0.02;
-
         let handle = *self.entity_to_body.get(&entity_id)?;
         let desired_vec = Vector::new(
             desired_translation.x,
@@ -1180,13 +1145,11 @@ impl PhysicsBackend for PhysicsWorld {
             // movement.  This prevents capsule stacking, landing-on-heads after launch CC,
             // and getting wedged between overlapping capsules.
             //
-            // Layer predicate: only collide with same-layer colliders. Reads the
-            // layer from collider.user_data — zero HashMap lookups. Strict
-            // same-layer means each layer must author its own floor; there is
-            // no layer-0 fallback.
+            // Layer predicate: only collide with same-layer or shared (layer 0) colliders.
+            // Reads the layer from collider.user_data — zero HashMap lookups.
             let layer_pred = move |_ch: ColliderHandle, collider: &Collider| -> bool {
                 let col_layer = ud_layer(collider.user_data);
-                col_layer == caller_layer
+                col_layer == 0 || col_layer == caller_layer
             };
             let filter = QueryFilter::default()
                 .exclude_rigid_body(handle)
@@ -1199,14 +1162,13 @@ impl PhysicsBackend for PhysicsWorld {
                 filter,
             );
             let controller = KinematicCharacterController {
-                offset: CharacterLength::Relative(KCC_OFFSET_REL),
+                offset: CharacterLength::Relative(0.02),
                 autostep: Some(CharacterAutostep {
                     max_height: CharacterLength::Relative(0.15),
                     min_width: CharacterLength::Relative(0.2),
                     include_dynamic_bodies: false,
                 }),
                 snap_to_ground: Some(CharacterLength::Relative(0.2)),
-                normal_nudge_factor: 1.0e-3,
                 ..Default::default()
             };
             let mut hits: Vec<ColliderHandle> = Vec::new();
@@ -1253,48 +1215,15 @@ impl PhysicsBackend for PhysicsWorld {
         }
 
         let mut new_pos = current_pos.translation + movement.translation;
-        let mut grounded = movement.grounded;
 
-        // For walk-style motion (ground-pull or horizontal shoves), repair small
-        // false-negative grounded results by snapping to the same-layer surface
-        // directly below when it is already within walk distance. This keeps
-        // authored floors and flat TriMesh terrain stable without introducing
-        // a global minimum-Y clamp or affecting true airborne movement.
-        if (-0.25..=1.0e-5).contains(&desired_vec.y) {
-            const SURFACE_PROBE_UP: f32 = 1.0;
-            const SURFACE_PROBE_DISTANCE: f32 = 2.0;
-            const MAX_GROUNDED_SNAP_DELTA: f32 = 0.35;
-
-            if let Some(hit) = self.raycast_surface(
-                game_protocol::types::Vec3f::new(
-                    new_pos.x,
-                    new_pos.y + SURFACE_PROBE_UP,
-                    new_pos.z,
-                ),
-                game_protocol::types::Vec3f::new(0.0, -1.0, 0.0),
-                SURFACE_PROBE_DISTANCE,
-                caller_layer,
-            ) {
-                let rest_y = hit.y
-                    + game_core::physics_constants::CAPSULE_HALF_HEIGHT
-                    + game_core::physics_constants::CAPSULE_RADIUS
-                    + (game_core::physics_constants::CAPSULE_HALF_HEIGHT
-                        + game_core::physics_constants::CAPSULE_RADIUS)
-                        * 2.0
-                        * KCC_OFFSET_REL;
-                let snap_delta = rest_y - new_pos.y;
-                if snap_delta.abs() <= MAX_GROUNDED_SNAP_DELTA {
-                    new_pos.y = rest_y;
-                    grounded = true;
-                }
-            }
+        // Ground clamp: prevent the character center from sinking below the
+        // floor surface.  The KCC offset + snap_to_ground handle normal cases,
+        // but a fast downward arc or edge-case penetration can still push the
+        // capsule below the surface. Clamp to the minimum valid Y.
+        let min_y = game_core::physics_constants::MIN_CHARACTER_Y;
+        if new_pos.y < min_y {
+            new_pos.y = min_y;
         }
-
-        // No global Y clamp here. Each layer's authored geometry (or the
-        // layer-0 placeholder cuboid) is the only thing that should stop
-        // a falling character. Entities on layers without ground fall
-        // indefinitely — game logic must add OOB / kill-volume handling
-        // where appropriate (§4.8b).
 
         // Apply the corrected position to the kinematic body.
         // Use `next_position().rotation` so that a preceding
@@ -1310,7 +1239,7 @@ impl PhysicsBackend for PhysicsWorld {
                 y: new_pos.y,
                 z: new_pos.z,
             },
-            grounded,
+            grounded: movement.grounded,
         })
     }
 
@@ -1327,7 +1256,7 @@ impl PhysicsBackend for PhysicsWorld {
             .unwrap_or(0);
         let layer_pred = move |_ch: ColliderHandle, collider: &Collider| -> bool {
             let col_layer = ud_layer(collider.user_data);
-            col_layer == caller_layer
+            col_layer == 0 || col_layer == caller_layer
         };
         let mut filter = QueryFilter::new()
             .groups(collision_groups::targeting_ray_groups())
@@ -1369,48 +1298,6 @@ impl PhysicsBackend for PhysicsWorld {
                     kind,
                 })
             })
-    }
-
-    fn raycast_surface(
-        &self,
-        origin: game_protocol::types::Vec3f,
-        direction: game_protocol::types::Vec3f,
-        max_distance: f32,
-        layer: u32,
-    ) -> Option<game_protocol::types::Vec3f> {
-        let len_sq =
-            direction.x * direction.x + direction.y * direction.y + direction.z * direction.z;
-        if !len_sq.is_finite() || len_sq < 1e-12 {
-            return None;
-        }
-        let inv = 1.0 / len_sq.sqrt();
-        let dir = Vector::new(direction.x * inv, direction.y * inv, direction.z * inv);
-        let ray = Ray::new(Vector::new(origin.x, origin.y, origin.z), dir);
-        // Strict same-layer environment query. Each layer (open world or
-        // dungeon) must author its own floor; there is no shared layer-0
-        // fallback. Templates that previously relied on the implicit
-        // open-world floor must now declare their own surface (heightfield,
-        // cuboid, or future TriMesh).
-        let layer_pred = move |_ch: ColliderHandle, collider: &Collider| -> bool {
-            let col_layer = ud_layer(collider.user_data);
-            col_layer == layer
-        };
-        let env_filter = QueryFilter::new()
-            .groups(collision_groups::kcc_movement_groups())
-            .predicate(&layer_pred);
-        let query = self.broad_phase.as_query_pipeline(
-            self.narrow_phase.query_dispatcher(),
-            &self.bodies,
-            &self.colliders,
-            env_filter,
-        );
-        let (_, hit) = query.cast_ray_and_get_normal(&ray, max_distance, true)?;
-        let toi = hit.time_of_impact;
-        Some(game_protocol::types::Vec3f {
-            x: origin.x + dir.x * toi,
-            y: origin.y + dir.y * toi,
-            z: origin.z + dir.z * toi,
-        })
     }
 
     fn line_of_sight(
@@ -1520,71 +1407,6 @@ impl PhysicsBackend for PhysicsWorld {
                 half_height,
                 radius,
             } => SharedShape::cylinder(half_height, radius),
-            EnvironmentShape::Heightfield {
-                nrows,
-                ncols,
-                scale_x,
-                scale_y,
-                scale_z,
-                heights,
-            } => {
-                // Length mismatches would panic inside Array2::new — guard
-                // with a clear error and fall back to a 1×1 flat cuboid so
-                // instance spawn keeps going (ground plane stays intact).
-                if heights.len() != nrows * ncols || nrows < 2 || ncols < 2 {
-                    log::error!(
-                        "heightfield shape has inconsistent dims (rows={nrows}, cols={ncols}, \
-                         heights.len()={}) — substituting 1m flat filler",
-                        heights.len()
-                    );
-                    SharedShape::cuboid(0.5, 0.05, 0.5)
-                } else {
-                    let heights_mat = Array2::new(nrows, ncols, heights);
-                    SharedShape::heightfield(heights_mat, Vector::new(scale_x, scale_y, scale_z))
-                }
-            }
-            EnvironmentShape::TriMesh { vertices, indices } => {
-                // Validate flat layouts: vertices = [x,y,z, ...], indices =
-                // [i0,i1,i2, ...]. Out-of-bounds indices would panic inside
-                // parry's trimesh ctor; guard with a clear error and fall
-                // back to a 1 m flat filler so layer materialisation keeps
-                // going (other geometry on the layer is unaffected).
-                let vert_count = vertices.len() / 3;
-                let tri_count = indices.len() / 3;
-                let max_index = indices.iter().copied().max().unwrap_or(0) as usize;
-                if vertices.len() % 3 != 0
-                    || indices.len() % 3 != 0
-                    || vert_count < 3
-                    || tri_count < 1
-                    || max_index >= vert_count
-                {
-                    log::error!(
-                        "trimesh shape has invalid layout (vertices.len()={}, indices.len()={}, \
-                         max_index={max_index}) — substituting 1m flat filler",
-                        vertices.len(),
-                        indices.len(),
-                    );
-                    SharedShape::cuboid(0.5, 0.05, 0.5)
-                } else {
-                    let points: Vec<Vector> = vertices
-                        .chunks_exact(3)
-                        .map(|c| Vector::new(c[0], c[1], c[2]))
-                        .collect();
-                    let tris: Vec<[u32; 3]> = indices
-                        .chunks_exact(3)
-                        .map(|c| [c[0], c[1], c[2]])
-                        .collect();
-                    match TriMesh::with_flags(points, tris, TriMeshFlags::FIX_INTERNAL_EDGES) {
-                        Ok(mesh) => SharedShape::new(mesh),
-                        Err(e) => {
-                            log::error!(
-                                "trimesh build failed ({e:?}) — substituting 1m flat filler"
-                            );
-                            SharedShape::cuboid(0.5, 0.05, 0.5)
-                        }
-                    }
-                }
-            }
         };
         let col_handle = self.add_environment_collider(
             rapier_shape,
@@ -1614,23 +1436,6 @@ impl PhysicsBackend for PhysicsWorld {
                 }
             }
         }
-    }
-
-    fn remove_environment_collider(&mut self, handle: u64) -> bool {
-        let Some(col_handle) = self.env_collider_handles.remove(&handle) else {
-            return false;
-        };
-        // Drop the layer-bucket entry too so per-layer bulk remove stays consistent.
-        for bucket in self.env_colliders_by_layer.values_mut() {
-            if let Some(pos) = bucket.iter().position(|h| *h == handle) {
-                bucket.swap_remove(pos);
-                break;
-            }
-        }
-        self.collider_kinds.remove(&col_handle);
-        self.colliders
-            .remove(col_handle, &mut self.islands, &mut self.bodies, true);
-        true
     }
 
     fn set_collider_enabled(&mut self, entity_id: EntityId, enabled: bool) -> bool {
@@ -1684,7 +1489,7 @@ impl PhysicsBackend for PhysicsWorld {
         let ray = Ray::new(origin, dir);
         let layer_pred = move |_ch: ColliderHandle, collider: &Collider| -> bool {
             let col_layer = ud_layer(collider.user_data);
-            col_layer == layer
+            col_layer == 0 || col_layer == layer
         };
         let env_filter = QueryFilter::new()
             .groups(collision_groups::kcc_movement_groups())
@@ -1720,7 +1525,7 @@ impl PhysicsBackend for PhysicsWorld {
         let ray = Ray::new(origin, dir);
         let layer_pred = move |_ch: ColliderHandle, collider: &Collider| -> bool {
             let col_layer = ud_layer(collider.user_data);
-            col_layer == layer
+            col_layer == 0 || col_layer == layer
         };
         let env_filter = QueryFilter::new()
             .groups(collision_groups::kcc_movement_groups())
@@ -1913,72 +1718,6 @@ mod tests {
     }
 
     #[test]
-    fn move_character_stays_on_flat_trimesh_surface() {
-        use game_core::physics_backend::{EnvironmentShape, PhysicsBackend};
-        use game_core::physics_constants::{CAPSULE_HALF_HEIGHT, CAPSULE_RADIUS, GROUND_PULL};
-        const KCC_OFFSET_REL: f32 = 0.02;
-
-        let dt = 0.05;
-        let mut world = PhysicsWorld::new(dt);
-
-        let vertices = vec![
-            -20.0, 0.0, -20.0, // 0
-            20.0, 0.0, -20.0, // 1
-            20.0, 0.0, 20.0, // 2
-            -20.0, 0.0, 20.0, // 3
-        ];
-        let indices = vec![0u32, 2, 1, 0, 3, 2];
-        world.add_environment_collider_on_layer(
-            EnvironmentShape::TriMesh { vertices, indices },
-            game_protocol::types::Vec3f::new(0.0, 0.0, 0.0),
-            4,
-        );
-
-        let entity = world.add_kinematic_capsule(
-            EntityId(1),
-            Vector::new(-10.0, CAPSULE_HALF_HEIGHT + CAPSULE_RADIUS, 0.0),
-            0.5,
-            0.3,
-            collision_groups::player_body_groups(),
-        );
-        PhysicsBackend::set_entity_layer(&mut world, entity, 4);
-        world.step();
-
-        let expected_y = CAPSULE_HALF_HEIGHT
-            + CAPSULE_RADIUS
-            + (CAPSULE_HALF_HEIGHT + CAPSULE_RADIUS) * 2.0 * KCC_OFFSET_REL;
-        let mut last_x = -10.0;
-
-        for _ in 0..120 {
-            let result = PhysicsBackend::move_character(
-                &mut world,
-                entity,
-                game_protocol::types::Vec3f::new(0.1, -GROUND_PULL * dt, 0.0),
-            )
-            .expect("character move should succeed");
-            world.step();
-
-            let pos = world
-                .get_body_position(entity)
-                .expect("character body should still exist");
-            assert!(result.grounded, "character should stay grounded on flat trimesh");
-            assert!(
-                (pos.y - expected_y).abs() < 0.05,
-                "character drifted off floor rest height: expected y≈{}, got {}",
-                expected_y,
-                pos.y
-            );
-            assert!(
-                pos.x > last_x,
-                "character should keep making forward progress on flat ground: prev x={}, new x={}",
-                last_x,
-                pos.x
-            );
-            last_x = pos.x;
-        }
-    }
-
-    #[test]
     fn add_and_remove_environment_colliders_by_layer() {
         use game_core::physics_backend::EnvironmentShape;
 
@@ -2038,13 +1777,12 @@ mod tests {
             world.env_colliders_by_layer.get(&101).map(|v| v.len()),
             Some(1)
         );
-        // 4 from this test + 1 layer-0 placeholder floor from PhysicsWorld::new.
-        assert_eq!(world.env_collider_handles.len(), 5);
+        assert_eq!(world.env_collider_handles.len(), 4);
 
-        // Remove layer 100 — should leave layer 101 + layer-0 floor intact.
+        // Remove layer 100 — should leave layer 101 intact.
         world.remove_environment_colliders_by_layer(100);
         assert!(world.env_colliders_by_layer.get(&100).is_none());
-        assert_eq!(world.env_collider_handles.len(), 2);
+        assert_eq!(world.env_collider_handles.len(), 1);
         assert_eq!(
             world.env_colliders_by_layer.get(&101).map(|v| v.len()),
             Some(1)
@@ -2052,12 +1790,8 @@ mod tests {
 
         // Remove layer 101.
         world.remove_environment_colliders_by_layer(101);
-        assert_eq!(world.env_collider_handles.len(), 1);
-        assert_eq!(
-            world.env_colliders_by_layer.get(&0).map(|v| v.len()),
-            Some(1),
-            "layer-0 placeholder floor must remain"
-        );
+        assert!(world.env_collider_handles.is_empty());
+        assert!(world.env_colliders_by_layer.is_empty());
 
         // Double-remove is a no-op.
         world.remove_environment_colliders_by_layer(100);
@@ -2217,251 +1951,5 @@ mod tests {
             Some(ColliderKind::Body),
             "kind clobbered by set_layer"
         );
-    }
-
-    #[test]
-    fn heightfield_collider_blocks_raycast_surface() {
-        use game_core::physics_backend::EnvironmentShape;
-        use game_core::physics_backend::PhysicsBackend;
-        let mut world = PhysicsWorld::new(1.0 / 60.0);
-
-        // 3×3 heightfield: flat at y=2.0 over a 10×10 footprint centred at origin.
-        // Column-major: heights[i + j*nrows]. Here all samples == 2.0.
-        let heights = vec![2.0_f32; 9];
-        let shape = EnvironmentShape::Heightfield {
-            nrows: 3,
-            ncols: 3,
-            scale_x: 10.0,
-            scale_y: 1.0,
-            scale_z: 10.0,
-            heights,
-        };
-        world.add_environment_collider_on_layer(
-            shape,
-            game_protocol::types::Vec3f::new(0.0, 0.0, 0.0),
-            0, // open-world layer
-        );
-        world.step();
-
-        // Cast straight down from high above the centre; should hit the
-        // heightfield plane at y=2.0 (scale_y * height sample == 1.0 * 2.0).
-        let hit = world.raycast_surface(
-            game_protocol::types::Vec3f::new(0.0, 50.0, 0.0),
-            game_protocol::types::Vec3f::new(0.0, -1.0, 0.0),
-            100.0,
-            0,
-        );
-        let hit = hit.expect("raycast_surface should hit heightfield");
-        assert!(
-            (hit.y - 2.0).abs() < 0.1,
-            "expected y≈2.0 on heightfield, got y={}",
-            hit.y
-        );
-    }
-
-    #[test]
-    fn trimesh_collider_blocks_raycast_surface() {
-        use game_core::physics_backend::EnvironmentShape;
-        use game_core::physics_backend::PhysicsBackend;
-        let mut world = PhysicsWorld::new(1.0 / 60.0);
-
-        // Two-triangle quad at y=3.0, spanning [-5..5] in x and z. Vertices
-        // are flat XYZ; indices form a triangle list. Wound CCW so the
-        // upward normal faces +Y (right-hand rule).
-        let vertices = vec![
-            -5.0, 3.0, -5.0, // 0
-            5.0, 3.0, -5.0, // 1
-            5.0, 3.0, 5.0, // 2
-            -5.0, 3.0, 5.0, // 3
-        ];
-        let indices = vec![0u32, 2, 1, 0, 3, 2];
-        world.add_environment_collider_on_layer(
-            EnvironmentShape::TriMesh { vertices, indices },
-            game_protocol::types::Vec3f::new(0.0, 0.0, 0.0),
-            4,
-        );
-        world.step();
-
-        // Cast straight down through the centre on layer 4: should land
-        // at y=3.0 on the trimesh.
-        let hit = world
-            .raycast_surface(
-                game_protocol::types::Vec3f::new(0.0, 50.0, 0.0),
-                game_protocol::types::Vec3f::new(0.0, -1.0, 0.0),
-                100.0,
-                4,
-            )
-            .expect("raycast_surface should hit trimesh");
-        assert!(
-            (hit.y - 3.0).abs() < 0.1,
-            "expected y≈3.0 on trimesh, got y={}",
-            hit.y
-        );
-
-        // Strict same-layer: a layer-5 caster must miss (the trimesh
-        // is on layer 4).
-        let miss = world.raycast_surface(
-            game_protocol::types::Vec3f::new(0.0, 50.0, 0.0),
-            game_protocol::types::Vec3f::new(0.0, -1.0, 0.0),
-            100.0,
-            5,
-        );
-        assert!(
-            miss.is_none(),
-            "layer-5 caster must not see layer-4 trimesh, got {miss:?}"
-        );
-    }
-
-    #[test]
-    fn trimesh_collider_falls_back_on_invalid_layout() {
-        use game_core::physics_backend::EnvironmentShape;
-        use game_core::physics_backend::PhysicsBackend;
-        let mut world = PhysicsWorld::new(1.0 / 60.0);
-
-        // Index out of range — should fall back to a 1m flat filler
-        // rather than panic.
-        let bad = EnvironmentShape::TriMesh {
-            vertices: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-            indices: vec![0, 1, 99],
-        };
-        let handle = world.add_environment_collider_on_layer(
-            bad,
-            game_protocol::types::Vec3f::new(0.0, 0.0, 0.0),
-            42,
-        );
-        // Handle was still issued — the layer is materialised with a filler.
-        assert!(world.env_collider_handles.contains_key(&handle));
-        assert_eq!(
-            world.env_colliders_by_layer.get(&42).map(|v| v.len()),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn raycast_surface_returns_none_when_miss() {
-        let mut world = PhysicsWorld::new(1.0 / 60.0);
-        world.step();
-        // Shoot upward — there's nothing above the layer-0 placeholder floor.
-        let hit = world.raycast_surface(
-            game_protocol::types::Vec3f::new(0.0, 1.0, 0.0),
-            game_protocol::types::Vec3f::new(0.0, 1.0, 0.0),
-            100.0,
-            0,
-        );
-        assert!(hit.is_none(), "upward ray should miss, got {hit:?}");
-    }
-
-    #[test]
-    fn raycast_surface_ignores_other_layer() {
-        use game_core::physics_backend::EnvironmentShape;
-        use game_core::physics_backend::PhysicsBackend;
-        let mut world = PhysicsWorld::new(1.0 / 60.0);
-        // Add a raised floor on layer 7.
-        world.add_environment_collider_on_layer(
-            EnvironmentShape::Cuboid {
-                half_x: 5.0,
-                half_y: 0.5,
-                half_z: 5.0,
-            },
-            game_protocol::types::Vec3f::new(0.0, 5.0, 0.0),
-            7,
-        );
-        world.step();
-
-        // Strict same-layer: a layer-3 caster sees neither the layer-7
-        // raised floor nor the layer-0 placeholder floor. With no terrain
-        // authored on layer 3, the downward ray misses entirely.
-        let hit3 = world.raycast_surface(
-            game_protocol::types::Vec3f::new(0.0, 20.0, 0.0),
-            game_protocol::types::Vec3f::new(0.0, -1.0, 0.0),
-            100.0,
-            3,
-        );
-        assert!(
-            hit3.is_none(),
-            "layer-3 caster must miss (no terrain on layer 3); strict layer rules \
-             reject the layer-0 floor and the layer-7 raised floor. got {hit3:?}"
-        );
-
-        // Caster on layer 7 SHOULD see the raised floor (top at y≈5.5).
-        let hit7 = world
-            .raycast_surface(
-                game_protocol::types::Vec3f::new(0.0, 20.0, 0.0),
-                game_protocol::types::Vec3f::new(0.0, -1.0, 0.0),
-                100.0,
-                7,
-            )
-            .expect("layer-7 caster should hit raised floor");
-        assert!(
-            hit7.y > 5.0 && hit7.y < 6.0,
-            "layer-7 caster should land on raised floor, got y={}",
-            hit7.y
-        );
-
-        // Open-world caster (layer 0) sees the layer-0 placeholder floor.
-        let hit0 = world
-            .raycast_surface(
-                game_protocol::types::Vec3f::new(0.0, 20.0, 0.0),
-                game_protocol::types::Vec3f::new(0.0, -1.0, 0.0),
-                100.0,
-                0,
-            )
-            .expect("layer-0 caster should hit the open-world placeholder floor");
-        assert!(
-            hit0.y < 1.0,
-            "layer-0 caster should land on the open-world placeholder floor, got y={}",
-            hit0.y
-        );
-    }
-
-    #[test]
-    fn remove_environment_collider_by_handle_swaps_one_shape() {
-        // Per-handle removal underpins the live terrain edit pipeline:
-        // an `on_update` of a `terrain_chunk` row removes the old collider
-        // and inserts the new one, without touching unrelated chunks on the
-        // same layer. Verify the bucket bookkeeping stays consistent.
-        use game_core::physics_backend::EnvironmentShape;
-
-        let mut world = PhysicsWorld::new(1.0 / 60.0);
-        let h_a = world.add_environment_collider_on_layer(
-            EnvironmentShape::Cuboid {
-                half_x: 1.0,
-                half_y: 1.0,
-                half_z: 1.0,
-            },
-            game_protocol::types::Vec3f::new(0.0, 0.0, 0.0),
-            7,
-        );
-        let h_b = world.add_environment_collider_on_layer(
-            EnvironmentShape::Cuboid {
-                half_x: 1.0,
-                half_y: 1.0,
-                half_z: 1.0,
-            },
-            game_protocol::types::Vec3f::new(10.0, 0.0, 0.0),
-            7,
-        );
-        assert_ne!(h_a, h_b);
-        assert_eq!(
-            world.env_colliders_by_layer.get(&7).map(|v| v.len()),
-            Some(2)
-        );
-
-        // Remove A only.
-        assert!(world.remove_environment_collider(h_a));
-        assert_eq!(
-            world.env_colliders_by_layer.get(&7).map(|v| v.len()),
-            Some(1)
-        );
-        assert!(!world.env_collider_handles.contains_key(&h_a));
-        assert!(world.env_collider_handles.contains_key(&h_b));
-
-        // Idempotent on unknown handle.
-        assert!(!world.remove_environment_collider(h_a));
-
-        // Bulk remove still cleans the rest of the layer.
-        world.remove_environment_colliders_by_layer(7);
-        assert!(world.env_colliders_by_layer.get(&7).is_none());
-        assert!(!world.env_collider_handles.contains_key(&h_b));
     }
 }

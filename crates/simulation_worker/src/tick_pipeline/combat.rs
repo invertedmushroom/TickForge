@@ -153,20 +153,8 @@ impl TickPipeline {
             None => return,
         };
 
-        // Snapshot per-hitbox overrides without materializing a default
-        // `HitEffectSpec` in the common (no-override) path. The override clone
-        // is only paid when an `effect` was supplied at spawn time.
-        let (effect_override, rules) = match exec_id
-            .and_then(|eid| self.state.combat.hitboxes.get(eid))
-            .map(|hb| (hb.effect.clone(), hb.rules))
-        {
-            Some((eff, r)) => (eff, r),
-            None => (None, ability.default_hitbox_rules()),
-        };
-        let effect_ref = effect_override.as_ref();
-
-        // Team-based target filter: skip if the hitbox cannot affect this target.
-        match rules.target_filter {
+        // Team-based target filter: skip if the ability cannot affect this target.
+        match ability.target_filter {
             TargetFilter::All => {} // no restriction
             TargetFilter::Hostile => {
                 let attacker_team = self
@@ -210,121 +198,21 @@ impl TickPipeline {
             })
             .unwrap_or(1.0);
 
-        let base_damage =
-            effect_ref.map(|e| e.base_damage).unwrap_or(ability.base_damage) * charge_mult;
-        let damage_type = effect_ref
-            .map(|e| e.damage_type)
-            .unwrap_or(ability.damage_type);
-        let threat_mult = effect_ref
-            .map(|e| e.threat_multiplier)
-            .unwrap_or(ability.threat_multiplier);
-        let on_hit_buffs = effect_ref
-            .map(|e| e.on_hit_buffs.clone())
-            .unwrap_or_else(|| ability.on_hit_buffs.clone());
-        let knockback_force = effect_ref
-            .map(|e| e.knockback_force)
-            .unwrap_or(ability.knockback_force);
-        let pull_force = effect_ref
-            .map(|e| e.pull_force)
-            .unwrap_or(ability.pull_force);
-        let launch_lift = effect_ref
-            .map(|e| e.launch_lift)
-            .unwrap_or(ability.launch_lift);
-        let launch_recovery_ticks = effect_ref
-            .map(|e| e.launch_recovery_ticks)
-            .unwrap_or(ability.launch_recovery_ticks);
-        let stun_ticks = effect_ref.map(|e| e.stun_ticks).unwrap_or(ability.stun_ticks);
-        let knockdown_ticks = effect_ref
-            .map(|e| e.knockdown_ticks)
-            .unwrap_or(ability.knockdown_ticks);
-        let sleep_ticks = effect_ref
-            .map(|e| e.sleep_ticks)
-            .unwrap_or(ability.sleep_ticks);
-        let silence_ticks = effect_ref
-            .map(|e| e.silence_ticks)
-            .unwrap_or(ability.silence_ticks);
-        let fear_ticks = effect_ref.map(|e| e.fear_ticks).unwrap_or(ability.fear_ticks);
-        // Only the override path can carry per-hitbox `on_contact` actions.
-        // Default abilities never trigger contact follow-ups, so an empty Vec
-        // here is allocation-free.
-        let on_contact: Vec<HitEffectAction> = effect_ref
-            .map(|e| e.on_contact.clone())
-            .unwrap_or_default();
+        let base_damage = ability.base_damage * charge_mult;
+        let damage_type = ability.damage_type;
+        let threat_mult = ability.threat_multiplier;
+        let on_hit_buffs = ability.on_hit_buffs.clone();
+        let knockback_force = ability.knockback_force;
+        let pull_force = ability.pull_force;
+        let launch_lift = ability.launch_lift;
+        let launch_recovery_ticks = ability.launch_recovery_ticks;
+        let stun_ticks = ability.stun_ticks;
+        let knockdown_ticks = ability.knockdown_ticks;
+        let sleep_ticks = ability.sleep_ticks;
+        let silence_ticks = ability.silence_ticks;
+        let fear_ticks = ability.fear_ticks;
 
         let attacker_idx = self.state.entities.lookup(attacker);
-
-        // ── Healing branch (Phase 6) ───────────────────────────────
-        // When a friendly-filter hit carries `heal_amount > 0`, route it through
-        // `HealthStore::apply_healing` and skip every damage-side step:
-        //   - no defensive routing (dodge / block / cover)
-        //   - no sleep-break (only damage breaks sleep)
-        //   - no CC application (heals never CC)
-        //   - no threat (healer aggro is deferred — see plan §3.4)
-        //   - no `on_contact` follow-ups (designed for damage chains)
-        //   - no `last_damage_source` update (`apply_healing` is source-less)
-        // On-hit buffs (e.g. HoT regen) DO still apply, mirroring the damage path.
-        let heal_amount = effect_ref
-            .map(|e| e.heal_amount)
-            .unwrap_or(ability.heal_amount);
-        if heal_amount > 0.0 {
-            // Outgoing damage stat scales healing too — keeps healing-power
-            // semantics aligned with damage modifiers until a dedicated
-            // `outgoing_heal_mult` stat is added.
-            let out_mult: f32 = attacker_idx
-                .map_or(1.0, |idx| self.state.stats.get(idx).damage_out_mult);
-            let scaled_heal = heal_amount * charge_mult * out_mult;
-            let actual = self
-                .state
-                .combat
-                .health
-                .apply_healing(target_idx, scaled_heal);
-            if actual > 0.0 {
-                audit!(self.state, Health, Combat, 6, Some(target), "heal");
-                self.emit_event(
-                    target,
-                    EventPayload::Healed {
-                        amount: actual,
-                        source: attacker,
-                    },
-                );
-            }
-            // Apply on-hit buffs (e.g. HoT / regen) even on zero-net heal so
-            // overhealed targets still receive durational support.
-            for &bid in &on_hit_buffs {
-                if let Some(template) = self.buff_registry.get(bid) {
-                    let active = game_core::combat::status::ActiveBuff::from_template(
-                        template,
-                        attacker,
-                        target,
-                        self.current_tick,
-                    );
-                    self.state.status.apply_or_stack_buff(target_idx, active);
-                    self.stats_dirty.insert(target);
-                    audit!(self.state, Buff, Combat, 6, Some(target), "on_heal_buff");
-                    let duration = template.duration_ticks.unwrap_or(0);
-                    self.emit_event(
-                        target,
-                        EventPayload::BuffApplied {
-                            buff_id: bid,
-                            source: attacker,
-                            duration_ticks: duration,
-                        },
-                    );
-                } else {
-                    warn!("on_hit_buff: buff_id {} not found in registry", bid);
-                }
-            }
-            // Always emit a SkillHit so client/UI hit-confirmation works for
-            // friendly hits the same as for damaging ones.
-            self.emit_event(
-                target,
-                EventPayload::SkillHit {
-                    skill_id: ability_id,
-                    source: attacker,
-                },
-            );
-            return;
-        }
 
         // ── Sleep break ────────────────────────────────────────────
         // If the target is sleeping, incoming damage breaks the sleep BEFORE
@@ -671,79 +559,6 @@ impl TickPipeline {
                     if stability_absorbed { 0 } else { silence_ticks },
                     if stability_absorbed { 0 } else { fear_ticks },
                 );
-            }
-        }
-
-        if let Some(exec_id) = exec_id {
-            self.queue_hit_effect_actions(attacker, target, ability_id, exec_id, &on_contact);
-        }
-    }
-
-    fn queue_hit_effect_actions(
-        &mut self,
-        attacker: EntityId,
-        target: EntityId,
-        ability_id: u32,
-        parent_execution_id: AbilityExecutionId,
-        actions: &[HitEffectAction],
-    ) {
-        if actions.is_empty() {
-            return;
-        }
-        let Some(target_pos) = self.physics.get_transform(target).map(|t| t.position) else {
-            return;
-        };
-        let Some(ability) = self.abilities.get(ability_id) else {
-            return;
-        };
-        const MAX_CONTACT_ACTIONS_PER_HIT: usize = 8;
-        for action in actions.iter().take(MAX_CONTACT_ACTIONS_PER_HIT) {
-            match action {
-                HitEffectAction::SpawnHitbox {
-                    delay_ticks,
-                    duration_ticks,
-                    shape,
-                    offset,
-                    effect,
-                    rules,
-                } => {
-                    let mut effect = effect
-                        .as_ref()
-                        .map(|spec| (**spec).clone())
-                        .unwrap_or_else(|| ability.default_hit_effect());
-                    // `on_contact` is one-shot: a contact-spawned hitbox does
-                    // not propagate further contact triggers. This bounds the
-                    // contact graph to depth 1 regardless of data authoring.
-                    effect.on_contact.clear();
-                    let rules = rules.unwrap_or_else(|| ability.default_hitbox_rules());
-                    let tick_id = TickId(self.current_tick.0 + *delay_ticks as u64);
-                    let scheduled = ScheduledAction {
-                        id: {
-                            let id = self.next_scheduled_id;
-                            self.next_scheduled_id += 1;
-                            id
-                        },
-                        tick_id,
-                        entity: attacker,
-                        source: Some(parent_execution_id),
-                        action_type: ScheduledActionType::ContactSpawnHitbox(Box::new(
-                            ContactSpawnHitboxPayload {
-                                parent_execution_id,
-                                ability_id,
-                                shape: *shape,
-                                position: target_pos,
-                                offset: *offset,
-                                effect,
-                                rules,
-                                duration_ticks: *duration_ticks,
-                            },
-                        )),
-                    };
-                    let pos = self
-                        .scheduled_actions
-                        .partition_point(|a| a.tick_id <= tick_id);
-                    self.scheduled_actions.insert(pos, scheduled);
-                }
             }
         }
     }
@@ -1539,7 +1354,7 @@ impl TickPipeline {
                 .combat
                 .hitboxes
                 .get(exec_id)
-                .map(|hb| hb.rules.pierce)
+                .map(|hb| hb.pierce)
                 .unwrap_or(false);
 
             for slot in 0..self.state.entities.len() {
@@ -1636,7 +1451,7 @@ impl TickPipeline {
                     hb.shape,
                     hb.offset,
                     hb.rewind_ticks,
-                    hb.rules.max_rewind_ticks,
+                    hb.max_rewind_ticks,
                 )
             })
             .collect();

@@ -166,8 +166,6 @@ mod tests {
             launch_lift: 0.0,
             launch_recovery_ticks: 0,
             usable_while_cc: false,
-            require_grounded: true,
-            heal_amount: 0.0,
             fear_ticks: 0,
             silence_ticks: 0,
             sleep_ticks: 0,

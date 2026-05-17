@@ -324,7 +324,6 @@ pub enum CombatEventKind {
     LockOnFired(LockOnFiredData),
     ProjectileLaunched(ProjectileLaunchedData),
     HazardSpawned(HazardSpawnedData),
-    ContactHitboxSpawned(ContactHitboxSpawnedData),
     SkillObjectRemoved(u64),
     Teleported(TeleportedData),
     // CC events
@@ -449,18 +448,6 @@ pub struct HazardSpawnedData {
     pub pos_y: f32,
     pub pos_z: f32,
     pub radius: f32,
-}
-
-#[derive(SpacetimeType, Clone, Debug)]
-pub struct ContactHitboxSpawnedData {
-    pub execution_id: u64,
-    pub parent_execution_id: u64,
-    pub ability_id: u32,
-    pub pos_x: f32,
-    pub pos_y: f32,
-    pub pos_z: f32,
-    pub radius: f32,
-    pub duration_ticks: u32,
 }
 
 #[derive(SpacetimeType, Clone, Debug)]
@@ -806,95 +793,4 @@ pub struct InteractableConfig {
     /// Max interaction distance. Default 3.0.
     pub interact_range: f32,
     pub state: InteractState,
-}
-
-// ── Voxel Terrain (§4.8b Phase 1) ───────────────────────────────────
-// Bulk baked terrain rows are rekeyed by `terrain_set_id` (NOT layer) so
-// multiple layers can share one bake (PvE/PvP forks of the same map, etc.).
-// `WorldLayerDef.terrain_set` and `DungeonTemplate.terrain_set` carry the
-// human-readable name; the worker resolves it to `terrain_set_id` via the
-// unique-name index on `terrain_set`.
-//
-// SpacetimeDB v2 allows only one `#[primary_key]` per table; logical
-// composite keys are expressed as a surrogate `row_id` plus a multi-column
-// btree index, matching the `entity_region` / `zone_counter` pattern above.
-// Logical uniqueness on `(terrain_set_id, chunk_morton[, voxel_idx])` is
-// enforced by the upsert reducers, not the storage layer.
-
-#[table(accessor = terrain_set, public)]
-pub struct TerrainSet {
-    #[primary_key]
-    #[auto_inc]
-    pub terrain_set_id: u32,
-    /// Human-readable name referenced by `WorldLayerDef.terrain_set` and
-    /// `DungeonTemplate.terrain_set`. Unique.
-    #[unique]
-    pub name: String,
-    /// Editor-bake artefact hash (hex). Bumps on any chunk change inside the set.
-    pub content_hash: String,
-    /// Combined content + bake-format version. Split into two fields if the
-    /// mesher schema diverges from semantic content versioning.
-    pub version: u32,
-}
-
-#[table(
-    accessor = terrain_chunk,
-    public,
-    index(accessor = by_set_chunk, btree(columns = [terrain_set_id, chunk_morton]))
-)]
-pub struct TerrainChunk {
-    #[primary_key]
-    #[auto_inc]
-    pub row_id: u64,
-    pub terrain_set_id: u32,
-    /// Canonical 21-bit zyx Morton key — see `game_schema::morton`.
-    pub chunk_morton: u64,
-    /// Flat XYZ vertices, length divisible by 3.
-    pub vertices: Vec<f32>,
-    /// Triangle list, length divisible by 3.
-    pub indices: Vec<u32>,
-    /// Level of detail. Server collision always uses LOD 0; field is
-    /// reserved for client mesh selection / future per-chunk variants.
-    pub lod: u8,
-}
-
-#[table(
-    accessor = terrain_manifest,
-    public,
-    index(accessor = by_set_chunk, btree(columns = [terrain_set_id, chunk_morton]))
-)]
-pub struct TerrainManifest {
-    #[primary_key]
-    #[auto_inc]
-    pub row_id: u64,
-    pub terrain_set_id: u32,
-    pub chunk_morton: u64,
-    /// Per-chunk content hash for client cache validation.
-    pub content_hash: String,
-    pub version: u32,
-}
-
-#[table(
-    accessor = terrain_core,
-    public,
-    index(accessor = by_set_chunk_voxel, btree(columns = [terrain_set_id, chunk_morton, voxel_idx]))
-)]
-pub struct TerrainCore {
-    #[primary_key]
-    #[auto_inc]
-    pub row_id: u64,
-    pub terrain_set_id: u32,
-    pub chunk_morton: u64,
-    /// Flat per-voxel index inside the chunk: `x + y*N + z*N*N`.
-    pub voxel_idx: u32,
-    pub hermite_normal_x: f32,
-    pub hermite_normal_y: f32,
-    pub hermite_normal_z: f32,
-    pub qef_offset_x: f32,
-    pub qef_offset_y: f32,
-    pub qef_offset_z: f32,
-    pub material_id: u16,
-    /// Mesher-defined bitfield (surface-cell, sharp-feature, hidden, …).
-    /// Layout documented when the voxel editor lands.
-    pub flags: u32,
 }

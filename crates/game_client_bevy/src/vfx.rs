@@ -18,7 +18,6 @@ impl Plugin for VfxPlugin {
         app.add_event::<ProjectileLaunchEvent>();
         app.add_event::<SkillObjectRemoveEvent>();
         app.add_event::<HazardSpawnEvent>();
-        app.add_event::<ContactHitboxSpawnEvent>();
         app.add_event::<HitboxSpawnedEvent>();
         app.add_event::<HitboxDamageFrameEvent>();
         app.add_event::<HitboxRemovedEvent>();
@@ -41,8 +40,6 @@ impl Plugin for VfxPlugin {
                 despawn_client_projectiles,
                 spawn_hazard_visuals,
                 update_hazard_visuals,
-                spawn_contact_hitbox_visuals,
-                update_contact_hitbox_visuals,
                 spawn_hitbox_visuals,
                 update_hitbox_visuals,
                 remove_hitbox_visuals,
@@ -52,7 +49,6 @@ impl Plugin for VfxPlugin {
             Update,
             (
                 despawn_hazard_visuals,
-                despawn_stale_hazards_on_layer_change,
                 spawn_buff_applied_effects,
                 update_buff_flash_effects,
                 spawn_teleport_effects,
@@ -685,142 +681,6 @@ fn despawn_hazard_visuals(
             if hv.execution_id == ev.execution_id {
                 commands.entity(entity).despawn();
             }
-        }
-    }
-}
-
-// ── Contact-hitbox flash visuals ──────────────────────────────────────────────
-//
-// Emitted by the server's `on_contact -> SpawnHitbox` follow-up. Renders a
-// short-lived expanding sphere at the spawn position that fades out over
-// `duration_ticks` server ticks (server runs at 20Hz). Because the underlying
-// hitbox is one-shot/short-lived, we drive the lifetime entirely from
-// `duration_ticks` and do not require a corresponding remove event.
-
-#[derive(Event)]
-pub struct ContactHitboxSpawnEvent {
-    pub execution_id: u64,
-    pub parent_execution_id: u64,
-    pub ability_id: u32,
-    pub source_entity_id: u64,
-    pub position: Vec3,
-    pub radius: f32,
-    pub duration_ticks: u32,
-}
-
-#[derive(Component)]
-struct ContactHitboxVisual {
-    age: f32,
-    /// Total visible lifetime in seconds. Visual fades to zero alpha over this.
-    lifetime: f32,
-}
-
-const SERVER_TICK_RATE_HZ: f32 = 20.0;
-const CONTACT_HITBOX_MIN_LIFETIME_SECS: f32 = 0.20;
-const CONTACT_HITBOX_BASE_ALPHA: f32 = 0.55;
-
-fn spawn_contact_hitbox_visuals(
-    mut commands: Commands,
-    mut events: EventReader<ContactHitboxSpawnEvent>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    for ev in events.read() {
-        let (_, ability_color) = crate::ability_visuals::visual_for(ev.ability_id);
-        let c = ability_color.to_srgba();
-
-        let mesh = meshes.add(Sphere::new(ev.radius.max(0.1)));
-        let mat = materials.add(StandardMaterial {
-            base_color: Color::srgba(c.red, c.green, c.blue, CONTACT_HITBOX_BASE_ALPHA),
-            emissive: LinearRgba::new(c.red * 2.0, c.green * 2.0, c.blue * 2.0, 1.0),
-            alpha_mode: AlphaMode::Blend,
-            unlit: true,
-            cull_mode: None,
-            ..default()
-        });
-
-        let lifetime = ((ev.duration_ticks.max(1) as f32) / SERVER_TICK_RATE_HZ)
-            .max(CONTACT_HITBOX_MIN_LIFETIME_SECS);
-
-        commands.spawn((
-            Mesh3d(mesh),
-            MeshMaterial3d(mat),
-            Transform::from_translation(ev.position),
-            ContactHitboxVisual {
-                age: 0.0,
-                lifetime,
-            },
-        ));
-    }
-}
-
-fn update_contact_hitbox_visuals(
-    mut commands: Commands,
-    time: Res<Time>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut query: Query<(
-        bevy::ecs::entity::Entity,
-        &mut ContactHitboxVisual,
-        &MeshMaterial3d<StandardMaterial>,
-    )>,
-) {
-    let dt = time.delta_secs();
-    for (e, mut v, mat_handle) in query.iter_mut() {
-        v.age += dt;
-        let t = (v.age / v.lifetime).clamp(0.0, 1.0);
-        let alpha = CONTACT_HITBOX_BASE_ALPHA * (1.0 - t);
-        if let Some(mat) = materials.get_mut(&mat_handle.0) {
-            let base = mat.base_color.to_srgba();
-            mat.base_color = Color::srgba(base.red, base.green, base.blue, alpha);
-        }
-        if v.age >= v.lifetime {
-            commands.entity(e).despawn();
-        }
-    }
-}
-
-/// Clears ground-placed hazard discs when the local player's layer changes.
-///
-/// Hazard zones on the server are layer-scoped (their sensor user_data is
-/// stamped with the layer where they were spawned) and only damage entities
-/// on the same layer. But `HazardSpawnEvent` is one-shot — the client has
-/// no way to "see" hazards that were spawned before it joined a new layer,
-/// and conversely any stale disc from the previous layer will keep rendering
-/// forever unless it's explicitly removed. On a layer transition, drop every
-/// local hazard visual so the view matches the server authority for the
-/// current layer.
-fn despawn_stale_hazards_on_layer_change(
-    mut commands: Commands,
-    stdb: Option<Res<crate::spacetime::StdbConnection>>,
-    local_player: Option<Res<crate::spacetime::LocalPlayerEntity>>,
-    hazards: Query<bevy::ecs::entity::Entity, With<HazardVisual>>,
-    mut last_layer: Local<Option<u32>>,
-) {
-    use game_client::module_bindings::*;
-    use spacetimedb_sdk::Table;
-    let Some(stdb) = stdb else { return };
-    let Some(lp) = local_player else { return };
-    let Some(entity_id) = lp.entity_id else {
-        return;
-    };
-    let current = stdb
-        .conn
-        .db
-        .my_region()
-        .iter()
-        .find(|r| r.entity_id == entity_id)
-        .map(|r| r.layer);
-    let Some(cur) = current else { return };
-    match *last_layer {
-        Some(prev) if prev == cur => {}
-        _ => {
-            if last_layer.is_some() {
-                // Layer changed — clear every hazard disc we currently have.
-                for e in hazards.iter() {
-                    commands.entity(e).despawn();
-                }
-            }
-            *last_layer = Some(cur);
         }
     }
 }

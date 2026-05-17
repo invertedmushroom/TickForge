@@ -182,24 +182,16 @@ fn update_diagnostics(
                 }
             }
 
-            // Active world phases — show all rows from the subscription cache so
-            // the phase is visible regardless of the player's current position.
-            // (world_phase is subscribed as SELECT * so all rows are local.)
-            // Decode zone_id back to (layer, rx, rz) — inverse of synthesise_zone_id.
-            for wp in stdb.conn.db.world_phase().iter() {
-                let layer = wp.zone_id / 1_000_000;
-                let rem = wp.zone_id % 1_000_000;
-                let rx = (rem / 1000) as i32 - 500;
-                let rz = (rem % 1000) as i32 - 500;
-                extra_lines.push_str(&format!(
-                    "\nWorld Phase (L{} {},{}) → {}",
-                    layer, rx, rz, wp.phase_name
-                ));
-            }
-
-            // Zone kills counter for current layer/region.
+            // World phase + zone kills for current layer/region.
             // my_region is a server-scoped view — always 0 or 1 rows for the current player.
             if let Some(region) = stdb.conn.db.my_region().iter().next() {
+                let zone_id = region.layer * 1_000_000
+                    + (region.region_x + 500) as u32 * 1000
+                    + (region.region_z + 500) as u32;
+                if let Some(wp) = stdb.conn.db.world_phase().zone_id().find(&zone_id) {
+                    extra_lines.push_str(&format!("\nWorld Phase: {}", wp.phase_name));
+                }
+                // Zone kills counter.
                 let kills: f64 = stdb
                     .conn
                     .db

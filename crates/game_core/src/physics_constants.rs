@@ -18,3 +18,6 @@ pub const AIM_ASSIST_DOT_WITH_HINT: f32 = 0.985;
 pub const AIM_ASSIST_DOT_NO_HINT: f32 = 0.966;
 pub const CAPSULE_HALF_HEIGHT: f32 = 0.5; // half-height of character capsule
 pub const CAPSULE_RADIUS: f32 = 0.3; // radius of character capsule
+/// Ground surface Y (cuboid half-extent) + capsule bottom-to-center distance.
+/// Any character center below this is embedded in the floor.
+pub const MIN_CHARACTER_Y: f32 = 0.1 + CAPSULE_HALF_HEIGHT + CAPSULE_RADIUS; // 0.9

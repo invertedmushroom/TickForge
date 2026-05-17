@@ -1,128 +1,6 @@
 use super::*;
 
 impl TickPipeline {
-    /// Push zone_counter deltas for a dying entity based on its `EntityKind`.
-    /// Looks up the entity's last-known region via `entity_regions`; if the
-    /// entity was never region-assigned (synthetic/test entities), emits no
-    /// delta rather than defaulting to region (0, 0, 0). Counter names match
-    /// the hardcoded `world_clock` rules in `server_module::reducers`.
-    fn push_death_zone_counter(&mut self, id: EntityId, idx: EntityIndex) {
-        use game_core::entity::lifecycle::EntityKind;
-        let Some(cell) = self.entity_regions.get(&id).copied() else {
-            return;
-        };
-        let kind = self.state.entities.kinds[idx.as_usize()];
-        // Instance layers are uniquely identified by `layer`; normalize the
-        // region cell to (0, 0) so all kills in a dungeon accumulate in one
-        // counter row rather than scattering across multiple 50 m cells.
-        // Open-world (layer 0) keeps the real region cell for AOI zone events.
-        let (rx, rz) = if cell.layer > 0 {
-            (0, 0)
-        } else {
-            (cell.region_x, cell.region_z)
-        };
-        match kind {
-            EntityKind::Npc => {
-                self.pending_zone_counter_deltas.push((
-                    cell.layer,
-                    rx,
-                    rz,
-                    "kills".to_string(),
-                    1.0,
-                ));
-            }
-            EntityKind::Boss => {
-                // Boss deaths bump both "kills" (so trash-count semantics hold
-                // "a kill is a kill") and "boss_killed" (triggers the higher-
-                // priority "completed" world_phase rule).
-                self.pending_zone_counter_deltas.push((
-                    cell.layer,
-                    rx,
-                    rz,
-                    "kills".to_string(),
-                    1.0,
-                ));
-                self.pending_zone_counter_deltas.push((
-                    cell.layer,
-                    rx,
-                    rz,
-                    "boss_killed".to_string(),
-                    1.0,
-                ));
-            }
-            // Players and non-combat kinds do not bump the "kills" counter —
-            // PvE progression must not be driven by player deaths, and
-            // scripted/environmental despawns must not pollute the counter.
-            _ => {}
-        }
-    }
-
-    /// Emit an authoritative `DeathState` row for player deaths.
-    ///
-    /// Called at the point of death detection so killer attribution
-    /// (`last_damage_source`/top-threat) and current position/layer are
-    /// captured directly from worker state, not re-derived in the reducer.
-    /// Only `Player` kinds produce a death-state row; NPCs and props skip.
-    fn push_player_death_state(
-        &mut self,
-        id: EntityId,
-        idx: EntityIndex,
-        killer: Option<EntityId>,
-    ) {
-        use game_core::entity::lifecycle::EntityKind;
-        if self.state.entities.kinds[idx.as_usize()] != EntityKind::Player {
-            return;
-        }
-        let pos = self
-            .physics
-            .get_transform(id)
-            .map(|t| t.position)
-            .unwrap_or_else(|| {
-                // Physics body missing: fall back to last-committed transform if any.
-                // This is a strict-best-effort path; with a healthy pipeline the
-                // physics body always exists when the entity transitions to
-                // DespawnPending in this same tick. Emit a warning when the
-                // fallback fires so the desync is visible rather than silently
-                // anchoring a respawn at the previous commit's position — or
-                // worse, at world origin.
-                let fallback = self.last_committed_transforms.get(&id).map(|t| t.position);
-                match fallback {
-                    Some(p) => {
-                        log::warn!(
-                            "death_state: physics transform missing for player {} \
-                             at death; using last-committed position ({:.2}, {:.2}, {:.2})",
-                            id.0,
-                            p.x,
-                            p.y,
-                            p.z,
-                        );
-                        p
-                    }
-                    None => {
-                        log::warn!(
-                            "death_state: no physics transform and no last-committed \
-                             transform for player {} at death; anchoring respawn at origin",
-                            id.0,
-                        );
-                        Vec3f {
-                            x: 0.0,
-                            y: 0.0,
-                            z: 0.0,
-                        }
-                    }
-                }
-            });
-        let layer = self.layer_of_idx(idx);
-        self.pending_death_state_inserts.push(super::DeathStateInsertEntry {
-            entity_id: id,
-            killer_entity: killer,
-            layer,
-            death_pos_x: pos.x,
-            death_pos_y: pos.y,
-            death_pos_z: pos.z,
-        });
-    }
-
     // ── Phase 8a: Cooldown expiry ───────────────────────────────
 
     /// Phase 8a: Drain the cooldown map of entries that have become ready this tick.
@@ -260,12 +138,7 @@ impl TickPipeline {
         let dead_indices: Vec<EntityIndex> = (0..self.state.entities.len())
             .map(|i| self.state.entities.index_at(i))
             .filter(|&idx| {
-                // Props are structural entities — HP reaching zero must not
-                // trigger the death/despawn lifecycle (gates, switches, barrels).
-                self.state.entities.is_active(idx)
-                    && self.state.combat.health.is_dead(idx)
-                    && self.state.entities.kinds[idx.as_usize()]
-                        != game_core::entity::lifecycle::EntityKind::Prop
+                self.state.entities.is_active(idx) && self.state.combat.health.is_dead(idx)
             })
             .collect();
 
@@ -292,8 +165,6 @@ impl TickPipeline {
                         .and_then(|t| t.top_threat())
                 });
             self.emit_event(id, EventPayload::EntityDied { killer });
-            self.push_death_zone_counter(id, idx);
-            self.push_player_death_state(id, idx, killer);
         }
 
         // Clean up DespawnPending entities.
@@ -460,10 +331,7 @@ impl TickPipeline {
         let dot_dead: Vec<EntityIndex> = (0..self.state.entities.len())
             .map(|i| self.state.entities.index_at(i))
             .filter(|&idx| {
-                self.state.entities.is_active(idx)
-                    && self.state.combat.health.is_dead(idx)
-                    && self.state.entities.kinds[idx.as_usize()]
-                        != game_core::entity::lifecycle::EntityKind::Prop
+                self.state.entities.is_active(idx) && self.state.combat.health.is_dead(idx)
             })
             .collect();
         let mut dot_newly_despawned = Vec::new();
@@ -489,8 +357,6 @@ impl TickPipeline {
                         .and_then(|t| t.top_threat())
                 });
             self.emit_event(id, EventPayload::EntityDied { killer });
-            self.push_death_zone_counter(id, idx);
-            self.push_player_death_state(id, idx, killer);
             dot_newly_despawned.push(id);
         }
         // Remove only the entities that DoT actually killed this tick,

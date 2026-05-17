@@ -185,29 +185,6 @@ pub trait PhysicsBackend: Send {
         ignore_entity: Option<EntityId>,
     ) -> Option<RayHit>;
 
-    /// Raycast against environment geometry only and return the first hit
-    /// point (world-space). Character bodies, hurtboxes, and sensors are
-    /// transparent — this query is for resolving ground-target Y, spawn
-    /// heights, and similar "where is the floor here?" questions against
-    /// terrain (cuboids, cylinders, heightfields).
-    ///
-    /// Layer-aware: only environment colliders on `layer` (or on the shared
-    /// unlayered ground plane, `layer == 0`) are considered.
-    ///
-    /// Returns `None` if the ray hits nothing within `max_distance`.
-    ///
-    /// Default: returns `None` (test backends without terrain).
-    fn raycast_surface(
-        &self,
-        origin: Vec3f,
-        direction: Vec3f,
-        max_distance: f32,
-        layer: u32,
-    ) -> Option<Vec3f> {
-        let _ = (origin, direction, max_distance, layer);
-        None
-    }
-
     /// Check line-of-sight between two world positions against environment geometry only.
     ///
     /// Returns `true` if the straight-line path is unobstructed (ray hits nothing).
@@ -216,9 +193,8 @@ pub trait PhysicsBackend: Send {
     /// Used for lock-on tagging validation and ground-target placement.
     fn line_of_sight(&self, from: Vec3f, to: Vec3f) -> bool;
 
-    /// Layer-aware line-of-sight: only environment colliders stamped with
-    /// `layer` can occlude the ray. Strict same-layer — there is no
-    /// shared layer-0 fallback; each layer must author its own geometry.
+    /// Layer-aware line-of-sight: only environment colliders on `layer` (or the
+    /// shared ground plane) can occlude the ray.
     ///
     /// Default: delegates to `line_of_sight` (ignores layer).
     fn line_of_sight_on_layer(&self, from: Vec3f, to: Vec3f, _layer: u32) -> bool {
@@ -232,9 +208,8 @@ pub trait PhysicsBackend: Send {
     /// Used by `TeleportForward` and `TeleportBehindTarget` to prevent going through walls.
     fn cast_to_wall(&self, from: Vec3f, to: Vec3f) -> Vec3f;
 
-    /// Layer-aware cast-to-wall: only environment colliders stamped with
-    /// `layer` can block the cast. Strict same-layer — there is no shared
-    /// layer-0 fallback.
+    /// Layer-aware cast-to-wall: only environment colliders on `layer` (or the
+    /// shared ground plane) can block the cast.
     ///
     /// Default: delegates to `cast_to_wall` (ignores layer).
     fn cast_to_wall_on_layer(&self, from: Vec3f, to: Vec3f, _layer: u32) -> Vec3f {
@@ -267,15 +242,6 @@ pub trait PhysicsBackend: Send {
     /// Used for bulk cleanup when a dungeon instance expires.
     fn remove_environment_colliders_by_layer(&mut self, layer: u32) {
         let _ = layer;
-    }
-
-    /// Remove a single environment collider previously returned from
-    /// [`add_environment_collider_on_layer`]. Used by the live terrain
-    /// edit pipeline to swap one chunk's TriMesh without rebuilding the
-    /// whole layer. Returns `true` if the handle was known and removed.
-    fn remove_environment_collider(&mut self, handle: u64) -> bool {
-        let _ = handle;
-        false
     }
 
     /// Toggle a prop entity's collider enabled/disabled (gate open/close).
@@ -366,25 +332,6 @@ pub enum EnvironmentShape {
     Cylinder {
         half_height: f32,
         radius: f32,
-    },
-    /// Heightfield terrain on the x-z plane. See
-    /// `game_schema::dungeon::ShapeDef::Heightfield` for layout.
-    Heightfield {
-        nrows: usize,
-        ncols: usize,
-        scale_x: f32,
-        scale_y: f32,
-        scale_z: f32,
-        heights: Vec<f32>,
-    },
-    /// Indexed triangle mesh. `vertices` is `[x, y, z, ...]` (flat),
-    /// `indices` is a flat triangle list. See
-    /// `game_schema::dungeon::ShapeDef::TriMesh` for the authoring layout.
-    /// Backends that don't support triangle meshes may fall back to a
-    /// degenerate filler collider.
-    TriMesh {
-        vertices: Vec<f32>,
-        indices: Vec<u32>,
     },
 }
 

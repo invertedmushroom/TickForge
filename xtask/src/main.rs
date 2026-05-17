@@ -53,14 +53,6 @@ enum DevCmd {
     ClientTest(ClientTestArgs),
     Client(RunClientArgs),
     Clients(RunClientsArgs),
-    /// Seed a synthetic terrain set + chunk via admin reducers (§4.8b smoke).
-    /// Pushes one `terrain_set`, one flat `terrain_chunk` (a 20×20 m quad
-    /// at y=0 made of 4 verts + 2 triangles), and a matching
-    /// `terrain_manifest` row, then exits. Bind a `WorldLayerDef` /
-    /// `DungeonTemplate` to the same `terrain_set` name and restart the
-    /// worker to verify the deferred queue end-to-end. Requires the
-    /// `debug` server feature (default on).
-    SeedTerrain(SeedTerrainArgs),
 }
 
 #[derive(Subcommand)]
@@ -162,29 +154,6 @@ struct RunClientsArgs {
     args: Vec<String>,
 }
 
-#[derive(Args)]
-struct SeedTerrainArgs {
-    /// Name of the `terrain_set` row to upsert. Bind a layer to this
-    /// name (in `data/layers.ron` or a `DungeonTemplate`) to see the
-    /// chunk applied.
-    #[arg(long, default_value = "smoke_floor")]
-    set_name: String,
-
-    /// `terrain_set_id` to use for the chunk + manifest rows. Must
-    /// match the auto-incremented id assigned by the first upsert call;
-    /// for a fresh DB this is typically `1`.
-    #[arg(long, default_value_t = 1)]
-    set_id: u32,
-
-    /// Half-extent of the synthetic flat quad on the X/Z axes (meters).
-    #[arg(long, default_value_t = 10.0)]
-    half_extent: f32,
-
-    /// Y elevation of the synthetic floor (meters).
-    #[arg(long, default_value_t = 0.0)]
-    elevation: f32,
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -205,7 +174,6 @@ fn run_dev(cmd: DevCmd) -> Result<()> {
         DevCmd::ClientTest(args) => dev_client_test(args),
         DevCmd::Client(args) => dev_client(args),
         DevCmd::Clients(args) => dev_clients(args),
-        DevCmd::SeedTerrain(args) => dev_seed_terrain(args),
     }
 }
 
@@ -478,139 +446,6 @@ fn dev_clients(args: RunClientsArgs) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Push one synthetic terrain set + one flat chunk + one manifest row
-/// into SpacetimeDB via the admin upsert reducers. Useful as an end-to-
-/// end smoke for §4.8b Phase 5: bind a layer to the same `set_name` and
-/// the worker should hydrate the chunk at the next tick boundary.
-///
-/// Vertices form a flat 2×half_extent square at `elevation` on the
-/// XZ plane, two CCW triangles, suitable for `SharedShape::trimesh`.
-fn dev_seed_terrain(args: SeedTerrainArgs) -> Result<()> {
-    if !is_server_up() {
-        bail!("SpacetimeDB is not running. Start it with `cargo xtask dev server`.");
-    }
-
-    let h = args.half_extent;
-    let y = args.elevation;
-    // 4 verts (xz-quad), CCW from above.
-    let vertices: Vec<f32> = vec![
-        -h, y, -h, // 0
-        h, y, -h, // 1
-        h, y, h, // 2
-        -h, y, h, // 3
-    ];
-    let indices: Vec<u32> = vec![0, 1, 2, 0, 2, 3];
-
-    let verts_json = floats_to_json(&vertices);
-    let idx_json = u32s_to_json(&indices);
-    let chunk_morton: u64 = 0; // single chunk at world origin
-    let lod: u8 = 0;
-    let content_hash = format!("smoke-{:x}-h{:.3}-y{:.3}", chunk_morton, h, y);
-    let version: u32 = 1;
-
-    println!(
-        "Seeding terrain set='{}' (id={}) with one {}×{} m flat chunk at y={}",
-        args.set_name,
-        args.set_id,
-        h * 2.0,
-        h * 2.0,
-        y,
-    );
-
-    // 1) terrain_set_upsert(name, content_hash, version)
-    run_command(command(
-        "spacetime",
-        [
-            "call",
-            MODULE_NAME,
-            "terrain_set_upsert",
-            args.set_name.as_str(),
-            content_hash.as_str(),
-            "1",
-            "-s",
-            SERVER_ALIAS,
-        ],
-    ))?;
-
-    // 2) terrain_chunk_upsert(set_id, morton, vertices, indices, lod)
-    let set_id_str = args.set_id.to_string();
-    let morton_str = chunk_morton.to_string();
-    let lod_str = lod.to_string();
-    run_command(command(
-        "spacetime",
-        [
-            "call",
-            MODULE_NAME,
-            "terrain_chunk_upsert",
-            set_id_str.as_str(),
-            morton_str.as_str(),
-            verts_json.as_str(),
-            idx_json.as_str(),
-            lod_str.as_str(),
-            "-s",
-            SERVER_ALIAS,
-        ],
-    ))?;
-
-    // 3) terrain_manifest_upsert(set_id, morton, content_hash, version)
-    let version_str = version.to_string();
-    run_command(command(
-        "spacetime",
-        [
-            "call",
-            MODULE_NAME,
-            "terrain_manifest_upsert",
-            set_id_str.as_str(),
-            morton_str.as_str(),
-            content_hash.as_str(),
-            version_str.as_str(),
-            "-s",
-            SERVER_ALIAS,
-        ],
-    ))?;
-
-    println!(
-        "Done. Bind a layer to terrain_set=\"{}\" (data/layers.ron or DungeonTemplate) \
-         and restart the worker; look for \"TerrainState: applied N insert(s)\" in the \
-         worker log.",
-        args.set_name,
-    );
-    Ok(())
-}
-
-/// Format a `&[f32]` as a SpacetimeDB CLI JSON array argument.
-fn floats_to_json(xs: &[f32]) -> String {
-    let mut s = String::with_capacity(xs.len() * 6 + 2);
-    s.push('[');
-    for (i, x) in xs.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        // Always emit a decimal point so STDB parses as f32, not int.
-        if x.fract() == 0.0 {
-            s.push_str(&format!("{:.1}", x));
-        } else {
-            s.push_str(&format!("{}", x));
-        }
-    }
-    s.push(']');
-    s
-}
-
-/// Format a `&[u32]` as a SpacetimeDB CLI JSON array argument.
-fn u32s_to_json(xs: &[u32]) -> String {
-    let mut s = String::with_capacity(xs.len() * 4 + 2);
-    s.push('[');
-    for (i, x) in xs.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
-        s.push_str(&x.to_string());
-    }
-    s.push(']');
-    s
 }
 
 fn dev_capture_fixture(args: CaptureFixtureArgs) -> Result<()> {

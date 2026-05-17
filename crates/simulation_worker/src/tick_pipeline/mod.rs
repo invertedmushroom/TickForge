@@ -1,9 +1,8 @@
 pub(super) use crate::lag_compensation::{self, TransformHistory};
 pub(super) use game_core::combat::skill::{
     AbilityAction, AbilityExecutionContext, AbilityExecutionId, AbilityParams, AbilityRegistry,
-    AbilityTimeline, CastFacingPolicy, ChargingState, ContactSpawnHitboxPayload, HitEffectAction,
-    HitEffectSpec, HitboxRules, ResolvedTargeting, ScheduledAction, ScheduledActionType,
-    SkillShape, TargetFilter, TargetingMode,
+    AbilityTimeline, CastFacingPolicy, ChargingState, ResolvedTargeting, ScheduledAction,
+    ScheduledActionType, SkillShape, TargetFilter, TargetingMode,
 };
 pub(super) use game_core::director::{DirectorSpawn, DirectorState};
 pub(super) use game_core::entity::entity_index::EntityIndex;
@@ -143,23 +142,6 @@ pub struct TickSummary {
     pub commit_retries: u32,
 }
 
-/// Authoritative death-state row emitted by the worker for player deaths.
-///
-/// Produced in Phase 8b at the moment the worker decides an entity transitions
-/// to `DespawnPending` due to combat death (HP-based or DoT). The reducer just
-/// inserts the row — it must not derive death state from observed lifecycle
-/// transitions, since that loses killer attribution and silently fabricates
-/// fallbacks for missing position/layer data.
-#[derive(Clone, Debug)]
-pub struct DeathStateInsertEntry {
-    pub entity_id: EntityId,
-    pub killer_entity: Option<EntityId>,
-    pub layer: u32,
-    pub death_pos_x: f32,
-    pub death_pos_y: f32,
-    pub death_pos_z: f32,
-}
-
 /// Output of a single simulation tick — committed atomically to SpacetimeDB.
 pub struct TickResult {
     pub tick_id: TickId,
@@ -194,9 +176,6 @@ pub struct TickResult {
     pub boss_phase_updates: Vec<(u64, u32, u64)>,
     /// Zone counter increments from the encounter executor and combat system.
     pub zone_counter_deltas: Vec<(u32, i32, i32, String, f64)>,
-    /// Player death rows produced this tick by Phase 8b. The reducer inserts
-    /// these into `death_state` verbatim (it does not derive them).
-    pub death_state_inserts: Vec<DeathStateInsertEntry>,
 }
 
 /// The canonical 10-phase simulation tick pipeline per spec.
@@ -330,18 +309,6 @@ pub struct TickPipeline {
     /// Keeps Health mutations centralised in combat/finalization phases.
     /// Each entry is (entity_id, heal_amount, heal_source).
     pub(super) pending_heals: Vec<(EntityId, f32, EntityId)>,
-    /// Zone counter deltas emitted by Phase 8b on entity death, indexed by
-    /// the dying entity's region cell and kind:
-    ///   - `Npc`  → ("kills", 1.0)
-    ///   - `Boss` → ("kills", 1.0) and ("boss_killed", 1.0)
-    ///   - `Player` / other → no delta
-    /// Drained into `TickResult.zone_counter_deltas` alongside encounter-
-    /// emitted deltas before the commit stage. Matches the hardcoded
-    /// `world_clock` threshold rules in `server_module::reducers`.
-    pub(super) pending_zone_counter_deltas: Vec<(u32, i32, i32, String, f64)>,
-    /// Authoritative `death_state` rows produced by Phase 8b for player deaths.
-    /// Drained into `TickResult.death_state_inserts` at commit assembly time.
-    pub(super) pending_death_state_inserts: Vec<DeathStateInsertEntry>,
 }
 
 impl TickPipeline {
@@ -565,8 +532,6 @@ impl TickPipeline {
             global_max_rewind_ticks: lag_compensation::MAX_REWIND_TICKS,
             pending_interactable_updates: Vec::new(),
             pending_heals: Vec::new(),
-            pending_zone_counter_deltas: Vec::new(),
-            pending_death_state_inserts: Vec::new(),
         }
     }
 
@@ -597,13 +562,6 @@ impl TickPipeline {
     #[doc(hidden)]
     pub fn encounters(&self) -> &HashMap<EntityId, game_core::encounter::EncounterState> {
         &self.encounters
-    }
-
-    /// Direct access to the world_phase projection map for test setup
-    /// (normally written by the coordinator on world_phase DB inserts).
-    #[doc(hidden)]
-    pub fn world_phases_mut(&mut self) -> &mut HashMap<u32, String> {
-        &mut self.world_phases
     }
 
     pub fn set_current_tick(&mut self, tick: TickId) {
@@ -1078,28 +1036,6 @@ impl TickPipeline {
         if self.is_on_cooldown(caster, resolved_id) {
             return false;
         }
-        let requirements = match self.abilities.get(resolved_id) {
-            Some(ability) => ability.cast_requirements(),
-            None => return false,
-        };
-        if requirements.require_grounded {
-            let grounded = self
-                .state
-                .entities
-                .lookup(caster)
-                .map(|idx| {
-                    let kind = self.state.entities.kinds[idx.as_usize()];
-                    // NPC locomotion can transiently report airborne while standing on
-                    // spawn snapshots; keep the player input gate strict and leave AI
-                    // cast gating to AI state/range/cooldown checks.
-                    kind != EntityKind::Player
-                        || self.state.combat.tactical[idx.as_usize()].is_grounded
-                })
-                .unwrap_or(false);
-            if !grounded {
-                return false;
-            }
-        }
         let timeline = match self.abilities.get_timeline(resolved_id).cloned() {
             Some(t) => t,
             None => return false,
@@ -1353,11 +1289,6 @@ impl TickPipeline {
         self.event_sequence = 0;
         self.pending_events.clear();
         self.pending_heals.clear();
-        // Defensive symmetry with `pending_heals.clear()`: the buffer is
-        // normally drained via `mem::take` in commit assembly, but an
-        // early-return path between Phase 8b and result assembly would
-        // otherwise leak prior-tick rows into the next commit.
-        self.pending_death_state_inserts.clear();
         self.summary = TickSummary::default();
 
         // Phase 1: Input ingestion — filter intents for this tick
@@ -1441,32 +1372,6 @@ impl TickPipeline {
                 health_updates.push(dot);
             }
         }
-        // Merge zone counter deltas emitted by Phase 8b death detection into the
-        // tick's outgoing delta vec. Encounter-driven deltas (collected above) and
-        // death-driven deltas are both associative increments, so merge order is
-        // irrelevant.
-        zone_counter_deltas.extend(self.pending_zone_counter_deltas.drain(..));
-
-        // Aggregate by (layer, region_x, region_z, counter_name) so multiple
-        // kills in the same region cell collapse into a single secondary
-        // reducer call. The coordinator dispatches one `increment_zone_counter`
-        // reducer per entry after the main commit, so an unaggregated N-death
-        // wave produced N sequential round-trips; on 10k clustered NPC deaths
-        // that serial fan-out was the dominant commit-latency tail. Counters
-        // are additive, so summing deltas per key preserves the final row
-        // value exactly. Also improves retry semantics: a failing write
-        // contributes a single entry to `pending_secondary` instead of N.
-        if zone_counter_deltas.len() > 1 {
-            let mut agg: HashMap<(u32, i32, i32, String), f64> =
-                HashMap::with_capacity(zone_counter_deltas.len());
-            for (layer, rx, rz, name, delta) in zone_counter_deltas.drain(..) {
-                *agg.entry((layer, rx, rz, name)).or_insert(0.0) += delta;
-            }
-            zone_counter_deltas = agg
-                .into_iter()
-                .map(|((layer, rx, rz, name), delta)| (layer, rx, rz, name, delta))
-                .collect();
-        }
 
         // Phase 9: Event emission (collect pending events)
         // Events have been accumulated during phases above.
@@ -1524,7 +1429,6 @@ impl TickPipeline {
             interactable_updates: std::mem::take(&mut self.pending_interactable_updates),
             boss_phase_updates,
             zone_counter_deltas,
-            death_state_inserts: std::mem::take(&mut self.pending_death_state_inserts),
         };
 
         self.current_tick = self.current_tick.next();
