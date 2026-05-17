@@ -66,14 +66,16 @@ impl SimulationRunner {
         canonical_tick: u64,
         intents: &[game_protocol::intent::PlayerIntent],
     ) -> Result<TickResult, TickSkipped> {
-        // Drain pending equipment-driven stat recalculations.
-        // Step 4 (Stats Pipeline) will act on these; for now just clear.
+        // Drain pending equipment-driven stat recalculations into the
+        // pipeline's stats_dirty set for Phase 1.5 recalculation.
         if !self.pending_stat_recalcs.is_empty() {
             log::info!(
                 "stat_recalc: draining {} pending equipment changes",
                 self.pending_stat_recalcs.len()
             );
-            self.pending_stat_recalcs.clear();
+            for eid in self.pending_stat_recalcs.drain() {
+                self.pipeline.mark_stats_dirty(eid);
+            }
         }
 
         self.tick_driver.process_tick(

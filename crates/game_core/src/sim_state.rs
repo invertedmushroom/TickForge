@@ -12,6 +12,7 @@ use crate::sparse_set::SparseSet;
 use crate::entity::entity_index::EntityIndex;
 use crate::entity::entity_store::EntityStore;
 use crate::physics_backend::CollisionEvent;
+use crate::stats::{StatBlock, StatsStore};
 
 // ── Mutation audit (debug/test only) ────────────────────────────────────────
 
@@ -421,6 +422,8 @@ pub struct SimState {
     pub status: StatusState,
     /// NPC AI.
     pub ai: AiState,
+    /// Cached per-entity derived stats (movement speed, damage multipliers, etc.).
+    pub stats: StatsStore,
     /// Per-tick mutation counters (debug/test only).
     #[cfg(any(debug_assertions, test))]
     pub audit: MutationAudit,
@@ -441,6 +444,7 @@ impl SimState {
             },
             status: StatusState::new(),
             ai: AiState { npc_ai: SparseSet::new(), home_positions: SparseSet::new() },
+            stats: StatsStore::new(),
             #[cfg(any(debug_assertions, test))]
             audit: MutationAudit::new(),
         }
@@ -458,6 +462,7 @@ impl SimState {
         debug_assert_eq!(self.status.len(), n, "buffs desync");
         debug_assert_eq!(self.ai.npc_ai.sparse_len(), n, "npc_ai desync");
         debug_assert_eq!(self.ai.home_positions.sparse_len(), n, "home_positions desync");
+        debug_assert_eq!(self.stats.len(), n, "stats desync");
     }
 
     /// Register a new entity, returning its dense index.
@@ -484,6 +489,7 @@ impl SimState {
             self.ai.npc_ai.insert(idx, NpcAiState::Idle);
         }
         self.combat.tactical.push(TacticalState::default());
+        self.stats.push(StatBlock::compute(kind, max_hp, &[]));
         idx
     }
 

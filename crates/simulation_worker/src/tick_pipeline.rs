@@ -212,6 +212,11 @@ pub struct TickPipeline {
     /// Entity ID counter for director-spawned entities.
     /// Starts at a high value to avoid collisions with DB-assigned IDs.
     next_director_entity_id: u64,
+    /// Entity indices whose cached `StatBlock` needs recalculation.
+    /// Populated by: (a) equipment changes (via `mark_stats_dirty`),
+    /// (b) buff changes (copied from `StatusState::dirty_entities` at Phase 10).
+    /// Drained by Phase 1.5 stat recalculation.
+    stats_dirty: HashSet<usize>,
 }
 
 impl TickPipeline {
@@ -313,6 +318,7 @@ impl TickPipeline {
             transform_history: TransformHistory::new(),
             director: DirectorState::new(),
             next_director_entity_id: 1_000_000_000,
+            stats_dirty: HashSet::new(),
 }
     }
 
@@ -580,6 +586,9 @@ impl TickPipeline {
             .collect();
         self.summary.intents_processed = tick_intents.len();
 
+        // Phase 1.5: Stat recalculation — recompute cached StatBlocks for dirty entities
+        self.phase_stat_recalc();
+
         // Phase 2: Controller update
         self.phase_controller_update(&tick_intents);
 
@@ -798,7 +807,7 @@ impl TickPipeline {
     }
 
     fn apply_movement(&mut self, entity_id: EntityId, dir: &MoveDir) {
-        // Normalise direction and scale by the per-entity-kind authoritative base speed.
+        // Normalise direction and scale by the cached movement speed from StatBlock.
         // Grounded movement: ignore vertical component to prevent client "flight".
         let x = dir.dir_x;
         let z = dir.dir_z;
@@ -808,22 +817,12 @@ impl TickPipeline {
         if !len_sq.is_finite() || len_sq < 1e-6 {
             return;
         }
-        // Derive base speed from entity kind (authoritative, not hardcoded).
-        let kind_speed = if let Some(idx) = self.state.entities.lookup(entity_id) {
-            game_core::stats::base_speed(self.state.entities.kinds[idx.as_usize()])
+        // Read cached movement speed from StatBlock (recalculated in Phase 1.5).
+        let speed = if let Some(idx) = self.state.entities.lookup(entity_id) {
+            self.state.stats.get(idx).movement_speed
         } else {
             return;
         };
-        // Apply speed_pct from active buff modifiers (additive stack: 0.1 = +10%).
-        let speed_modifier: f32 = if let Some(idx) = self.state.entities.lookup(entity_id) {
-            self.state.status.get_buffs(idx)
-                .iter()
-                .filter_map(|b| b.modifiers.speed_pct)
-                .sum()
-        } else {
-            0.0
-        };
-        let speed = kind_speed * (1.0 + speed_modifier).max(0.0);
         let inv_len = 1.0 / len_sq.sqrt();
         let vx = x * inv_len * speed;
         let vy = 0.0;
@@ -997,17 +996,9 @@ impl TickPipeline {
                     audit!(self.state, Cooldown, AbilityTimeline, 3, Some(entity), "expire_retro");
                     self.emit_event(entity, EventPayload::CooldownReady { ability_id });
                 }
-                // Apply cooldown reduction from active buffs on the caster.
-                // Positive cooldown_reduce_pct shortens the cooldown (e.g. 0.2 = 20% faster).
-                // Clamped to [0, 1) so cooldowns can never go negative or instant.
+                // Read cached cooldown reduction from StatBlock (recalculated in Phase 1.5).
                 let cd_reduce: f32 = self.state.entities.lookup(entity)
-                    .map(|idx| {
-                        self.state.status.get_buffs(idx)
-                            .iter()
-                            .filter_map(|b| b.modifiers.cooldown_reduce_pct)
-                            .sum::<f32>()
-                            .clamp(0.0, 0.99)
-                    })
+                    .map(|idx| self.state.stats.get(idx).cooldown_reduce_pct)
                     .unwrap_or(0.0);
                 let effective_duration = ((*duration_ticks as f32) * (1.0 - cd_reduce)).ceil() as u64;
                 let ready_at = TickId(self.current_tick.0 + effective_duration.max(1));
@@ -1092,20 +1083,14 @@ impl TickPipeline {
             return;
         }
 
-        // Apply damage_out_pct modifier from attacker's buffs.
-        let out_mult: f32 = attacker_idx.map_or(0.0, |idx| {
-            self.state.status.get_buffs(idx)
-                .iter()
-                .filter_map(|b| b.modifiers.damage_out_pct)
-                .sum()
+        // Apply damage_out_mult from attacker's cached StatBlock.
+        let out_mult: f32 = attacker_idx.map_or(1.0, |idx| {
+            self.state.stats.get(idx).damage_out_mult
         });
-        // Apply damage_in_pct modifier from target's buffs.
-        let in_mult: f32 = self.state.status.get_buffs(target_idx)
-            .iter()
-            .filter_map(|b| b.modifiers.damage_in_pct)
-            .sum();
+        // Apply damage_in_mult from target's cached StatBlock.
+        let in_mult: f32 = self.state.stats.get(target_idx).damage_in_mult;
         let block_factor = if tactical.blocking { 0.5 } else { 1.0 };
-        let effective_damage = base_damage * (1.0 + out_mult) * (1.0 + in_mult).max(0.0) * block_factor;
+        let effective_damage = base_damage * out_mult * in_mult * block_factor;
 
         let actual = self.state.combat.health.apply_damage(target_idx, effective_damage, Some(attacker));
         if compensated {
@@ -1497,24 +1482,19 @@ impl TickPipeline {
     }
 
     /// Shared step: move `npc_id` from `from_pos` toward `to_pos` by one tick of movement.
-    /// Uses `game_core::stats::base_speed(kind)` as the speed and is grounded (Y fixed).
-    fn npc_step_toward(&mut self, npc_id: EntityId, from: Vec3f, to: Vec3f, kind: EntityKind, dt: f32) {
+    /// Uses cached `StatBlock::movement_speed` (recalculated in Phase 1.5).
+    fn npc_step_toward(&mut self, npc_id: EntityId, from: Vec3f, to: Vec3f, _kind: EntityKind, dt: f32) {
         let dx = to.x - from.x;
         let dz = to.z - from.z;
         let dist_sq = dx * dx + dz * dz;
         if dist_sq < 1e-6 {
             return;
         }
-        let base_speed = game_core::stats::base_speed(kind);
-        let speed_modifier: f32 = if let Some(idx) = self.state.entities.lookup(npc_id) {
-            self.state.status.get_buffs(idx)
-                .iter()
-                .filter_map(|b| b.modifiers.speed_pct)
-                .sum()
+        let speed = if let Some(idx) = self.state.entities.lookup(npc_id) {
+            self.state.stats.get(idx).movement_speed
         } else {
-            0.0
+            return;
         };
-        let speed = base_speed * (1.0 + speed_modifier).max(0.0);
         let inv = 1.0 / dist_sq.sqrt();
         self.physics.set_kinematic_position(npc_id, Vec3f {
             x: from.x + dx * inv * speed * dt,
@@ -1577,6 +1557,37 @@ impl TickPipeline {
         &self.director
     }
 
+    /// Mark an entity for stat recalculation on the next tick's Phase 1.5.
+    ///
+    /// Called by the coordinator (via `SimulationRunner`) when equipment changes
+    /// are observed between ticks. Also used internally when buffs change.
+    pub fn mark_stats_dirty(&mut self, entity_id: EntityId) {
+        if let Some(idx) = self.state.entities.lookup(entity_id) {
+            self.stats_dirty.insert(idx.as_usize());
+        }
+    }
+
+    // ── Phase 1.5: Stat recalculation ───────────────────────────
+
+    /// Recalculate cached `StatBlock` for entities whose buffs or equipment changed.
+    ///
+    /// Drains `stats_dirty` and recomputes each entity's stats from its kind,
+    /// spawn-time max_hp, and current active buffs using `StatBlock::compute`.
+    fn phase_stat_recalc(&mut self) {
+        if self.stats_dirty.is_empty() {
+            return;
+        }
+        let dirty: Vec<usize> = self.stats_dirty.drain().collect();
+        for i in dirty {
+            let kind = self.state.entities.kinds[i];
+            let max_hp = self.state.combat.health.max_hp[i];
+            let idx = EntityIndex(i as u32);
+            let buffs = self.state.status.get_buffs(idx);
+            let block = game_core::stats::StatBlock::compute(kind, max_hp, buffs);
+            self.state.stats.set(idx, block);
+        }
+    }
+
     // ── Health delta collection ─────────────────────────────────
 
     /// Snapshot current hp/max_hp for every entity that received a Damage event this tick.
@@ -1606,12 +1617,14 @@ impl TickPipeline {
     fn collect_buff_updates(&mut self) -> Vec<(EntityId, Vec<game_core::combat::status::ActiveBuff>)> {
         let dirty = self.state.status.take_dirty();
         let mut out = Vec::with_capacity(dirty.len());
-        for i in dirty {
-            if self.state.entities.states[i] == game_core::entity::lifecycle::EntityState::Removed {
+        for i in &dirty {
+            // Mark buff-dirty entities for stat recalculation next tick.
+            self.stats_dirty.insert(*i);
+            if self.state.entities.states[*i] == game_core::entity::lifecycle::EntityState::Removed {
                 continue;
             }
-            let eid = self.state.entities.id_of(EntityIndex(i as u32));
-            out.push((eid, self.state.status.clone_buffs(i)));
+            let eid = self.state.entities.id_of(EntityIndex(*i as u32));
+            out.push((eid, self.state.status.clone_buffs(*i)));
         }
         out
     }
