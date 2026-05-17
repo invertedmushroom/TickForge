@@ -50,7 +50,6 @@ enum DevCmd {
     Worker(RunWorkerArgs),
     /// Capture a deterministic replay fixture to a JSON file.
     CaptureFixture(CaptureFixtureArgs),
-    ClientTest(ClientTestArgs),
     Client(RunClientArgs),
     Clients(RunClientsArgs),
     /// Seed a synthetic terrain set + chunk via admin reducers (§4.8b smoke).
@@ -84,7 +83,8 @@ enum BuildCmd {
 #[derive(Subcommand)]
 enum TestCmd {
     Fast,
-    Worker,
+    /// Run simulation_worker tests with the `connected` feature enabled.
+    Worker(BuildProfileArgs),
     Cli(ClientTestArgs),
     /// Run multi-client integration tests (requires running server + worker)
     MultiClient(ClientTestArgs),
@@ -259,7 +259,6 @@ fn run_dev(cmd: DevCmd) -> Result<()> {
         DevCmd::WorkerRegister(args) => dev_worker_register(args),
         DevCmd::Worker(args) => dev_worker(args),
         DevCmd::CaptureFixture(args) => dev_capture_fixture(args),
-        DevCmd::ClientTest(args) => dev_client_test(args),
         DevCmd::Client(args) => dev_client(args),
         DevCmd::Clients(args) => dev_clients(args),
         DevCmd::SeedTerrain(args) => dev_seed_terrain(args),
@@ -310,13 +309,10 @@ fn run_test(cmd: TestCmd) -> Result<()> {
             run_command(cargo_cmd(["test", "-p", "game_core"]))?;
             run_command(cargo_cmd(["test", "-p", "simulation_worker"]))
         }
-        TestCmd::Worker => run_command(cargo_cmd([
-            "test",
-            "-p",
-            "simulation_worker",
-            "--features",
-            "connected",
-        ])),
+        TestCmd::Worker(args) => run_command(cargo_test_command(
+            ["-p", "simulation_worker", "--features", "connected"],
+            args.release,
+        )),
         TestCmd::Cli(args) => dev_client_test(args),
         TestCmd::MultiClient(args) => {
             let mut command = cargo_run_command(

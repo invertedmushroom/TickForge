@@ -112,6 +112,7 @@ fn update_diagnostics(
     #[cfg(feature = "connected")] stdb: Option<Res<crate::spacetime::StdbConnection>>,
     #[cfg(feature = "connected")] tick_counter: Option<Res<crate::spacetime::TickCounter>>,
     #[cfg(feature = "connected")] lock: Option<Res<crate::input::TargetLockState>>,
+    #[cfg(feature = "connected")] smoothing: Option<Res<crate::sync::NetSmoothingTelemetry>>,
 ) {
     if !state.visible {
         return;
@@ -162,6 +163,29 @@ fn update_diagnostics(
     }
 
     let backlog = state.last_tick_id.saturating_sub(last_committed);
+
+    // Smoothing/reconcile telemetry — primary tuning signal for a no-Rapier
+    // client. Hidden until we've seen at least one reconcile sample so the
+    // panel doesn't show zeroed metrics during the connect handshake.
+    let mut smoothing_lines = String::new();
+    #[cfg(feature = "connected")]
+    if let Some(sm) = smoothing.as_ref() {
+        if sm.reconcile_samples > 0 || sm.extrapolation_events > 0 {
+            smoothing_lines.push_str(&format!(
+                "\nReconcile err: ewma={ewma:.3}m max={max:.3}m snaps={snaps}\n\
+                 Extrapolation: {ev} events ({total:.2}s total, {emax:.3}s max)\n\
+                 Snapshot gap: ewma={gap_ewma:.2}t max={gap_max}t",
+                ewma = sm.reconcile_err_ewma,
+                max = sm.reconcile_err_max,
+                snaps = sm.snap_corrections,
+                ev = sm.extrapolation_events,
+                total = sm.extrapolation_secs_total,
+                emax = sm.extrapolation_secs_max,
+                gap_ewma = sm.snapshot_gap_ewma,
+                gap_max = sm.snapshot_gap_max,
+            ));
+        }
+    }
 
     // Tier 1/2 orchestration debug lines.
     let mut extra_lines = String::new();
@@ -233,12 +257,13 @@ fn update_diagnostics(
          Intent rate: {intent_rate}/s\n\
          Last committed: {last_committed}\n\
          Backlog: {backlog}\n\
-         Workers: {workers}{extra}",
+         Workers: {workers}{smoothing}{extra}",
         tick_id = state.last_tick_id,
         tick_rate = state.ticks_per_second,
         entities = entity_count,
         intent_rate = state.intents_per_second,
         workers = worker_count,
+        smoothing = smoothing_lines,
         extra = extra_lines,
     );
 }

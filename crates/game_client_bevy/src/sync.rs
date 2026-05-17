@@ -21,6 +21,7 @@ pub enum SyncSet {
 impl Plugin for SyncPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<EntityMap>();
+        app.init_resource::<NetSmoothingTelemetry>();
         app.add_systems(
             Update,
             (
@@ -46,6 +47,77 @@ const MAX_SNAPSHOT_HISTORY: usize = 12;
 const LOCAL_RECONCILE_RATE: f32 = 8.0;
 const LOCAL_ROTATE_RATE: f32 = 10.0;
 const LOCAL_SNAP_DISTANCE: f32 = 3.0;
+
+/// EWMA decay applied per-sample to reconcile-error and snapshot-gap means.
+/// Tuned for ~20 Hz sample rate so the reading reflects ≈ the last second of
+/// activity without being drowned by transient spikes.
+const TELEMETRY_EWMA_ALPHA: f32 = 0.05;
+
+/// Smoothing/reconcile telemetry. Production client has no local Rapier, so
+/// these metrics are the primary feedback channel for tuning REMOTE_BUFFER_TICKS,
+/// MAX_EXTRAPOLATION_SECS, and LOCAL_RECONCILE_RATE under live network conditions.
+///
+/// All counters are cumulative since client start. EWMA fields decay toward
+/// recent activity (see TELEMETRY_EWMA_ALPHA).
+#[derive(Resource, Default, Debug, Clone)]
+pub struct NetSmoothingTelemetry {
+    /// How many remote samples needed to extrapolate past the latest snapshot.
+    pub extrapolation_events: u64,
+    /// Cumulative extrapolation time in seconds (clamped per-event to MAX_EXTRAPOLATION_SECS).
+    pub extrapolation_secs_total: f32,
+    /// Maximum extrapolation seconds observed in a single sample.
+    pub extrapolation_secs_max: f32,
+    /// Number of `reconcile_translation` calls on the local player.
+    pub reconcile_samples: u64,
+    /// EWMA of |authoritative - predicted| meters. Approximates current
+    /// prediction-error magnitude for the local player.
+    pub reconcile_err_ewma: f32,
+    /// Largest single-frame |authoritative - predicted| meters seen.
+    pub reconcile_err_max: f32,
+    /// Times the LOCAL_SNAP_DISTANCE threshold was crossed (hard correction).
+    pub snap_corrections: u64,
+    /// EWMA of inter-snapshot tick gap. Steady state should hover near 1.0
+    /// (one snapshot per simulation tick); higher values indicate dropped or
+    /// merged snapshots between client and server.
+    pub snapshot_gap_ewma: f32,
+    /// Largest gap (in ticks) observed between successive snapshots for any entity.
+    pub snapshot_gap_max: u64,
+}
+
+impl NetSmoothingTelemetry {
+    fn record_extrapolation(&mut self, secs: f32) {
+        self.extrapolation_events += 1;
+        self.extrapolation_secs_total += secs;
+        if secs > self.extrapolation_secs_max {
+            self.extrapolation_secs_max = secs;
+        }
+    }
+
+    fn record_reconcile(&mut self, error_m: f32, snapped: bool) {
+        self.reconcile_samples += 1;
+        if error_m > self.reconcile_err_max {
+            self.reconcile_err_max = error_m;
+        }
+        // EWMA: new = α·sample + (1−α)·old.
+        self.reconcile_err_ewma =
+            TELEMETRY_EWMA_ALPHA * error_m + (1.0 - TELEMETRY_EWMA_ALPHA) * self.reconcile_err_ewma;
+        if snapped {
+            self.snap_corrections += 1;
+        }
+    }
+
+    fn record_snapshot_gap(&mut self, gap_ticks: u64) {
+        if gap_ticks == 0 {
+            // Same-tick replacement, not a true gap.
+            return;
+        }
+        if gap_ticks > self.snapshot_gap_max {
+            self.snapshot_gap_max = gap_ticks;
+        }
+        self.snapshot_gap_ewma = TELEMETRY_EWMA_ALPHA * gap_ticks as f32
+            + (1.0 - TELEMETRY_EWMA_ALPHA) * self.snapshot_gap_ewma;
+    }
+}
 
 /// Visible child mesh that makes the local player's body facing obvious in third-person tests.
 #[derive(Component)]
@@ -317,6 +389,7 @@ fn sync_entities(
     >,
     entity_meshes: Option<Res<EntityMeshes>>,
     time: Res<Time>,
+    mut telemetry: ResMut<NetSmoothingTelemetry>,
 ) {
     let Some(stdb) = stdb else { return };
 
@@ -360,10 +433,24 @@ fn sync_entities(
 
         if let Some(&bevy_entity) = entity_map.map.get(&row.entity_id) {
             if let Ok((mut tf, mut smoothing, mut motion, is_local)) = query.get_mut(bevy_entity) {
+                // Capture gap (server tick - last_seen) before authoritative state advances.
+                let prev_server_tick = smoothing.last_server_tick;
+                let new_server_tick = snapshot.tick as u64;
+                if new_server_tick > prev_server_tick && prev_server_tick != 0 {
+                    telemetry
+                        .record_snapshot_gap(new_server_tick.saturating_sub(prev_server_tick));
+                }
                 update_authoritative_state(&mut smoothing, snapshot);
 
                 let previous = tf.translation;
                 if is_local.is_some() {
+                    // Reconcile error = the divergence the server *just* corrected
+                    // on the local predicted transform. Recorded BEFORE the lerp
+                    // so the magnitude reflects pre-correction prediction drift.
+                    let error_m = (smoothing.authoritative_pos - tf.translation).length();
+                    let snapped = error_m > LOCAL_SNAP_DISTANCE;
+                    telemetry.record_reconcile(error_m, snapped);
+
                     tf.translation =
                         reconcile_translation(tf.translation, smoothing.authoritative_pos, dt);
                     tf.rotation = tf.rotation.slerp(
@@ -377,6 +464,16 @@ fn sync_entities(
                     };
                     update_presentation_motion(&mut motion, velocity, dt);
                 } else {
+                    // Detect extrapolation: presentation tick is past the latest
+                    // snapshot in the buffer → sample_remote_snapshot will fall
+                    // through to the velocity-extrapolation branch.
+                    if let Some(latest) = smoothing.snapshots.back() {
+                        if presentation_tick > latest.tick {
+                            let secs = ((presentation_tick - latest.tick) / SIM_TICKS_PER_SECOND)
+                                .clamp(0.0, MAX_EXTRAPOLATION_SECS);
+                            telemetry.record_extrapolation(secs);
+                        }
+                    }
                     let sampled = sample_remote_snapshot(&smoothing.snapshots, presentation_tick);
                     tf.translation = sampled.position;
                     tf.rotation = sampled.rotation;
@@ -941,5 +1038,39 @@ mod tests {
         }
 
         assert!(current.x > 0.9);
+    }
+
+    #[test]
+    fn telemetry_records_extrapolation_reconcile_and_gap() {
+        let mut t = NetSmoothingTelemetry::default();
+
+        // Extrapolation event recording.
+        t.record_extrapolation(0.05);
+        t.record_extrapolation(0.12);
+        assert_eq!(t.extrapolation_events, 2);
+        assert!((t.extrapolation_secs_total - 0.17).abs() < 1e-5);
+        assert!((t.extrapolation_secs_max - 0.12).abs() < 1e-5);
+
+        // Reconcile error: max tracks peak, ewma trends toward sustained value,
+        // snap counter increments only when threshold crossed.
+        t.record_reconcile(0.5, false);
+        t.record_reconcile(2.0, false);
+        t.record_reconcile(5.0, true); // exceeds LOCAL_SNAP_DISTANCE → snap
+        assert_eq!(t.reconcile_samples, 3);
+        assert!((t.reconcile_err_max - 5.0).abs() < 1e-5);
+        assert_eq!(t.snap_corrections, 1);
+        assert!(
+            t.reconcile_err_ewma > 0.0 && t.reconcile_err_ewma < 5.0,
+            "ewma should sit between samples and peak; got {}",
+            t.reconcile_err_ewma
+        );
+
+        // Snapshot gap: zero-gap (same-tick replacement) ignored.
+        t.record_snapshot_gap(0);
+        assert_eq!(t.snapshot_gap_max, 0);
+        t.record_snapshot_gap(1);
+        t.record_snapshot_gap(4);
+        assert_eq!(t.snapshot_gap_max, 4);
+        assert!(t.snapshot_gap_ewma > 0.0);
     }
 }

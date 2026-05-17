@@ -465,6 +465,176 @@ pub fn submit_intent(
     Ok(())
 }
 
+/// One element of a batched intent submission.
+///
+/// Carries the same payload as `submit_intent`'s positional arguments minus
+/// the entity_id (which is shared across the batch and validated once).
+#[derive(spacetimedb::SpacetimeType, Clone, Debug)]
+pub struct BatchedIntent {
+    pub sequence_id: u64,
+    pub client_observed_tick: u64,
+    pub action: IntentAction,
+}
+
+/// Submit a redundant batch of recent intents in a single reducer call.
+///
+/// The client maintains a small ring buffer of recent unacknowledged intents
+/// and resends the tail on every send tick. The server idempotently drops
+/// any entry that is either already processed (`sequence_id <=
+/// last_processed_sequence`) or already queued (matching `sequence_id` row
+/// already present for `entity_id`). New entries are scheduled for
+/// `current_tick + 1`, identical to the single-shot path.
+///
+/// Rate-limit semantics: rather than rejecting the whole call when the
+/// resulting queue would exceed `MAX_QUEUED_INTENTS`, the server inserts
+/// new entries until the cap is reached and silently drops the rest. The
+/// client will resend dropped entries in the next batch — a single
+/// dropped network call no longer loses input forever.
+#[reducer]
+pub fn submit_intents_batch(
+    ctx: &ReducerContext,
+    entity_id: u64,
+    intents: Vec<BatchedIntent>,
+) -> Result<(), String> {
+    let caller = ctx.sender();
+
+    // Verify client owns this entity.
+    let seq = ctx
+        .db
+        .client_sequence()
+        .client_identity()
+        .find(&caller)
+        .ok_or("Client not registered")?;
+
+    if seq.entity_id != entity_id {
+        return Err("Client does not own this entity".into());
+    }
+
+    if intents.is_empty() {
+        return Ok(());
+    }
+
+    // Reject batches large enough to be abusive on their own. The legitimate
+    // client ring buffer is bounded; anything substantially larger is either
+    // a bug or an attempt to flood DB writes.
+    const MAX_BATCH_LEN: usize = 16;
+    if intents.len() > MAX_BATCH_LEN {
+        return Err(format!(
+            "Intent batch too large: {} > {MAX_BATCH_LEN}",
+            intents.len()
+        ));
+    }
+
+    // Snapshot the queue's current sequence_ids and depth in a single scan.
+    let mut queued_seqs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut queued_depth: usize = 0;
+    for row in ctx.db.player_intent().entity_id().filter(&entity_id) {
+        queued_seqs.insert(row.sequence_id);
+        queued_depth += 1;
+    }
+
+    // Process in ascending sequence order so `last_processed_sequence`
+    // advances monotonically and dropped-tail entries are the newest ones,
+    // which the next batch will resend with the lowest urgency cost.
+    let mut sorted = intents;
+    sorted.sort_by_key(|i| i.sequence_id);
+
+    let current_tick = ctx
+        .db
+        .module_config()
+        .key()
+        .find(0)
+        .map(|c| c.next_tick_id)
+        .unwrap_or(0);
+    let target_tick = current_tick + 1;
+
+    const MAX_QUEUED_INTENTS: usize = 5;
+    let mut highest_inserted: u64 = seq.last_processed_sequence;
+    let mut inserted = 0usize;
+    let mut stale = 0usize;
+    let mut duplicate = 0usize;
+    let mut dropped_queue_full = 0usize;
+
+    for intent in sorted {
+        // Idempotent: already-processed intents are silently skipped.
+        if intent.sequence_id <= seq.last_processed_sequence {
+            stale += 1;
+            continue;
+        }
+        // Idempotent: already-queued sequence_ids are silently skipped.
+        // Note: we deliberately do NOT advance `highest_inserted` here.
+        // A duplicate is "already accepted" so it's safe in principle, but
+        // it would let a single seen-but-unprocessed sequence mask a true
+        // gap (e.g. queued=[12], batch=[12,14] would advance past 13).
+        // Only insertions advance the cursor.
+        if queued_seqs.contains(&intent.sequence_id) {
+            duplicate += 1;
+            continue;
+        }
+        // Cap the resulting queue depth, not the batch size.
+        if queued_depth >= MAX_QUEUED_INTENTS {
+            dropped_queue_full += 1;
+            continue;
+        }
+
+        ctx.db.player_intent().insert(PlayerIntent {
+            intent_id: 0, // auto_inc
+            client_identity: caller,
+            entity_id,
+            sequence_id: intent.sequence_id,
+            target_tick,
+            client_observed_tick: intent.client_observed_tick,
+            action: intent.action,
+        });
+        queued_seqs.insert(intent.sequence_id);
+        queued_depth += 1;
+        inserted += 1;
+        if intent.sequence_id > highest_inserted {
+            highest_inserted = intent.sequence_id;
+        }
+    }
+
+    // Telemetry: structured log when a batch produced anything other than
+    // a clean all-duplicate redundancy resend. Stale/duplicate are normal
+    // for the redundancy mechanism; dropped_queue_full is the signal that
+    // the client is sending faster than the queue cap allows.
+    if inserted > 0 || dropped_queue_full > 0 {
+        log::debug!(
+            "submit_intents_batch entity={} inserted={} stale={} duplicate={} dropped_queue_full={} highest_inserted={}",
+            entity_id,
+            inserted,
+            stale,
+            duplicate,
+            dropped_queue_full,
+            highest_inserted,
+        );
+    }
+    if dropped_queue_full > 0 {
+        log::warn!(
+            "intent batch tail dropped (queue full) entity={} dropped={} queue_depth={}",
+            entity_id,
+            dropped_queue_full,
+            queued_depth,
+        );
+    }
+
+    // Advance the sequence cursor only if we inserted something new.
+    // `highest_inserted` is updated only on actual insertion above, so this
+    // never advances past a sequence the server hasn't accepted.
+    if inserted > 0 && highest_inserted > seq.last_processed_sequence {
+        ctx.db
+            .client_sequence()
+            .client_identity()
+            .update(ClientSequence {
+                client_identity: caller,
+                last_processed_sequence: highest_inserted,
+                entity_id: seq.entity_id,
+            });
+    }
+
+    Ok(())
+}
+
 // ── Entity Spawning ─────────────────────────────────────────────────
 // Register a player entity for the connected client.
 

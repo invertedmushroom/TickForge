@@ -328,6 +328,9 @@ pub fn run_tests(config: ClientConfig) -> i32 {
             // ── Smoke Tests (from smoke-test.ps1) ──
             run_smoke_tests(&conn, &mut r);
 
+            // ── Intent Batch Contract Tests (Phase 2 netcode) ──
+            run_intent_batch_tests(&conn, &mut r);
+
             // ── Fault / Boundary Tests (from fault-test.ps1) ──
             run_fault_tests(&conn, &mut r);
 
@@ -1267,6 +1270,521 @@ fn run_smoke_tests(conn: &DbConnection, r: &mut TestResults) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Intent Batch Contract Tests (Phase 2 netcode — submit_intents_batch)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// These tests cover the contract surface of the `submit_intents_batch`
+// reducer added in netcode Phase 2: idempotent dedupe (stale + already-
+// queued), in-batch sorting and duplicate handling, MAX_BATCH_LEN cap,
+// and gap-preservation (cursor never advances past a sequence that wasn't
+// actually inserted). They run against a live WASM module — unit tests
+// can't exercise the real reducer signature.
+//
+// Intent ticks at 20 Hz, so insertion-side cursor advancement (which the
+// reducer does synchronously on insert) is observable within a few
+// pump cycles. Tick processing of the inserted intents is incidental to
+// these tests; we assert on `client_sequence.last_processed_sequence`
+// which the reducer writes inline.
+
+fn run_intent_batch_tests(conn: &DbConnection, r: &mut TestResults) {
+    info!("");
+    info!("── Intent Batch Contract Tests ───────────────────────────────");
+
+    let entity_id = match current_entity_id(conn) {
+        Some(id) => id,
+        None => {
+            r.fail("B0  no client_sequence — cannot run batch tests");
+            return;
+        }
+    };
+
+    // Drain any intents queued by run_smoke_tests so cursor reflects a
+    // settled state before we start.
+    pump(conn, 400);
+
+    // Use a seq_base well above any value the smoke/fault tests touch
+    // (those use seq_base + 0..500). Each B-test gets its own +N offset.
+    let seq_base = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 10_000;
+
+    run_b1_empty_batch(conn, r, entity_id);
+    run_b2_sorted_ascending(conn, r, entity_id, seq_base + 100);
+    run_b3_out_of_order(conn, r, entity_id, seq_base + 200);
+    run_b4_in_batch_duplicate(conn, r, entity_id, seq_base + 300);
+    run_b5_stale_in_batch(conn, r, entity_id, seq_base + 400);
+    run_b6_max_batch_len(conn, r, entity_id, seq_base + 500);
+    run_b7_gap_preservation(conn, r, entity_id, seq_base + 600);
+    run_b8_queue_cap_tail_drop(conn, r, entity_id, seq_base + 700);
+}
+
+/// Wait until `last_processed_sequence` reaches at least `expected`,
+/// or the timeout expires. Returns the observed cursor value.
+fn wait_for_cursor(conn: &DbConnection, expected: u64, timeout_ms: u64) -> u64 {
+    wait_for(conn, timeout_ms, || {
+        current_client_sequence(conn)
+            .map(|s| s.last_processed_sequence >= expected)
+            .unwrap_or(false)
+    });
+    current_client_sequence(conn)
+        .map(|s| s.last_processed_sequence)
+        .unwrap_or(0)
+}
+
+fn run_b1_empty_batch(conn: &DbConnection, r: &mut TestResults, entity_id: u64) {
+    info!("  B1: Empty batch → Ok(()), no DB writes");
+
+    let cursor_before = current_client_sequence(conn)
+        .map(|s| s.last_processed_sequence)
+        .unwrap_or(0);
+
+    let done = Arc::new(AtomicBool::new(false));
+    let ok = Arc::new(AtomicBool::new(false));
+    let d = Arc::clone(&done);
+    let o = Arc::clone(&ok);
+    let _ = conn
+        .reducers()
+        .submit_intents_batch_then(entity_id, vec![], move |_ctx, result| {
+            if let Ok(Ok(())) = result {
+                o.store(true, Ordering::SeqCst);
+            }
+            d.store(true, Ordering::SeqCst);
+        });
+    wait_for(conn, 3000, || done.load(Ordering::SeqCst));
+    pump(conn, 200);
+
+    let cursor_after = current_client_sequence(conn)
+        .map(|s| s.last_processed_sequence)
+        .unwrap_or(0);
+
+    if ok.load(Ordering::SeqCst) && cursor_after == cursor_before {
+        r.pass("B1  empty batch accepted, cursor unchanged");
+    } else if !ok.load(Ordering::SeqCst) {
+        r.fail("B1  empty batch was NOT accepted as Ok(())");
+    } else {
+        r.fail(&format!(
+            "B1  empty batch advanced cursor ({cursor_before} → {cursor_after})"
+        ));
+    }
+}
+
+fn batched_stop(seq: u64) -> BatchedIntent {
+    BatchedIntent {
+        sequence_id: seq,
+        client_observed_tick: 0,
+        action: IntentAction::Stop,
+    }
+}
+
+fn run_b2_sorted_ascending(
+    conn: &DbConnection,
+    r: &mut TestResults,
+    entity_id: u64,
+    seq_base: u64,
+) {
+    info!("  B2: Sorted ascending insertion");
+
+    let intents = vec![
+        batched_stop(seq_base + 1),
+        batched_stop(seq_base + 2),
+        batched_stop(seq_base + 3),
+    ];
+    let target_max = seq_base + 3;
+
+    let done = Arc::new(AtomicBool::new(false));
+    let ok = Arc::new(AtomicBool::new(false));
+    let d = Arc::clone(&done);
+    let o = Arc::clone(&ok);
+    let _ = conn
+        .reducers()
+        .submit_intents_batch_then(entity_id, intents, move |_ctx, result| {
+            if let Ok(Ok(())) = result {
+                o.store(true, Ordering::SeqCst);
+            }
+            d.store(true, Ordering::SeqCst);
+        });
+    wait_for(conn, 3000, || done.load(Ordering::SeqCst));
+    let cursor = wait_for_cursor(conn, target_max, 2000);
+
+    if ok.load(Ordering::SeqCst) && cursor == target_max {
+        r.pass(&format!(
+            "B2  3 ascending intents inserted, cursor={cursor} == max"
+        ));
+    } else {
+        r.fail(&format!(
+            "B2  expected cursor={target_max}, ok={}, got cursor={cursor}",
+            ok.load(Ordering::SeqCst)
+        ));
+    }
+    pump(conn, 200);
+}
+
+fn run_b3_out_of_order(conn: &DbConnection, r: &mut TestResults, entity_id: u64, seq_base: u64) {
+    info!("  B3: Out-of-order batch sorted internally");
+
+    // Submit intentionally shuffled order; reducer sorts ascending.
+    let intents = vec![
+        batched_stop(seq_base + 3),
+        batched_stop(seq_base + 1),
+        batched_stop(seq_base + 2),
+    ];
+    let target_max = seq_base + 3;
+
+    let done = Arc::new(AtomicBool::new(false));
+    let d = Arc::clone(&done);
+    let _ = conn
+        .reducers()
+        .submit_intents_batch_then(entity_id, intents, move |_ctx, _result| {
+            d.store(true, Ordering::SeqCst);
+        });
+    wait_for(conn, 3000, || done.load(Ordering::SeqCst));
+    let cursor = wait_for_cursor(conn, target_max, 2000);
+
+    if cursor == target_max {
+        r.pass(&format!(
+            "B3  shuffled batch sorted, cursor={cursor} == max"
+        ));
+    } else {
+        r.fail(&format!(
+            "B3  expected cursor={target_max}, got {cursor}"
+        ));
+    }
+    pump(conn, 200);
+}
+
+fn run_b4_in_batch_duplicate(
+    conn: &DbConnection,
+    r: &mut TestResults,
+    entity_id: u64,
+    seq_base: u64,
+) {
+    info!("  B4: In-batch duplicate sequence_id");
+
+    // First entry inserts seq+1; second entry with same id must be skipped
+    // by the already-queued check (or stale check after tick consumes the
+    // first); cursor still reaches seq+2 from the third entry.
+    let intents = vec![
+        batched_stop(seq_base + 1),
+        batched_stop(seq_base + 1),
+        batched_stop(seq_base + 2),
+    ];
+    let target_max = seq_base + 2;
+
+    let done = Arc::new(AtomicBool::new(false));
+    let ok = Arc::new(AtomicBool::new(false));
+    let d = Arc::clone(&done);
+    let o = Arc::clone(&ok);
+    let _ = conn
+        .reducers()
+        .submit_intents_batch_then(entity_id, intents, move |_ctx, result| {
+            if let Ok(Ok(())) = result {
+                o.store(true, Ordering::SeqCst);
+            }
+            d.store(true, Ordering::SeqCst);
+        });
+    wait_for(conn, 3000, || done.load(Ordering::SeqCst));
+    let cursor = wait_for_cursor(conn, target_max, 2000);
+
+    if ok.load(Ordering::SeqCst) && cursor == target_max {
+        r.pass(&format!(
+            "B4  in-batch duplicate handled idempotently, cursor={cursor}"
+        ));
+    } else {
+        r.fail(&format!(
+            "B4  expected ok+cursor={target_max}, ok={}, cursor={cursor}",
+            ok.load(Ordering::SeqCst)
+        ));
+    }
+    pump(conn, 200);
+}
+
+fn run_b5_stale_in_batch(
+    conn: &DbConnection,
+    r: &mut TestResults,
+    entity_id: u64,
+    seq_base: u64,
+) {
+    info!("  B5: Stale entry in batch is silently skipped");
+
+    let cursor_before = current_client_sequence(conn)
+        .map(|s| s.last_processed_sequence)
+        .unwrap_or(0);
+
+    // Stale = below current cursor. Mix one stale with two valid;
+    // the reducer must skip the stale and insert the rest.
+    let stale_seq = if cursor_before > 0 { cursor_before - 1 } else { 1 };
+    let intents = vec![
+        batched_stop(stale_seq),
+        batched_stop(seq_base + 1),
+        batched_stop(seq_base + 2),
+    ];
+    let target_max = seq_base + 2;
+
+    let done = Arc::new(AtomicBool::new(false));
+    let ok = Arc::new(AtomicBool::new(false));
+    let d = Arc::clone(&done);
+    let o = Arc::clone(&ok);
+    let _ = conn
+        .reducers()
+        .submit_intents_batch_then(entity_id, intents, move |_ctx, result| {
+            if let Ok(Ok(())) = result {
+                o.store(true, Ordering::SeqCst);
+            }
+            d.store(true, Ordering::SeqCst);
+        });
+    wait_for(conn, 3000, || done.load(Ordering::SeqCst));
+    let cursor = wait_for_cursor(conn, target_max, 2000);
+
+    if ok.load(Ordering::SeqCst) && cursor == target_max {
+        r.pass(&format!(
+            "B5  stale entry skipped, valid entries inserted, cursor={cursor}"
+        ));
+    } else {
+        r.fail(&format!(
+            "B5  expected ok+cursor={target_max}, ok={}, cursor={cursor}",
+            ok.load(Ordering::SeqCst)
+        ));
+    }
+    pump(conn, 200);
+}
+
+fn run_b6_max_batch_len(
+    conn: &DbConnection,
+    r: &mut TestResults,
+    entity_id: u64,
+    seq_base: u64,
+) {
+    info!("  B6: MAX_BATCH_LEN overflow rejected");
+
+    let cursor_before = current_client_sequence(conn)
+        .map(|s| s.last_processed_sequence)
+        .unwrap_or(0);
+
+    // 17 entries — one over the server cap.
+    let intents: Vec<BatchedIntent> = (1..=17u64).map(|i| batched_stop(seq_base + i)).collect();
+
+    let done = Arc::new(AtomicBool::new(false));
+    let rejected = Arc::new(AtomicBool::new(false));
+    let d = Arc::clone(&done);
+    let rj = Arc::clone(&rejected);
+    let _ = conn
+        .reducers()
+        .submit_intents_batch_then(entity_id, intents, move |_ctx, result| {
+            if let Ok(Err(e)) = &result {
+                if e.contains("too large") {
+                    rj.store(true, Ordering::SeqCst);
+                }
+            }
+            d.store(true, Ordering::SeqCst);
+        });
+    wait_for(conn, 3000, || done.load(Ordering::SeqCst));
+    pump(conn, 200);
+
+    let cursor_after = current_client_sequence(conn)
+        .map(|s| s.last_processed_sequence)
+        .unwrap_or(0);
+
+    if rejected.load(Ordering::SeqCst) && cursor_after == cursor_before {
+        r.pass(&format!(
+            "B6  17-entry batch rejected, cursor unchanged ({cursor_before})"
+        ));
+    } else if !rejected.load(Ordering::SeqCst) {
+        r.fail("B6  17-entry batch was NOT rejected with 'too large'");
+    } else {
+        r.fail(&format!(
+            "B6  rejected but cursor advanced ({cursor_before} → {cursor_after})"
+        ));
+    }
+}
+
+fn run_b7_gap_preservation(
+    conn: &DbConnection,
+    r: &mut TestResults,
+    entity_id: u64,
+    seq_base: u64,
+) {
+    info!("  B7: Gap preservation (cursor never advances past an unfilled gap)");
+
+    // Step 1: queue a single intent at seq_base+1 via the single-shot path.
+    let single_done = Arc::new(AtomicBool::new(false));
+    let sd = Arc::clone(&single_done);
+    let _ = conn.reducers().submit_intent_then(
+        entity_id,
+        seq_base + 1,
+        IntentAction::Stop,
+        seq_base,
+        move |_ctx, _r| sd.store(true, Ordering::SeqCst),
+    );
+    wait_for(conn, 3000, || single_done.load(Ordering::SeqCst));
+
+    // Step 2: batch [seq+1, seq+3]. seq+1 is either still queued
+    // (already-queued skip) or already processed (stale skip); either way
+    // it must NOT advance the cursor through that path. seq+3 inserts
+    // and the cursor lands at exactly seq+3 — *not* at seq+2 spuriously
+    // and *not* short of seq+3.
+    let intents = vec![batched_stop(seq_base + 1), batched_stop(seq_base + 3)];
+    let batch_done = Arc::new(AtomicBool::new(false));
+    let bd = Arc::clone(&batch_done);
+    let _ = conn
+        .reducers()
+        .submit_intents_batch_then(entity_id, intents, move |_ctx, _r| {
+            bd.store(true, Ordering::SeqCst)
+        });
+    wait_for(conn, 3000, || batch_done.load(Ordering::SeqCst));
+    let cursor = wait_for_cursor(conn, seq_base + 3, 2000);
+
+    if cursor == seq_base + 3 {
+        r.pass(&format!(
+            "B7a cursor advanced exactly to seq+3 ({cursor}), gap at seq+2 not skipped over"
+        ));
+    } else {
+        r.fail(&format!(
+            "B7a expected cursor=seq+3 ({}), got {cursor}",
+            seq_base + 3
+        ));
+    }
+
+    // Step 3: a follow-up submit at seq+2 must be rejected as Stale.
+    // This documents the model: once the cursor passes a sequence, that
+    // sequence is permanently lost (the ring buffer's job is to prevent
+    // this from happening in practice). The cursor's behaviour is
+    // monotonic and consistent — there is no spurious "still acceptable"
+    // window introduced by the batch path.
+    let gap_done = Arc::new(AtomicBool::new(false));
+    let gap_stale = Arc::new(AtomicBool::new(false));
+    let gd = Arc::clone(&gap_done);
+    let gs = Arc::clone(&gap_stale);
+    let _ = conn.reducers().submit_intent_then(
+        entity_id,
+        seq_base + 2,
+        IntentAction::Stop,
+        seq_base,
+        move |_ctx, result| {
+            if let Ok(Err(e)) = &result {
+                if e.contains("Stale sequence") {
+                    gs.store(true, Ordering::SeqCst);
+                }
+            }
+            gd.store(true, Ordering::SeqCst);
+        },
+    );
+    wait_for(conn, 3000, || gap_done.load(Ordering::SeqCst));
+
+    if gap_stale.load(Ordering::SeqCst) {
+        r.pass("B7b post-batch fill at seq+2 rejected as stale (monotonic cursor)");
+    } else {
+        r.fail("B7b post-batch fill at seq+2 was NOT rejected as stale");
+    }
+    pump(conn, 200);
+}
+
+fn run_b8_queue_cap_tail_drop(
+    conn: &DbConnection,
+    r: &mut TestResults,
+    entity_id: u64,
+    seq_base: u64,
+) {
+    info!("  B8: MAX_QUEUED_INTENTS tail-drop and resend recovery");
+
+    // Pre-condition: drain any in-flight intents for our entity so the
+    // server-side queue starts at depth 0. Without this, B7's residual
+    // queue depth could mask the cap-trigger boundary.
+    pump(conn, 600);
+    let pre_queue_depth = conn
+        .db()
+        .player_intent()
+        .iter()
+        .filter(|p| p.entity_id == entity_id)
+        .count();
+    if pre_queue_depth > 0 {
+        info!("  B8: pre-test queue depth = {pre_queue_depth}, draining further");
+        pump(conn, 800);
+    }
+
+    // Step 1: single batch with 8 entries. Server cap is
+    // MAX_QUEUED_INTENTS = 5, so the first 5 (seq+1..seq+5) insert and
+    // the trailing 3 (seq+6..seq+8) are silently dropped. Cursor must
+    // advance to seq+5 (highest INSERTED) — never to seq+8 — otherwise
+    // the redundant-resend mechanism would convert into stale rejections.
+    let intents: Vec<BatchedIntent> =
+        (1..=8u64).map(|i| batched_stop(seq_base + i)).collect();
+    let target_inserted_max = seq_base + 5;
+
+    let done = Arc::new(AtomicBool::new(false));
+    let ok = Arc::new(AtomicBool::new(false));
+    let d = Arc::clone(&done);
+    let o = Arc::clone(&ok);
+    let _ = conn
+        .reducers()
+        .submit_intents_batch_then(entity_id, intents, move |_ctx, result| {
+            if let Ok(Ok(())) = result {
+                o.store(true, Ordering::SeqCst);
+            }
+            d.store(true, Ordering::SeqCst);
+        });
+    wait_for(conn, 3000, || done.load(Ordering::SeqCst));
+    let cursor_after_overflow = wait_for_cursor(conn, target_inserted_max, 2000);
+
+    if ok.load(Ordering::SeqCst) && cursor_after_overflow == target_inserted_max {
+        r.pass(&format!(
+            "B8a 8-entry batch hit cap, cursor advanced to highest-inserted ({cursor_after_overflow}), tail [seq+6..seq+8] silently dropped"
+        ));
+    } else {
+        r.fail(&format!(
+            "B8a expected ok+cursor={target_inserted_max}, ok={}, cursor={cursor_after_overflow}",
+            ok.load(Ordering::SeqCst)
+        ));
+    }
+
+    // Step 2: pump for worker tick consumption so the 5 queued intents
+    // drain. Cursor stays at seq+5; player_intent rows for our entity
+    // disappear, freeing capacity for the resend.
+    pump(conn, 600);
+    let post_drain_queue_depth = conn
+        .db()
+        .player_intent()
+        .iter()
+        .filter(|p| p.entity_id == entity_id)
+        .count();
+
+    // Step 3: resend the dropped tail — this is exactly the pattern the
+    // client ring buffer produces on its next 20 Hz batch tick after the
+    // initial cap-drop. The cursor must advance cleanly to seq+8,
+    // proving the redundant-resend recovery loop closes end-to-end.
+    let resend: Vec<BatchedIntent> = (6..=8u64).map(|i| batched_stop(seq_base + i)).collect();
+    let target_final = seq_base + 8;
+
+    let done2 = Arc::new(AtomicBool::new(false));
+    let ok2 = Arc::new(AtomicBool::new(false));
+    let d2 = Arc::clone(&done2);
+    let o2 = Arc::clone(&ok2);
+    let _ = conn
+        .reducers()
+        .submit_intents_batch_then(entity_id, resend, move |_ctx, result| {
+            if let Ok(Ok(())) = result {
+                o2.store(true, Ordering::SeqCst);
+            }
+            d2.store(true, Ordering::SeqCst);
+        });
+    wait_for(conn, 3000, || done2.load(Ordering::SeqCst));
+    let cursor_final = wait_for_cursor(conn, target_final, 2000);
+
+    if ok2.load(Ordering::SeqCst) && cursor_final == target_final {
+        r.pass(&format!(
+            "B8b dropped tail recovered via resend, cursor={cursor_final} (post-drain queue was {post_drain_queue_depth})"
+        ));
+    } else {
+        r.fail(&format!(
+            "B8b expected ok+cursor={target_final}, ok={}, cursor={cursor_final}, post-drain queue={post_drain_queue_depth}",
+            ok2.load(Ordering::SeqCst)
+        ));
+    }
+    pump(conn, 200);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Fault / Boundary Tests
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1283,10 +1801,19 @@ fn run_fault_tests(conn: &DbConnection, r: &mut TestResults) {
         }
     };
 
-    let seq_base = std::time::SystemTime::now()
+    // Base sequence numbers above the current cursor. The batch tests
+    // (B1–B7) push the cursor well past wall-clock-ms by submitting
+    // sequences at `now_ms + 10_000 + …`, so a naive `now_ms` here
+    // produces sequences that are already stale and F1b ("subsequent
+    // valid sequence") falsely rejects.
+    let cursor_now = current_client_sequence(conn)
+        .map(|s| s.last_processed_sequence)
+        .unwrap_or(0);
+    let wall_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
+    let seq_base = cursor_now.max(wall_ms) + 100_000;
 
     // F1: Stale-sequence anti-replay.
     run_f1_stale_sequence(conn, r, entity_id, seq_base);

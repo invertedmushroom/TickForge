@@ -2,8 +2,11 @@ use bevy::prelude::*;
 use bevy::time::{Time, Timer, TimerMode};
 use game_client::module_bindings::*;
 use spacetimedb_sdk::Table;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::ability_bar::{AbilityCooldowns, BLOCK_ABILITY_ID, ClientTargetingMode, all_abilities};
 #[allow(unused)]
@@ -30,11 +33,15 @@ pub struct LastMoveDir {
 pub struct IntentThrottle(pub Timer);
 
 /// Async reducer acknowledgement counters for quick on-screen debugging.
+///
+/// Also owns the redundant-resend ring buffer so that `submit_intent_logged`
+/// only needs a single resource handle on the call sites.
 #[derive(Resource)]
 pub struct IntentAckStats {
     sent: Arc<AtomicU64>,
     accepted: Arc<AtomicU64>,
     rejected: Arc<AtomicU64>,
+    ring: IntentRingBuffer,
 }
 
 impl Default for IntentAckStats {
@@ -43,6 +50,7 @@ impl Default for IntentAckStats {
             sent: Arc::new(AtomicU64::new(0)),
             accepted: Arc::new(AtomicU64::new(0)),
             rejected: Arc::new(AtomicU64::new(0)),
+            ring: IntentRingBuffer::default(),
         }
     }
 }
@@ -56,6 +64,156 @@ impl IntentAckStats {
     }
     pub fn rejected(&self) -> u64 {
         self.rejected.load(Ordering::Relaxed)
+    }
+    /// Advance the ring's ack cursor to the authoritative server cursor.
+    /// Called from `pump_connection` every frame with
+    /// `client_sequence.last_processed_sequence` from the table cache, which
+    /// is the only ground-truth signal of which sequences the server has
+    /// committed to its queue. Reducer success callbacks alone are not
+    /// sufficient: `submit_intents_batch` returns `Ok(())` even when its
+    /// tail entries were silently dropped to the queue cap.
+    pub fn ack_up_to(&self, sequence_id: u64) {
+        self.ring.mark_acked(sequence_id);
+    }
+}
+
+/// Maximum number of recent unacknowledged intents the client retains for
+/// redundant batch resends. At 20 Hz this is ~600 ms of input redundancy —
+/// comfortable headroom over typical jitter and a couple of consecutive
+/// dropped reducer calls, while staying well below the server-side
+/// `MAX_BATCH_LEN = 16`.
+const INTENT_RING_CAPACITY: usize = 12;
+
+/// Minimum age a ring entry must reach before the redundant-resend path
+/// will include it in a batch. The single-shot `submit_intent` call's ack
+/// (or the authoritative `client_sequence` cursor) normally lands within
+/// one server tick (~50 ms at 20 Hz). This threshold sits one full resend
+/// cycle past that, so an entry only gets resent when its original
+/// reducer call was *actually* dropped — not merely in flight. Keeps the
+/// redundancy path zero-cost during normal play.
+const RESEND_MIN_AGE: Duration = Duration::from_millis(75);
+
+/// Ring buffer of recent intents the client has submitted but not yet seen
+/// acknowledged. A 20 Hz Bevy system resends the buffer contents via the
+/// `submit_intents_batch` reducer so that a single dropped network call
+/// no longer permanently loses an input.
+#[derive(Default, Clone)]
+pub struct IntentRingBuffer {
+    inner: Arc<Mutex<RingState>>,
+}
+
+/// Single ring entry: `(sequence_id, client_observed_tick, action,
+/// pushed_at)`. `pushed_at` powers the adaptive resend gate — entries
+/// younger than `RESEND_MIN_AGE` are skipped so the redundancy path
+/// only fires when the single-shot reducer call was actually dropped.
+type RingEntry = (u64, u64, IntentAction, Instant);
+
+#[derive(Default)]
+struct RingState {
+    /// Recent unacknowledged intents. Bounded to `INTENT_RING_CAPACITY`;
+    /// oldest entries evicted as new intents are pushed.
+    entries: VecDeque<RingEntry>,
+    /// Highest sequence_id known to be accepted by the server.
+    /// Entries with `sequence_id <= highest_acked` are pruned on push and
+    /// before each redundant batch send.
+    highest_acked: u64,
+}
+
+impl IntentRingBuffer {
+    fn push(&self, sequence_id: u64, observed_tick: u64, action: IntentAction) {
+        self.push_at(sequence_id, observed_tick, action, Instant::now());
+    }
+
+    /// Test seam: push with an explicit timestamp so unit tests can
+    /// exercise the `RESEND_MIN_AGE` gate without sleeping.
+    fn push_at(
+        &self,
+        sequence_id: u64,
+        observed_tick: u64,
+        action: IntentAction,
+        pushed_at: Instant,
+    ) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        // Drop entries the server has already acknowledged.
+        while guard
+            .entries
+            .front()
+            .is_some_and(|(seq, _, _, _)| *seq <= guard.highest_acked)
+        {
+            guard.entries.pop_front();
+        }
+        // Cap the buffer — drop the oldest unacked entry to make room.
+        while guard.entries.len() >= INTENT_RING_CAPACITY {
+            guard.entries.pop_front();
+        }
+        guard
+            .entries
+            .push_back((sequence_id, observed_tick, action, pushed_at));
+    }
+
+    fn mark_acked(&self, sequence_id: u64) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return;
+        };
+        if sequence_id > guard.highest_acked {
+            guard.highest_acked = sequence_id;
+        }
+    }
+
+    /// Snapshot **all** unacked entries. Used by tests and any future
+    /// caller that wants the full ring contents regardless of age.
+    #[cfg(test)]
+    fn snapshot(&self) -> Vec<BatchedIntent> {
+        self.snapshot_filtered(None)
+    }
+
+    /// Snapshot only entries that have been waiting at least `min_age`
+    /// without an ack. The single-shot reducer call's ack typically lands
+    /// well under this threshold, so during normal play the result is
+    /// empty and `resend_intent_batch` makes no reducer call.
+    fn snapshot_stale(&self, min_age: Duration) -> Vec<BatchedIntent> {
+        self.snapshot_filtered(Some((Instant::now(), min_age)))
+    }
+
+    fn snapshot_filtered(
+        &self,
+        age_gate: Option<(Instant, Duration)>,
+    ) -> Vec<BatchedIntent> {
+        let Ok(mut guard) = self.inner.lock() else {
+            return Vec::new();
+        };
+        while guard
+            .entries
+            .front()
+            .is_some_and(|(seq, _, _, _)| *seq <= guard.highest_acked)
+        {
+            guard.entries.pop_front();
+        }
+        guard
+            .entries
+            .iter()
+            .filter(|(_, _, _, pushed_at)| match age_gate {
+                Some((now, min_age)) => now.saturating_duration_since(*pushed_at) >= min_age,
+                None => true,
+            })
+            .map(|(seq, tick, action, _)| BatchedIntent {
+                sequence_id: *seq,
+                client_observed_tick: *tick,
+                action: action.clone(),
+            })
+            .collect()
+    }
+}
+
+/// 20 Hz timer driving redundant `submit_intents_batch` resends.
+#[derive(Resource)]
+pub struct IntentBatchTimer(pub Timer);
+
+impl Default for IntentBatchTimer {
+    fn default() -> Self {
+        Self(Timer::from_seconds(1.0 / 20.0, TimerMode::Repeating))
     }
 }
 
@@ -202,18 +360,50 @@ fn submit_intent_logged(
     ack.sent.fetch_add(1, Ordering::Relaxed);
     let accepted = Arc::clone(&ack.accepted);
     let rejected = Arc::clone(&ack.rejected);
+    let ring_for_callback = ack.ring.clone();
+
+    // Record locally for redundant batch resend before issuing the reducer
+    // call. If the single-shot call is dropped on the wire, the next
+    // `submit_intents_batch` tick will redeliver this entry.
+    ack.ring
+        .push(sequence_id, client_observed_tick, action.clone());
 
     if let Err(e) = stdb.conn.reducers.submit_intent_then(
         entity_id,
         sequence_id,
         action,
         client_observed_tick,
+        // INVARIANT: this callback body MUST be order-independent. The
+        // SpacetimeDB SDK does not guarantee callback delivery order
+        // relative to other reducer callbacks (or relative to the
+        // overlapping `submit_intents_batch_then` callback below).
+        // The only mutations performed here are:
+        //   - `accepted` / `rejected` AtomicU64 counters (commutative)
+        //   - `ring.mark_acked(seq)` which is max(highest_acked, seq)
+        //     (commutative, monotonic)
+        // Authoritative gameplay sequence state lives in the
+        // `client_sequence` table cache and is read in `pump_connection`.
+        // Do NOT add gameplay-affecting writes to this closure.
         move |_ctx, result| match result {
             Ok(Ok(())) => {
                 accepted.fetch_add(1, Ordering::Relaxed);
+                ring_for_callback.mark_acked(sequence_id);
             }
             Ok(Err(msg)) => {
                 rejected.fetch_add(1, Ordering::Relaxed);
+                // Only a "stale sequence" rejection counts as an implicit
+                // ack: the server cursor is already at or above this seq,
+                // so further redundancy resends would just be skipped. This
+                // is an early-prune optimization; the same prune will
+                // happen via `pump_connection` once the next frame reads
+                // `client_sequence.last_processed_sequence`. Other
+                // rejections (queue full, ownership/registration errors)
+                // MUST NOT prune the ring — queue-full is transient
+                // backpressure that the next 20 Hz `submit_intents_batch`
+                // resend should recover.
+                if msg.starts_with("Stale sequence") {
+                    ring_for_callback.mark_acked(sequence_id);
+                }
                 log::warn!(
                     "Intent rejected ({label}, seq={sequence_id}, tick={client_observed_tick}): {msg}"
                 );
@@ -238,6 +428,7 @@ impl Plugin for InputPlugin {
         let timer = Timer::from_seconds(1.0 / 20.0, TimerMode::Repeating);
         app.insert_resource(IntentThrottle(timer));
         app.init_resource::<IntentAckStats>();
+        app.init_resource::<IntentBatchTimer>();
         app.init_resource::<TargetLockState>();
         app.init_resource::<SkillBindings>();
         app.init_resource::<CrosshairAim>();
@@ -253,9 +444,71 @@ impl Plugin for InputPlugin {
                 handle_lock_on_input,
                 handle_weapon_swap,
                 handle_interact,
+                resend_intent_batch,
             )
                 .in_set(InputSet::DriveInput),
         );
+    }
+}
+
+/// Periodically resend the recent unacknowledged intents as a single
+/// `submit_intents_batch` reducer call. The server idempotently drops any
+/// entries it has already processed, so a single dropped single-shot call
+/// no longer permanently loses an input.
+fn resend_intent_batch(
+    time: Res<Time>,
+    mut timer: ResMut<IntentBatchTimer>,
+    stdb: Option<Res<StdbConnection>>,
+    local_player: Res<LocalPlayerEntity>,
+    ack: Res<IntentAckStats>,
+) {
+    if !timer.0.tick(time.delta()).just_finished() {
+        return;
+    }
+    let Some(stdb) = stdb else { return };
+    let Some(entity_id) = local_player.entity_id else {
+        return;
+    };
+
+    // Adaptive gate: only resend entries that have already outlived
+    // their normal ack window. In the common case the single-shot
+    // `submit_intent` ack arrives first and prunes the ring via
+    // `mark_acked`, so this snapshot is empty and we make no reducer
+    // call. The redundancy path only costs a reducer call when the
+    // original single-shot was actually dropped on the wire.
+    let snapshot = ack.ring.snapshot_stale(RESEND_MIN_AGE);
+    if snapshot.is_empty() {
+        return;
+    }
+
+    // Track the highest sequence in this batch for log correlation.
+    let highest_seq = snapshot
+        .iter()
+        .map(|i| i.sequence_id)
+        .max()
+        .unwrap_or(0);
+
+    if let Err(e) = stdb.conn.reducers.submit_intents_batch_then(
+        entity_id,
+        snapshot,
+        // INVARIANT: order-independent. See `submit_intent_then` callback
+        // above for the rationale. The batch reducer returns `Ok(())` even
+        // when tail entries were silently dropped to the server-side queue
+        // cap, so we deliberately do NOT mark the ring acked from this
+        // callback. The authoritative ack signal is
+        // `client_sequence.last_processed_sequence`, pumped into the ring
+        // via `IntentAckStats::ack_up_to` in `pump_connection`.
+        move |_ctx, result| match result {
+            Ok(Ok(())) => {}
+            Ok(Err(msg)) => {
+                log::warn!("Intent batch rejected (highest_seq={highest_seq}): {msg}");
+            }
+            Err(err) => {
+                log::warn!("Intent batch callback error (highest_seq={highest_seq}): {err}");
+            }
+        },
+    ) {
+        log::warn!("Failed to submit intent batch (highest_seq={highest_seq}): {e}");
     }
 }
 
@@ -1131,5 +1384,80 @@ mod tests {
             "Expected forward component to be preserved, got {}",
             dir.z
         );
+    }
+
+    fn ring_with_capacity_marker() -> IntentRingBuffer {
+        IntentRingBuffer::default()
+    }
+
+    #[test]
+    fn ring_snapshot_stale_excludes_fresh_entries() {
+        let ring = ring_with_capacity_marker();
+        // Push at "now" — snapshot_stale called immediately must skip it.
+        ring.push(1, 0, IntentAction::Stop);
+        let snap = ring.snapshot_stale(RESEND_MIN_AGE);
+        assert!(
+            snap.is_empty(),
+            "fresh entry should not appear in stale snapshot, got {} entries",
+            snap.len()
+        );
+    }
+
+    #[test]
+    fn ring_snapshot_stale_includes_aged_entries() {
+        let ring = ring_with_capacity_marker();
+        let now = Instant::now();
+        // Backdate one entry past the threshold; leave a fresh one too.
+        ring.push_at(
+            1,
+            10,
+            IntentAction::Stop,
+            now - RESEND_MIN_AGE - Duration::from_millis(10),
+        );
+        ring.push_at(2, 11, IntentAction::Stop, now);
+
+        let snap = ring.snapshot_stale(RESEND_MIN_AGE);
+        assert_eq!(snap.len(), 1, "only the aged entry should be resent");
+        assert_eq!(snap[0].sequence_id, 1);
+        assert_eq!(snap[0].client_observed_tick, 10);
+    }
+
+    #[test]
+    fn ring_mark_acked_prunes_regardless_of_age() {
+        let ring = ring_with_capacity_marker();
+        let aged = Instant::now() - RESEND_MIN_AGE - Duration::from_millis(50);
+        ring.push_at(1, 0, IntentAction::Stop, aged);
+        ring.push_at(2, 1, IntentAction::Stop, aged);
+        ring.push_at(3, 2, IntentAction::Stop, aged);
+
+        ring.mark_acked(2);
+        let snap = ring.snapshot_stale(RESEND_MIN_AGE);
+        assert_eq!(snap.len(), 1, "entries up to the acked seq should be pruned");
+        assert_eq!(snap[0].sequence_id, 3);
+    }
+
+    #[test]
+    fn ring_capacity_evicts_oldest_unacked() {
+        let ring = ring_with_capacity_marker();
+        let aged = Instant::now() - RESEND_MIN_AGE - Duration::from_millis(50);
+        for seq in 1..=(INTENT_RING_CAPACITY as u64 + 3) {
+            ring.push_at(seq, seq, IntentAction::Stop, aged);
+        }
+        let snap = ring.snapshot_stale(RESEND_MIN_AGE);
+        assert_eq!(snap.len(), INTENT_RING_CAPACITY);
+        // First three sequences should have been evicted.
+        assert_eq!(snap.first().unwrap().sequence_id, 4);
+        assert_eq!(
+            snap.last().unwrap().sequence_id,
+            INTENT_RING_CAPACITY as u64 + 3
+        );
+    }
+
+    #[test]
+    fn ring_full_snapshot_ignores_age_gate() {
+        let ring = ring_with_capacity_marker();
+        ring.push(1, 0, IntentAction::Stop);
+        let snap = ring.snapshot();
+        assert_eq!(snap.len(), 1, "snapshot() must not apply the age filter");
     }
 }

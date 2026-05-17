@@ -167,7 +167,11 @@ fn connect(mut commands: Commands) {
 }
 
 /// Pump the SpacetimeDB connection each frame (processes callbacks).
-fn pump_connection(stdb: Option<Res<StdbConnection>>, mut tick_counter: ResMut<TickCounter>) {
+fn pump_connection(
+    stdb: Option<Res<StdbConnection>>,
+    mut tick_counter: ResMut<TickCounter>,
+    intent_ack: Option<Res<crate::input::IntentAckStats>>,
+) {
     let Some(stdb) = stdb else { return };
     let _ = stdb.conn.frame_tick();
 
@@ -194,6 +198,16 @@ fn pump_connection(stdb: Option<Res<StdbConnection>>, mut tick_counter: ResMut<T
                 seq.last_processed_sequence
             );
             tick_counter.intent_seq = seq.last_processed_sequence;
+        }
+        // Authoritative ack signal for the redundancy ring buffer. The
+        // `submit_intents_batch` reducer returns `Ok(())` even when tail
+        // entries were silently dropped to the server queue cap, so the
+        // batch callback alone cannot prune the ring safely. The cursor
+        // table is the only source of truth for what the server actually
+        // committed. `mark_acked` is monotonic-max, so calling it every
+        // frame is cheap and idempotent.
+        if let Some(ack) = intent_ack.as_ref() {
+            ack.ack_up_to(seq.last_processed_sequence);
         }
     }
 }
