@@ -74,9 +74,14 @@ impl TickDriver {
         }
 
         let tick_to_process = commit.next_expected_tick();
-        if canonical_tick > tick_to_process {
+        let gap = canonical_tick.saturating_sub(tick_to_process);
+        if gap > commit.pipeline_depth() as u64 {
             warn!(
-                "tick backlog: canonical={canonical_tick} processing_contiguous_tick={tick_to_process}"
+                "tick backlog: canonical={canonical_tick} processing_contiguous_tick={tick_to_process} gap={gap}"
+            );
+        } else if gap > 0 {
+            debug!(
+                "tick pipelining: canonical={canonical_tick} processing_contiguous_tick={tick_to_process} gap={gap}"
             );
         }
 
@@ -111,10 +116,18 @@ impl TickDriver {
         {
             info!(
                 "tick={tick} intents={} contacts={} damage={} deaths={} despawns={} entities={} hitboxes={} transforms={} region_updates={} actions={} tick_us={} retries={}",
-                summary.intents_processed, summary.contacts, summary.damage_events,
-                summary.deaths, summary.despawns, summary.active_entities, summary.active_hitboxes,
-                summary.transform_updates, summary.region_updates, summary.scheduled_actions_len,
-                summary.tick_duration_us, summary.commit_retries,
+                summary.intents_processed,
+                summary.contacts,
+                summary.damage_events,
+                summary.deaths,
+                summary.despawns,
+                summary.active_entities,
+                summary.active_hitboxes,
+                summary.transform_updates,
+                summary.region_updates,
+                summary.scheduled_actions_len,
+                summary.tick_duration_us,
+                summary.commit_retries,
             );
         }
     }
@@ -153,6 +166,8 @@ mod tests {
             launch_lift: 0.0,
             launch_recovery_ticks: 0,
             usable_while_cc: false,
+            require_grounded: true,
+            heal_amount: 0.0,
             fear_ticks: 0,
             silence_ticks: 0,
             sleep_ticks: 0,
@@ -161,6 +176,8 @@ mod tests {
             projectile_speed: None,
             max_range: None,
             lock_on_timeout_ticks: None,
+            max_rewind_ticks: None,
+            target_filter: game_core::combat::skill::TargetFilter::Hostile,
         });
         reg.register_timeline(AbilityTimeline {
             ability_id: 1,

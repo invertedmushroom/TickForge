@@ -5,7 +5,10 @@ pub struct HudPlugin;
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, (spawn_hud, spawn_buff_bar, spawn_crosshair));
-        app.add_systems(Update, (update_hud, update_buff_bar, update_crosshair_color));
+        app.add_systems(
+            Update,
+            (update_hud, update_buff_bar, update_crosshair_color),
+        );
     }
 }
 
@@ -15,7 +18,7 @@ struct HudText;
 
 fn spawn_hud(mut commands: Commands) {
     commands.spawn((
-        Text::new("Jump Client\nConnecting..."),
+        Text::new("TickForge Client\nConnecting..."),
         TextFont {
             font_size: 18.0,
             ..default()
@@ -37,14 +40,22 @@ struct CrosshairReticle;
 
 /// TERA-style reticle: small dot crosshair, offset slightly above screen center
 /// to match the perceived horizon in a third-person orbit camera.
-const RETICLE_TOP: f32 = 46.5; // % from top — ~3.5% above center
+pub const RETICLE_LEFT: f32 = 50.0;
+pub const RETICLE_TOP: f32 = 55.0; // % from top
+
+pub fn reticle_viewport_position(viewport_size: Vec2) -> Vec2 {
+    Vec2::new(
+        viewport_size.x * (RETICLE_LEFT * 0.01),
+        viewport_size.y * (RETICLE_TOP * 0.01),
+    )
+}
 
 fn spawn_crosshair(mut commands: Commands) {
     // Center dot
     commands.spawn((
         Node {
             position_type: PositionType::Absolute,
-            left: Val::Percent(52.0),
+            left: Val::Percent(RETICLE_LEFT),
             top: Val::Percent(RETICLE_TOP),
             margin: UiRect {
                 left: Val::Px(-4.0),
@@ -64,7 +75,7 @@ fn spawn_crosshair(mut commands: Commands) {
     commands.spawn((
         Node {
             position_type: PositionType::Absolute,
-            left: Val::Percent(50.0),
+            left: Val::Percent(RETICLE_LEFT),
             top: Val::Percent(RETICLE_TOP),
             margin: UiRect {
                 left: Val::Px(-14.0),
@@ -82,7 +93,7 @@ fn spawn_crosshair(mut commands: Commands) {
     commands.spawn((
         Node {
             position_type: PositionType::Absolute,
-            left: Val::Percent(50.0),
+            left: Val::Percent(RETICLE_LEFT),
             top: Val::Percent(RETICLE_TOP),
             margin: UiRect {
                 left: Val::Px(6.0),
@@ -100,7 +111,7 @@ fn spawn_crosshair(mut commands: Commands) {
     commands.spawn((
         Node {
             position_type: PositionType::Absolute,
-            left: Val::Percent(50.0),
+            left: Val::Percent(RETICLE_LEFT),
             top: Val::Percent(RETICLE_TOP),
             margin: UiRect {
                 left: Val::Px(-1.0),
@@ -118,7 +129,7 @@ fn spawn_crosshair(mut commands: Commands) {
     commands.spawn((
         Node {
             position_type: PositionType::Absolute,
-            left: Val::Percent(50.0),
+            left: Val::Percent(RETICLE_LEFT),
             top: Val::Percent(RETICLE_TOP),
             margin: UiRect {
                 left: Val::Px(-1.0),
@@ -163,20 +174,25 @@ fn update_crosshair_color() {}
 
 fn update_hud(
     mut hud_q: Query<&mut Text, With<HudText>>,
-    #[cfg(feature = "connected")]
-    player_q: Query<(&Transform, Option<&crate::sync::Health>), With<crate::camera::LocalPlayer>>,
-    #[cfg(not(feature = "connected"))]
-    player_q: Query<&Transform, With<crate::camera::LocalPlayer>>,
-    #[cfg(feature = "connected")]
-    ack: Option<Res<crate::input::IntentAckStats>>,
-    #[cfg(feature = "connected")]
-    lock: Option<Res<crate::input::TargetLockState>>,
-    #[cfg(feature = "connected")]
-    crosshair: Option<Res<crate::input::CrosshairAim>>,
-    #[cfg(feature = "connected")]
-    lock_on: Option<Res<crate::input::LockOnSession>>,
+    #[cfg(feature = "connected")] player_q: Query<
+        (&Transform, Option<&crate::sync::Health>),
+        With<crate::camera::LocalPlayer>,
+    >,
+    #[cfg(not(feature = "connected"))] player_q: Query<
+        &Transform,
+        With<crate::camera::LocalPlayer>,
+    >,
+    #[cfg(feature = "connected")] ack: Option<Res<crate::input::IntentAckStats>>,
+    #[cfg(feature = "connected")] lock: Option<Res<crate::input::TargetLockState>>,
+    #[cfg(feature = "connected")] crosshair: Option<Res<crate::input::CrosshairAim>>,
+    #[cfg(feature = "connected")] lock_on: Option<Res<crate::input::LockOnSession>>,
+    #[cfg(feature = "connected")] stdb: Option<Res<crate::spacetime::StdbConnection>>,
+    #[cfg(feature = "connected")] local_player: Option<Res<crate::spacetime::LocalPlayerEntity>>,
+    #[cfg(feature = "connected")] tick_counter: Option<Res<crate::spacetime::TickCounter>>,
 ) {
-    let Ok(mut text) = hud_q.get_single_mut() else { return };
+    let Ok(mut text) = hud_q.get_single_mut() else {
+        return;
+    };
 
     #[cfg(feature = "connected")]
     let ack_line = match ack {
@@ -202,12 +218,18 @@ fn update_hud(
 
     #[cfg(feature = "connected")]
     let aim_line = match &crosshair {
-        Some(ch) => match ch.soft_target {
-            Some(eid) => format!("Aim: #{eid}"),
-            None => match &ch.ground_position {
-                Some(p) => format!("Aim: ground ({:.1}, {:.1})", p.x, p.z),
-                None => "Aim: --".to_string(),
-            },
+        Some(ch) => match (ch.soft_target, &ch.world_aim_point, ch.aim_source) {
+            (Some(eid), Some(_), _) => format!("Aim: #{eid}"),
+            (_, Some(p), crate::input::AimPointSource::WorldHit) => {
+                format!("Aim: world ({:.1}, {:.1}, {:.1})", p.x, p.y, p.z)
+            }
+            (_, Some(p), crate::input::AimPointSource::Fallback) => {
+                format!("Aim: far ({:.1}, {:.1}, {:.1})", p.x, p.y, p.z)
+            }
+            (_, Some(p), crate::input::AimPointSource::EntityHit) => {
+                format!("Aim: hit ({:.1}, {:.1}, {:.1})", p.x, p.y, p.z)
+            }
+            _ => "Aim: --".to_string(),
         },
         None => "Aim: --".to_string(),
     };
@@ -218,10 +240,10 @@ fn update_hud(
     #[cfg(feature = "connected")]
     let lock_on_line = match lock_on.and_then(|lo| lo.active_ability) {
         Some(aid) => {
-            let name = crate::ability_bar::ALL_ABILITIES
+            let name = crate::ability_bar::all_abilities()
                 .iter()
                 .find(|a| a.id == aid)
-                .map(|a| a.name)
+                .map(|a| a.name.as_str())
                 .unwrap_or("???");
             format!("⚡ LOCK-ON: {} — click to tag, press again to fire", name)
         }
@@ -240,15 +262,66 @@ fn update_hud(
                 Some(h) => format!("HP: {:.0}/{:.0}", h.hp, h.max_hp),
                 None => "HP: --/--".to_string(),
             };
+
+            let entity_id = local_player
+                .as_ref()
+                .and_then(|lp| lp.entity_id)
+                .unwrap_or(0);
+
+            // Layer from my_region view.
+            let layer_line = {
+                use game_client::module_bindings::*;
+                use spacetimedb_sdk::Table;
+                let layer = stdb.as_ref().and_then(|s| {
+                    s.conn
+                        .db
+                        .my_region()
+                        .iter()
+                        .find(|r| r.entity_id == entity_id)
+                        .map(|r| r.layer)
+                });
+                match layer {
+                    Some(0) => "Layer: 0 (open world)".to_string(),
+                    Some(l) => format!("Layer: {l} (instance)"),
+                    None => "Layer: --".to_string(),
+                }
+            };
+
+            // Respawn countdown from death_state.
+            let respawn_line = {
+                use game_client::module_bindings::*;
+                let current_tick = tick_counter.as_ref().map(|tc| tc.last_tick).unwrap_or(0);
+                stdb.as_ref()
+                    .and_then(|s| s.conn.db.death_state().entity_id().find(&entity_id))
+                    .and_then(|ds| {
+                        if ds.respawn_at_tick > current_tick {
+                            let remaining_ticks = ds.respawn_at_tick - current_tick;
+                            let secs = remaining_ticks / 20; // 20 Hz
+                            Some(format!("Respawn in {}s (R)", secs))
+                        } else {
+                            Some("Respawn ready (R)".to_string())
+                        }
+                    })
+            };
+
             let mut hud = format!(
-                "Jump Client\nPos: ({:.1}, {:.1}, {:.1})\nFacing: ({:.2}, {:.2}) yaw {:.0}°\n{}\n{}\n{}\n{}",
-                tf.translation.x, tf.translation.y, tf.translation.z,
-                forward.x, forward.z, facing_yaw_deg,
+                "TickForge Client\nPos: ({:.1}, {:.1}, {:.1})\nFacing: ({:.2}, {:.2}) yaw {:.0}°\n{}\n{}\n{}\n{}\n{}",
+                tf.translation.x,
+                tf.translation.y,
+                tf.translation.z,
+                forward.x,
+                forward.z,
+                facing_yaw_deg,
                 hp_line,
+                layer_line,
                 ack_line,
                 lock_line,
                 aim_line,
             );
+            if let Some(respawn) = respawn_line {
+                hud.push('\n');
+                hud.push_str(&respawn);
+            }
             if !lock_on_line.is_empty() {
                 hud.push('\n');
                 hud.push_str(&lock_on_line);
@@ -256,7 +329,10 @@ fn update_hud(
             **text = hud;
         }
         Err(_) => {
-            **text = format!("Jump Client\nWaiting for player...\n{}\n{}\n{}", ack_line, lock_line, aim_line);
+            **text = format!(
+                "TickForge Client\nWaiting for player...\n{}\n{}\n{}",
+                ack_line, lock_line, aim_line
+            );
         }
     }
 
@@ -264,20 +340,42 @@ fn update_hud(
     match player_q.get_single() {
         Ok(tf) => {
             **text = format!(
-                "Jump Client\nPos: ({:.1}, {:.1}, {:.1})\n{}\n{}\n{}",
-                tf.translation.x, tf.translation.y, tf.translation.z,
-                ack_line,
-                lock_line,
-                aim_line,
+                "TickForge Client\nPos: ({:.1}, {:.1}, {:.1})\n{}\n{}\n{}",
+                tf.translation.x, tf.translation.y, tf.translation.z, ack_line, lock_line, aim_line,
             );
         }
         Err(_) => {
-            **text = format!("Jump Client\nWaiting for player...\n{}\n{}\n{}", ack_line, lock_line, aim_line);
+            **text = format!(
+                "TickForge Client\nWaiting for player...\n{}\n{}\n{}",
+                ack_line, lock_line, aim_line
+            );
         }
     }
 }
 
 // ── Buff bar ─────────────────────────────────────────────────────────
+
+/// Parsed buff templates from `data/buffs.ron`, cached at first access.
+pub fn all_buffs() -> &'static [game_core::combat::status::BuffTemplate] {
+    use game_core::combat::status::BuffFile;
+    static BUFF_DEFS: std::sync::OnceLock<Vec<game_core::combat::status::BuffTemplate>> =
+        std::sync::OnceLock::new();
+    BUFF_DEFS.get_or_init(|| {
+        let src = include_str!("../../../data/buffs.ron");
+        ron::from_str::<BuffFile>(src)
+            .expect("data/buffs.ron embedded at compile time must be valid RON")
+            .buffs
+    })
+}
+
+/// Look up a buff's display name from the embedded definitions.
+fn buff_name(id: u32) -> &'static str {
+    all_buffs()
+        .iter()
+        .find(|b| b.buff_id == id)
+        .map(|b| b.name.as_str())
+        .unwrap_or("???")
+}
 
 /// Tag for the buff bar text node.
 #[derive(Component)]
@@ -304,19 +402,19 @@ fn spawn_buff_bar(mut commands: Commands) {
 
 /// Update the buff bar text with active buffs on the local player.
 fn update_buff_bar(
-    mut text_q: Query<&mut Text, With<BuffBarText>>,
-    #[cfg(feature = "connected")]
-    stdb: Option<Res<crate::spacetime::StdbConnection>>,
-    #[cfg(feature = "connected")]
-    local_player: Option<Res<crate::spacetime::LocalPlayerEntity>>,
-    #[cfg(feature = "connected")]
-    tick_counter: Option<Res<crate::spacetime::TickCounter>>,
+    mut text_q: Query<(&mut Text, &mut TextColor), With<BuffBarText>>,
+    #[cfg(feature = "connected")] stdb: Option<Res<crate::spacetime::StdbConnection>>,
+    #[cfg(feature = "connected")] local_player: Option<Res<crate::spacetime::LocalPlayerEntity>>,
+    #[cfg(feature = "connected")] tick_counter: Option<Res<crate::spacetime::TickCounter>>,
 ) {
-    let Ok(mut text) = text_q.get_single_mut() else { return };
+    let Ok((mut text, mut text_color)) = text_q.get_single_mut() else {
+        return;
+    };
 
     #[cfg(feature = "connected")]
     {
         use game_client::module_bindings::*;
+        use game_core::combat::status::BuffKind;
         use spacetimedb_sdk::Table;
 
         let Some(stdb) = stdb else {
@@ -333,29 +431,63 @@ fn update_buff_bar(
         };
         let current_tick = tick_counter.map(|tc| tc.last_tick).unwrap_or(0);
 
-        let mut lines = Vec::new();
+        let mut boons = Vec::new();
+        let mut conditions = Vec::new();
+
         for buff in stdb.conn.db.active_buff().iter() {
             if buff.entity_id != entity_id {
                 continue;
             }
             let remaining = match buff.expires_at_tick {
                 Some(exp) if exp > current_tick => {
-                    let ticks_left = exp - current_tick;
-                    format!("{}s", ticks_left / 20) // 20 Hz tick rate
+                    let secs_left = (exp - current_tick) / 20; // 20 Hz tick rate
+                    format!("{secs_left}s")
                 }
                 Some(_) => "expiring".into(),
                 None => "∞".into(),
             };
-            lines.push(format!(
-                "Buff #{} x{} ({})",
-                buff.buff_id, buff.stacks, remaining
-            ));
+
+            let name = buff_name(buff.buff_id);
+            let stacks = if buff.stacks > 1 {
+                format!(" x{}", buff.stacks)
+            } else {
+                String::new()
+            };
+            let line = format!("{name}{stacks} ({remaining})");
+
+            // Classify by buff_kind from the template definitions.
+            let kind = all_buffs()
+                .iter()
+                .find(|b| b.buff_id == buff.buff_id)
+                .map(|b| b.buff_kind)
+                .unwrap_or(BuffKind::Boon);
+
+            match kind {
+                BuffKind::Boon => boons.push(line),
+                BuffKind::Condition => conditions.push(line),
+            }
         }
 
-        if lines.is_empty() {
+        if boons.is_empty() && conditions.is_empty() {
             **text = String::new();
         } else {
-            **text = format!("Buffs:\n{}", lines.join("\n"));
+            let mut parts = Vec::new();
+            if !boons.is_empty() {
+                parts.push(format!("Boons: {}", boons.join(", ")));
+            }
+            if !conditions.is_empty() {
+                parts.push(format!("Conditions: {}", conditions.join(", ")));
+            }
+            **text = parts.join("\n");
+
+            // Tint the text: green if only boons, red if only conditions, yellow if both.
+            if boons.is_empty() {
+                text_color.0 = Color::srgba(1.0, 0.4, 0.4, 0.9);
+            } else if conditions.is_empty() {
+                text_color.0 = Color::srgba(0.5, 1.0, 0.5, 0.9);
+            } else {
+                text_color.0 = Color::srgba(1.0, 0.9, 0.4, 0.9);
+            }
         }
     }
 

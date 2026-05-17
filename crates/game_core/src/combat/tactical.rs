@@ -2,7 +2,7 @@ use game_protocol::entity_id::EntityId;
 use game_protocol::tick::TickId;
 use game_protocol::types::Vec3f;
 use game_schema::CCEffect;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// Per-entity tactical interaction flags.
 ///
@@ -123,7 +123,9 @@ impl CCCategory {
     /// Map a `CCEffect` to its DR category.
     pub fn from_cc_effect(effect: CCEffect) -> Self {
         match effect {
-            CCEffect::Stun | CCEffect::Knockdown | CCEffect::Sleep | CCEffect::Knockback => CCCategory::HardCC,
+            CCEffect::Stun | CCEffect::Knockdown | CCEffect::Sleep | CCEffect::Knockback => {
+                CCCategory::HardCC
+            }
             CCEffect::Fear => CCCategory::Soft,
             CCEffect::Silence => CCCategory::Silence,
         }
@@ -189,7 +191,10 @@ impl DRTracker {
             }
             _ => {
                 // First application or window expired — reset.
-                *entry = Some(DREntry { last_applied: now, count: 1 });
+                *entry = Some(DREntry {
+                    last_applied: now,
+                    count: 1,
+                });
                 1
             }
         };
@@ -240,17 +245,37 @@ impl MovementConditions {
     /// SILENCED is intentionally excluded — silenced entities can still move/jump/block.
     pub const CC_DISABLED: Self = MovementConditions(0b1011_1100); // STUNNED | KNOCKED_DOWN | FLOATING | SLEEPING | FEARED
 
-    #[inline] pub fn empty() -> Self { Self(0) }
-    #[inline] pub fn is_empty(self) -> bool { self.0 == 0 }
-    #[inline] pub fn contains(self, other: Self) -> bool { self.0 & other.0 == other.0 }
-    #[inline] pub fn intersects(self, other: Self) -> bool { self.0 & other.0 != 0 }
-    #[inline] pub fn insert(&mut self, other: Self) { self.0 |= other.0; }
-    #[inline] pub fn remove(&mut self, other: Self) { self.0 &= !other.0; }
+    #[inline]
+    pub fn empty() -> Self {
+        Self(0)
+    }
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+    #[inline]
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+    #[inline]
+    pub fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+    #[inline]
+    pub fn insert(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+    #[inline]
+    pub fn remove(&mut self, other: Self) {
+        self.0 &= !other.0;
+    }
 }
 
 impl std::ops::BitOr for MovementConditions {
     type Output = Self;
-    fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) }
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
 }
 
 /// Kinematic arc state for vault/leap abilities.

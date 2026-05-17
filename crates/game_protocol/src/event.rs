@@ -125,6 +125,18 @@ pub enum EventPayload {
         position: crate::types::Vec3f,
         radius: f32,
     },
+    /// A short-lived world-space hitbox spawned by another hitbox's `on_contact`
+    /// follow-up. Clients render a brief flash at `position` that fades over
+    /// `duration_ticks`. `parent_execution_id` is the cast that triggered the
+    /// follow-up (useful for grouping/attribution on the client).
+    ContactHitboxSpawned {
+        execution_id: u64,
+        parent_execution_id: u64,
+        ability_id: u32,
+        position: crate::types::Vec3f,
+        radius: f32,
+        duration_ticks: u32,
+    },
     /// A detached skill object (projectile or hazard) was removed.
     /// Clients kill the predicted/placed visual for this `execution_id`.
     SkillObjectRemoved {
@@ -138,6 +150,12 @@ pub enum EventPayload {
     FallDamage {
         damage: f32,
         impact_speed: f32,
+    },
+
+    /// Entity was healed (e.g. NPC evade arrival full-heal).
+    Healed {
+        amount: f32,
+        source: EntityId,
     },
 
     /// Entity left the ground by jumping. Clients use this to trigger jump
@@ -235,6 +253,16 @@ pub enum EventPayload {
         source: EntityId,
     },
 
+    /// A lag-compensated hit was confirmed against this entity.
+    /// Emitted alongside `SkillHit`/`Damage` for observability — clients can
+    /// use this to display a "rewound" indicator or log latency diagnostics.
+    CompensationApplied {
+        source: EntityId,
+        ability_id: u32,
+        /// How many ticks the target position was rewound.
+        rewind_ticks: u32,
+    },
+
     // ── System events ──────────────────────────────────
     TickBoundary,
 
@@ -270,4 +298,3 @@ pub enum EventPayload {
         to: crate::types::Vec3f,
     },
 }
-

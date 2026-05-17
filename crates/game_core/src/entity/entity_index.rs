@@ -38,7 +38,10 @@ impl EntityIndex {
     #[cfg(test)]
     #[inline]
     pub fn dangling(slot: u32) -> Self {
-        Self { slot, generation: 0 }
+        Self {
+            slot,
+            generation: 0,
+        }
     }
 }
 

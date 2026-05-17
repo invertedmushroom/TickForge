@@ -1,0 +1,43 @@
+// Named static world layers, materialised by the simulation worker at
+// startup. Layer IDs MUST be in `0..100`; dynamic dungeon-instance layers
+// are allocated from 100+ by `create_instance`.
+//
+// Each entry is the static-layer counterpart to `DungeonTemplate`:
+// hand-authored `geometry` (cuboids / cylinders / heightfield tiles)
+// always materialise, and an optional `terrain_set` references baked
+// voxel-terrain chunks loaded from the DB. See docs/plan/plan.md §4.8b.
+(
+    layers: [
+        // ── Layer 0: open-world ─────────────────────────────────────
+        // Replaces the previously-hardcoded placeholder floor in
+        // `PhysicsWorld::new`. Once a real `terrain_set` is baked for
+        // the open world, drop the cuboid floor below and set
+        // `terrain_set: Some("open_world_main")`.
+        (
+            layer_id: 0,
+            name: "open_world",
+            geometry: [
+                // 1000 x 1000 m placeholder floor centered at origin.
+                (
+                    shape: Cuboid(half_x: 500.0, half_y: 0.1, half_z: 500.0),
+                    position: (0.0, 0.0, 0.0),
+                ),
+            ],
+            terrain_set: None,
+            collision_policy: (player_collides_player: false),
+            spawn_points: [
+                (0.0, 1.0, 0.0),
+            ],
+        ),
+        (
+            layer_id: 1,
+            name: "morton",
+            geometry: [],
+            terrain_set: Some("smoke_floor"),
+            collision_policy: (player_collides_player: true),
+            spawn_points: [
+                (0.0, 1.0, 0.0),
+            ],
+        ),
+    ],
+)

@@ -73,12 +73,18 @@ impl TickPipeline {
                 if let Some(handle) = removed.sensor_handle {
                     self.physics.remove_sensor(handle);
                 }
-                self.emit_event(removed.owner, EventPayload::SkillObjectRemoved {
-                    execution_id: exec_id.0,
-                });
-                self.emit_event(removed.owner, EventPayload::HitboxRemoved {
-                    ability_id: removed.ability_id,
-                });
+                self.emit_event(
+                    removed.owner,
+                    EventPayload::SkillObjectRemoved {
+                        execution_id: exec_id.0,
+                    },
+                );
+                self.emit_event(
+                    removed.owner,
+                    EventPayload::HitboxRemoved {
+                        ability_id: removed.ability_id,
+                    },
+                );
             }
         }
     }
@@ -117,7 +123,9 @@ impl TickPipeline {
     pub(crate) fn rebuild_cover_blockers(&mut self) {
         self.cover_blockers.clear();
         for (i, slot) in self.state.combat.tactical.iter().enumerate() {
-            if !(slot.blocking || slot.block_grace) { continue; }
+            if !(slot.blocking || slot.block_grace) {
+                continue;
+            }
             if let Some(id) = self.state.entities.lookup_by_slot(i) {
                 self.cover_blockers.push((i, id));
             }
@@ -135,56 +143,218 @@ impl TickPipeline {
         compensated: bool,
         exec_id: Option<AbilityExecutionId>,
     ) {
+        // Layer isolation: reject cross-layer damage at the central choke point.
+        if !self.same_layer(attacker, target) {
+            return;
+        }
+
         let ability = match self.abilities.get(ability_id) {
             Some(a) => a,
             None => return,
         };
+
+        // Snapshot per-hitbox overrides without materializing a default
+        // `HitEffectSpec` in the common (no-override) path. The override clone
+        // is only paid when an `effect` was supplied at spawn time.
+        let (effect_override, rules) = match exec_id
+            .and_then(|eid| self.state.combat.hitboxes.get(eid))
+            .map(|hb| (hb.effect.clone(), hb.rules))
+        {
+            Some((eff, r)) => (eff, r),
+            None => (None, ability.default_hitbox_rules()),
+        };
+        let effect_ref = effect_override.as_ref();
+
+        // Team-based target filter: skip if the hitbox cannot affect this target.
+        match rules.target_filter {
+            TargetFilter::All => {} // no restriction
+            TargetFilter::Hostile => {
+                let attacker_team = self
+                    .state
+                    .entities
+                    .lookup(attacker)
+                    .map(|idx| self.team_of_idx(idx))
+                    .unwrap_or(0);
+                let target_team = self.team_of_idx(target_idx);
+                // Same non-zero team → friendly, reject.
+                if attacker_team != 0 && target_team != 0 && attacker_team == target_team {
+                    return;
+                }
+            }
+            TargetFilter::Friendly => {
+                let attacker_team = self
+                    .state
+                    .entities
+                    .lookup(attacker)
+                    .map(|idx| self.team_of_idx(idx))
+                    .unwrap_or(0);
+                let target_team = self.team_of_idx(target_idx);
+                // Must share a non-zero team.
+                if attacker_team == 0 || target_team == 0 || attacker_team != target_team {
+                    return;
+                }
+            }
+        }
 
         // Resolve charge-tier damage multiplier from execution context.
         let charge_mult: f32 = exec_id
             .and_then(|eid| self.state.combat.executions.get(eid))
             .map(|ctx| {
                 let tier = ctx.params.charge_level as usize;
-                ability.charge_tiers.as_ref()
+                ability
+                    .charge_tiers
+                    .as_ref()
                     .and_then(|tiers| tiers.get(tier))
                     .map(|t| t.damage_mult)
                     .unwrap_or(1.0)
             })
             .unwrap_or(1.0);
 
-        let base_damage = ability.base_damage * charge_mult;
-        let damage_type = ability.damage_type;
-        let threat_mult = ability.threat_multiplier;
-        let on_hit_buffs = ability.on_hit_buffs.clone();
-        let knockback_force = ability.knockback_force;
-        let pull_force = ability.pull_force;
-        let launch_lift = ability.launch_lift;
-        let launch_recovery_ticks = ability.launch_recovery_ticks;
-        let stun_ticks = ability.stun_ticks;
-        let knockdown_ticks = ability.knockdown_ticks;
-        let sleep_ticks = ability.sleep_ticks;
-        let silence_ticks = ability.silence_ticks;
-        let fear_ticks = ability.fear_ticks;
+        let base_damage =
+            effect_ref.map(|e| e.base_damage).unwrap_or(ability.base_damage) * charge_mult;
+        let damage_type = effect_ref
+            .map(|e| e.damage_type)
+            .unwrap_or(ability.damage_type);
+        let threat_mult = effect_ref
+            .map(|e| e.threat_multiplier)
+            .unwrap_or(ability.threat_multiplier);
+        let on_hit_buffs = effect_ref
+            .map(|e| e.on_hit_buffs.clone())
+            .unwrap_or_else(|| ability.on_hit_buffs.clone());
+        let knockback_force = effect_ref
+            .map(|e| e.knockback_force)
+            .unwrap_or(ability.knockback_force);
+        let pull_force = effect_ref
+            .map(|e| e.pull_force)
+            .unwrap_or(ability.pull_force);
+        let launch_lift = effect_ref
+            .map(|e| e.launch_lift)
+            .unwrap_or(ability.launch_lift);
+        let launch_recovery_ticks = effect_ref
+            .map(|e| e.launch_recovery_ticks)
+            .unwrap_or(ability.launch_recovery_ticks);
+        let stun_ticks = effect_ref.map(|e| e.stun_ticks).unwrap_or(ability.stun_ticks);
+        let knockdown_ticks = effect_ref
+            .map(|e| e.knockdown_ticks)
+            .unwrap_or(ability.knockdown_ticks);
+        let sleep_ticks = effect_ref
+            .map(|e| e.sleep_ticks)
+            .unwrap_or(ability.sleep_ticks);
+        let silence_ticks = effect_ref
+            .map(|e| e.silence_ticks)
+            .unwrap_or(ability.silence_ticks);
+        let fear_ticks = effect_ref.map(|e| e.fear_ticks).unwrap_or(ability.fear_ticks);
+        // Only the override path can carry per-hitbox `on_contact` actions.
+        // Default abilities never trigger contact follow-ups, so an empty Vec
+        // here is allocation-free.
+        let on_contact: Vec<HitEffectAction> = effect_ref
+            .map(|e| e.on_contact.clone())
+            .unwrap_or_default();
 
         let attacker_idx = self.state.entities.lookup(attacker);
+
+        // ── Healing branch (Phase 6) ───────────────────────────────
+        // When a friendly-filter hit carries `heal_amount > 0`, route it through
+        // `HealthStore::apply_healing` and skip every damage-side step:
+        //   - no defensive routing (dodge / block / cover)
+        //   - no sleep-break (only damage breaks sleep)
+        //   - no CC application (heals never CC)
+        //   - no threat (healer aggro is deferred — see plan §3.4)
+        //   - no `on_contact` follow-ups (designed for damage chains)
+        //   - no `last_damage_source` update (`apply_healing` is source-less)
+        // On-hit buffs (e.g. HoT regen) DO still apply, mirroring the damage path.
+        let heal_amount = effect_ref
+            .map(|e| e.heal_amount)
+            .unwrap_or(ability.heal_amount);
+        if heal_amount > 0.0 {
+            // Outgoing damage stat scales healing too — keeps healing-power
+            // semantics aligned with damage modifiers until a dedicated
+            // `outgoing_heal_mult` stat is added.
+            let out_mult: f32 = attacker_idx
+                .map_or(1.0, |idx| self.state.stats.get(idx).damage_out_mult);
+            let scaled_heal = heal_amount * charge_mult * out_mult;
+            let actual = self
+                .state
+                .combat
+                .health
+                .apply_healing(target_idx, scaled_heal);
+            if actual > 0.0 {
+                audit!(self.state, Health, Combat, 6, Some(target), "heal");
+                self.emit_event(
+                    target,
+                    EventPayload::Healed {
+                        amount: actual,
+                        source: attacker,
+                    },
+                );
+            }
+            // Apply on-hit buffs (e.g. HoT / regen) even on zero-net heal so
+            // overhealed targets still receive durational support.
+            for &bid in &on_hit_buffs {
+                if let Some(template) = self.buff_registry.get(bid) {
+                    let active = game_core::combat::status::ActiveBuff::from_template(
+                        template,
+                        attacker,
+                        target,
+                        self.current_tick,
+                    );
+                    self.state.status.apply_or_stack_buff(target_idx, active);
+                    self.stats_dirty.insert(target);
+                    audit!(self.state, Buff, Combat, 6, Some(target), "on_heal_buff");
+                    let duration = template.duration_ticks.unwrap_or(0);
+                    self.emit_event(
+                        target,
+                        EventPayload::BuffApplied {
+                            buff_id: bid,
+                            source: attacker,
+                            duration_ticks: duration,
+                        },
+                    );
+                } else {
+                    warn!("on_hit_buff: buff_id {} not found in registry", bid);
+                }
+            }
+            // Always emit a SkillHit so client/UI hit-confirmation works for
+            // friendly hits the same as for damaging ones.
+            self.emit_event(
+                target,
+                EventPayload::SkillHit {
+                    skill_id: ability_id,
+                    source: attacker,
+                },
+            );
+            return;
+        }
 
         // ── Sleep break ────────────────────────────────────────────
         // If the target is sleeping, incoming damage breaks the sleep BEFORE
         // applying the damage. The damage still lands after the break.
         {
             let t = &self.state.combat.tactical[target_idx.as_usize()];
-            let is_sleeping = t.movement_conditions.contains(
-                game_core::combat::tactical::MovementConditions::SLEEPING,
-            );
+            let is_sleeping = t
+                .movement_conditions
+                .contains(game_core::combat::tactical::MovementConditions::SLEEPING);
             if is_sleeping {
                 self.clear_cc_by_effect(target, target_idx, game_schema::CCEffect::Sleep);
-                self.state.status.remove_cc_debuff(target_idx, game_schema::CCEffect::Sleep);
+                self.state
+                    .status
+                    .remove_cc_debuff(target_idx, game_schema::CCEffect::Sleep);
                 self.stats_dirty.insert(target);
-                audit!(self.state, Tactical, Combat, 6, Some(target), "sleep_broken_by_damage");
-                self.emit_event(target, EventPayload::CCCleared {
-                    cc_effect: game_schema::CCEffect::Sleep,
-                    source: attacker,
-                });
+                audit!(
+                    self.state,
+                    Tactical,
+                    Combat,
+                    6,
+                    Some(target),
+                    "sleep_broken_by_damage"
+                );
+                self.emit_event(
+                    target,
+                    EventPayload::CCCleared {
+                        cc_effect: game_schema::CCEffect::Sleep,
+                        source: attacker,
+                    },
+                );
             }
         }
 
@@ -240,17 +410,17 @@ impl TickPipeline {
         // Perfect block window: first N ticks of a block sequence deal zero damage.
         const PERFECT_BLOCK_TICKS: u64 = 3;
         let (block_factor, perfect_block) = if is_blocking && facing_attacker {
-            let perfect = tactical.block_start_tick
-                .map_or(false, |start| self.current_tick.0.saturating_sub(start.0) < PERFECT_BLOCK_TICKS);
+            let perfect = tactical.block_start_tick.map_or(false, |start| {
+                self.current_tick.0.saturating_sub(start.0) < PERFECT_BLOCK_TICKS
+            });
             if perfect { (0.0, true) } else { (0.5, false) }
         } else {
             (1.0, false)
         };
 
         // Apply damage_out_mult from attacker's cached StatBlock.
-        let out_mult: f32 = attacker_idx.map_or(1.0, |idx| {
-            self.state.stats.get(idx).damage_out_mult
-        });
+        let out_mult: f32 =
+            attacker_idx.map_or(1.0, |idx| self.state.stats.get(idx).damage_out_mult);
         // True damage ignores damage_in_mult (incoming reduction/amplification).
         let in_mult: f32 = if is_true_damage {
             1.0
@@ -263,12 +433,11 @@ impl TickPipeline {
         // Iterates blocking entities to see if any friendly blocker is
         // interposed between the attacker and the target within a rear cone.
         // True damage bypasses cover (same as self-block).
-        const COVER_RADIUS_SQ: f32 = 16.0;     // 4 units
-        const COVER_DOT_THRESHOLD: f32 = -0.3;  // ~110° rear arc
-        const COVER_FACTOR: f32 = 0.7;          // 30% damage reduction
+        const COVER_RADIUS_SQ: f32 = 16.0; // 4 units
+        const COVER_DOT_THRESHOLD: f32 = -0.3; // ~110° rear arc
+        const COVER_FACTOR: f32 = 0.7; // 30% damage reduction
         let (cover_factor, cover_source) = if !is_true_damage && block_factor >= 1.0 {
             // Only check cover if the target isn't already self-blocking.
-            let target_kind = self.state.entities.kinds[target_idx.as_usize()];
             if let (Some(tp), Some(ap)) = (
                 self.physics.get_transform(target),
                 self.physics.get_transform(attacker),
@@ -276,35 +445,47 @@ impl TickPipeline {
                 let mut best_factor = 1.0f32;
                 let mut best_blocker: Option<EntityId> = None;
                 for &(i, blocker_id) in &self.cover_blockers {
-                    if blocker_id == target || blocker_id == attacker { continue; }
-                    // Same-team check: blocker and target must be the same entity kind category.
-                    // Players cover players; NPCs/Bosses cover NPCs/Bosses.
-                    let blocker_kind = self.state.entities.kinds[i];
-                    let same_team = matches!(
-                        (blocker_kind, target_kind),
-                        (EntityKind::Player, EntityKind::Player)
-                        | (EntityKind::Npc | EntityKind::Boss, EntityKind::Npc | EntityKind::Boss)
-                    );
-                    if !same_team { continue; }
-                    let Some(bp) = self.physics.get_transform(blocker_id) else { continue };
+                    if blocker_id == target || blocker_id == attacker {
+                        continue;
+                    }
+                    // Same-team check: blocker and target must share a non-zero team.
+                    // Team 0 (unassigned) never covers anyone.
+                    let blocker_idx = self.state.entities.index_at(i);
+                    let blocker_team = self.team_of_idx(blocker_idx);
+                    let target_team = self.team_of_idx(target_idx);
+                    let same_team = blocker_team != 0 && blocker_team == target_team;
+                    if !same_team {
+                        continue;
+                    }
+                    let Some(bp) = self.physics.get_transform(blocker_id) else {
+                        continue;
+                    };
                     // Distance: target must be within COVER_RADIUS of blocker.
                     let dx = tp.position.x - bp.position.x;
                     let dz = tp.position.z - bp.position.z;
                     let dist_sq = dx * dx + dz * dz;
-                    if dist_sq > COVER_RADIUS_SQ { continue; }
+                    if dist_sq > COVER_RADIUS_SQ {
+                        continue;
+                    }
                     // Cone: target must be behind blocker (relative to blocker's facing).
                     let yaw = 2.0 * bp.rotation.y.atan2(bp.rotation.w);
                     let facing = (yaw.sin(), yaw.cos());
                     let len = dist_sq.sqrt();
-                    if len < 1e-6 { continue; }
+                    if len < 1e-6 {
+                        continue;
+                    }
                     let dot = facing.0 * (dx / len) + facing.1 * (dz / len);
-                    if dot > COVER_DOT_THRESHOLD { continue; } // target not behind blocker
+                    if dot > COVER_DOT_THRESHOLD {
+                        continue;
+                    } // target not behind blocker
                     // Interposition: blocker must be closer to attacker than target is.
                     let bax = bp.position.x - ap.position.x;
                     let baz = bp.position.z - ap.position.z;
                     let tax = tp.position.x - ap.position.x;
                     let taz = tp.position.z - ap.position.z;
-                    if bax * bax + baz * baz >= tax * tax + taz * taz { continue; }
+                    if bax * bax + baz * baz >= tax * tax + taz * taz {
+                        continue;
+                    }
                     if COVER_FACTOR < best_factor {
                         best_factor = COVER_FACTOR;
                         best_blocker = Some(blocker_id);
@@ -319,9 +500,20 @@ impl TickPipeline {
         };
         let effective_damage = effective_damage * cover_factor;
 
-        let actual = self.state.combat.health.apply_damage(target_idx, effective_damage, Some(attacker));
+        let actual =
+            self.state
+                .combat
+                .health
+                .apply_damage(target_idx, effective_damage, Some(attacker));
         if compensated {
-            audit!(self.state, Health, Combat, 6, Some(target), "damage_compensated");
+            audit!(
+                self.state,
+                Health,
+                Combat,
+                6,
+                Some(target),
+                "damage_compensated"
+            );
         } else {
             audit!(self.state, Health, Combat, 6, Some(target), "damage");
         }
@@ -333,7 +525,14 @@ impl TickPipeline {
             if let Some(table) = self.state.combat.threat_tables.get_mut(target_idx) {
                 table.add_threat(attacker, actual * threat_mult);
                 if compensated {
-                    audit!(self.state, Threat, Combat, 6, Some(target), "add_threat_compensated");
+                    audit!(
+                        self.state,
+                        Threat,
+                        Combat,
+                        6,
+                        Some(target),
+                        "add_threat_compensated"
+                    );
                 } else {
                     audit!(self.state, Threat, Combat, 6, Some(target), "add_threat");
                 }
@@ -396,17 +595,23 @@ impl TickPipeline {
         for &bid in &on_hit_buffs {
             if let Some(template) = self.buff_registry.get(bid) {
                 let active = game_core::combat::status::ActiveBuff::from_template(
-                    template, attacker, target, self.current_tick,
+                    template,
+                    attacker,
+                    target,
+                    self.current_tick,
                 );
                 self.state.status.apply_or_stack_buff(target_idx, active);
                 self.stats_dirty.insert(target);
                 audit!(self.state, Buff, Combat, 6, Some(target), "on_hit_buff");
                 let duration = template.duration_ticks.unwrap_or(0);
-                self.emit_event(target, EventPayload::BuffApplied {
-                    buff_id: bid,
-                    source: attacker,
-                    duration_ticks: duration,
-                });
+                self.emit_event(
+                    target,
+                    EventPayload::BuffApplied {
+                        buff_id: bid,
+                        source: attacker,
+                        duration_ticks: duration,
+                    },
+                );
             } else {
                 warn!("on_hit_buff: buff_id {} not found in registry", bid);
             }
@@ -423,11 +628,14 @@ impl TickPipeline {
         // mitigation against true damage). Stability and DR still apply.
         // `facing_attacker` is already false when is_true_damage (see above),
         // so this falls out naturally — stated here for clarity.
-        let cc_blocked = tactical.blocking && facing_attacker;
-        let has_stability_cc = stun_ticks > 0 || knockdown_ticks > 0
-            || launch_lift > 0.0 || pull_force > 0.0
+        let cc_blocked = is_blocking && facing_attacker;
+        let has_stability_cc = stun_ticks > 0
+            || knockdown_ticks > 0
+            || launch_lift > 0.0
+            || pull_force > 0.0
             || knockback_force > 0.0
-            || silence_ticks > 0 || fear_ticks > 0;
+            || silence_ticks > 0
+            || fear_ticks > 0;
         let has_sleep = sleep_ticks > 0;
         if (has_stability_cc || has_sleep) && !cc_blocked {
             // Stability check: only for non-sleep CC.
@@ -438,17 +646,104 @@ impl TickPipeline {
             };
             if !stability_absorbed || has_sleep {
                 self.apply_cc_effects(
-                    attacker, target, target_idx,
+                    attacker,
+                    target,
+                    target_idx,
                     if stability_absorbed { 0 } else { stun_ticks },
-                    if stability_absorbed { 0 } else { knockdown_ticks },
+                    if stability_absorbed {
+                        0
+                    } else {
+                        knockdown_ticks
+                    },
                     if stability_absorbed { 0.0 } else { launch_lift },
-                    if stability_absorbed { 0 } else { launch_recovery_ticks },
+                    if stability_absorbed {
+                        0
+                    } else {
+                        launch_recovery_ticks
+                    },
                     if stability_absorbed { 0.0 } else { pull_force },
-                    if stability_absorbed { 0.0 } else { knockback_force },
+                    if stability_absorbed {
+                        0.0
+                    } else {
+                        knockback_force
+                    },
                     sleep_ticks,
                     if stability_absorbed { 0 } else { silence_ticks },
                     if stability_absorbed { 0 } else { fear_ticks },
                 );
+            }
+        }
+
+        if let Some(exec_id) = exec_id {
+            self.queue_hit_effect_actions(attacker, target, ability_id, exec_id, &on_contact);
+        }
+    }
+
+    fn queue_hit_effect_actions(
+        &mut self,
+        attacker: EntityId,
+        target: EntityId,
+        ability_id: u32,
+        parent_execution_id: AbilityExecutionId,
+        actions: &[HitEffectAction],
+    ) {
+        if actions.is_empty() {
+            return;
+        }
+        let Some(target_pos) = self.physics.get_transform(target).map(|t| t.position) else {
+            return;
+        };
+        let Some(ability) = self.abilities.get(ability_id) else {
+            return;
+        };
+        const MAX_CONTACT_ACTIONS_PER_HIT: usize = 8;
+        for action in actions.iter().take(MAX_CONTACT_ACTIONS_PER_HIT) {
+            match action {
+                HitEffectAction::SpawnHitbox {
+                    delay_ticks,
+                    duration_ticks,
+                    shape,
+                    offset,
+                    effect,
+                    rules,
+                } => {
+                    let mut effect = effect
+                        .as_ref()
+                        .map(|spec| (**spec).clone())
+                        .unwrap_or_else(|| ability.default_hit_effect());
+                    // `on_contact` is one-shot: a contact-spawned hitbox does
+                    // not propagate further contact triggers. This bounds the
+                    // contact graph to depth 1 regardless of data authoring.
+                    effect.on_contact.clear();
+                    let rules = rules.unwrap_or_else(|| ability.default_hitbox_rules());
+                    let tick_id = TickId(self.current_tick.0 + *delay_ticks as u64);
+                    let scheduled = ScheduledAction {
+                        id: {
+                            let id = self.next_scheduled_id;
+                            self.next_scheduled_id += 1;
+                            id
+                        },
+                        tick_id,
+                        entity: attacker,
+                        source: Some(parent_execution_id),
+                        action_type: ScheduledActionType::ContactSpawnHitbox(Box::new(
+                            ContactSpawnHitboxPayload {
+                                parent_execution_id,
+                                ability_id,
+                                shape: *shape,
+                                position: target_pos,
+                                offset: *offset,
+                                effect,
+                                rules,
+                                duration_ticks: *duration_ticks,
+                            },
+                        )),
+                    };
+                    let pos = self
+                        .scheduled_actions
+                        .partition_point(|a| a.tick_id <= tick_id);
+                    self.scheduled_actions.insert(pos, scheduled);
+                }
             }
         }
     }
@@ -458,12 +753,21 @@ impl TickPipeline {
     fn try_consume_stability(&mut self, target: EntityId, target_idx: EntityIndex) -> bool {
         let buffs = self.state.status.get_buffs(target_idx);
         let stability_buff = buffs.iter().find(|b| b.modifiers.stability == Some(true));
-        let Some(buff_id) = stability_buff.map(|b| b.buff_id) else { return false };
+        let Some(buff_id) = stability_buff.map(|b| b.buff_id) else {
+            return false;
+        };
 
         // Consume one stack. If stacks reach 0, remove the buff entirely.
         let removed = self.state.status.consume_stack(target_idx, buff_id);
         self.stats_dirty.insert(target);
-        audit!(self.state, Buff, Combat, 6, Some(target), "stability_consumed");
+        audit!(
+            self.state,
+            Buff,
+            Combat,
+            6,
+            Some(target),
+            "stability_consumed"
+        );
         self.emit_event(target, EventPayload::StabilityConsumed { buff_id });
         if removed {
             self.emit_event(target, EventPayload::BuffExpired { buff_id });
@@ -516,7 +820,10 @@ impl TickPipeline {
             let (raw_recovery, recovery_effect) = if stun_ticks > 0 {
                 (stun_ticks, Some(game_schema::CCEffect::Stun))
             } else if launch_recovery_ticks > 0 {
-                (launch_recovery_ticks, Some(game_schema::CCEffect::Knockdown))
+                (
+                    launch_recovery_ticks,
+                    Some(game_schema::CCEffect::Knockdown),
+                )
             } else if knockdown_ticks > 0 {
                 (knockdown_ticks, Some(game_schema::CCEffect::Knockdown))
             } else {
@@ -525,24 +832,41 @@ impl TickPipeline {
             // Apply DR + cc_duration_reduce to recovery CC at authoring time
             // so controller.rs doesn't need to re-derive it on landing.
             let (recovery_ticks, recovery_immune) = if let Some(eff) = recovery_effect {
-                apply_dr_reduction(raw_recovery, eff, dr_immune, cc_reduce, current_tick,
-                    &mut self.state.combat.tactical[target_idx.as_usize()].dr_tracker)
+                apply_dr_reduction(
+                    raw_recovery,
+                    eff,
+                    dr_immune,
+                    cc_reduce,
+                    current_tick,
+                    &mut self.state.combat.tactical[target_idx.as_usize()].dr_tracker,
+                )
             } else {
                 (0, false)
             };
-            if recovery_immune {
-                self.emit_event(target, EventPayload::CCImmune {
-                    cc_effect: recovery_effect.unwrap(),
-                    source: attacker,
-                });
+            if let (true, Some(eff)) = (recovery_immune, recovery_effect) {
+                self.emit_event(
+                    target,
+                    EventPayload::CCImmune {
+                        cc_effect: eff,
+                        source: attacker,
+                    },
+                );
             }
             let t = &mut self.state.combat.tactical[target_idx.as_usize()];
             t.movement_conditions.insert(MovementConditions::FLOATING);
             t.arc_recovery_ticks = recovery_ticks;
-            t.arc_recovery_effect = if recovery_ticks > 0 { recovery_effect } else { None };
+            t.arc_recovery_effect = if recovery_ticks > 0 {
+                recovery_effect
+            } else {
+                None
+            };
             t.arc_attacker = Some(attacker);
             t.arc_state = Some(game_core::combat::tactical::ArcState {
-                velocity: Vec3f { x: 0.0, y: launch_lift, z: 0.0 },
+                velocity: Vec3f {
+                    x: 0.0,
+                    y: launch_lift,
+                    z: 0.0,
+                },
                 gravity: CC_LAUNCH_GRAVITY,
                 gravity_only: false,
             });
@@ -572,25 +896,42 @@ impl TickPipeline {
                     (0, None)
                 };
                 let (recovery_ticks, recovery_immune) = if let Some(eff) = recovery_effect {
-                    apply_dr_reduction(raw_recovery, eff, dr_immune, cc_reduce, current_tick,
-                        &mut self.state.combat.tactical[target_idx.as_usize()].dr_tracker)
+                    apply_dr_reduction(
+                        raw_recovery,
+                        eff,
+                        dr_immune,
+                        cc_reduce,
+                        current_tick,
+                        &mut self.state.combat.tactical[target_idx.as_usize()].dr_tracker,
+                    )
                 } else {
                     (0, false)
                 };
-                if recovery_immune {
-                    self.emit_event(target, EventPayload::CCImmune {
-                        cc_effect: recovery_effect.unwrap(),
-                        source: attacker,
-                    });
+                if let (true, Some(eff)) = (recovery_immune, recovery_effect) {
+                    self.emit_event(
+                        target,
+                        EventPayload::CCImmune {
+                            cc_effect: eff,
+                            source: attacker,
+                        },
+                    );
                 }
                 let t = &mut self.state.combat.tactical[target_idx.as_usize()];
                 t.movement_conditions.insert(MovementConditions::FLOATING);
                 t.arc_recovery_ticks = recovery_ticks;
-                t.arc_recovery_effect = if recovery_ticks > 0 { recovery_effect } else { None };
+                t.arc_recovery_effect = if recovery_ticks > 0 {
+                    recovery_effect
+                } else {
+                    None
+                };
                 t.arc_attacker = Some(attacker);
                 const PULL_LIFT: f32 = 2.0;
                 t.arc_state = Some(game_core::combat::tactical::ArcState {
-                    velocity: Vec3f { x: dir_x * pull_force, y: PULL_LIFT, z: dir_z * pull_force },
+                    velocity: Vec3f {
+                        x: dir_x * pull_force,
+                        y: PULL_LIFT,
+                        z: dir_z * pull_force,
+                    },
                     gravity: CC_ARC_GRAVITY,
                     gravity_only: false,
                 });
@@ -621,23 +962,36 @@ impl TickPipeline {
                     (0, None)
                 };
                 let (recovery_ticks, recovery_immune) = if let Some(eff) = recovery_effect {
-                    apply_dr_reduction(raw_recovery, eff, dr_immune, cc_reduce, current_tick,
-                        &mut self.state.combat.tactical[target_idx.as_usize()].dr_tracker)
+                    apply_dr_reduction(
+                        raw_recovery,
+                        eff,
+                        dr_immune,
+                        cc_reduce,
+                        current_tick,
+                        &mut self.state.combat.tactical[target_idx.as_usize()].dr_tracker,
+                    )
                 } else {
                     (0, false)
                 };
-                if recovery_immune {
-                    self.emit_event(target, EventPayload::CCImmune {
-                        cc_effect: recovery_effect.unwrap(),
-                        source: attacker,
-                    });
+                if let (true, Some(eff)) = (recovery_immune, recovery_effect) {
+                    self.emit_event(
+                        target,
+                        EventPayload::CCImmune {
+                            cc_effect: eff,
+                            source: attacker,
+                        },
+                    );
                 }
                 const KNOCKBACK_LIFT: f32 = 3.0;
                 const KNOCKBACK_GRAVITY: f32 = 20.0;
                 let t = &mut self.state.combat.tactical[target_idx.as_usize()];
                 t.movement_conditions.insert(MovementConditions::FLOATING);
                 t.arc_recovery_ticks = recovery_ticks;
-                t.arc_recovery_effect = if recovery_ticks > 0 { recovery_effect } else { None };
+                t.arc_recovery_effect = if recovery_ticks > 0 {
+                    recovery_effect
+                } else {
+                    None
+                };
                 t.arc_attacker = Some(attacker);
                 t.arc_state = Some(game_core::combat::tactical::ArcState {
                     velocity: Vec3f {
@@ -650,11 +1004,21 @@ impl TickPipeline {
                 });
                 t.is_grounded = false;
                 arc_fired = true;
-                audit!(self.state, Tactical, Combat, 6, Some(target), "cc_knockback");
-                self.emit_event(target, EventPayload::Knockback {
-                    source: attacker,
-                    force: knockback_force,
-                });
+                audit!(
+                    self.state,
+                    Tactical,
+                    Combat,
+                    6,
+                    Some(target),
+                    "cc_knockback"
+                );
+                self.emit_event(
+                    target,
+                    EventPayload::Knockback {
+                        source: attacker,
+                        force: knockback_force,
+                    },
+                );
             }
         }
 
@@ -662,53 +1026,86 @@ impl TickPipeline {
         if !arc_fired {
             if stun_ticks > 0 {
                 let (effective, immune) = apply_dr_reduction(
-                    stun_ticks, game_schema::CCEffect::Stun, dr_immune, cc_reduce, current_tick,
+                    stun_ticks,
+                    game_schema::CCEffect::Stun,
+                    dr_immune,
+                    cc_reduce,
+                    current_tick,
                     &mut self.state.combat.tactical[target_idx.as_usize()].dr_tracker,
                 );
                 if immune {
-                    self.emit_event(target, EventPayload::CCImmune {
-                        cc_effect: game_schema::CCEffect::Stun,
-                        source: attacker,
-                    });
+                    self.emit_event(
+                        target,
+                        EventPayload::CCImmune {
+                            cc_effect: game_schema::CCEffect::Stun,
+                            source: attacker,
+                        },
+                    );
                 } else if effective > 0 {
                     let until = TickId(current_tick.0 + effective as u64);
-                    let extends = self.cc_debuff_expiry(target_idx, 500).map_or(true, |prev| until > prev);
+                    let extends = self
+                        .cc_debuff_expiry(target_idx, 500)
+                        .map_or(true, |prev| until > prev);
                     if extends {
                         self.state.combat.tactical[target_idx.as_usize()]
-                            .movement_conditions.insert(MovementConditions::STUNNED);
+                            .movement_conditions
+                            .insert(MovementConditions::STUNNED);
                         self.insert_cc_debuff(target, target_idx, attacker, 500, until);
                     }
                     audit!(self.state, Tactical, Combat, 6, Some(target), "cc_stun");
-                    self.emit_event(target, EventPayload::Stunned {
-                        source: attacker,
-                        duration_ticks: effective,
-                    });
+                    self.emit_event(
+                        target,
+                        EventPayload::Stunned {
+                            source: attacker,
+                            duration_ticks: effective,
+                        },
+                    );
                 }
             }
 
             if knockdown_ticks > 0 {
                 let (effective, immune) = apply_dr_reduction(
-                    knockdown_ticks, game_schema::CCEffect::Knockdown, dr_immune, cc_reduce, current_tick,
+                    knockdown_ticks,
+                    game_schema::CCEffect::Knockdown,
+                    dr_immune,
+                    cc_reduce,
+                    current_tick,
                     &mut self.state.combat.tactical[target_idx.as_usize()].dr_tracker,
                 );
                 if immune {
-                    self.emit_event(target, EventPayload::CCImmune {
-                        cc_effect: game_schema::CCEffect::Knockdown,
-                        source: attacker,
-                    });
+                    self.emit_event(
+                        target,
+                        EventPayload::CCImmune {
+                            cc_effect: game_schema::CCEffect::Knockdown,
+                            source: attacker,
+                        },
+                    );
                 } else if effective > 0 {
                     let until = TickId(current_tick.0 + effective as u64);
-                    let extends = self.cc_debuff_expiry(target_idx, 501).map_or(true, |prev| until > prev);
+                    let extends = self
+                        .cc_debuff_expiry(target_idx, 501)
+                        .map_or(true, |prev| until > prev);
                     if extends {
                         self.state.combat.tactical[target_idx.as_usize()]
-                            .movement_conditions.insert(MovementConditions::KNOCKED_DOWN);
+                            .movement_conditions
+                            .insert(MovementConditions::KNOCKED_DOWN);
                         self.insert_cc_debuff(target, target_idx, attacker, 501, until);
                     }
-                    audit!(self.state, Tactical, Combat, 6, Some(target), "cc_knockdown");
-                    self.emit_event(target, EventPayload::KnockedDown {
-                        source: attacker,
-                        duration_ticks: effective,
-                    });
+                    audit!(
+                        self.state,
+                        Tactical,
+                        Combat,
+                        6,
+                        Some(target),
+                        "cc_knockdown"
+                    );
+                    self.emit_event(
+                        target,
+                        EventPayload::KnockedDown {
+                            source: attacker,
+                            duration_ticks: effective,
+                        },
+                    );
                 }
             }
         }
@@ -716,82 +1113,121 @@ impl TickPipeline {
         // ── Sleep (always applies, regardless of arc) ──────────────
         if sleep_ticks > 0 {
             let (effective, immune) = apply_dr_reduction(
-                sleep_ticks, game_schema::CCEffect::Sleep, dr_immune, cc_reduce, current_tick,
+                sleep_ticks,
+                game_schema::CCEffect::Sleep,
+                dr_immune,
+                cc_reduce,
+                current_tick,
                 &mut self.state.combat.tactical[target_idx.as_usize()].dr_tracker,
             );
             if immune {
-                self.emit_event(target, EventPayload::CCImmune {
-                    cc_effect: game_schema::CCEffect::Sleep,
-                    source: attacker,
-                });
+                self.emit_event(
+                    target,
+                    EventPayload::CCImmune {
+                        cc_effect: game_schema::CCEffect::Sleep,
+                        source: attacker,
+                    },
+                );
             } else if effective > 0 {
                 let until = TickId(current_tick.0 + effective as u64);
-                let extends = self.cc_debuff_expiry(target_idx, 502).map_or(true, |prev| until > prev);
+                let extends = self
+                    .cc_debuff_expiry(target_idx, 502)
+                    .map_or(true, |prev| until > prev);
                 if extends {
                     self.state.combat.tactical[target_idx.as_usize()]
-                        .movement_conditions.insert(MovementConditions::SLEEPING);
+                        .movement_conditions
+                        .insert(MovementConditions::SLEEPING);
                     self.insert_cc_debuff(target, target_idx, attacker, 502, until);
                 }
                 audit!(self.state, Tactical, Combat, 6, Some(target), "cc_sleep");
-                self.emit_event(target, EventPayload::Slept {
-                    source: attacker,
-                    duration_ticks: effective,
-                });
+                self.emit_event(
+                    target,
+                    EventPayload::Slept {
+                        source: attacker,
+                        duration_ticks: effective,
+                    },
+                );
             }
         }
 
         // ── Silence (always applies, regardless of arc) ────────────
         if silence_ticks > 0 {
             let (effective, immune) = apply_dr_reduction(
-                silence_ticks, game_schema::CCEffect::Silence, dr_immune, cc_reduce, current_tick,
+                silence_ticks,
+                game_schema::CCEffect::Silence,
+                dr_immune,
+                cc_reduce,
+                current_tick,
                 &mut self.state.combat.tactical[target_idx.as_usize()].dr_tracker,
             );
             if immune {
-                self.emit_event(target, EventPayload::CCImmune {
-                    cc_effect: game_schema::CCEffect::Silence,
-                    source: attacker,
-                });
+                self.emit_event(
+                    target,
+                    EventPayload::CCImmune {
+                        cc_effect: game_schema::CCEffect::Silence,
+                        source: attacker,
+                    },
+                );
             } else if effective > 0 {
                 let until = TickId(current_tick.0 + effective as u64);
-                let extends = self.cc_debuff_expiry(target_idx, 503).map_or(true, |prev| until > prev);
+                let extends = self
+                    .cc_debuff_expiry(target_idx, 503)
+                    .map_or(true, |prev| until > prev);
                 if extends {
                     self.state.combat.tactical[target_idx.as_usize()]
-                        .movement_conditions.insert(MovementConditions::SILENCED);
+                        .movement_conditions
+                        .insert(MovementConditions::SILENCED);
                     self.insert_cc_debuff(target, target_idx, attacker, 503, until);
                 }
                 audit!(self.state, Tactical, Combat, 6, Some(target), "cc_silence");
-                self.emit_event(target, EventPayload::Silenced {
-                    source: attacker,
-                    duration_ticks: effective,
-                });
+                self.emit_event(
+                    target,
+                    EventPayload::Silenced {
+                        source: attacker,
+                        duration_ticks: effective,
+                    },
+                );
             }
         }
 
         // ── Fear (always applies, regardless of arc) ───────────────
         if fear_ticks > 0 {
             let (effective, immune) = apply_dr_reduction(
-                fear_ticks, game_schema::CCEffect::Fear, dr_immune, cc_reduce, current_tick,
+                fear_ticks,
+                game_schema::CCEffect::Fear,
+                dr_immune,
+                cc_reduce,
+                current_tick,
                 &mut self.state.combat.tactical[target_idx.as_usize()].dr_tracker,
             );
             if immune {
-                self.emit_event(target, EventPayload::CCImmune {
-                    cc_effect: game_schema::CCEffect::Fear,
-                    source: attacker,
-                });
+                self.emit_event(
+                    target,
+                    EventPayload::CCImmune {
+                        cc_effect: game_schema::CCEffect::Fear,
+                        source: attacker,
+                    },
+                );
             } else if effective > 0 {
                 let until = TickId(current_tick.0 + effective as u64);
-                let extends = self.cc_debuff_expiry(target_idx, 504).map_or(true, |prev| until > prev);
+                let extends = self
+                    .cc_debuff_expiry(target_idx, 504)
+                    .map_or(true, |prev| until > prev);
                 if extends {
                     self.state.combat.tactical[target_idx.as_usize()]
-                        .movement_conditions.insert(MovementConditions::FEARED);
+                        .movement_conditions
+                        .insert(MovementConditions::FEARED);
                     self.state.combat.tactical[target_idx.as_usize()].fear_source = Some(attacker);
                     self.insert_cc_debuff(target, target_idx, attacker, 504, until);
                 }
                 audit!(self.state, Tactical, Combat, 6, Some(target), "cc_fear");
-                self.emit_event(target, EventPayload::Feared {
-                    source: attacker,
-                    duration_ticks: effective,
-                });
+                self.emit_event(
+                    target,
+                    EventPayload::Feared {
+                        source: attacker,
+                        duration_ticks: effective,
+                    },
+                );
             }
         }
     }
@@ -808,18 +1244,24 @@ impl TickPipeline {
     ) {
         if let Some(template) = self.buff_registry.get(buff_id) {
             let mut ab = game_core::combat::status::ActiveBuff::from_template(
-                template, attacker, target, self.current_tick,
+                template,
+                attacker,
+                target,
+                self.current_tick,
             );
             // Override expires_at to match the CC timer (template has duration_ticks = None).
             ab.expires_at = Some(until);
             self.state.status.apply_or_stack_buff(target_idx, ab);
             self.stats_dirty.insert(target);
             let duration = (until.0 - self.current_tick.0) as u32;
-            self.emit_event(target, EventPayload::BuffApplied {
-                buff_id,
-                source: attacker,
-                duration_ticks: duration,
-            });
+            self.emit_event(
+                target,
+                EventPayload::BuffApplied {
+                    buff_id,
+                    source: attacker,
+                    duration_ticks: duration,
+                },
+            );
         }
     }
 
@@ -829,7 +1271,10 @@ impl TickPipeline {
         use game_core::physics_backend::ColliderKind;
 
         // Process sensor contacts — hitbox vs hurtbox overlaps.
-        let contacts: Vec<_> = self.state.physics.contacts
+        let contacts: Vec<_> = self
+            .state
+            .physics
+            .contacts
             .iter()
             .filter(|c| c.started && c.is_sensor)
             .cloned()
@@ -839,8 +1284,10 @@ impl TickPipeline {
             // Normalise the pair: acting collider (Hitbox, future: Projectile) first.
             // Eliminates duplicate match arms — each interaction rule is stated once.
             let (acting, receiving, attacker, target) = normalize_contact_pair(
-                contact.kind1, contact.entity1,
-                contact.kind2, contact.entity2,
+                contact.kind1,
+                contact.entity1,
+                contact.kind2,
+                contact.entity2,
             );
 
             // Dispatch on interaction type. Today only (Hitbox → Hurtbox/Body) deals damage.
@@ -861,14 +1308,19 @@ impl TickPipeline {
             // positions. Detached world sensors (GroundTarget/CasterOffset)
             // keep an authoritative world pose and must still resolve through
             // their actual Rapier sensor at that pose.
-            if self.state.combat.hitboxes.get(exec_id)
-                .is_some_and(|hb| hb.projectile.is_some() || (hb.rewind_ticks > 0 && !hb.world_sensor))
-            {
+            if self.state.combat.hitboxes.get(exec_id).is_some_and(|hb| {
+                hb.projectile.is_some() || (hb.rewind_ticks > 0 && !hb.world_sensor)
+            }) {
                 continue;
             }
 
             // Skip self-hits.
             if attacker == target {
+                continue;
+            }
+
+            // Layer isolation: hitboxes only affect entities on the same layer.
+            if !self.same_layer(attacker, target) {
                 continue;
             }
 
@@ -893,18 +1345,30 @@ impl TickPipeline {
                 _ => continue,
             };
 
-            self.apply_hit_damage(attacker, target, target_idx, ability_id, false, Some(exec_id));
+            self.apply_hit_damage(
+                attacker,
+                target,
+                target_idx,
+                ability_id,
+                false,
+                Some(exec_id),
+            );
         }
 
         // Second pass: process Stopped sensor events to clear already_hit for
         // reentry-capable hitboxes and remove from overlapping set.
-        for contact in self.state.physics.contacts
+        for contact in self
+            .state
+            .physics
+            .contacts
             .iter()
             .filter(|c| !c.started && c.is_sensor)
         {
             let (acting, _receiving, _attacker, target) = normalize_contact_pair(
-                contact.kind1, contact.entity1,
-                contact.kind2, contact.entity2,
+                contact.kind1,
+                contact.entity1,
+                contact.kind2,
+                contact.entity2,
             );
             if let ColliderKind::Hitbox(eid_raw) = acting {
                 let eid = AbilityExecutionId(eid_raw);
@@ -930,9 +1394,12 @@ impl TickPipeline {
             let (attacker, ability_id, sensor_handle, previous_targets) =
                 match self.state.combat.hitboxes.get(exec_id) {
                     Some(hb) => match hb.sensor_handle {
-                        Some(sensor_handle) => {
-                            (hb.owner, hb.ability_id, sensor_handle, hb.overlapping.clone())
-                        }
+                        Some(sensor_handle) => (
+                            hb.owner,
+                            hb.ability_id,
+                            sensor_handle,
+                            hb.overlapping.clone(),
+                        ),
                         None => continue,
                     },
                     None => continue,
@@ -955,11 +1422,18 @@ impl TickPipeline {
 
             for target in exited {
                 self.state.combat.hitboxes.clear_hit(exec_id, target);
-                self.state.combat.hitboxes.remove_overlapping(exec_id, target);
+                self.state
+                    .combat
+                    .hitboxes
+                    .remove_overlapping(exec_id, target);
             }
 
             for target in entered {
                 if target == attacker {
+                    continue;
+                }
+                // Layer isolation: skip targets on a different layer.
+                if !self.same_layer(attacker, target) {
                     continue;
                 }
 
@@ -974,17 +1448,31 @@ impl TickPipeline {
                     continue;
                 }
 
-                self.apply_hit_damage(attacker, target, target_idx, ability_id, false, Some(exec_id));
+                self.apply_hit_damage(
+                    attacker,
+                    target,
+                    target_idx,
+                    ability_id,
+                    false,
+                    Some(exec_id),
+                );
             }
         }
     }
 
     /// Periodic re-damage for lingering area effects (HazardZone).
     fn resolve_periodic_damage(&mut self) {
-        let due = self.state.combat.hitboxes.collect_periodic_due(self.current_tick);
+        let due = self
+            .state
+            .combat
+            .hitboxes
+            .collect_periodic_due(self.current_tick);
         for (exec_id, attacker, ability_id, targets) in due {
             for target in targets {
                 if target == attacker {
+                    continue;
+                }
+                if !self.same_layer(attacker, target) {
                     continue;
                 }
                 let target_idx = match self.state.entities.lookup(target) {
@@ -998,9 +1486,19 @@ impl TickPipeline {
                 if !self.state.combat.hitboxes.record_hit(exec_id, target) {
                     continue;
                 }
-                self.apply_hit_damage(attacker, target, target_idx, ability_id, false, Some(exec_id));
+                self.apply_hit_damage(
+                    attacker,
+                    target,
+                    target_idx,
+                    ability_id,
+                    false,
+                    Some(exec_id),
+                );
             }
-            self.state.combat.hitboxes.mark_periodic_tick(exec_id, self.current_tick);
+            self.state
+                .combat
+                .hitboxes
+                .mark_periodic_tick(exec_id, self.current_tick);
         }
     }
 
@@ -1015,7 +1513,14 @@ impl TickPipeline {
             .filter_map(|eid| {
                 let hb = self.state.combat.hitboxes.get(eid)?;
                 let proj = hb.projectile.as_ref()?;
-                Some((eid, hb.owner, hb.ability_id, hb.shape, proj.prev_position, proj.position))
+                Some((
+                    eid,
+                    hb.owner,
+                    hb.ability_id,
+                    hb.shape,
+                    proj.prev_position,
+                    proj.position,
+                ))
             })
             .collect();
 
@@ -1023,13 +1528,18 @@ impl TickPipeline {
             return;
         }
 
-        let mut confirmed_hits: Vec<(EntityId, EntityId, EntityIndex, u32, AbilityExecutionId)> = Vec::new();
+        let mut confirmed_hits: Vec<(EntityId, EntityId, EntityIndex, u32, AbilityExecutionId)> =
+            Vec::new();
         let mut hit_projectiles: Vec<AbilityExecutionId> = Vec::new();
 
         for (exec_id, attacker, ability_id, shape, prev_pos, curr_pos) in projectiles {
             let hitbox_shape = lag_compensation::hitbox_sensor_shape(shape);
-            let pierce = self.state.combat.hitboxes.get(exec_id)
-                .map(|hb| hb.pierce)
+            let pierce = self
+                .state
+                .combat
+                .hitboxes
+                .get(exec_id)
+                .map(|hb| hb.rules.pierce)
                 .unwrap_or(false);
 
             for slot in 0..self.state.entities.len() {
@@ -1044,6 +1554,9 @@ impl TickPipeline {
                 if target_id == attacker {
                     continue;
                 }
+                if !self.same_layer(attacker, target_id) {
+                    continue;
+                }
                 if self.state.combat.hitboxes.has_hit(exec_id, target_id) {
                     continue;
                 }
@@ -1053,7 +1566,12 @@ impl TickPipeline {
                     None => continue,
                 };
 
-                if !lag_compensation::swept_shapes_intersect(hitbox_shape, prev_pos, curr_pos, target_pos) {
+                if !lag_compensation::swept_shapes_intersect(
+                    hitbox_shape,
+                    prev_pos,
+                    curr_pos,
+                    target_pos,
+                ) {
                     continue;
                 }
                 if !self.state.combat.hitboxes.record_hit(exec_id, target_id) {
@@ -1070,7 +1588,14 @@ impl TickPipeline {
         }
 
         for (attacker, target_id, target_idx, ability_id, exec_id) in confirmed_hits {
-            self.apply_hit_damage(attacker, target_id, target_idx, ability_id, false, Some(exec_id));
+            self.apply_hit_damage(
+                attacker,
+                target_id,
+                target_idx,
+                ability_id,
+                false,
+                Some(exec_id),
+            );
         }
 
         // Remove projectiles that hit a target (single-target behaviour).
@@ -1079,12 +1604,18 @@ impl TickPipeline {
                 if let Some(handle) = removed.sensor_handle {
                     self.physics.remove_sensor(handle);
                 }
-                self.emit_event(removed.owner, EventPayload::SkillObjectRemoved {
-                    execution_id: exec_id.0,
-                });
-                self.emit_event(removed.owner, EventPayload::HitboxRemoved {
-                    ability_id: removed.ability_id,
-                });
+                self.emit_event(
+                    removed.owner,
+                    EventPayload::SkillObjectRemoved {
+                        execution_id: exec_id.0,
+                    },
+                );
+                self.emit_event(
+                    removed.owner,
+                    EventPayload::HitboxRemoved {
+                        ability_id: removed.ability_id,
+                    },
+                );
             }
         }
     }
@@ -1097,21 +1628,54 @@ impl TickPipeline {
             .combat
             .hitboxes
             .iter_armed_compensated()
-            .map(|hb| (hb.execution_id, hb.owner, hb.ability_id, hb.shape, hb.offset, hb.rewind_ticks))
+            .map(|hb| {
+                (
+                    hb.execution_id,
+                    hb.owner,
+                    hb.ability_id,
+                    hb.shape,
+                    hb.offset,
+                    hb.rewind_ticks,
+                    hb.rules.max_rewind_ticks,
+                )
+            })
             .collect();
 
         if compensated.is_empty() {
             return;
         }
 
-        let mut confirmed_hits: Vec<(EntityId, EntityId, EntityIndex, u32, AbilityExecutionId)> = Vec::new();
+        let global_max = self.global_max_rewind_ticks;
+        let mut confirmed_hits: Vec<(
+            EntityId,
+            EntityId,
+            EntityIndex,
+            u32,
+            AbilityExecutionId,
+            u32,
+        )> = Vec::new();
 
-        for (exec_id, attacker, ability_id, shape, offset, rewind_ticks) in compensated {
+        for (exec_id, attacker, ability_id, shape, offset, rewind_ticks, max_rewind_override) in
+            compensated
+        {
+            // Apply per-ability cap, then global cap.
+            let effective_rewind = rewind_ticks
+                .min(max_rewind_override.unwrap_or(global_max))
+                .min(global_max);
+
+            if effective_rewind == 0 {
+                continue;
+            }
+
             let (attacker_pos, facing) = match self.state.combat.executions.get(exec_id) {
                 Some(ctx) => {
                     if let Some(t) = self.physics.get_transform(attacker) {
                         let yaw = 2.0 * t.rotation.y.atan2(t.rotation.w);
-                        let current_facing = Vec3f { x: yaw.sin(), y: 0.0, z: yaw.cos() };
+                        let current_facing = Vec3f {
+                            x: yaw.sin(),
+                            y: 0.0,
+                            z: yaw.cos(),
+                        };
                         (t.position, current_facing)
                     } else {
                         (ctx.origin, ctx.facing)
@@ -1120,12 +1684,11 @@ impl TickPipeline {
                 None => continue,
             };
 
-            let hitbox_pos =
-                lag_compensation::hitbox_world_position(attacker_pos, facing, offset);
+            let hitbox_pos = lag_compensation::hitbox_world_position(attacker_pos, facing, offset);
             let hitbox_shape = lag_compensation::hitbox_sensor_shape(shape);
 
             // Determine the historical tick to sample.
-            let rewind_tick = TickId(self.current_tick.0.saturating_sub(rewind_ticks as u64));
+            let rewind_tick = TickId(self.current_tick.0.saturating_sub(effective_rewind as u64));
             let snapshot = match self.transform_history.get_snapshot(rewind_tick) {
                 Some(s) => s,
                 None => continue, // Not enough history yet.
@@ -1138,6 +1701,9 @@ impl TickPipeline {
             for (target_id, historical_pos) in candidates {
                 // Skip self-hits.
                 if target_id == attacker {
+                    continue;
+                }
+                if !self.same_layer(attacker, target_id) {
                     continue;
                 }
 
@@ -1162,13 +1728,37 @@ impl TickPipeline {
                     continue;
                 }
 
-                confirmed_hits.push((attacker, target_id, target_idx, ability_id, exec_id));
+                confirmed_hits.push((
+                    attacker,
+                    target_id,
+                    target_idx,
+                    ability_id,
+                    exec_id,
+                    effective_rewind,
+                ));
             }
         }
 
         // Apply damage for all confirmed compensated hits.
-        for (attacker, target_id, target_idx, ability_id, exec_id) in confirmed_hits {
-            self.apply_hit_damage(attacker, target_id, target_idx, ability_id, true, Some(exec_id));
+        for (attacker, target_id, target_idx, ability_id, exec_id, effective_rewind) in
+            confirmed_hits
+        {
+            self.emit_event(
+                target_id,
+                EventPayload::CompensationApplied {
+                    source: attacker,
+                    ability_id,
+                    rewind_ticks: effective_rewind,
+                },
+            );
+            self.apply_hit_damage(
+                attacker,
+                target_id,
+                target_idx,
+                ability_id,
+                true,
+                Some(exec_id),
+            );
         }
     }
 }

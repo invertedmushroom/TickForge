@@ -8,6 +8,7 @@
 // This eliminates the previous type duplication and prevents schema drift.
 // ─────────────────────────────────────────────────────────────────────
 
-pub mod tables;
 pub mod reducers;
+pub mod rls;
+pub mod tables;
 pub mod views;

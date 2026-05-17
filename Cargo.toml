@@ -44,4 +44,4 @@ log = "0.4"
 env_logger = "0.11"
 
 # SpacetimeDB client SDK (must match server spacetimedb version)
-spacetimedb-sdk = "2.0"
+spacetimedb-sdk = "2.1"

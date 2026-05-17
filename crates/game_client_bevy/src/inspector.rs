@@ -50,7 +50,11 @@ fn toggle_inspector(
     if keyboard.just_pressed(KeyCode::F4) {
         vis_state.0 = !vis_state.0;
         if let Ok(mut vis) = query.get_single_mut() {
-            *vis = if vis_state.0 { Visibility::Visible } else { Visibility::Hidden };
+            *vis = if vis_state.0 {
+                Visibility::Visible
+            } else {
+                Visibility::Hidden
+            };
         }
     }
 }
@@ -64,7 +68,9 @@ fn update_inspector(
     if !vis.0 {
         return;
     }
-    let Ok(mut text) = query.get_single_mut() else { return };
+    let Ok(mut text) = query.get_single_mut() else {
+        return;
+    };
     let Some(stdb) = stdb else {
         **text = "Inspector: not connected".into();
         return;
@@ -77,13 +83,23 @@ fn update_inspector(
     let mut lines = vec![format!("--- Inspector (F4) ---\nEntity #{target_id}")];
 
     // Entity row
-    if let Some(entity) = stdb.conn.db.nearby_entities().iter().find(|entity| entity.entity_id == target_id) {
+    if let Some(entity) = stdb
+        .conn
+        .db
+        .nearby_entities()
+        .iter()
+        .find(|entity| entity.entity_id == target_id)
+    {
         lines.push(format!("Kind: {:?}", entity.kind));
         lines.push(format!("State: {:?}", entity.state));
         lines.push(format!("Spawned tick: {}", entity.spawned_at_tick));
         if let Some(ref owner) = entity.owner_identity {
             let id_str = format!("{owner:?}");
-            let short = if id_str.len() > 16 { &id_str[..16] } else { &id_str };
+            let short = if id_str.len() > 16 {
+                &id_str[..16]
+            } else {
+                &id_str
+            };
             lines.push(format!("Owner: {short}.."));
         }
     } else {
@@ -91,7 +107,13 @@ fn update_inspector(
     }
 
     // Transform
-    if let Some(tf) = stdb.conn.db.nearby_transforms().iter().find(|t| t.entity_id == target_id) {
+    if let Some(tf) = stdb
+        .conn
+        .db
+        .nearby_transforms()
+        .iter()
+        .find(|t| t.entity_id == target_id)
+    {
         lines.push(format!(
             "Pos: ({:.1}, {:.1}, {:.1})",
             tf.pos_x, tf.pos_y, tf.pos_z
@@ -103,7 +125,13 @@ fn update_inspector(
     }
 
     // Health
-    if let Some(hp) = stdb.conn.db.nearby_health().iter().find(|hp| hp.entity_id == target_id) {
+    if let Some(hp) = stdb
+        .conn
+        .db
+        .nearby_health()
+        .iter()
+        .find(|hp| hp.entity_id == target_id)
+    {
         lines.push(format!("HP: {:.0}/{:.0}", hp.hp, hp.max_hp));
     }
 
@@ -116,7 +144,11 @@ fn update_inspector(
     }
 
     // Buffs
-    let buffs: Vec<_> = stdb.conn.db.active_buff().iter()
+    let buffs: Vec<_> = stdb
+        .conn
+        .db
+        .active_buff()
+        .iter()
         .filter(|b| b.entity_id == target_id)
         .collect();
     if !buffs.is_empty() {

@@ -1,11 +1,10 @@
-use spacetimedb::{table, ScheduleAt, SpacetimeType};
+use spacetimedb::{ScheduleAt, SpacetimeType, table};
 
 // Re-export shared types from game_schema so the rest of server_module
 // (and generated client bindings) can use them directly.
 pub use game_schema::{
-    Vec3f, EntityKind, EntityState, NpcAiState, DamageType,
-    IntentAction, AbilityTarget, BlockData, MoveDir, UseAbilityData,
-    EquipmentSlot,
+    AbilityTarget, BlockData, DamageType, EntityKind, EntityState, EquipmentSlot, IntentAction,
+    MoveDir, NpcAiState, UseAbilityData, Vec3f,
 };
 // ── Module Config ───────────────────────────────────────────────────
 // Stores the admin identity (the CLI identity that published the module).
@@ -19,6 +18,12 @@ pub struct ModuleConfig {
     /// Last sim tick successfully committed by the simulation worker.
     /// Read by tick_trigger to gate backpressure (skip insert when backlog is too large).
     pub last_committed_tick: u64,
+    /// Next dynamic instance layer to allocate. Layers 0–99 are reserved;
+    /// dynamic instances start at 100 and increment.
+    pub next_instance_layer: u32,
+    /// Monotonically increasing counter tracking the latest sim_tick row inserted.
+    /// Eliminates the O(N) `sim_tick().iter().max_by_key()` scan in tick_trigger.
+    pub next_tick_id: u64,
 }
 // ── Simulation Clock ────────────────────────────────────────────────
 // Per spec: tick number must be committed through the database.
@@ -56,11 +61,15 @@ pub struct Entity {
     pub state: EntityState,
     pub spawned_at_tick: u64,
     pub owner_identity: Option<spacetimedb::Identity>,
+    /// RLS join key — always 0. Enables equi-join with trusted_worker for
+    /// client_visibility_filter (cross-joins unsupported by subscription engine).
+    #[index(btree)]
+    pub rls_group: u8,
 }
 
 // ── Team Assignment ─────────────────────────────────────────────────
 // Associates entities with teams for faction-based visibility (stealth).
-// Single writer: commit_tick_results reducer.
+// Primary writer during simulation commits: commit_tick_results reducer.
 
 #[table(accessor = entity_team, public)]
 pub struct EntityTeam {
@@ -69,11 +78,25 @@ pub struct EntityTeam {
     pub team_id: u32,
 }
 
+// ── Layer Assignment ────────────────────────────────────────────────
+// Public projection of entity_region.layer so the simulation worker can
+// subscribe and track layer changes without exposing the private
+// entity_region table (which contains spatial data used for stealth/AOI).
+// Written alongside entity_region inserts/updates that change layer.
+
+#[table(accessor = entity_layer, public)]
+pub struct EntityLayer {
+    #[primary_key]
+    pub entity_id: u64,
+    pub layer: u32,
+}
+
 // ── Stealth ─────────────────────────────────────────────────────────
 // Tracks which entities are currently stealthed and their team.
 // Private — enemies must not be able to query this table directly.
-// The nearby_transforms view reads it to filter invisible entities.
-// Single writer: commit_tick_results reducer (derived from buff state).
+// The nearby_* views read it to filter invisible entities.
+// Primary writer during simulation commits: commit_tick_results reducer
+// (derived from buff state).
 
 #[table(accessor = stealthed_entity)]
 pub struct StealthedEntity {
@@ -83,7 +106,10 @@ pub struct StealthedEntity {
 }
 
 // ── Transforms ──────────────────────────────────────────────────────
-// Authoritative spatial state. Single writer: physics system.
+// Authoritative spatial state replicated to clients.
+// Primary writer during simulation commits: the worker's physics snapshot.
+// Server reducers also seed or restore rows during spawn, respawn, and
+// instance-management flows.
 
 #[table(accessor = entity_transform, public)]
 pub struct EntityTransform {
@@ -103,10 +129,15 @@ pub struct EntityTransform {
     pub angvel_y: f32,
     pub angvel_z: f32,
     pub last_tick: u64,
+    #[index(btree)]
+    pub rls_group: u8,
 }
 
 // ── Health ──────────────────────────────────────────────────────────
-// Single writer: combat system.
+// Authoritative health state replicated to clients.
+// Primary writer during simulation commits: the worker combat snapshot.
+// Server reducers also seed or restore rows during spawn, respawn, and
+// instance-management flows.
 
 #[table(accessor = entity_health, public)]
 pub struct EntityHealth {
@@ -114,6 +145,8 @@ pub struct EntityHealth {
     pub entity_id: u64,
     pub hp: f32,
     pub max_hp: f32,
+    #[index(btree)]
+    pub rls_group: u8,
 }
 
 // ── Player Intents ──────────────────────────────────────────────────
@@ -149,6 +182,11 @@ pub struct ClientSequence {
 // ── Buffs ───────────────────────────────────────────────────────────
 // Single writer: combat system.
 
+/// Persisted buff state — only per-instance runtime fields.
+///
+/// Static template data (modifiers, buff_kind, max_stacks, etc.) is
+/// reconstructed from `BuffRegistry::get(buff_id)` at rehydration time.
+/// This keeps the commit payload small: ~10 columns instead of ~25.
 #[table(accessor = active_buff, public)]
 pub struct ActiveBuff {
     #[primary_key]
@@ -160,33 +198,16 @@ pub struct ActiveBuff {
     pub source_entity: u64,
     pub stacks: u32,
     pub expires_at_tick: Option<u64>,
-    // ── Modifier fields (flat columns) ──
-    pub mod_damage_out_pct: Option<f32>,
-    pub mod_damage_in_pct: Option<f32>,
-    pub mod_cooldown_reduce_pct: Option<f32>,
-    pub mod_speed_pct: Option<f32>,
     /// AI override kind: 0=ForceFlee, 1=ForceIdle, 2=ForceFocus. None = no override.
+    /// Persisted because ForceFocus carries a per-instance target entity.
     pub mod_ai_override_kind: Option<u8>,
     /// Target entity for ForceFocus override. Only meaningful when ai_override_kind == 2.
     pub mod_ai_override_target: Option<u64>,
-    /// Root: prevents movement when `Some(true)`.
-    pub mod_root: Option<bool>,
-    /// Stealth: hides entity from enemy teams in the nearby_transforms view.
+    /// Stealth flag — persisted so the reducer can derive `stealthed_entity` rows
+    /// without needing the buff registry.
     pub mod_stealth: Option<bool>,
-}
-
-// ── Aggro ───────────────────────────────────────────────────────────
-// Single writer: combat system.
-
-#[table(accessor = threat_entry, public)]
-pub struct ThreatEntry {
-    #[primary_key]
-    #[auto_inc]
-    pub threat_id: u64,
-    #[index(btree)]
-    pub npc_entity: u64,
-    pub source_entity: u64,
-    pub threat: f32,
+    /// Tick when DoT damage was last applied. Per-instance runtime state.
+    pub last_dot_tick: Option<u64>,
 }
 
 // ── NPC State ───────────────────────────────────────────────────────
@@ -203,7 +224,8 @@ pub struct NpcState {
 // ── NPC Config ──────────────────────────────────────────────────────
 // Static per-NPC spawn configuration read by the coordinator at entity
 // creation. Unlike NpcState (which is updated every tick by AI), this
-// table is written once at spawn and only read thereafter.
+// table is typically written during spawn/setup and then treated as
+// read-mostly runtime configuration.
 
 #[table(accessor = npc_config, public)]
 pub struct NpcConfig {
@@ -219,6 +241,10 @@ pub struct NpcConfig {
     pub ability_id_2: Option<u32>,
     pub ability_id_3: Option<u32>,
     pub ability_id_4: Option<u32>,
+    /// Max distance from home position before NPC evades back. 0 = no leash.
+    pub leash_radius: f32,
+    /// Proximity aggro radius. Idle/patrol NPCs attack players within this. 0 = disabled.
+    pub aggro_radius: f32,
 }
 
 // ── Event Tables ────────────────────────────────────────────────────
@@ -227,7 +253,7 @@ pub struct NpcConfig {
 // effectively consumed. We use public tables so clients subscribe.
 // DamageType is in game_schema.
 
-#[table(accessor = combat_event, public)]
+#[table(accessor = combat_event, public, event)]
 pub struct CombatEvent {
     #[primary_key]
     #[auto_inc]
@@ -244,6 +270,11 @@ pub struct CombatEvent {
 pub struct DamageData {
     pub amount: f32,
     pub damage_type: DamageType,
+}
+
+#[derive(SpacetimeType, Clone, Debug)]
+pub struct HealedData {
+    pub amount: f32,
 }
 
 #[derive(SpacetimeType, Clone, Debug)]
@@ -278,6 +309,7 @@ pub enum CombatEventKind {
     BlockStart,
     BlockEnd,
     Damage(DamageData),
+    Healed(HealedData),
     SkillHit(u32),
     BuffApplied(BuffAppliedData),
     BuffExpired(u32),
@@ -285,10 +317,16 @@ pub enum CombatEventKind {
     Dodged(u32),
     Blocked(BlockedData),
     Covered(CoveredData),
-    LockOnWarning(LockOnWarningData),
+    TelegraphWarning(TelegraphWarningData),
+    LockOnAcquired,
+    LockOnSessionStarted(LockOnSessionStartedData),
+    LockOnCanceled(LockOnCanceledData),
+    LockOnFired(LockOnFiredData),
     ProjectileLaunched(ProjectileLaunchedData),
     HazardSpawned(HazardSpawnedData),
+    ContactHitboxSpawned(ContactHitboxSpawnedData),
     SkillObjectRemoved(u64),
+    Teleported(TeleportedData),
     // CC events
     Knockback(KnockbackData),
     Launched,
@@ -307,9 +345,24 @@ pub enum CombatEventKind {
 }
 
 #[derive(SpacetimeType, Clone, Debug)]
-pub struct LockOnWarningData {
+pub struct TelegraphWarningData {
     pub target: u64,
     pub impact_tick: u64,
+}
+
+#[derive(SpacetimeType, Clone, Debug)]
+pub struct LockOnSessionStartedData {
+    pub ability_id: u32,
+}
+
+#[derive(SpacetimeType, Clone, Debug)]
+pub struct LockOnCanceledData {
+    pub target: u64,
+}
+
+#[derive(SpacetimeType, Clone, Debug)]
+pub struct LockOnFiredData {
+    pub targets: Vec<u64>,
 }
 
 #[derive(SpacetimeType, Clone, Debug)]
@@ -398,7 +451,29 @@ pub struct HazardSpawnedData {
     pub radius: f32,
 }
 
-#[table(accessor = world_event, public)]
+#[derive(SpacetimeType, Clone, Debug)]
+pub struct ContactHitboxSpawnedData {
+    pub execution_id: u64,
+    pub parent_execution_id: u64,
+    pub ability_id: u32,
+    pub pos_x: f32,
+    pub pos_y: f32,
+    pub pos_z: f32,
+    pub radius: f32,
+    pub duration_ticks: u32,
+}
+
+#[derive(SpacetimeType, Clone, Debug)]
+pub struct TeleportedData {
+    pub from_x: f32,
+    pub from_y: f32,
+    pub from_z: f32,
+    pub to_x: f32,
+    pub to_y: f32,
+    pub to_z: f32,
+}
+
+#[table(accessor = world_event, public, event)]
 pub struct WorldEvent {
     #[primary_key]
     #[auto_inc]
@@ -453,6 +528,8 @@ pub struct EntityRegion {
 pub struct TrustedWorker {
     #[primary_key]
     pub worker_identity: spacetimedb::Identity,
+    #[index(btree)]
+    pub rls_group: u8,
 }
 
 // ── Inventory & Equipment ───────────────────────────────────────────
@@ -506,4 +583,318 @@ pub struct Bank {
     pub item_id: u32,
     /// Stack count.
     pub quantity: u32,
+}
+
+// ── Party System ────────────────────────────────────────────────────
+// Party tables enable group play, required for dungeon entry.
+// Single writer: client-facing party reducers (validated per-player).
+
+#[table(accessor = party, public)]
+pub struct Party {
+    #[primary_key]
+    #[auto_inc]
+    pub party_id: u64,
+    /// Entity ID of the party leader.
+    pub leader_entity: u64,
+    /// Maximum number of members (default 5).
+    pub max_members: u32,
+    pub created_at: i64,
+}
+
+#[table(accessor = party_member, public)]
+pub struct PartyMember {
+    #[primary_key]
+    #[auto_inc]
+    pub member_id: u64,
+    #[index(btree)]
+    pub party_id: u64,
+    /// The entity in this party slot.
+    #[index(btree)]
+    pub entity_id: u64,
+}
+
+#[table(accessor = party_invite, public)]
+pub struct PartyInvite {
+    #[primary_key]
+    #[auto_inc]
+    pub invite_id: u64,
+    #[index(btree)]
+    pub party_id: u64,
+    pub inviter_entity: u64,
+    #[index(btree)]
+    pub invitee_entity: u64,
+    /// Microseconds since unix epoch.
+    pub expires_at: i64,
+}
+
+// ── Boss Phase (ADR-0002 Tier 1) ────────────────────────────────────
+// Tracks current phase for boss encounters. Written by commit_boss_phase
+// reducer (trusted worker). Worker detects HP thresholds and transitions.
+
+#[table(accessor = boss_phase, public)]
+pub struct BossPhase {
+    #[primary_key]
+    pub boss_entity_id: u64,
+    pub phase: u32,
+    pub entered_at_tick: u64,
+}
+
+// ── Zone Counter (ADR-0002 Tier 1) ──────────────────────────────────
+// Per-zone counters incremented on kill/damage events. Written by
+// increment_zone_counter reducer (trusted worker). Used by world_clock
+// to evaluate phase transitions.
+
+#[table(accessor = zone_counter, public, index(accessor = by_zone, btree(columns = [layer, region_x, region_z])))]
+pub struct ZoneCounter {
+    #[primary_key]
+    #[auto_inc]
+    pub counter_id: u64,
+    pub layer: u32,
+    pub region_x: i32,
+    pub region_z: i32,
+    pub counter_name: String,
+    pub value: f64,
+}
+
+// ── World Phase (ADR-0002 Tier 2) ───────────────────────────────────
+// Zone-level progression state. Written by world_clock scheduled reducer.
+// Transitions based on zone_counter thresholds.
+
+#[table(accessor = world_phase, public)]
+pub struct WorldPhase {
+    #[primary_key]
+    pub zone_id: u32,
+    pub phase_name: String,
+    pub started_at: i64,
+    pub metadata: String,
+}
+
+// ── NPC Goal (ADR-0002 Tier 2) ──────────────────────────────────────
+// High-level NPC directives written by world_clock. Worker subscribes
+// read-only; Phase 7 AI reads before decisions.
+
+#[table(accessor = npc_goal, public)]
+pub struct NpcGoal {
+    #[primary_key]
+    #[auto_inc]
+    pub goal_id: u64,
+    #[index(btree)]
+    pub entity_id: u64,
+    pub goal_kind: String,
+    /// JSON-encoded waypoints.
+    pub waypoints: String,
+    pub priority: u32,
+}
+
+// ── World Clock Scheduler (ADR-0002 Tier 2) ─────────────────────────
+// Drives the world_clock reducer at a low frequency (30s) for
+// aggregate/timed world state transitions.
+
+#[table(accessor = world_clock_schedule, scheduled(crate::reducers::world_clock))]
+pub struct WorldClockSchedule {
+    #[primary_key]
+    #[auto_inc]
+    pub scheduled_id: u64,
+    pub scheduled_at: ScheduleAt,
+}
+
+// ── Respawn System ──────────────────────────────────────────────────
+// Delayed respawn at zone-specific points. Death state is created by
+// commit_tick_results when a player entity transitions to DespawnPending;
+// consumed by respawn_player reducer after the delay expires.
+
+#[table(accessor = respawn_point, public)]
+pub struct RespawnPoint {
+    #[primary_key]
+    #[auto_inc]
+    pub point_id: u64,
+    #[index(btree)]
+    pub layer: u32,
+    pub region_x: i32,
+    pub region_z: i32,
+    pub pos_x: f32,
+    pub pos_y: f32,
+    pub pos_z: f32,
+    pub name: String,
+}
+
+#[table(accessor = death_state, public)]
+pub struct DeathState {
+    #[primary_key]
+    pub entity_id: u64,
+    pub died_at_tick: u64,
+    pub respawn_at_tick: u64,
+    pub killer_entity: Option<u64>,
+    pub layer: u32,
+    pub death_pos_x: f32,
+    pub death_pos_y: f32,
+    pub death_pos_z: f32,
+}
+
+// ── Instance Management ─────────────────────────────────────────────
+// Dungeon/instanced zone lifecycle. Layer 0 = open world, 1–99 reserved
+// persistent zones, 100+ dynamic instances.
+// Single writer: instance reducers (create_instance, join_instance, etc.)
+
+#[derive(SpacetimeType, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstanceState {
+    Pending,
+    Active,
+    Completed,
+    Expired,
+}
+
+#[table(accessor = instance, public)]
+pub struct Instance {
+    #[primary_key]
+    #[auto_inc]
+    pub instance_id: u64,
+    pub template_id: String,
+    pub layer: u32,
+    pub layer_group: u32,
+    pub state: InstanceState,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub max_players: u32,
+}
+
+#[table(accessor = instance_membership, public)]
+pub struct InstanceMembership {
+    #[primary_key]
+    pub entity_id: u64,
+    #[index(btree)]
+    pub instance_id: u64,
+    /// Set on disconnect. If all members disconnect > grace period → expire instance.
+    pub disconnect_at: Option<i64>,
+}
+
+// ── Interactable Config ─────────────────────────────────────────────
+// Per-entity config for interactive world objects (gates, switches,
+// chests, grabs). Sim worker subscribes for physics-driven interactions.
+// Single writer: instance spawn path (create_instance) and
+// commit_tick_results reducer (trusted worker, inline interactable updates).
+
+#[derive(SpacetimeType, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InteractKind {
+    Switch,
+    Gate,
+    Grab,
+    Chest,
+}
+
+#[derive(SpacetimeType, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InteractState {
+    /// Default resting state (gate closed, switch off, chest sealed).
+    Idle,
+    /// Active state (gate open, switch on, chest opened, grab held).
+    Active,
+    /// Cooldown before returning to Idle (one-shot switches, etc.)
+    Cooldown,
+}
+
+#[table(accessor = interactable_config, public)]
+pub struct InteractableConfig {
+    #[primary_key]
+    pub entity_id: u64,
+    pub interact_kind: InteractKind,
+    /// Entity this interactable controls (e.g. switch → gate entity).
+    pub linked_entity: Option<u64>,
+    /// Buff required to interact. None = no requirement.
+    pub required_buff: Option<u32>,
+    /// Item required to interact. None = no requirement.
+    pub required_item: Option<u32>,
+    /// Max interaction distance. Default 3.0.
+    pub interact_range: f32,
+    pub state: InteractState,
+}
+
+// ── Voxel Terrain (§4.8b Phase 1) ───────────────────────────────────
+// Bulk baked terrain rows are rekeyed by `terrain_set_id` (NOT layer) so
+// multiple layers can share one bake (PvE/PvP forks of the same map, etc.).
+// `WorldLayerDef.terrain_set` and `DungeonTemplate.terrain_set` carry the
+// human-readable name; the worker resolves it to `terrain_set_id` via the
+// unique-name index on `terrain_set`.
+//
+// SpacetimeDB v2 allows only one `#[primary_key]` per table; logical
+// composite keys are expressed as a surrogate `row_id` plus a multi-column
+// btree index, matching the `entity_region` / `zone_counter` pattern above.
+// Logical uniqueness on `(terrain_set_id, chunk_morton[, voxel_idx])` is
+// enforced by the upsert reducers, not the storage layer.
+
+#[table(accessor = terrain_set, public)]
+pub struct TerrainSet {
+    #[primary_key]
+    #[auto_inc]
+    pub terrain_set_id: u32,
+    /// Human-readable name referenced by `WorldLayerDef.terrain_set` and
+    /// `DungeonTemplate.terrain_set`. Unique.
+    #[unique]
+    pub name: String,
+    /// Editor-bake artefact hash (hex). Bumps on any chunk change inside the set.
+    pub content_hash: String,
+    /// Combined content + bake-format version. Split into two fields if the
+    /// mesher schema diverges from semantic content versioning.
+    pub version: u32,
+}
+
+#[table(
+    accessor = terrain_chunk,
+    public,
+    index(accessor = by_set_chunk, btree(columns = [terrain_set_id, chunk_morton]))
+)]
+pub struct TerrainChunk {
+    #[primary_key]
+    #[auto_inc]
+    pub row_id: u64,
+    pub terrain_set_id: u32,
+    /// Canonical 21-bit zyx Morton key — see `game_schema::morton`.
+    pub chunk_morton: u64,
+    /// Flat XYZ vertices, length divisible by 3.
+    pub vertices: Vec<f32>,
+    /// Triangle list, length divisible by 3.
+    pub indices: Vec<u32>,
+    /// Level of detail. Server collision always uses LOD 0; field is
+    /// reserved for client mesh selection / future per-chunk variants.
+    pub lod: u8,
+}
+
+#[table(
+    accessor = terrain_manifest,
+    public,
+    index(accessor = by_set_chunk, btree(columns = [terrain_set_id, chunk_morton]))
+)]
+pub struct TerrainManifest {
+    #[primary_key]
+    #[auto_inc]
+    pub row_id: u64,
+    pub terrain_set_id: u32,
+    pub chunk_morton: u64,
+    /// Per-chunk content hash for client cache validation.
+    pub content_hash: String,
+    pub version: u32,
+}
+
+#[table(
+    accessor = terrain_core,
+    public,
+    index(accessor = by_set_chunk_voxel, btree(columns = [terrain_set_id, chunk_morton, voxel_idx]))
+)]
+pub struct TerrainCore {
+    #[primary_key]
+    #[auto_inc]
+    pub row_id: u64,
+    pub terrain_set_id: u32,
+    pub chunk_morton: u64,
+    /// Flat per-voxel index inside the chunk: `x + y*N + z*N*N`.
+    pub voxel_idx: u32,
+    pub hermite_normal_x: f32,
+    pub hermite_normal_y: f32,
+    pub hermite_normal_z: f32,
+    pub qef_offset_x: f32,
+    pub qef_offset_y: f32,
+    pub qef_offset_z: f32,
+    pub material_id: u16,
+    /// Mesher-defined bitfield (surface-cell, sharp-feature, hidden, …).
+    /// Layout documented when the voxel editor lands.
+    pub flags: u32,
 }

@@ -2,9 +2,10 @@
 name = "game_client_bevy"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [[bin]]
-name = "jump_client"
+name = "tickforge_client"
 path = "src/main.rs"
 
 [features]
@@ -13,7 +14,11 @@ connected = ["game_client/connected", "dep:spacetimedb-sdk"]
 
 [dependencies]
 game_client = { path = "../game_client" }
+game_core = { workspace = true }
+game_schema = { workspace = true }
+ron = { workspace = true }
 spacetimedb-sdk = { workspace = true, optional = true }
 bevy = "0.15"
 log = { workspace = true }
 env_logger = { workspace = true }
+crossbeam-channel = "0.5"

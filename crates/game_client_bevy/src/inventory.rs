@@ -23,7 +23,10 @@ struct InventoryPanel;
 fn spawn_inventory_panel(mut commands: Commands) {
     commands.spawn((
         Text::new(""),
-        TextFont { font_size: 13.0, ..default() },
+        TextFont {
+            font_size: 13.0,
+            ..default()
+        },
         TextColor(Color::srgba(0.95, 0.9, 0.7, 0.95)),
         Node {
             position_type: PositionType::Absolute,
@@ -46,7 +49,11 @@ fn toggle_inventory(
     if keyboard.just_pressed(KeyCode::KeyI) {
         vis.0 = !vis.0;
         if let Ok(mut v) = query.get_single_mut() {
-            *v = if vis.0 { Visibility::Visible } else { Visibility::Hidden };
+            *v = if vis.0 {
+                Visibility::Visible
+            } else {
+                Visibility::Hidden
+            };
         }
     }
 }
@@ -57,8 +64,12 @@ fn update_inventory(
     local_player: Option<Res<LocalPlayerEntity>>,
     mut query: Query<&mut Text, With<InventoryPanel>>,
 ) {
-    if !vis.0 { return; }
-    let Ok(mut text) = query.get_single_mut() else { return };
+    if !vis.0 {
+        return;
+    }
+    let Ok(mut text) = query.get_single_mut() else {
+        return;
+    };
     let Some(stdb) = stdb else {
         **text = "Inventory: not connected".into();
         return;
@@ -71,7 +82,11 @@ fn update_inventory(
     let mut lines = vec!["--- Inventory (I) ---".to_string()];
 
     // Equipment
-    let mut equips: Vec<_> = stdb.conn.db.player_equipment().iter()
+    let mut equips: Vec<_> = stdb
+        .conn
+        .db
+        .player_equipment()
+        .iter()
         .filter(|e| e.owner_entity == entity_id)
         .collect();
     equips.sort_by_key(|e| format!("{:?}", e.slot));
@@ -86,7 +101,11 @@ fn update_inventory(
     }
 
     // Inventory bag
-    let mut items: Vec<_> = stdb.conn.db.player_inventory().iter()
+    let mut items: Vec<_> = stdb
+        .conn
+        .db
+        .player_inventory()
+        .iter()
         .filter(|i| i.owner_entity == entity_id)
         .collect();
     items.sort_by_key(|i| i.slot_index);
@@ -96,7 +115,10 @@ fn update_inventory(
     } else {
         lines.push(format!("Bag ({} slots):", items.len()));
         for i in &items {
-            lines.push(format!("  [{}] item #{} x{}", i.slot_index, i.item_id, i.quantity));
+            lines.push(format!(
+                "  [{}] item #{} x{}",
+                i.slot_index, i.item_id, i.quantity
+            ));
         }
     }
 

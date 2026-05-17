@@ -1,0 +1,14 @@
+(
+    encounters: [
+        (
+            boss_name: "default",
+            rules: [
+                (
+                    trigger: OnHpBelowOnce(percent: 0.5),
+                    action: ChangePhase(phase: Phase2),
+                    fired: false,
+                ),
+            ],
+        ),
+    ],
+)

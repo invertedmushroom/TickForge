@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use game_schema::EntityKind;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::combat::status::ActiveBuff;
 use crate::entity::entity_index::EntityIndex;
@@ -20,24 +20,24 @@ use crate::entity::entity_index::EntityIndex;
 /// | Hazard     | 0.0   | Hazards are stationary by default                     |
 pub fn base_speed(kind: EntityKind) -> f32 {
     match kind {
-        EntityKind::Player    => 5.0,
-        EntityKind::Npc       => 3.5,
-        EntityKind::Boss      => 2.5,
+        EntityKind::Player => 5.0,
+        EntityKind::Npc => 3.5,
+        EntityKind::Boss => 2.5,
         EntityKind::Projectile => 12.0,
-        EntityKind::Hazard    => 0.0,
-        EntityKind::Prop      => 0.0,
+        EntityKind::Hazard => 0.0,
+        EntityKind::Prop => 0.0,
     }
 }
 
 /// Base attack power per entity kind.
 pub fn base_attack_power(kind: EntityKind) -> f32 {
     match kind {
-        EntityKind::Player     => 1.0,
-        EntityKind::Npc        => 1.0,
-        EntityKind::Boss       => 1.5,
+        EntityKind::Player => 1.0,
+        EntityKind::Npc => 1.0,
+        EntityKind::Boss => 1.5,
         EntityKind::Projectile => 1.0,
-        EntityKind::Hazard     => 1.0,
-        EntityKind::Prop       => 0.0,
+        EntityKind::Hazard => 1.0,
+        EntityKind::Prop => 0.0,
     }
 }
 
@@ -45,12 +45,14 @@ pub fn base_attack_power(kind: EntityKind) -> f32 {
 /// provided at spawn — the spawn-time `max_hp` parameter takes precedence.
 pub fn base_max_hp(kind: EntityKind) -> f32 {
     match kind {
-        EntityKind::Player     => 100.0,
-        EntityKind::Npc        => 80.0,
-        EntityKind::Boss       => 500.0,
+        EntityKind::Player => 100.0,
+        EntityKind::Npc => 80.0,
+        EntityKind::Boss => 500.0,
         EntityKind::Projectile => 1.0,
-        EntityKind::Hazard     => 1.0,
-        EntityKind::Prop       => 1.0,
+        EntityKind::Hazard => 1.0,
+        // Props (gates, switches, barrels) are indestructible
+        // they are excluded from the death-detection sweep in finalization.rs
+        EntityKind::Prop => f32::MAX,
     }
 }
 
@@ -118,7 +120,9 @@ impl ItemRegistry {
 
     /// Look up an item and return its modifiers, or `Default` if unknown.
     pub fn modifiers(&self, item_id: u32) -> EquipmentModifiers {
-        self.items.get(&item_id).map_or(EquipmentModifiers::default(), |d| d.modifiers)
+        self.items
+            .get(&item_id)
+            .map_or(EquipmentModifiers::default(), |d| d.modifiers)
     }
 }
 
@@ -165,9 +169,17 @@ impl StatBlock {
     /// Compute a stat block from entity kind, spawn-time max_hp, active buffs, and equipment.
     ///
     /// Formula: `(base + gear_flat) * (1.0 + sum(buff_pct_modifiers))`, clamped to sane ranges.
-    pub fn compute(kind: EntityKind, spawn_max_hp: f32, buffs: &[ActiveBuff], equip: &EquipmentModifiers) -> Self {
+    pub fn compute(
+        kind: EntityKind,
+        spawn_max_hp: f32,
+        buffs: &[ActiveBuff],
+        equip: &EquipmentModifiers,
+    ) -> Self {
         let speed_pct: f32 = buffs.iter().filter_map(|b| b.modifiers.speed_pct).sum();
-        let dmg_out: f32 = buffs.iter().filter_map(|b| b.modifiers.damage_out_pct).sum();
+        let dmg_out: f32 = buffs
+            .iter()
+            .filter_map(|b| b.modifiers.damage_out_pct)
+            .sum();
         let dmg_in: f32 = buffs.iter().filter_map(|b| b.modifiers.damage_in_pct).sum();
         let cd_reduce: f32 = (buffs
             .iter()
@@ -241,12 +253,21 @@ mod tests {
     use game_protocol::entity_id::EntityId;
 
     const NO_EQUIP: EquipmentModifiers = EquipmentModifiers {
-        max_hp: 0.0, attack_power: 0.0, speed: 0.0,
-        damage_out: 0.0, damage_in: 0.0, cooldown_reduce: 0.0,
+        max_hp: 0.0,
+        attack_power: 0.0,
+        speed: 0.0,
+        damage_out: 0.0,
+        damage_in: 0.0,
+        cooldown_reduce: 0.0,
         cc_duration_reduce: 0.0,
     };
 
-    fn make_buff(speed: Option<f32>, dmg_out: Option<f32>, dmg_in: Option<f32>, cd: Option<f32>) -> ActiveBuff {
+    fn make_buff(
+        speed: Option<f32>,
+        dmg_out: Option<f32>,
+        dmg_in: Option<f32>,
+        cd: Option<f32>,
+    ) -> ActiveBuff {
         ActiveBuff {
             buff_id: 1,
             source: EntityId(0),
@@ -336,7 +357,13 @@ mod tests {
         let sb = store.get(EntityIndex::dangling(0));
         assert_eq!(sb.movement_speed, 5.0);
 
-        store.set(EntityIndex::dangling(0), StatBlock { movement_speed: 10.0, ..StatBlock::default() });
+        store.set(
+            EntityIndex::dangling(0),
+            StatBlock {
+                movement_speed: 10.0,
+                ..StatBlock::default()
+            },
+        );
         assert_eq!(store.get(EntityIndex::dangling(0)).movement_speed, 10.0);
     }
 

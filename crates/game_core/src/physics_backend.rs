@@ -3,6 +3,7 @@ use std::any::Any;
 use game_protocol::entity_id::EntityId;
 use game_protocol::types::{Quatf, Transform, Vec3f};
 use game_schema::EntityKind;
+use game_schema::LayerCollisionPolicy;
 
 /// What role a collider plays on an entity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -92,14 +93,26 @@ pub trait PhysicsBackend: Send {
     ///
     /// `offset` is in entity-local space — Vec3f::ZERO centres the sensor on the body origin.
     /// Returns an opaque handle for later removal. Returns None if the entity has no body.
-    fn spawn_sensor(&mut self, entity_id: EntityId, shape: SensorShape, offset: Vec3f, kind: ColliderKind) -> Option<u64>;
+    fn spawn_sensor(
+        &mut self,
+        entity_id: EntityId,
+        shape: SensorShape,
+        offset: Vec3f,
+        kind: ColliderKind,
+    ) -> Option<u64>;
 
     /// Spawn a sensor collider at a fixed world position, not attached to any entity body.
     ///
     /// Used for projectiles and ground-targeted abilities whose collision region moves
     /// independently of any entity. `owner` is the caster entity for damage attribution
     /// in collision events. Returns an opaque handle for positioning and removal.
-    fn spawn_world_sensor(&mut self, position: Vec3f, shape: SensorShape, kind: ColliderKind, owner: EntityId) -> u64;
+    fn spawn_world_sensor(
+        &mut self,
+        position: Vec3f,
+        shape: SensorShape,
+        kind: ColliderKind,
+        owner: EntityId,
+    ) -> u64;
 
     /// Update the world-space position of a sensor created by `spawn_world_sensor`.
     /// No-op and returns false if the handle is unknown.
@@ -124,7 +137,12 @@ pub trait PhysicsBackend: Send {
     ///
     /// Used by the coordinator to create physics bodies for entities arriving via DB subscription.
     /// Returns true if the body was created; false if the entity already has a body.
-    fn spawn_character_body(&mut self, entity_id: EntityId, position: Vec3f, kind: EntityKind) -> bool;
+    fn spawn_character_body(
+        &mut self,
+        entity_id: EntityId,
+        position: Vec3f,
+        kind: EntityKind,
+    ) -> bool;
 
     /// Spawn a dynamic box body for a prop entity.
     ///
@@ -132,14 +150,24 @@ pub trait PhysicsBackend: Send {
     /// physics forces (gravity, collisions). Players and NPCs push it around via
     /// kinematic contacts. Returns true if the body was created, false if the
     /// entity already has a body.
-    fn spawn_prop_body(&mut self, entity_id: EntityId, position: Vec3f, half_extents: Vec3f, pushable: bool) -> bool;
+    fn spawn_prop_body(
+        &mut self,
+        entity_id: EntityId,
+        position: Vec3f,
+        half_extents: Vec3f,
+        pushable: bool,
+    ) -> bool;
 
     /// Move a kinematic character body by `desired_translation`, sliding along obstacles.
     ///
     /// Uses a character controller to resolve collisions against static geometry
     /// (walls, floors, obstacles).  Returns the corrected world-space position
     /// and whether the character is touching the ground after the move.
-    fn move_character(&mut self, entity_id: EntityId, desired_translation: Vec3f) -> Option<MoveResult>;
+    fn move_character(
+        &mut self,
+        entity_id: EntityId,
+        desired_translation: Vec3f,
+    ) -> Option<MoveResult>;
 
     /// Cast a targeting ray from `origin` along `direction` up to `max_distance`.
     ///
@@ -149,7 +177,36 @@ pub trait PhysicsBackend: Send {
     /// physical capsule in front of an entity's hurtbox. If `ignore_entity` is
     /// provided, that entity's own rigid body and attached colliders are also
     /// excluded from the query.
-    fn raycast(&self, origin: Vec3f, direction: Vec3f, max_distance: f32, ignore_entity: Option<EntityId>) -> Option<RayHit>;
+    fn raycast(
+        &self,
+        origin: Vec3f,
+        direction: Vec3f,
+        max_distance: f32,
+        ignore_entity: Option<EntityId>,
+    ) -> Option<RayHit>;
+
+    /// Raycast against environment geometry only and return the first hit
+    /// point (world-space). Character bodies, hurtboxes, and sensors are
+    /// transparent — this query is for resolving ground-target Y, spawn
+    /// heights, and similar "where is the floor here?" questions against
+    /// terrain (cuboids, cylinders, heightfields).
+    ///
+    /// Layer-aware: only environment colliders on `layer` (or on the shared
+    /// unlayered ground plane, `layer == 0`) are considered.
+    ///
+    /// Returns `None` if the ray hits nothing within `max_distance`.
+    ///
+    /// Default: returns `None` (test backends without terrain).
+    fn raycast_surface(
+        &self,
+        origin: Vec3f,
+        direction: Vec3f,
+        max_distance: f32,
+        layer: u32,
+    ) -> Option<Vec3f> {
+        let _ = (origin, direction, max_distance, layer);
+        None
+    }
 
     /// Check line-of-sight between two world positions against environment geometry only.
     ///
@@ -159,6 +216,15 @@ pub trait PhysicsBackend: Send {
     /// Used for lock-on tagging validation and ground-target placement.
     fn line_of_sight(&self, from: Vec3f, to: Vec3f) -> bool;
 
+    /// Layer-aware line-of-sight: only environment colliders stamped with
+    /// `layer` can occlude the ray. Strict same-layer — there is no
+    /// shared layer-0 fallback; each layer must author its own geometry.
+    ///
+    /// Default: delegates to `line_of_sight` (ignores layer).
+    fn line_of_sight_on_layer(&self, from: Vec3f, to: Vec3f, _layer: u32) -> bool {
+        self.line_of_sight(from, to)
+    }
+
     /// Cast from `from` toward `to` through environment-only geometry and return
     /// the safe teleport destination. If no wall is hit, returns `to` unchanged.
     /// If a wall is hit, returns the contact point pulled back 0.3 units toward `from`
@@ -166,12 +232,160 @@ pub trait PhysicsBackend: Send {
     /// Used by `TeleportForward` and `TeleportBehindTarget` to prevent going through walls.
     fn cast_to_wall(&self, from: Vec3f, to: Vec3f) -> Vec3f;
 
+    /// Layer-aware cast-to-wall: only environment colliders stamped with
+    /// `layer` can block the cast. Strict same-layer — there is no shared
+    /// layer-0 fallback.
+    ///
+    /// Default: delegates to `cast_to_wall` (ignores layer).
+    fn cast_to_wall_on_layer(&self, from: Vec3f, to: Vec3f, _layer: u32) -> Vec3f {
+        self.cast_to_wall(from, to)
+    }
+
     /// Teleport an entity's physics body to `position` immediately.
     ///
     /// Moves the kinematic body in world space (no contact resolution — teleports
     /// through walls). Used by `TeleportBehindTarget` and `TeleportForward` abilities.
     /// No-op and returns `false` if the entity has no physics body.
     fn teleport_entity(&mut self, entity_id: EntityId, position: Vec3f) -> bool;
+
+    // ── Environment collider layer management ───────────────────
+
+    /// Add static environment geometry at the given position, tagged with an instance layer.
+    /// Returns an opaque handle for later removal.
+    /// Used by dungeon instance creation to spawn walls, floors, pillars.
+    fn add_environment_collider_on_layer(
+        &mut self,
+        shape: EnvironmentShape,
+        position: Vec3f,
+        layer: u32,
+    ) -> u64 {
+        let _ = (shape, position, layer);
+        0
+    }
+
+    /// Remove all environment colliders tagged with the given layer.
+    /// Used for bulk cleanup when a dungeon instance expires.
+    fn remove_environment_colliders_by_layer(&mut self, layer: u32) {
+        let _ = layer;
+    }
+
+    /// Remove a single environment collider previously returned from
+    /// [`add_environment_collider_on_layer`]. Used by the live terrain
+    /// edit pipeline to swap one chunk's TriMesh without rebuilding the
+    /// whole layer. Returns `true` if the handle was known and removed.
+    fn remove_environment_collider(&mut self, handle: u64) -> bool {
+        let _ = handle;
+        false
+    }
+
+    /// Toggle a prop entity's collider enabled/disabled (gate open/close).
+    /// Uses Rapier's `Collider::set_enabled()` natively.
+    fn set_collider_enabled(&mut self, entity_id: EntityId, enabled: bool) -> bool {
+        let _ = (entity_id, enabled);
+        false
+    }
+
+    /// Disable a character body and pool it for later reuse instead of destroying it.
+    ///
+    /// The body and its colliders stay allocated but are removed from broadphase
+    /// and collision detection. `kind` is used as the pool key so bodies are
+    /// reused within the same entity kind (matching collider geometry).
+    ///
+    /// Default: falls back to `remove_entity` (no pooling).
+    fn disable_entity(&mut self, entity_id: EntityId, _kind: EntityKind) -> bool {
+        self.remove_entity(entity_id)
+    }
+
+    /// Try to reuse a pooled character body for `entity_id`, or create a fresh one.
+    ///
+    /// Default: falls back to `spawn_character_body` (no pooling).
+    fn reuse_or_spawn_character(
+        &mut self,
+        entity_id: EntityId,
+        position: Vec3f,
+        kind: EntityKind,
+    ) -> bool {
+        self.spawn_character_body(entity_id, position, kind)
+    }
+
+    /// Remove excess pooled bodies above `max_idle` to bound memory.
+    ///
+    /// Default: no-op (no pool to drain).
+    fn drain_pool(&mut self, _max_idle: usize) {}
+
+    // ── Layer metadata ──────────────────────────────────────────
+
+    /// Set the visibility/isolation layer for an entity in the physics runtime.
+    ///
+    /// Used by scene-query predicates to filter colliders so entities on
+    /// different layers never interact physically. Called on spawn and when
+    /// an entity changes layer (instance join/leave).
+    ///
+    /// Default: no-op.
+    fn set_entity_layer(&mut self, _entity_id: EntityId, _layer: u32) {}
+
+    /// Set the team for an entity in the physics runtime.
+    /// Get the visibility/isolation layer for an entity.
+    ///
+    /// Returns 0 (open world) if the entity is unknown or layer was never set.
+    fn entity_layer(&self, _entity_id: EntityId) -> u32 {
+        0
+    }
+
+    /// Register a collision policy for a layer.
+    ///
+    /// Called when a dungeon instance is created; the policy is looked up by
+    /// scene-query predicates to decide whether specific entity kinds can
+    /// interact physically (e.g. player-vs-player collision).
+    ///
+    /// Default: no-op.
+    fn set_layer_policy(&mut self, _layer: u32, _policy: LayerCollisionPolicy) {}
+
+    /// Get the collision policy for a layer.
+    ///
+    /// Returns `LayerCollisionPolicy::default()` for unknown layers.
+    fn layer_policy(&self, _layer: u32) -> LayerCollisionPolicy {
+        LayerCollisionPolicy::default()
+    }
+
+    /// Remove the collision policy for a layer (instance teardown).
+    ///
+    /// Default: no-op.
+    fn remove_layer_policy(&mut self, _layer: u32) {}
+}
+
+/// Abstract shape for environment colliders (walls, floors, pillars).
+/// Maps to a physics engine shape without exposing engine-specific types.
+#[derive(Clone, Debug)]
+pub enum EnvironmentShape {
+    Cuboid {
+        half_x: f32,
+        half_y: f32,
+        half_z: f32,
+    },
+    Cylinder {
+        half_height: f32,
+        radius: f32,
+    },
+    /// Heightfield terrain on the x-z plane. See
+    /// `game_schema::dungeon::ShapeDef::Heightfield` for layout.
+    Heightfield {
+        nrows: usize,
+        ncols: usize,
+        scale_x: f32,
+        scale_y: f32,
+        scale_z: f32,
+        heights: Vec<f32>,
+    },
+    /// Indexed triangle mesh. `vertices` is `[x, y, z, ...]` (flat),
+    /// `indices` is a flat triangle list. See
+    /// `game_schema::dungeon::ShapeDef::TriMesh` for the authoring layout.
+    /// Backends that don't support triangle meshes may fall back to a
+    /// degenerate filler collider.
+    TriMesh {
+        vertices: Vec<f32>,
+        indices: Vec<u32>,
+    },
 }
 
 /// Result of a `move_character` call.

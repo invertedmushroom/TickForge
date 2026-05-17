@@ -8,7 +8,7 @@
 //!
 //! This module has no SpacetimeDB dependency and is testable offline.
 
-use game_core::combat::status::{ActiveBuff, ThreatEntry};
+use game_core::combat::status::ActiveBuff;
 use game_protocol::entity_id::EntityId;
 use game_protocol::tick::TickId;
 use game_protocol::types::Vec3f;
@@ -56,12 +56,12 @@ pub enum SyncDeleteResult {
 
 /// Runtime state recovered from the DB for seeding after a spawn.
 ///
-/// Groups the three optional restoration payloads (buffs, threats, NPC AI)
-/// that `sync_insert` passes to `SimulationRunner::seed_runtime_state`.
+/// Groups the optional restoration payloads (buffs, NPC AI) that
+/// `sync_insert` passes to `SimulationRunner::seed_runtime_state`.
+/// Threat is reconstructed from `npc_state.target_entity` at seed time.
 #[derive(Default)]
 pub struct RuntimeSnapshot {
     pub buffs: Vec<ActiveBuff>,
-    pub threats: Vec<ThreatEntry>,
     pub npc_state: Option<(NpcAiState, Option<EntityId>)>,
     /// NPC spawn config: (passive, no_chase, ability_ids).
     pub npc_config: Option<NpcSpawnConfig>,
@@ -73,6 +73,8 @@ pub struct NpcSpawnConfig {
     pub passive: bool,
     pub no_chase: bool,
     pub ability_ids: Vec<u32>,
+    pub leash_radius: f32,
+    pub aggro_radius: f32,
 }
 
 /// SDK-free entity lifecycle mirroring logic.
@@ -99,15 +101,13 @@ impl EntitySync {
         tick: TickId,
         max_hp: f32,
         position: Vec3f,
+        layer: u32,
         snapshot: RuntimeSnapshot,
     ) -> SyncInsertResult {
         // Guard: never spawn entities that have already passed their useful lifecycle.
         match state {
             EntityState::Removed | EntityState::DespawnPending => {
-                debug!(
-                    "Entity {} is {:?} in DB — skipping spawn",
-                    id.0, state
-                );
+                debug!("Entity {} is {:?} in DB — skipping spawn", id.0, state);
                 return SyncInsertResult::SkippedTerminal;
             }
             _ => {}
@@ -121,32 +121,26 @@ impl EntitySync {
             return SyncInsertResult::SkippedDuplicate;
         }
 
-        sim.spawn_entity_from_snapshot(id, kind, tick, max_hp, position);
+        sim.spawn_entity_from_snapshot(id, kind, tick, max_hp, position, layer);
 
         let RuntimeSnapshot {
             buffs,
-            mut threats,
             npc_state,
             npc_config,
         } = snapshot;
 
-        // `npc_state.target_entity` is the exported aggro view. When no persisted
-        // threat rows are provided, reconstruct a minimal in-memory threat table so
-        // restart recovery preserves the current aggro holder without subscribing to
-        // `threat_entry`.
-        if threats.is_empty()
-            && let Some((_, Some(target))) = npc_state.as_ref() {
-                threats.push(ThreatEntry { source: *target, threat: 1.0 });
-            }
-
         // Restore runtime state from DB rows (noops if slices are empty).
-        let buff_pairs = if buffs.is_empty() { vec![] } else { vec![(id, buffs)] };
-        let threat_pairs = if threats.is_empty() { vec![] } else { vec![(id, threats)] };
+        // Threat is reconstructed from npc_state.target_entity inside seed_runtime_state.
+        let buff_pairs = if buffs.is_empty() {
+            vec![]
+        } else {
+            vec![(id, buffs)]
+        };
         let npc_pairs: Vec<(EntityId, NpcAiState, Option<EntityId>)> = npc_state
             .map(|(ai, tgt)| vec![(id, ai, tgt)])
             .unwrap_or_default();
-        if !buff_pairs.is_empty() || !threat_pairs.is_empty() || !npc_pairs.is_empty() {
-            sim.seed_runtime_state(&buff_pairs, &threat_pairs, &npc_pairs);
+        if !buff_pairs.is_empty() || !npc_pairs.is_empty() {
+            sim.seed_runtime_state(&buff_pairs, &npc_pairs);
         }
 
         // Apply NPC spawn config (passive, no_chase, custom abilities).
@@ -154,10 +148,7 @@ impl EntitySync {
             sim.configure_npc(id, cfg);
         }
 
-        info!(
-            "Entity {} ({kind:?}) spawned into simulation at tick {:?} pos=({},{},{})",
-            id.0, tick, position.x, position.y, position.z
-        );
+        //info!("Entity {} ({kind:?}) spawned into simulation at tick {:?} pos=({},{},{})",id.0, tick, position.x, position.y, position.z);
         SyncInsertResult::Spawned
     }
 
@@ -215,7 +206,10 @@ impl EntitySync {
             (_, EntityState::Spawning) => {
                 if sim.entity_exists(id) {
                     sim.force_remove_entity(id);
-                    info!("Entity {} respawning — cleaned up stale simulation state", id.0);
+                    info!(
+                        "Entity {} respawning — cleaned up stale simulation state",
+                        id.0
+                    );
                 }
                 SyncUpdateResult::Respawn
             }
@@ -259,21 +253,34 @@ mod tests {
 
     impl MockPhysics {
         fn new() -> Self {
-            Self { transforms: HashMap::new() }
+            Self {
+                transforms: HashMap::new(),
+            }
         }
     }
 
     impl PhysicsBackend for MockPhysics {
-        fn as_any(&self) -> &dyn std::any::Any { self }
-        fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
         fn step(&mut self, _dt: f32) {}
         fn get_transform(&self, id: EntityId) -> Option<Transform> {
-            self.transforms.get(&id).map(|p| Transform::at_position(p.x, p.y, p.z))
+            self.transforms
+                .get(&id)
+                .map(|p| Transform::at_position(p.x, p.y, p.z))
         }
         fn get_all_transforms(&self) -> Vec<(EntityId, Transform)> {
-            self.transforms.iter().map(|(id, p)| (*id, Transform::at_position(p.x, p.y, p.z))).collect()
+            self.transforms
+                .iter()
+                .map(|(id, p)| (*id, Transform::at_position(p.x, p.y, p.z)))
+                .collect()
         }
-        fn drain_collision_events(&mut self) -> Vec<CollisionEvent> { vec![] }
+        fn drain_collision_events(&mut self) -> Vec<CollisionEvent> {
+            vec![]
+        }
         fn remove_entity(&mut self, id: EntityId) -> bool {
             self.transforms.remove(&id).is_some()
         }
@@ -281,33 +288,82 @@ mod tests {
             if let Some(t) = self.transforms.get_mut(&id) {
                 *t = pos;
                 true
-            } else { false }
+            } else {
+                false
+            }
         }
-        fn set_kinematic_rotation(&mut self, _id: EntityId, _rot: Quatf) -> bool { true }
-        fn set_linear_velocity(&mut self, _id: EntityId, _vel: Vec3f) -> bool { true }
-        fn spawn_sensor(&mut self, _id: EntityId, _shape: SensorShape, _offset: Vec3f, _kind: ColliderKind) -> Option<u64> {
+        fn set_kinematic_rotation(&mut self, _id: EntityId, _rot: Quatf) -> bool {
+            true
+        }
+        fn set_linear_velocity(&mut self, _id: EntityId, _vel: Vec3f) -> bool {
+            true
+        }
+        fn spawn_sensor(
+            &mut self,
+            _id: EntityId,
+            _shape: SensorShape,
+            _offset: Vec3f,
+            _kind: ColliderKind,
+        ) -> Option<u64> {
             Some(999)
         }
-        fn spawn_world_sensor(&mut self, _position: Vec3f, _shape: SensorShape, _kind: ColliderKind, _owner: EntityId) -> u64 { 0 }
-        fn set_sensor_position(&mut self, _handle: u64, _position: Vec3f) -> bool { false }
+        fn spawn_world_sensor(
+            &mut self,
+            _position: Vec3f,
+            _shape: SensorShape,
+            _kind: ColliderKind,
+            _owner: EntityId,
+        ) -> u64 {
+            0
+        }
+        fn set_sensor_position(&mut self, _handle: u64, _position: Vec3f) -> bool {
+            false
+        }
         fn remove_sensor(&mut self, _handle: u64) {}
         fn spawn_character_body(&mut self, id: EntityId, pos: Vec3f, _kind: EntityKind) -> bool {
             self.transforms.insert(id, pos);
             true
         }
-        fn spawn_prop_body(&mut self, id: EntityId, pos: Vec3f, _half_extents: Vec3f, _pushable: bool) -> bool {
+        fn spawn_prop_body(
+            &mut self,
+            id: EntityId,
+            pos: Vec3f,
+            _half_extents: Vec3f,
+            _pushable: bool,
+        ) -> bool {
             self.transforms.insert(id, pos);
             true
         }
         fn move_character(&mut self, id: EntityId, desired: Vec3f) -> Option<MoveResult> {
             let p = self.transforms.get_mut(&id)?;
-            *p = Vec3f { x: p.x + desired.x, y: p.y + desired.y, z: p.z + desired.z };
-            Some(MoveResult { position: *p, grounded: true })
+            *p = Vec3f {
+                x: p.x + desired.x,
+                y: p.y + desired.y,
+                z: p.z + desired.z,
+            };
+            Some(MoveResult {
+                position: *p,
+                grounded: true,
+            })
         }
-        fn raycast(&self, _origin: Vec3f, _direction: Vec3f, _max_distance: f32, _ignore_entity: Option<EntityId>) -> Option<RayHit> { None }
-        fn line_of_sight(&self, _from: Vec3f, _to: Vec3f) -> bool { true }
-        fn cast_to_wall(&self, _from: Vec3f, to: Vec3f) -> Vec3f { to }
-        fn teleport_entity(&mut self, id: EntityId, pos: Vec3f) -> bool { self.set_kinematic_position(id, pos) }
+        fn raycast(
+            &self,
+            _origin: Vec3f,
+            _direction: Vec3f,
+            _max_distance: f32,
+            _ignore_entity: Option<EntityId>,
+        ) -> Option<RayHit> {
+            None
+        }
+        fn line_of_sight(&self, _from: Vec3f, _to: Vec3f) -> bool {
+            true
+        }
+        fn cast_to_wall(&self, _from: Vec3f, to: Vec3f) -> Vec3f {
+            to
+        }
+        fn teleport_entity(&mut self, id: EntityId, pos: Vec3f) -> bool {
+            self.set_kinematic_position(id, pos)
+        }
     }
 
     fn test_runner() -> SimulationRunner {
@@ -327,8 +383,18 @@ mod tests {
         let mut sim = test_runner();
         let id = EntityId(100);
         let result = EntitySync::sync_insert(
-            &mut sim, id, EntityKind::Player, EntityState::Spawning,
-            TickId(1), 100.0, Vec3f { x: 1.0, y: 2.0, z: 3.0 },
+            &mut sim,
+            id,
+            EntityKind::Player,
+            EntityState::Spawning,
+            TickId(1),
+            100.0,
+            Vec3f {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+            0,
             Default::default(),
         );
         assert_eq!(result, SyncInsertResult::Spawned);
@@ -340,8 +406,18 @@ mod tests {
         let mut sim = test_runner();
         let id = EntityId(200);
         let result = EntitySync::sync_insert(
-            &mut sim, id, EntityKind::Npc, EntityState::Removed,
-            TickId(1), 50.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            &mut sim,
+            id,
+            EntityKind::Npc,
+            EntityState::Removed,
+            TickId(1),
+            50.0,
+            Vec3f {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            0,
             Default::default(),
         );
         assert_eq!(result, SyncInsertResult::SkippedTerminal);
@@ -353,8 +429,18 @@ mod tests {
         let mut sim = test_runner();
         let id = EntityId(201);
         let result = EntitySync::sync_insert(
-            &mut sim, id, EntityKind::Npc, EntityState::DespawnPending,
-            TickId(1), 50.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            &mut sim,
+            id,
+            EntityKind::Npc,
+            EntityState::DespawnPending,
+            TickId(1),
+            50.0,
+            Vec3f {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            0,
             Default::default(),
         );
         assert_eq!(result, SyncInsertResult::SkippedTerminal);
@@ -366,15 +452,35 @@ mod tests {
         let mut sim = test_runner();
         let id = EntityId(300);
         let first = EntitySync::sync_insert(
-            &mut sim, id, EntityKind::Player, EntityState::Spawning,
-            TickId(1), 100.0, Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+            &mut sim,
+            id,
+            EntityKind::Player,
+            EntityState::Spawning,
+            TickId(1),
+            100.0,
+            Vec3f {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
+            0,
             Default::default(),
         );
         assert_eq!(first, SyncInsertResult::Spawned);
 
         let second = EntitySync::sync_insert(
-            &mut sim, id, EntityKind::Player, EntityState::Active,
-            TickId(2), 100.0, Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+            &mut sim,
+            id,
+            EntityKind::Player,
+            EntityState::Active,
+            TickId(2),
+            100.0,
+            Vec3f {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
+            0,
             Default::default(),
         );
         assert_eq!(second, SyncInsertResult::SkippedDuplicate);
@@ -392,7 +498,12 @@ mod tests {
             EntityState::Active,
             TickId(1),
             80.0,
-            Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            Vec3f {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            0,
             RuntimeSnapshot {
                 npc_state: Some((NpcAiState::Combat, Some(target))),
                 ..Default::default()
@@ -401,11 +512,13 @@ mod tests {
         assert_eq!(result, SyncInsertResult::Spawned);
 
         let tick = sim.run_tick(1, &[]).expect("first tick should run");
-        assert!(tick.npc_state_updates.iter().any(|(eid, ai_state, target_entity)| {
-            *eid == npc
-                && *ai_state == NpcAiState::Combat
-                && *target_entity == Some(target)
-        }));
+        assert!(
+            tick.npc_state_updates
+                .iter()
+                .any(|(eid, ai_state, target_entity)| {
+                    *eid == npc && *ai_state == NpcAiState::Combat && *target_entity == Some(target)
+                })
+        );
     }
 
     // ── sync_update tests ───────────────────────────────────────
@@ -415,15 +528,28 @@ mod tests {
         let mut sim = test_runner();
         let id = EntityId(400);
         EntitySync::sync_insert(
-            &mut sim, id, EntityKind::Npc, EntityState::Spawning,
-            TickId(1), 80.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            &mut sim,
+            id,
+            EntityKind::Npc,
+            EntityState::Spawning,
+            TickId(1),
+            80.0,
+            Vec3f {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            0,
             Default::default(),
         );
         // Activate the entity so is_active() returns true.
         sim.mark_despawn(id); // Spawning doesn't become Active without a tick,
         // so test the branch where is_active() is false:
         let result = EntitySync::sync_update(
-            &mut sim, id, EntityState::Active, EntityState::DespawnPending,
+            &mut sim,
+            id,
+            EntityState::Active,
+            EntityState::DespawnPending,
         );
         // Entity was Spawning (not Active), so is_active() returns false → Ignored.
         assert_eq!(result, SyncUpdateResult::Ignored);
@@ -434,15 +560,24 @@ mod tests {
         let mut sim = test_runner();
         let id = EntityId(500);
         EntitySync::sync_insert(
-            &mut sim, id, EntityKind::Npc, EntityState::Spawning,
-            TickId(1), 60.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            &mut sim,
+            id,
+            EntityKind::Npc,
+            EntityState::Spawning,
+            TickId(1),
+            60.0,
+            Vec3f {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            0,
             Default::default(),
         );
         assert!(sim.contains(id));
 
-        let result = EntitySync::sync_update(
-            &mut sim, id, EntityState::Active, EntityState::Removed,
-        );
+        let result =
+            EntitySync::sync_update(&mut sim, id, EntityState::Active, EntityState::Removed);
         assert_eq!(result, SyncUpdateResult::Removed);
         assert!(!sim.contains(id));
     }
@@ -451,9 +586,8 @@ mod tests {
     fn update_removed_noop_when_not_present() {
         let mut sim = test_runner();
         let id = EntityId(600);
-        let result = EntitySync::sync_update(
-            &mut sim, id, EntityState::Active, EntityState::Removed,
-        );
+        let result =
+            EntitySync::sync_update(&mut sim, id, EntityState::Active, EntityState::Removed);
         assert_eq!(result, SyncUpdateResult::RemoveNoop);
     }
 
@@ -462,13 +596,22 @@ mod tests {
         let mut sim = test_runner();
         let id = EntityId(700);
         EntitySync::sync_insert(
-            &mut sim, id, EntityKind::Player, EntityState::Spawning,
-            TickId(1), 100.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            &mut sim,
+            id,
+            EntityKind::Player,
+            EntityState::Spawning,
+            TickId(1),
+            100.0,
+            Vec3f {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            0,
             Default::default(),
         );
-        let result = EntitySync::sync_update(
-            &mut sim, id, EntityState::Spawning, EntityState::Active,
-        );
+        let result =
+            EntitySync::sync_update(&mut sim, id, EntityState::Spawning, EntityState::Active);
         assert_eq!(result, SyncUpdateResult::Ignored);
     }
 
@@ -479,8 +622,18 @@ mod tests {
         let mut sim = test_runner();
         let id = EntityId(800);
         EntitySync::sync_insert(
-            &mut sim, id, EntityKind::Player, EntityState::Spawning,
-            TickId(1), 100.0, Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            &mut sim,
+            id,
+            EntityKind::Player,
+            EntityState::Spawning,
+            TickId(1),
+            100.0,
+            Vec3f {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            0,
             Default::default(),
         );
         let result = EntitySync::sync_delete(&mut sim, id);
@@ -494,5 +647,114 @@ mod tests {
         let id = EntityId(900);
         let result = EntitySync::sync_delete(&mut sim, id);
         assert_eq!(result, SyncDeleteResult::Noop);
+    }
+
+    // ── Respawn layer preservation ──────────────────────────────
+
+    #[test]
+    fn respawn_on_instance_layer_preserves_layer() {
+        // Validates Finding 2: when a player dies in a dungeon instance
+        // (layer 100) and respawns, the coordinator must pass the death
+        // layer to sync_insert — not hard-code 0.
+        let mut sim = test_runner();
+        let id = EntityId(1000);
+        let instance_layer = 100u32;
+
+        // 1. Spawn on instance layer.
+        let r = EntitySync::sync_insert(
+            &mut sim,
+            id,
+            EntityKind::Player,
+            EntityState::Spawning,
+            TickId(1),
+            1000.0,
+            Vec3f {
+                x: 10.0,
+                y: 0.0,
+                z: 20.0,
+            },
+            instance_layer,
+            Default::default(),
+        );
+        assert_eq!(r, SyncInsertResult::Spawned);
+        assert_eq!(sim.entity_layer(id), instance_layer);
+
+        // 2. Simulate death → force-remove (mirrors what commit_tick_results does).
+        sim.force_remove_entity(id);
+        assert!(!sim.contains(id));
+
+        // 3. sync_update detects Removed→Spawning transition → returns Respawn.
+        let update_result =
+            EntitySync::sync_update(&mut sim, id, EntityState::Removed, EntityState::Spawning);
+        assert_eq!(update_result, SyncUpdateResult::Respawn);
+
+        // 4. Coordinator re-inserts with the correct layer (this is the fix).
+        let r2 = EntitySync::sync_insert(
+            &mut sim,
+            id,
+            EntityKind::Player,
+            EntityState::Spawning,
+            TickId(5),
+            1000.0,
+            Vec3f {
+                x: 10.0,
+                y: 0.0,
+                z: 20.0,
+            },
+            instance_layer, // Correct: reads from entity_layer DB row
+            Default::default(),
+        );
+        assert_eq!(r2, SyncInsertResult::Spawned);
+        assert_eq!(
+            sim.entity_layer(id),
+            instance_layer,
+            "Respawned entity must retain the instance layer, not reset to 0"
+        );
+    }
+
+    #[test]
+    fn respawn_on_layer_zero_works() {
+        // Complementary test: respawn on open world (layer 0) still works.
+        let mut sim = test_runner();
+        let id = EntityId(1001);
+
+        EntitySync::sync_insert(
+            &mut sim,
+            id,
+            EntityKind::Player,
+            EntityState::Spawning,
+            TickId(1),
+            1000.0,
+            Vec3f {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            0,
+            Default::default(),
+        );
+        sim.force_remove_entity(id);
+
+        let update_result =
+            EntitySync::sync_update(&mut sim, id, EntityState::Removed, EntityState::Spawning);
+        assert_eq!(update_result, SyncUpdateResult::Respawn);
+
+        let r2 = EntitySync::sync_insert(
+            &mut sim,
+            id,
+            EntityKind::Player,
+            EntityState::Spawning,
+            TickId(5),
+            1000.0,
+            Vec3f {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            0,
+            Default::default(),
+        );
+        assert_eq!(r2, SyncInsertResult::Spawned);
+        assert_eq!(sim.entity_layer(id), 0);
     }
 }

@@ -19,7 +19,10 @@ pub fn interaction_groups(membership: CollisionLayer, filter: u32) -> Interactio
 
 /// Pre-built interaction groups for common entity types.
 pub fn player_body_groups() -> InteractionGroups {
-    interaction_groups(CollisionLayer::PLAYER_BODY, CollisionMasks::PLAYER_BODY_FILTER)
+    interaction_groups(
+        CollisionLayer::PLAYER_BODY,
+        CollisionMasks::PLAYER_BODY_FILTER,
+    )
 }
 
 pub fn npc_body_groups() -> InteractionGroups {
@@ -27,19 +30,31 @@ pub fn npc_body_groups() -> InteractionGroups {
 }
 
 pub fn projectile_groups() -> InteractionGroups {
-    interaction_groups(CollisionLayer::PROJECTILE, CollisionMasks::PROJECTILE_FILTER)
+    interaction_groups(
+        CollisionLayer::PROJECTILE,
+        CollisionMasks::PROJECTILE_FILTER,
+    )
 }
 
 pub fn skill_hitbox_groups() -> InteractionGroups {
-    interaction_groups(CollisionLayer::SKILL_HITBOX, CollisionMasks::SKILL_HITBOX_FILTER)
+    interaction_groups(
+        CollisionLayer::SKILL_HITBOX,
+        CollisionMasks::SKILL_HITBOX_FILTER,
+    )
 }
 
 pub fn skill_hurtbox_groups() -> InteractionGroups {
-    interaction_groups(CollisionLayer::SKILL_HURTBOX, CollisionMasks::SKILL_HURTBOX_FILTER)
+    interaction_groups(
+        CollisionLayer::SKILL_HURTBOX,
+        CollisionMasks::SKILL_HURTBOX_FILTER,
+    )
 }
 
 pub fn environment_groups() -> InteractionGroups {
-    interaction_groups(CollisionLayer::ENVIRONMENT, CollisionMasks::ENVIRONMENT_FILTER)
+    interaction_groups(
+        CollisionLayer::ENVIRONMENT,
+        CollisionMasks::ENVIRONMENT_FILTER,
+    )
 }
 
 pub fn trigger_groups() -> InteractionGroups {
@@ -99,7 +114,10 @@ mod tests {
         // Both directions must pass
         let a_hits_b = (player.memberships & env.filter).bits() != 0;
         let b_hits_a = (env.memberships & player.filter).bits() != 0;
-        assert!(a_hits_b && b_hits_a, "Player should collide with environment");
+        assert!(
+            a_hits_b && b_hits_a,
+            "Player should collide with environment"
+        );
     }
 
     #[test]
@@ -109,7 +127,10 @@ mod tests {
 
         let a_hits_b = (hitbox.memberships & env.filter).bits() != 0;
         let b_hits_a = (env.memberships & hitbox.filter).bits() != 0;
-        assert!(!(a_hits_b && b_hits_a), "Hitbox should not collide with environment");
+        assert!(
+            !(a_hits_b && b_hits_a),
+            "Hitbox should not collide with environment"
+        );
     }
 
     #[test]
@@ -148,7 +169,13 @@ mod tests {
         let ray_hits_npc_body = (ray.memberships & npc_body.filter).bits() != 0
             && (npc_body.memberships & ray.filter).bits() != 0;
 
-        assert!(ray_hits_hurtbox, "Targeting ray should interact with hurtboxes");
-        assert!(!ray_hits_npc_body, "Targeting ray must ignore character body colliders");
+        assert!(
+            ray_hits_hurtbox,
+            "Targeting ray should interact with hurtboxes"
+        );
+        assert!(
+            !ray_hits_npc_body,
+            "Targeting ray must ignore character body colliders"
+        );
     }
 }

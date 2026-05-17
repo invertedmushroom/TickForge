@@ -1,5 +1,5 @@
-use bevy::prelude::*;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
+use bevy::prelude::*;
 
 pub struct DiagnosticsPlugin;
 
@@ -95,7 +95,11 @@ fn toggle_diagnostics(
     if keyboard.just_pressed(KeyCode::F3) {
         state.visible = !state.visible;
         if let Ok(mut vis) = query.get_single_mut() {
-            *vis = if state.visible { Visibility::Visible } else { Visibility::Hidden };
+            *vis = if state.visible {
+                Visibility::Visible
+            } else {
+                Visibility::Hidden
+            };
         }
     }
 }
@@ -105,10 +109,9 @@ fn update_diagnostics(
     diagnostics: Res<DiagnosticsStore>,
     mut state: ResMut<DiagnosticsState>,
     mut query: Query<&mut Text, With<DiagnosticsPanel>>,
-    #[cfg(feature = "connected")]
-    stdb: Option<Res<crate::spacetime::StdbConnection>>,
-    #[cfg(feature = "connected")]
-    tick_counter: Option<Res<crate::spacetime::TickCounter>>,
+    #[cfg(feature = "connected")] stdb: Option<Res<crate::spacetime::StdbConnection>>,
+    #[cfg(feature = "connected")] tick_counter: Option<Res<crate::spacetime::TickCounter>>,
+    #[cfg(feature = "connected")] lock: Option<Res<crate::input::TargetLockState>>,
 ) {
     if !state.visible {
         return;
@@ -146,9 +149,9 @@ fn update_diagnostics(
     let mut worker_count: usize = 0;
     #[cfg(feature = "connected")]
     {
-        use spacetimedb_sdk::Table;
         use game_client::module_bindings::*;
-        if let Some(stdb) = stdb {
+        use spacetimedb_sdk::Table;
+        if let Some(stdb) = &stdb {
             connected = stdb.connected.load(std::sync::atomic::Ordering::Relaxed);
             entity_count = stdb.conn.db.nearby_entities().count() as usize;
             worker_count = stdb.conn.db.trusted_worker().count() as usize;
@@ -160,7 +163,66 @@ fn update_diagnostics(
 
     let backlog = state.last_tick_id.saturating_sub(last_committed);
 
-    let Ok(mut text) = query.get_single_mut() else { return };
+    // Tier 1/2 orchestration debug lines.
+    let mut extra_lines = String::new();
+    #[cfg(feature = "connected")]
+    {
+        use game_client::module_bindings::*;
+        use spacetimedb_sdk::Table;
+        if let Some(stdb) = &stdb {
+            // Boss phase for tab-locked target.
+            if let Some(lock_res) = &lock {
+                if let Some(target_eid) = lock_res.target_entity {
+                    if let Some(bp) = stdb.conn.db.boss_phase().boss_entity_id().find(&target_eid) {
+                        extra_lines.push_str(&format!(
+                            "\nBoss Phase: {} (tick {})",
+                            bp.phase, bp.entered_at_tick
+                        ));
+                    }
+                }
+            }
+
+            // Active world phases — show all rows from the subscription cache so
+            // the phase is visible regardless of the player's current position.
+            // (world_phase is subscribed as SELECT * so all rows are local.)
+            // Decode zone_id back to (layer, rx, rz) — inverse of synthesise_zone_id.
+            for wp in stdb.conn.db.world_phase().iter() {
+                let layer = wp.zone_id / 1_000_000;
+                let rem = wp.zone_id % 1_000_000;
+                let rx = (rem / 1000) as i32 - 500;
+                let rz = (rem % 1000) as i32 - 500;
+                extra_lines.push_str(&format!(
+                    "\nWorld Phase (L{} {},{}) → {}",
+                    layer, rx, rz, wp.phase_name
+                ));
+            }
+
+            // Zone kills counter for current layer/region.
+            // my_region is a server-scoped view — always 0 or 1 rows for the current player.
+            if let Some(region) = stdb.conn.db.my_region().iter().next() {
+                let kills: f64 = stdb
+                    .conn
+                    .db
+                    .zone_counter()
+                    .iter()
+                    .filter(|zc| {
+                        zc.layer == region.layer
+                            && zc.region_x == region.region_x
+                            && zc.region_z == region.region_z
+                            && zc.counter_name == "kills"
+                    })
+                    .map(|zc| zc.value)
+                    .sum();
+                if kills > 0.0 {
+                    extra_lines.push_str(&format!("\nZone Kills: {kills:.0}"));
+                }
+            }
+        }
+    }
+
+    let Ok(mut text) = query.get_single_mut() else {
+        return;
+    };
     **text = format!(
         "--- Diagnostics (F3) ---\n\
          FPS: {fps:.0}\n\
@@ -171,11 +233,12 @@ fn update_diagnostics(
          Intent rate: {intent_rate}/s\n\
          Last committed: {last_committed}\n\
          Backlog: {backlog}\n\
-         Workers: {workers}",
+         Workers: {workers}{extra}",
         tick_id = state.last_tick_id,
         tick_rate = state.ticks_per_second,
         entities = entity_count,
         intent_rate = state.intents_per_second,
         workers = worker_count,
+        extra = extra_lines,
     );
 }

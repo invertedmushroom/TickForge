@@ -18,12 +18,20 @@ pub struct WeaponLoadout {
 impl WeaponLoadout {
     /// Create a new loadout with two ability sets.
     pub fn new(set_0: Vec<u32>, set_1: Vec<u32>) -> Self {
-        Self { set_0, set_1, active: 0 }
+        Self {
+            set_0,
+            set_1,
+            active: 0,
+        }
     }
 
     /// Return the ability IDs for the currently active weapon set.
     pub fn active_abilities(&self) -> &[u32] {
-        if self.active == 0 { &self.set_0 } else { &self.set_1 }
+        if self.active == 0 {
+            &self.set_0
+        } else {
+            &self.set_1
+        }
     }
 
     /// Return `true` if `ability_id` is in the currently active weapon set.
@@ -40,6 +48,10 @@ impl WeaponLoadout {
 
 impl Default for WeaponLoadout {
     fn default() -> Self {
-        Self { set_0: Vec::new(), set_1: Vec::new(), active: 0 }
+        Self {
+            set_0: Vec::new(),
+            set_1: Vec::new(),
+            active: 0,
+        }
     }
 }

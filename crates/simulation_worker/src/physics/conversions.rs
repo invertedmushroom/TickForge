@@ -1,6 +1,6 @@
 use game_protocol::types::{Quatf, Transform, Vec3f};
+use rapier3d::math::{Rotation, Vector};
 use rapier3d::prelude::*;
-use rapier3d::math::{Vector, Rotation};
 
 /// Convert a Rapier RigidBody's state into our protocol Transform.
 ///

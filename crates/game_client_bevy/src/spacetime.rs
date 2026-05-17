@@ -1,10 +1,11 @@
 use bevy::prelude::*;
 use game_client::module_bindings::*;
 use log::info;
-use spacetimedb_sdk::{DbContext, Table};
+use spacetimedb_sdk::{DbContext, EventTable, Table};
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use crossbeam_channel::{Receiver, unbounded};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct SpacetimePlugin;
 
@@ -15,18 +16,27 @@ impl Plugin for SpacetimePlugin {
     }
 }
 
-const TOKEN_FILE: &str = ".client_token";
+const DEFAULT_TOKEN_FILE: &str = ".client_token";
+
+fn token_file() -> String {
+    std::env::var("STDB_TOKEN_FILE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_TOKEN_FILE.to_string())
+}
 
 fn load_token() -> Option<String> {
-    std::fs::read_to_string(TOKEN_FILE)
+    std::fs::read_to_string(token_file())
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
 fn save_token(token: &str) {
-    if let Err(e) = std::fs::write(TOKEN_FILE, token) {
-        log::warn!("Failed to save client token: {e}");
+    let token_file = token_file();
+    if let Err(e) = std::fs::write(&token_file, token) {
+        log::warn!("Failed to save client token to {token_file}: {e}");
     }
 }
 
@@ -35,6 +45,13 @@ fn save_token(token: &str) {
 pub struct StdbConnection {
     pub conn: DbConnection,
     pub connected: Arc<AtomicBool>,
+}
+
+/// Push queues for transient SpacetimeDB event tables.
+#[derive(Resource)]
+pub struct SpacetimeEvents {
+    pub combat_event_rx: Receiver<CombatEvent>,
+    pub world_event_rx: Receiver<WorldEvent>,
 }
 #[allow(dead_code)]
 /// Bevy resource tracking the local player's entity ID once spawned.
@@ -53,8 +70,11 @@ pub struct TickCounter {
 
 fn connect(mut commands: Commands) {
     let uri = std::env::var("STDB_URI").unwrap_or_else(|_| "http://localhost:3000".into());
-    let module_name = std::env::var("STDB_MODULE").unwrap_or_else(|_| "jump".into());
+    let module_name = std::env::var("STDB_MODULE").unwrap_or_else(|_| "tickforge".into());
     let auth_token = std::env::var("STDB_TOKEN").ok().or_else(load_token);
+
+    let (combat_tx, combat_rx) = unbounded();
+    let (world_tx, world_rx) = unbounded();
 
     let connected = Arc::new(AtomicBool::new(false));
     let connected_flag = Arc::clone(&connected);
@@ -66,6 +86,15 @@ fn connect(mut commands: Commands) {
         .with_database_name(&module_name)
         .with_token(auth_token.as_deref())
         .on_connect(move |ctx: &DbConnection, identity, token: &str| {
+            let combat_tx_clone = combat_tx.clone();
+            ctx.db.combat_event().on_insert(move |_, row| {
+                let _ = combat_tx_clone.send(row.clone());
+            });
+            let world_tx_clone = world_tx.clone();
+            ctx.db.world_event().on_insert(move |_, row| {
+                let _ = world_tx_clone.send(row.clone());
+            });
+
             save_token(token);
             info!("Connected as {identity}");
             connected_flag.store(true, Ordering::SeqCst);
@@ -98,6 +127,13 @@ fn connect(mut commands: Commands) {
                     "SELECT * FROM player_inventory",
                     "SELECT * FROM player_equipment",
                     "SELECT * FROM module_config",
+                    "SELECT * FROM interactable_config",
+                    "SELECT * FROM boss_phase",
+                    "SELECT * FROM world_phase",
+                    "SELECT * FROM zone_counter",
+                    "SELECT * FROM instance",
+                    "SELECT * FROM instance_membership",
+                    "SELECT * FROM death_state",
                 ]);
 
             // Spawn the player.
@@ -120,19 +156,17 @@ fn connect(mut commands: Commands) {
         .build()
         .expect("Failed to build SpacetimeDB connection");
 
-    commands.insert_resource(StdbConnection {
-        conn,
-        connected,
+    commands.insert_resource(StdbConnection { conn, connected });
+    commands.insert_resource(SpacetimeEvents {
+        combat_event_rx: combat_rx,
+        world_event_rx: world_rx,
     });
     commands.insert_resource(LocalPlayerEntity::default());
     commands.insert_resource(TickCounter::default());
 }
 
 /// Pump the SpacetimeDB connection each frame (processes callbacks).
-fn pump_connection(
-    stdb: Option<Res<StdbConnection>>,
-    mut tick_counter: ResMut<TickCounter>,
-) {
+fn pump_connection(stdb: Option<Res<StdbConnection>>, mut tick_counter: ResMut<TickCounter>) {
     let Some(stdb) = stdb else { return };
     let _ = stdb.conn.frame_tick();
 
@@ -145,7 +179,13 @@ fn pump_connection(
 
     // Keep local intent sequence aligned with authoritative server sequence.
     let identity = stdb.conn.identity();
-    if let Some(seq) = stdb.conn.db.client_sequence().client_identity().find(&identity) {
+    if let Some(seq) = stdb
+        .conn
+        .db
+        .client_sequence()
+        .client_identity()
+        .find(&identity)
+    {
         if tick_counter.intent_seq < seq.last_processed_sequence {
             log::warn!(
                 "Resyncing intent sequence from {} -> {}",

@@ -119,11 +119,16 @@ impl EntityStore {
     pub fn activate(&mut self, idx: EntityIndex) {
         let slot = idx.as_usize();
         debug_assert_eq!(
-            self.generations[slot], idx.generation(),
+            self.generations[slot],
+            idx.generation(),
             "activate called with stale EntityIndex (slot={} gen={} current={})",
-            slot, idx.generation(), self.generations[slot],
+            slot,
+            idx.generation(),
+            self.generations[slot],
         );
-        if self.generations[slot] != idx.generation() { return; }
+        if self.generations[slot] != idx.generation() {
+            return;
+        }
         self.states[slot] = EntityState::Active;
     }
 
@@ -131,11 +136,16 @@ impl EntityStore {
     pub fn mark_despawn(&mut self, idx: EntityIndex) {
         let slot = idx.as_usize();
         debug_assert_eq!(
-            self.generations[slot], idx.generation(),
+            self.generations[slot],
+            idx.generation(),
             "mark_despawn called with stale EntityIndex (slot={} gen={} current={})",
-            slot, idx.generation(), self.generations[slot],
+            slot,
+            idx.generation(),
+            self.generations[slot],
         );
-        if self.generations[slot] != idx.generation() { return; }
+        if self.generations[slot] != idx.generation() {
+            return;
+        }
         self.states[slot] = EntityState::DespawnPending;
     }
 
@@ -144,11 +154,16 @@ impl EntityStore {
     pub fn mark_removed(&mut self, idx: EntityIndex) {
         let slot = idx.as_usize();
         debug_assert_eq!(
-            self.generations[slot], idx.generation(),
+            self.generations[slot],
+            idx.generation(),
             "mark_removed called with stale EntityIndex (slot={} gen={} current={})",
-            slot, idx.generation(), self.generations[slot],
+            slot,
+            idx.generation(),
+            self.generations[slot],
         );
-        if self.generations[slot] != idx.generation() { return; }
+        if self.generations[slot] != idx.generation() {
+            return;
+        }
         self.states[slot] = EntityState::Removed;
         let id = self.index_to_id[slot];
         self.id_to_index.remove(&id);

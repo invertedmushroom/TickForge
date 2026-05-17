@@ -38,7 +38,10 @@ impl<T> SparseSet<T> {
     /// Insert a component for an entity. Panics if the entity already has one.
     pub fn insert(&mut self, idx: EntityIndex, value: T) {
         let i = idx.as_usize();
-        debug_assert!(i < self.entity_to_dense.len(), "push_slot not called for {idx}");
+        debug_assert!(
+            i < self.entity_to_dense.len(),
+            "push_slot not called for {idx}"
+        );
         debug_assert!(
             self.entity_to_dense[i].is_none(),
             "duplicate insert for {idx}"
@@ -135,10 +138,7 @@ impl<T> SparseSet<T> {
     /// so this is cache-friendly for the component data.
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = (EntityIndex, &T)> {
-        self.dense_to_entity
-            .iter()
-            .copied()
-            .zip(self.dense.iter())
+        self.dense_to_entity.iter().copied().zip(self.dense.iter())
     }
 
     /// Mutable iteration over all (EntityIndex, &mut T) pairs.
@@ -248,10 +248,7 @@ mod tests {
 
         let mut collected: Vec<_> = set.iter().collect();
         collected.sort_by_key(|(idx, _)| *idx);
-        assert_eq!(
-            collected,
-            vec![(idx(1), &10), (idx(3), &30), (idx(4), &40)]
-        );
+        assert_eq!(collected, vec![(idx(1), &10), (idx(3), &30), (idx(4), &40)]);
     }
 
     #[test]

@@ -32,11 +32,11 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use game_core::combat::skill::SkillShape;
+use game_core::physics_backend::SensorShape;
 use game_protocol::entity_id::EntityId;
 use game_protocol::tick::TickId;
 use game_schema::Vec3f;
-use game_core::combat::skill::SkillShape;
-use game_core::physics_backend::SensorShape;
 
 // ── Constants ───────────────────────────────────────────────────
 
@@ -133,7 +133,8 @@ impl TransformHistory {
         if self.buffer.len() >= MAX_HISTORY_TICKS + 1 {
             self.buffer.pop_front();
         }
-        self.buffer.push_back(TransformSnapshot::new(tick, positions));
+        self.buffer
+            .push_back(TransformSnapshot::new(tick, positions));
     }
 
     /// Look up the nearest snapshot at or before the requested tick.
@@ -173,12 +174,17 @@ impl Default for TransformHistory {
 /// (repurposed from wall-clock timestamp to tick number by the client).
 ///
 /// If `client_observed_tick == 0`, no rewind is applied (legacy or local client).
-pub fn compute_rewind_ticks(current_tick: TickId, client_observed_tick: u64) -> u32 {
+/// The result is clamped to `global_max` (from `TickConfig::global_max_rewind_ticks`).
+pub fn compute_rewind_ticks(
+    current_tick: TickId,
+    client_observed_tick: u64,
+    global_max: u32,
+) -> u32 {
     if client_observed_tick == 0 {
         return 0;
     }
     let delta = current_tick.0.saturating_sub(client_observed_tick);
-    (delta as u32).min(MAX_REWIND_TICKS)
+    (delta as u32).min(global_max)
 }
 
 // ── Shape intersection ──────────────────────────────────────────
@@ -195,12 +201,21 @@ pub fn hurtbox_sensor_shape() -> SensorShape {
 /// Mirrors `skill_shape_to_sensor` in tick_pipeline.rs — kept in sync.
 pub fn hitbox_sensor_shape(shape: SkillShape) -> SensorShape {
     match shape {
-        SkillShape::Sphere       => SensorShape::Sphere { radius: 2.0 },
-        SkillShape::Cone         => SensorShape::Capsule { half_height: 1.5, radius: 1.0 },
-        SkillShape::CapsuleSweep => SensorShape::Capsule { half_height: 1.0, radius: 0.75 },
-        SkillShape::Projectile   => SensorShape::Sphere { radius: 0.5 },
-        SkillShape::LineSweep    => SensorShape::Capsule { half_height: 3.0, radius: 0.5 },
-        SkillShape::HazardZone   => SensorShape::Sphere { radius: 2.0 },
+        SkillShape::Sphere => SensorShape::Sphere { radius: 2.0 },
+        SkillShape::Cone => SensorShape::Capsule {
+            half_height: 1.5,
+            radius: 1.0,
+        },
+        SkillShape::CapsuleSweep => SensorShape::Capsule {
+            half_height: 1.0,
+            radius: 0.75,
+        },
+        SkillShape::Projectile => SensorShape::Sphere { radius: 0.5 },
+        SkillShape::LineSweep => SensorShape::Capsule {
+            half_height: 3.0,
+            radius: 0.5,
+        },
+        SkillShape::HazardZone => SensorShape::Sphere { radius: 2.0 },
     }
 }
 
@@ -227,12 +242,16 @@ pub fn shapes_intersect(
     hitbox_world_pos: Vec3f,
     hurtbox_world_pos: Vec3f,
 ) -> bool {
-    use rapier3d::parry::query::intersection_test as parry_intersect;
     use rapier3d::parry::math::Pose3;
+    use rapier3d::parry::query::intersection_test as parry_intersect;
     use rapier3d::parry::shape::{Ball, Capsule};
 
     let iso_hitbox = Pose3::translation(hitbox_world_pos.x, hitbox_world_pos.y, hitbox_world_pos.z);
-    let iso_hurtbox = Pose3::translation(hurtbox_world_pos.x, hurtbox_world_pos.y, hurtbox_world_pos.z);
+    let iso_hurtbox = Pose3::translation(
+        hurtbox_world_pos.x,
+        hurtbox_world_pos.y,
+        hurtbox_world_pos.z,
+    );
 
     let hurtbox = Capsule::new_y(HURTBOX_HALF_HEIGHT, HURTBOX_RADIUS);
 
@@ -241,7 +260,10 @@ pub fn shapes_intersect(
             let shape = Ball::new(radius);
             parry_intersect(&iso_hitbox, &shape, &iso_hurtbox, &hurtbox).unwrap_or(false)
         }
-        SensorShape::Capsule { half_height, radius } => {
+        SensorShape::Capsule {
+            half_height,
+            radius,
+        } => {
             let shape = Capsule::new_y(half_height, radius);
             parry_intersect(&iso_hitbox, &shape, &iso_hurtbox, &hurtbox).unwrap_or(false)
         }
@@ -262,12 +284,16 @@ pub fn swept_shapes_intersect(
     curr_pos: Vec3f,
     hurtbox_world_pos: Vec3f,
 ) -> bool {
-    use rapier3d::parry::query::{cast_shapes, ShapeCastOptions};
     use rapier3d::parry::math::{Pose3, Vector};
+    use rapier3d::parry::query::{ShapeCastOptions, cast_shapes};
     use rapier3d::parry::shape::{Ball, Capsule};
 
     let iso_hitbox = Pose3::translation(prev_pos.x, prev_pos.y, prev_pos.z);
-    let iso_hurtbox = Pose3::translation(hurtbox_world_pos.x, hurtbox_world_pos.y, hurtbox_world_pos.z);
+    let iso_hurtbox = Pose3::translation(
+        hurtbox_world_pos.x,
+        hurtbox_world_pos.y,
+        hurtbox_world_pos.z,
+    );
 
     // Displacement over this tick = velocity for t ∈ [0, 1].
     let vel = Vector::new(
@@ -284,16 +310,27 @@ pub fn swept_shapes_intersect(
         SensorShape::Sphere { radius } => {
             let shape = Ball::new(radius);
             cast_shapes(
-                &iso_hitbox, vel, &shape,
-                &iso_hurtbox, zero_vel, &hurtbox,
+                &iso_hitbox,
+                vel,
+                &shape,
+                &iso_hurtbox,
+                zero_vel,
+                &hurtbox,
                 options,
             )
         }
-        SensorShape::Capsule { half_height, radius } => {
+        SensorShape::Capsule {
+            half_height,
+            radius,
+        } => {
             let shape = Capsule::new_y(half_height, radius);
             cast_shapes(
-                &iso_hitbox, vel, &shape,
-                &iso_hurtbox, zero_vel, &hurtbox,
+                &iso_hitbox,
+                vel,
+                &shape,
+                &iso_hurtbox,
+                zero_vel,
+                &hurtbox,
                 options,
             )
         }
@@ -330,23 +367,32 @@ mod tests {
 
     #[test]
     fn compute_rewind_zero_observed() {
-        assert_eq!(compute_rewind_ticks(TickId(100), 0), 0);
+        assert_eq!(compute_rewind_ticks(TickId(100), 0, MAX_REWIND_TICKS), 0);
     }
 
     #[test]
     fn compute_rewind_normal_delta() {
-        assert_eq!(compute_rewind_ticks(TickId(100), 98), 2);
+        assert_eq!(compute_rewind_ticks(TickId(100), 98, MAX_REWIND_TICKS), 2);
     }
 
     #[test]
     fn compute_rewind_clamped_to_max() {
-        assert_eq!(compute_rewind_ticks(TickId(100), 90), MAX_REWIND_TICKS);
+        assert_eq!(
+            compute_rewind_ticks(TickId(100), 90, MAX_REWIND_TICKS),
+            MAX_REWIND_TICKS
+        );
     }
 
     #[test]
     fn compute_rewind_future_observed_returns_zero() {
         // Client claims to have observed a future tick — impossible, return 0.
-        assert_eq!(compute_rewind_ticks(TickId(100), 105), 0);
+        assert_eq!(compute_rewind_ticks(TickId(100), 105, MAX_REWIND_TICKS), 0);
+    }
+
+    #[test]
+    fn compute_rewind_respects_custom_global_max() {
+        // With global_max=2, a delta of 3 should clamp to 2.
+        assert_eq!(compute_rewind_ticks(TickId(100), 97, 2), 2);
     }
 
     #[test]
@@ -399,7 +445,10 @@ mod tests {
     fn transform_history_evicts_oldest() {
         let mut history = TransformHistory::new();
         for t in 0..MAX_HISTORY_TICKS as u64 + 5 {
-            history.record(TickId(t), vec![(EntityId(1), Vec3f::new(t as f32, 0.0, 0.0))]);
+            history.record(
+                TickId(t),
+                vec![(EntityId(1), Vec3f::new(t as f32, 0.0, 0.0))],
+            );
         }
         assert!(history.len() <= MAX_HISTORY_TICKS + 1);
         // Oldest snapshots should be evicted once the extra rewind headroom is exceeded.
@@ -545,8 +594,16 @@ mod tests {
         // Swept: catches passage at ~t=0.6 (x≈3.0) → hit.
         let shape = SensorShape::Sphere { radius: 0.5 };
         // Confirm point-in-time would miss at both endpoints:
-        assert!(!shapes_intersect(shape, Vec3f::new(0.0, 0.0, 0.0), Vec3f::new(3.0, 0.0, 0.0)));
-        assert!(!shapes_intersect(shape, Vec3f::new(5.0, 0.0, 0.0), Vec3f::new(3.0, 0.0, 0.0)));
+        assert!(!shapes_intersect(
+            shape,
+            Vec3f::new(0.0, 0.0, 0.0),
+            Vec3f::new(3.0, 0.0, 0.0)
+        ));
+        assert!(!shapes_intersect(
+            shape,
+            Vec3f::new(5.0, 0.0, 0.0),
+            Vec3f::new(3.0, 0.0, 0.0)
+        ));
         // Swept catches it:
         assert!(swept_shapes_intersect(
             shape,

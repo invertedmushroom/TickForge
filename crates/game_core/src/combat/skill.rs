@@ -74,6 +74,21 @@ pub enum CastFacingPolicy {
     FaceResolvedTarget,
 }
 
+/// Which entities a hitbox is allowed to affect based on team membership.
+///
+/// Checked in `apply_hit_damage` after layer isolation passes.
+/// Team 0 (unassigned) is treated as hostile to everyone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TargetFilter {
+    /// Damages/affects only entities on a different team (or team 0).
+    #[default]
+    Hostile,
+    /// Heals/buffs only entities on the same team (team must match and be non-zero).
+    Friendly,
+    /// Affects all entities regardless of team (e.g. environmental hazards).
+    All,
+}
+
 /// Runtime parameters for a single ability cast.
 ///
 /// Created in Phase 2 alongside `AbilityExecutionContext` so that a single
@@ -123,6 +138,107 @@ pub struct ScheduledAbilityAction {
     pub action: AbilityAction,
 }
 
+/// Cast gating flags checked before an ability execution is accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CastRequirements {
+    /// Most abilities are grounded by default. Air skills opt out.
+    #[serde(default = "default_require_grounded")]
+    pub require_grounded: bool,
+    /// Allows stunbreak-style abilities while hard-CC disabled.
+    #[serde(default)]
+    pub usable_while_cc: bool,
+}
+
+impl Default for CastRequirements {
+    fn default() -> Self {
+        Self {
+            require_grounded: true,
+            usable_while_cc: false,
+        }
+    }
+}
+
+/// Runtime hit payload copied into an `ActiveHitbox` at spawn time.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HitEffectSpec {
+    pub base_damage: f32,
+    pub damage_type: DamageType,
+    pub threat_multiplier: f32,
+    /// Healing applied to friendly targets (`TargetFilter::Friendly`). 0.0 = no heal.
+    /// When > 0, Phase 6 routes the hit through `HealthStore::apply_healing`
+    /// instead of `apply_damage` and skips defensive routing, CC, and threat.
+    #[serde(default)]
+    pub heal_amount: f32,
+    #[serde(default)]
+    pub on_hit_buffs: Vec<u32>,
+    #[serde(default)]
+    pub knockback_force: f32,
+    #[serde(default)]
+    pub pull_force: f32,
+    #[serde(default)]
+    pub launch_lift: f32,
+    #[serde(default)]
+    pub launch_recovery_ticks: u32,
+    #[serde(default)]
+    pub stun_ticks: u32,
+    #[serde(default)]
+    pub knockdown_ticks: u32,
+    #[serde(default)]
+    pub sleep_ticks: u32,
+    #[serde(default)]
+    pub silence_ticks: u32,
+    #[serde(default)]
+    pub fear_ticks: u32,
+    #[serde(default)]
+    pub on_contact: Vec<HitEffectAction>,
+}
+
+/// Runtime hitbox behavior copied into an `ActiveHitbox` at spawn time.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct HitboxRules {
+    #[serde(default)]
+    pub allow_reentry: bool,
+    #[serde(default)]
+    pub damage_interval_ticks: u32,
+    #[serde(default)]
+    pub pierce: bool,
+    #[serde(default)]
+    pub max_rewind_ticks: Option<u32>,
+    #[serde(default)]
+    pub target_filter: TargetFilter,
+}
+
+impl Default for HitboxRules {
+    fn default() -> Self {
+        Self {
+            allow_reentry: false,
+            damage_interval_ticks: 0,
+            pierce: false,
+            max_rewind_ticks: None,
+            target_filter: TargetFilter::Hostile,
+        }
+    }
+}
+
+/// Secondary effects queued when a hitbox successfully contacts a target.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum HitEffectAction {
+    /// Queue a detached world-space hitbox at the contacted target's position.
+    SpawnHitbox {
+        #[serde(default)]
+        delay_ticks: u32,
+        #[serde(default = "default_contact_hitbox_duration_ticks")]
+        duration_ticks: u32,
+        shape: SkillShape,
+        #[serde(default = "default_vec3f_zero")]
+        offset: Vec3f,
+        #[serde(default)]
+        effect: Option<Box<HitEffectSpec>>,
+        #[serde(default)]
+        rules: Option<HitboxRules>,
+    },
+}
+
 /// Actions that occur at specific frames during an ability.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AbilityAction {
@@ -130,10 +246,30 @@ pub enum AbilityAction {
     /// `offset` is interpreted in entity-local space (forward = +Z). Whether the
     /// resulting sensor is entity-parented or stationary in world space depends
     /// on the resolved targeting mode for the cast.
-    SpawnHitbox { shape: SkillShape, offset: game_schema::Vec3f },
+    SpawnHitbox {
+        shape: SkillShape,
+        offset: game_schema::Vec3f,
+    },
+    /// Spawn a hitbox with per-hitbox effect/rule overrides.
+    ///
+    /// `effect` is boxed so this variant doesn't bloat `AbilityAction` (and
+    /// therefore every entry in the sorted `scheduled_actions` queue). With
+    /// the inline `HitEffectSpec` (~100 B incl. two `Vec`s), the queue's
+    /// `partition_point + Vec::insert` memmove cost dominated heavy action
+    /// ticks — boxing keeps the variant ~24 B.
+    SpawnConfiguredHitbox {
+        shape: SkillShape,
+        offset: game_schema::Vec3f,
+        #[serde(default)]
+        effect: Option<Box<HitEffectSpec>>,
+        #[serde(default)]
+        rules: Option<HitboxRules>,
+    },
     ApplyDamageFrame,
     RemoveHitbox,
-    CooldownStart { duration_ticks: u32 },
+    CooldownStart {
+        duration_ticks: u32,
+    },
     /// Open a combo / follow-up eligibility window.
     ///
     /// Phase 3 writes `(next_ability_id, expiry)` into `CombatState::active_windows`
@@ -141,14 +277,19 @@ pub enum AbilityAction {
     /// ability again within the window, Phase 2 redirects the cast to
     /// `next_ability_id` — a distinct ability with its own timeline, damage, and
     /// cooldown — then consumes the window.  Phase 8 drains expired entries.
-    OpenFollowUpWindow { duration_ticks: u32, next_ability_id: u32 },
+    OpenFollowUpWindow {
+        duration_ticks: u32,
+        next_ability_id: u32,
+    },
     /// Apply a buff to the caster (self-buff) from the ability timeline.
     ///
     /// Phase 3 looks up the `buff_id` in the `BuffRegistry` and creates an
     /// `ActiveBuff` from the template with the caster as both source and target.
     /// Stacking logic applies: if a buff with the same `buff_id` already exists,
     /// stacks are incremented (up to `max_stacks`) and the duration is refreshed.
-    ApplyBuff { buff_id: u32 },
+    ApplyBuff {
+        buff_id: u32,
+    },
     /// Set tactical iframe flags on the caster (timeline-driven).
     ///
     /// Phase 3 writes `dodge_active` into `CombatState::tactical`. The flag
@@ -156,7 +297,11 @@ pub enum AbilityAction {
     /// NOT clear `dodge_active`.
     ///
     /// `blocking` is no longer set here — blocking is intent-driven (hold-to-block).
-    StanceBegin { dodge_active: bool, #[serde(default)] rooted: bool },
+    StanceBegin {
+        dodge_active: bool,
+        #[serde(default)]
+        rooted: bool,
+    },
     /// Clear tactical iframe flags on the caster (timeline-driven).
     ///
     /// Paired with `StanceBegin` to define a fixed-duration iframe window.
@@ -167,35 +312,50 @@ pub enum AbilityAction {
     /// Implemented by scheduling a `SetMovement` to `Rooted` now and a
     /// `SetMovement` back to `empty()` at expiry so it composes with other
     /// root sources without clobbering them.
-    RootForTicks { ticks: u32 },
+    RootForTicks {
+        ticks: u32,
+    },
     /// Explicitly replace the caster's movement conditions for the remainder of this window.
     /// Pass `MovementConditions::empty()` to fully clear all conditions.
-    SetMovement { conditions: crate::combat::tactical::MovementConditions },
+    SetMovement {
+        conditions: crate::combat::tactical::MovementConditions,
+    },
     /// Launch the caster in a kinematic arc (vault / leap).
     ///
     /// Phase 3 sets `TacticalState::arc_velocity` and roots the caster.
     /// Phase 2 integrates gravity each tick and feeds the result into
     /// `move_character`. The arc ends automatically when `MoveResult::grounded`
     /// is true (after the launch tick) or when a `StanceEnd` fires.
-    ArcMovement { speed: f32, lift: f32, gravity: f32 },
-    /// Emit a `LockOnWarning` event to the resolved target.
+    ArcMovement {
+        speed: f32,
+        lift: f32,
+        gravity: f32,
+    },
+    /// Emit a `TelegraphWarning` event to resolved target entities.
     ///
     /// `impact_delay` is the number of ticks from now until the damage frame lands.
     /// Phase 3 reads the execution context's `ResolvedTargeting` to determine the
-    /// target entity — only `Entity` and `LockOn` targeting produce a warning.
-    Telegraph { impact_delay: u32 },
+    /// warning targets. Current support covers single-target and multi-lock-on
+    /// resolutions.
+    Telegraph {
+        impact_delay: u32,
+    },
     /// Remove up to `count` oldest Condition debuffs from the caster.
     ///
     /// Phase 3 iterates the caster's buffs, collects up to `count` entries with
     /// `buff_kind == Condition`, removes them, and emits `BuffExpired` for each.
     /// If any removed debuff had a `cc_effect`, the matching CC timer/bitflag
     /// is also cleared via `clear_cc_by_effect`.
-    Cleanse { count: u32 },
+    Cleanse {
+        count: u32,
+    },
     /// Remove a specific CC type from the caster (e.g. Arise = ClearCC { Knockdown }).
     ///
     /// Phase 3 finds the first debuff with matching `cc_effect`, removes it,
     /// and clears the corresponding CC timer/bitflag.
-    ClearCC { cc_effect: game_schema::CCEffect },
+    ClearCC {
+        cc_effect: game_schema::CCEffect,
+    },
     /// Break free of ALL active CC effects on the caster (self-only).
     ///
     /// Phase 3 clears every CC timer/bitflag + matching debuffs,
@@ -206,14 +366,18 @@ pub enum AbilityAction {
     /// Reads `ResolvedTargeting::Entity { target }` from the execution context.
     /// Destination: `target_position - target_facing * distance`.
     /// No-op if the execution context has no entity target.
-    TeleportBehindTarget { distance: f32 },
+    TeleportBehindTarget {
+        distance: f32,
+    },
     /// Teleport the caster forward along their cast-time facing.
     ///
     /// Raycasts from the caster's current position along `ctx.facing` up to
     /// `distance` against environment-only geometry (entities are ignored).
     /// If a wall is hit, stops at `hit_point - facing * 0.3`; otherwise
     /// travels the full distance. Emits `Teleported` event.
-    TeleportForward { distance: f32 },
+    TeleportForward {
+        distance: f32,
+    },
 }
 
 impl AbilityAction {
@@ -223,23 +387,24 @@ impl AbilityAction {
     /// place that needs updating for logging to stay accurate.
     pub const fn label(&self) -> &'static str {
         match self {
-            Self::SpawnHitbox { .. }        => "SpawnHitbox",
-            Self::ApplyDamageFrame          => "ApplyDamageFrame",
-            Self::RemoveHitbox              => "RemoveHitbox",
-            Self::CooldownStart { .. }      => "CooldownStart",
+            Self::SpawnHitbox { .. } => "SpawnHitbox",
+            Self::SpawnConfiguredHitbox { .. } => "SpawnConfiguredHitbox",
+            Self::ApplyDamageFrame => "ApplyDamageFrame",
+            Self::RemoveHitbox => "RemoveHitbox",
+            Self::CooldownStart { .. } => "CooldownStart",
             Self::OpenFollowUpWindow { .. } => "OpenFollowUpWindow",
-            Self::ApplyBuff { .. }          => "ApplyBuff",
-            Self::StanceBegin { .. }        => "StanceBegin",
-            Self::StanceEnd                 => "StanceEnd",
-            Self::RootForTicks { .. }       => "RootForTicks",
-            Self::SetMovement { .. }        => "SetMovement",
-            Self::Telegraph { .. }          => "Telegraph",
-            Self::ArcMovement { .. }        => "ArcMovement",
-            Self::Cleanse { .. }            => "Cleanse",
-            Self::ClearCC { .. }            => "ClearCC",
-            Self::Stunbreak                 => "Stunbreak",
+            Self::ApplyBuff { .. } => "ApplyBuff",
+            Self::StanceBegin { .. } => "StanceBegin",
+            Self::StanceEnd => "StanceEnd",
+            Self::RootForTicks { .. } => "RootForTicks",
+            Self::SetMovement { .. } => "SetMovement",
+            Self::Telegraph { .. } => "Telegraph",
+            Self::ArcMovement { .. } => "ArcMovement",
+            Self::Cleanse { .. } => "Cleanse",
+            Self::ClearCC { .. } => "ClearCC",
+            Self::Stunbreak => "Stunbreak",
             Self::TeleportBehindTarget { .. } => "TeleportBehindTarget",
-            Self::TeleportForward { .. }    => "TeleportForward",
+            Self::TeleportForward { .. } => "TeleportForward",
         }
     }
 }
@@ -276,10 +441,30 @@ pub enum ScheduledActionType {
         ability_id: u32,
         action: AbilityAction,
     },
-    BuffExpire { buff_id: u32 },
+    /// Boxed payload — see `ContactSpawnHitboxPayload`. Boxing keeps
+    /// `ScheduledActionType` (and therefore `ScheduledAction`) compact even
+    /// though contact-spawn data is heavy. The sorted `scheduled_actions`
+    /// queue uses `partition_point + Vec::insert`, so per-element size
+    /// directly drives memmove cost on action-storm ticks.
+    ContactSpawnHitbox(Box<ContactSpawnHitboxPayload>),
+    BuffExpire {
+        buff_id: u32,
+    },
     // CooldownExpire removed — cooldown expiry is now owned by TickPipeline::cooldowns.
     // Phase 8 drains the HashMap each tick and emits CooldownReady events directly,
     // making this variant unnecessary and eliminating the O(n) queue scan in is_on_cooldown.
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContactSpawnHitboxPayload {
+    pub parent_execution_id: AbilityExecutionId,
+    pub ability_id: u32,
+    pub shape: SkillShape,
+    pub position: Vec3f,
+    pub offset: Vec3f,
+    pub effect: HitEffectSpec,
+    pub rules: HitboxRules,
+    pub duration_ticks: u32,
 }
 
 /// Discrete charge tier definition (TERA / Monster Hunter style).
@@ -382,6 +567,10 @@ pub struct AbilityData {
     /// downed-state abilities.
     #[serde(default)]
     pub usable_while_cc: bool,
+    /// If true (default), the caster must be grounded to start this ability.
+    /// Airborne abilities set this false.
+    #[serde(default = "default_require_grounded")]
+    pub require_grounded: bool,
     /// Server-side targeting validation mode. Determines which `AbilityTarget`
     /// variants are accepted and what validation is applied before the cast.
     /// Default: `DirectionTarget`.
@@ -405,6 +594,22 @@ pub struct AbilityData {
     /// `None` = default 400 ticks (20 s at 20 Hz).
     #[serde(default)]
     pub lock_on_timeout_ticks: Option<u32>,
+    /// Per-ability cap on lag compensation rewind depth.
+    /// `None` = use the global `TickConfig::global_max_rewind_ticks` (default 4).
+    /// Lower values reduce the compensation window for skills that don't need it
+    /// (e.g. melee AoE). Higher values extend it for precise skill-shots (capped by global).
+    #[serde(default)]
+    pub max_rewind_ticks: Option<u32>,
+    /// Which entities this ability's hitbox is allowed to affect.
+    /// `Hostile` (default) = only enemies. `Friendly` = only allies. `All` = everything.
+    #[serde(default)]
+    pub target_filter: TargetFilter,
+    /// Healing applied per hit when `target_filter == Friendly`. 0.0 = no heal
+    /// (default). Heal scales with `charge_tiers[tier].damage_mult` and clamps
+    /// to max_hp via `HealthStore::apply_healing`. Healing bypasses dodge,
+    /// block, cover, CC, and generates no threat.
+    #[serde(default)]
+    pub heal_amount: f32,
 }
 
 /// Registry of all known abilities, keyed by ability_id.
@@ -416,6 +621,57 @@ pub struct AbilityRegistry {
 
 fn default_charge_roots_while_charging() -> bool {
     true
+}
+
+fn default_require_grounded() -> bool {
+    true
+}
+
+fn default_contact_hitbox_duration_ticks() -> u32 {
+    1
+}
+
+fn default_vec3f_zero() -> Vec3f {
+    Vec3f::ZERO
+}
+
+impl AbilityData {
+    pub fn cast_requirements(&self) -> CastRequirements {
+        CastRequirements {
+            require_grounded: self.require_grounded,
+            usable_while_cc: self.usable_while_cc,
+        }
+    }
+
+    pub fn default_hit_effect(&self) -> HitEffectSpec {
+        HitEffectSpec {
+            base_damage: self.base_damage,
+            damage_type: self.damage_type,
+            threat_multiplier: self.threat_multiplier,
+            heal_amount: self.heal_amount,
+            on_hit_buffs: self.on_hit_buffs.clone(),
+            knockback_force: self.knockback_force,
+            pull_force: self.pull_force,
+            launch_lift: self.launch_lift,
+            launch_recovery_ticks: self.launch_recovery_ticks,
+            stun_ticks: self.stun_ticks,
+            knockdown_ticks: self.knockdown_ticks,
+            sleep_ticks: self.sleep_ticks,
+            silence_ticks: self.silence_ticks,
+            fear_ticks: self.fear_ticks,
+            on_contact: Vec::new(),
+        }
+    }
+
+    pub fn default_hitbox_rules(&self) -> HitboxRules {
+        HitboxRules {
+            allow_reentry: self.allow_reentry,
+            damage_interval_ticks: self.damage_interval_ticks,
+            pierce: self.pierce,
+            max_rewind_ticks: self.max_rewind_ticks,
+            target_filter: self.target_filter,
+        }
+    }
 }
 
 impl AbilityRegistry {
@@ -561,4 +817,19 @@ impl AbilityExecutionStore {
     pub fn is_empty(&self) -> bool {
         self.active.is_empty()
     }
+}
+
+// ── On-disk format ──────────────────────────────────────────
+
+/// On-disk serialization format for `data/abilities.ron`.
+///
+/// Both `AbilityData` and `AbilityTimeline` already derive `serde::Deserialize`,
+/// so any crate with `ron` in its deps can parse the file directly:
+/// ```ignore
+/// let file = ron::from_str::<AbilityFile>(include_str!("../../../../data/abilities.ron"))?;
+/// ```
+#[derive(serde::Deserialize)]
+pub struct AbilityFile {
+    pub abilities: Vec<AbilityData>,
+    pub timelines: Vec<AbilityTimeline>,
 }

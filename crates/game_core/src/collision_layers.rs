@@ -87,9 +87,7 @@ impl CollisionMasks {
         CollisionLayer::SKILL_HURTBOX,
     ]);
 
-    pub const SKILL_HURTBOX_FILTER: u32 = CollisionLayer::combine(&[
-        CollisionLayer::SKILL_HITBOX,
-    ]);
+    pub const SKILL_HURTBOX_FILTER: u32 = CollisionLayer::combine(&[CollisionLayer::SKILL_HITBOX]);
 
     pub const ENVIRONMENT_FILTER: u32 = CollisionLayer::combine(&[
         CollisionLayer::PLAYER_BODY,
@@ -98,14 +96,10 @@ impl CollisionMasks {
         CollisionLayer::PROP_BODY,
     ]);
 
-    pub const TRIGGER_FILTER: u32 = CollisionLayer::combine(&[
-        CollisionLayer::PLAYER_BODY,
-    ]);
+    pub const TRIGGER_FILTER: u32 = CollisionLayer::combine(&[CollisionLayer::PLAYER_BODY]);
 
-    pub const FLIGHT_BLOCKER_FILTER: u32 = CollisionLayer::combine(&[
-        CollisionLayer::PLAYER_BODY,
-        CollisionLayer::NPC_BODY,
-    ]);
+    pub const FLIGHT_BLOCKER_FILTER: u32 =
+        CollisionLayer::combine(&[CollisionLayer::PLAYER_BODY, CollisionLayer::NPC_BODY]);
 
     pub const PROP_BODY_FILTER: u32 = CollisionLayer::combine(&[
         CollisionLayer::PLAYER_BODY,
@@ -118,10 +112,8 @@ impl CollisionMasks {
     /// KCC movement filter: character controllers only collide with static/prop
     /// geometry during movement, preventing capsule stacking and landing-on-heads.
     /// Membership is PLAYER_BODY | NPC_BODY so environment/prop filters still match.
-    pub const KCC_MOVEMENT_MEMBERSHIP: u32 = CollisionLayer::combine(&[
-        CollisionLayer::PLAYER_BODY,
-        CollisionLayer::NPC_BODY,
-    ]);
+    pub const KCC_MOVEMENT_MEMBERSHIP: u32 =
+        CollisionLayer::combine(&[CollisionLayer::PLAYER_BODY, CollisionLayer::NPC_BODY]);
 
     pub const KCC_MOVEMENT_FILTER: u32 = CollisionLayer::combine(&[
         CollisionLayer::ENVIRONMENT,
@@ -150,7 +142,11 @@ mod tests {
 
         // Each layer should be a single bit
         for layer in &layers {
-            assert!(layer.0.is_power_of_two(), "Layer {:#010b} is not a single bit", layer.0);
+            assert!(
+                layer.0.is_power_of_two(),
+                "Layer {:#010b} is not a single bit",
+                layer.0
+            );
         }
 
         // No two layers share a bit
@@ -165,20 +161,41 @@ mod tests {
     fn collision_matrix_is_symmetric() {
         // If A collides with B, B must collide with A.
         // Player vs NPC
-        assert_ne!(CollisionMasks::PLAYER_BODY_FILTER & CollisionLayer::NPC_BODY.0, 0);
-        assert_ne!(CollisionMasks::NPC_BODY_FILTER & CollisionLayer::PLAYER_BODY.0, 0);
+        assert_ne!(
+            CollisionMasks::PLAYER_BODY_FILTER & CollisionLayer::NPC_BODY.0,
+            0
+        );
+        assert_ne!(
+            CollisionMasks::NPC_BODY_FILTER & CollisionLayer::PLAYER_BODY.0,
+            0
+        );
 
         // Player vs Projectile
-        assert_ne!(CollisionMasks::PLAYER_BODY_FILTER & CollisionLayer::PROJECTILE.0, 0);
-        assert_ne!(CollisionMasks::PROJECTILE_FILTER & CollisionLayer::PLAYER_BODY.0, 0);
+        assert_ne!(
+            CollisionMasks::PLAYER_BODY_FILTER & CollisionLayer::PROJECTILE.0,
+            0
+        );
+        assert_ne!(
+            CollisionMasks::PROJECTILE_FILTER & CollisionLayer::PLAYER_BODY.0,
+            0
+        );
 
         // Player vs Environment
-        assert_ne!(CollisionMasks::PLAYER_BODY_FILTER & CollisionLayer::ENVIRONMENT.0, 0);
-        assert_ne!(CollisionMasks::ENVIRONMENT_FILTER & CollisionLayer::PLAYER_BODY.0, 0);
+        assert_ne!(
+            CollisionMasks::PLAYER_BODY_FILTER & CollisionLayer::ENVIRONMENT.0,
+            0
+        );
+        assert_ne!(
+            CollisionMasks::ENVIRONMENT_FILTER & CollisionLayer::PLAYER_BODY.0,
+            0
+        );
     }
 
     #[test]
     fn hitbox_does_not_collide_with_environment() {
-        assert_eq!(CollisionMasks::SKILL_HITBOX_FILTER & CollisionLayer::ENVIRONMENT.0, 0);
+        assert_eq!(
+            CollisionMasks::SKILL_HITBOX_FILTER & CollisionLayer::ENVIRONMENT.0,
+            0
+        );
     }
 }

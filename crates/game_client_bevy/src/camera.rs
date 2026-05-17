@@ -1,5 +1,5 @@
-use bevy::prelude::*;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
+use bevy::prelude::*;
 use bevy::window::{CursorGrabMode, PrimaryWindow};
 
 pub struct CameraPlugin;
@@ -9,7 +9,21 @@ impl Plugin for CameraPlugin {
         app.init_resource::<OrbitState>();
         app.init_resource::<CursorCaptured>();
         app.add_systems(Startup, (spawn_camera, capture_cursor));
-        app.add_systems(Update, (toggle_cursor_capture, orbit_input, follow_player).chain());
+        #[cfg(feature = "connected")]
+        app.add_systems(
+            Update,
+            (
+                toggle_cursor_capture,
+                orbit_input,
+                follow_player.after(crate::sync::SyncSet::ApplyPresentation),
+            )
+                .chain(),
+        );
+        #[cfg(not(feature = "connected"))]
+        app.add_systems(
+            Update,
+            (toggle_cursor_capture, orbit_input, follow_player).chain(),
+        );
     }
 }
 
@@ -28,7 +42,9 @@ pub struct LocalPlayer;
 pub struct CursorCaptured(pub bool);
 
 impl Default for CursorCaptured {
-    fn default() -> Self { Self(true) }
+    fn default() -> Self {
+        Self(true)
+    }
 }
 
 /// Orbit camera state: yaw, pitch, distance.
@@ -43,7 +59,7 @@ impl Default for OrbitState {
     fn default() -> Self {
         Self {
             yaw: 0.0,
-            pitch: -0.5,      // ~30° down
+            pitch: -0.5, // ~30° down
             distance: 25.0,
         }
     }
@@ -98,6 +114,7 @@ fn orbit_input(
     mut scroll_events: EventReader<MouseWheel>,
     mut orbit: ResMut<OrbitState>,
     captured: Res<CursorCaptured>,
+    menu_state: Option<Res<crate::ability_bar::SkillMenuState>>,
 ) {
     // Mouse-look when cursor is captured, OR right-mouse-drag when free.
     if captured.0 || mouse_button.pressed(MouseButton::Right) {
@@ -113,8 +130,15 @@ fn orbit_input(
     orbit.pitch = orbit.pitch.clamp(-1.4, -0.1);
 
     // Scroll zoom.
-    for ev in scroll_events.read() {
-        orbit.distance -= ev.y * 2.0;
+    let menu_open = menu_state
+        .as_ref()
+        .is_some_and(|state| state.active_slot.is_some());
+    if !menu_open {
+        for ev in scroll_events.read() {
+            orbit.distance -= ev.y * 2.0;
+        }
+    } else {
+        scroll_events.clear();
     }
     orbit.distance = orbit.distance.clamp(5.0, 60.0);
 }
@@ -126,8 +150,12 @@ fn follow_player(
     orbit: Res<OrbitState>,
     time: Res<Time>,
 ) {
-    let Ok(player_tf) = player_q.get_single() else { return };
-    let Ok(mut cam_tf) = cam_q.get_single_mut() else { return };
+    let Ok(player_tf) = player_q.get_single() else {
+        return;
+    };
+    let Ok(mut cam_tf) = cam_q.get_single_mut() else {
+        return;
+    };
 
     let orbit_origin = player_tf.translation + Vec3::Y * CAMERA_ORBIT_HEIGHT;
     let focus_point = player_tf.translation + Vec3::Y * CAMERA_LOOK_AT_HEIGHT;
@@ -140,9 +168,8 @@ fn follow_player(
     );
 
     let target = orbit_origin + offset;
-    cam_tf.translation = cam_tf.translation.lerp(
-        target,
-        CAMERA_FOLLOW_LERP_SPEED * time.delta_secs(),
-    );
+    cam_tf.translation = cam_tf
+        .translation
+        .lerp(target, CAMERA_FOLLOW_LERP_SPEED * time.delta_secs());
     cam_tf.look_at(focus_point, Vec3::Y);
 }

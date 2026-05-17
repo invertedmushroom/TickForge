@@ -1,7 +1,7 @@
 use log::{error, info, warn};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::module_bindings::*;
 use spacetimedb_sdk::{DbContext, Table};

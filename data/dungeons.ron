@@ -1,0 +1,72 @@
+(
+    templates: [
+        (
+            template_id: "test_dungeon_01",
+            name: "Training Grounds",
+            max_players: 4,
+            spawn_points: [
+                (0.0, 1.0, 0.0),
+            ],
+            exit_points: [
+                (0.0, 1.0, 0.0),
+            ],
+            geometry: [
+                // Floor (mandatory — per-layer floors are required after the
+                // strict-layer migration; there is no shared layer-0 fallback).
+                (shape: Cuboid(half_x: 20.0, half_y: 0.5, half_z: 20.0), position: (0.0, -0.5, 0.0)),
+                // North wall
+                (shape: Cuboid(half_x: 20.0, half_y: 3.0, half_z: 0.5), position: (0.0, 3.0, -20.0)),
+                // South wall
+                (shape: Cuboid(half_x: 20.0, half_y: 3.0, half_z: 0.5), position: (0.0, 3.0, 20.0)),
+                // East wall
+                (shape: Cuboid(half_x: 0.5, half_y: 3.0, half_z: 20.0), position: (20.0, 3.0, 0.0)),
+                // West wall
+                (shape: Cuboid(half_x: 0.5, half_y: 3.0, half_z: 20.0), position: (-20.0, 3.0, 0.0)),
+                // Center pillar
+                (shape: Cylinder(half_height: 3.0, radius: 1.0), position: (0.0, 3.0, 0.0)),
+                // ── Heightfield test tiles (client bilinear sampler + server raycast) ──
+                // Pyramidal hill, peak ~2 m at centre. Sits in the (+X, -Z)
+                // quadrant away from the gate/switch/boss.
+                // parry column-major heights: index = i + j * nrows
+                (shape: Heightfield(
+                    nrows: 5, ncols: 5,
+                    scale_x: 8.0, scale_y: 1.0, scale_z: 8.0,
+                    heights: [
+                        // j=0
+                        0.0, 0.5, 1.0, 0.5, 0.0,
+                        // j=1
+                        0.5, 1.0, 1.5, 1.0, 0.5,
+                        // j=2 (centre column)
+                        1.0, 1.5, 2.0, 1.5, 1.0,
+                        // j=3
+                        0.5, 1.0, 1.5, 1.0, 0.5,
+                        // j=4
+                        0.0, 0.5, 1.0, 0.5, 0.0,
+                    ],
+                ), position: (12.0, 0.1, -12.0)),
+                // Linear ramp rising from z=+16 down to z=+8 in the (-X, +Z)
+                // quadrant. Lets you walk up and jump off onto the flat floor.
+                (shape: Heightfield(
+                    nrows: 3, ncols: 3,
+                    scale_x: 8.0, scale_y: 1.0, scale_z: 8.0,
+                    heights: [
+                        // j=0 (low end)
+                        0.0, 0.0, 0.0,
+                        // j=1
+                        0.75, 0.75, 0.75,
+                        // j=2 (high end, 1.5 m)
+                        1.5, 1.5, 1.5,
+                    ],
+                ), position: (-12.0, 0.1, 12.0)),
+            ],
+            interactables: [
+                // Gate blocking boss arena
+                (local_id: 1, kind: Gate, position: (0.0, 1.5, -10.0), linked_to: None, required_buff: None, required_item: None, interact_range: None),
+                // Switch that opens the gate
+                (local_id: 2, kind: Switch, position: (5.0, 1.0, -8.0), linked_to: Some(1), required_buff: None, required_item: None, interact_range: Some(3.0)),
+                // Boss spawn behind the gate
+                (local_id: 3, kind: BossSpawn(npc_name: "TrainingDummy"), position: (0.0, 1.0, -15.0), linked_to: None, required_buff: None, required_item: None, interact_range: None),
+            ],
+        ),
+    ],
+)

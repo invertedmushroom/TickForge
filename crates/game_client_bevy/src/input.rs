@@ -5,15 +5,26 @@ use spacetimedb_sdk::Table;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::ability_bar::{ALL_ABILITIES, AbilityCooldowns, BLOCK_ABILITY_ID, ClientTargetingMode};
+use crate::ability_bar::{AbilityCooldowns, BLOCK_ABILITY_ID, ClientTargetingMode, all_abilities};
 #[allow(unused)]
 use crate::camera::CursorCaptured;
 use crate::camera::GameCamera;
 use crate::camera::LocalPlayer;
 use crate::diagnostics::DiagnosticsState;
+use crate::hud::reticle_viewport_position;
 use crate::spacetime::{LocalPlayerEntity, StdbConnection, TickCounter};
 
 pub struct InputPlugin;
+
+#[derive(SystemSet, Debug, Hash, PartialEq, Eq, Clone)]
+pub enum InputSet {
+    DriveInput,
+}
+
+#[derive(Component, Default)]
+pub struct LastMoveDir {
+    pub world: Vec3,
+}
 
 #[derive(Resource)]
 pub struct IntentThrottle(pub Timer);
@@ -71,14 +82,25 @@ impl Default for SkillBindings {
 /// Crosshair world aim state. Updated each frame by `update_crosshair`.
 ///
 /// Computed via camera raycast through screen center (TERA-style reticle).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AimPointSource {
+    #[default]
+    None,
+    EntityHit,
+    WorldHit,
+    Fallback,
+}
+
 #[derive(Resource, Default)]
 pub struct CrosshairAim {
-    /// World-space aim point (entity hit or ground intersection).
-    pub aim_position: Option<Vec3F>,
+    /// Canonical world-space aim point used for directional casts and aiming.
+    pub world_aim_point: Option<Vec3F>,
     /// Ground-plane intersection point (Y≈0). Always set when looking down.
     pub ground_position: Option<Vec3F>,
     /// Soft-target: entity the crosshair is hovering over.
     pub soft_target: Option<u64>,
+    /// What kind of world aim point was resolved this frame.
+    pub aim_source: AimPointSource,
     /// The normalized direction of the camera ray.
     pub camera_ray_dir: Option<Vec3F>,
     /// The origin point of the camera ray.
@@ -92,6 +114,25 @@ pub struct CrosshairAim {
 pub struct LockOnSession {
     /// The lock-on ability id currently in tagging phase, if any.
     pub active_ability: Option<u32>,
+    /// The observed sim tick when the client should locally expire this session.
+    pub expires_at_tick: Option<u64>,
+}
+
+const LOCK_ON_DEFAULT_TIMEOUT_TICKS: u64 = 400;
+
+fn lock_on_timeout_ticks_for(ability_id: u32) -> u64 {
+    all_abilities()
+        .iter()
+        .find(|a| a.id == ability_id)
+        .and_then(|a| a.lock_on_timeout_ticks)
+        .map(u64::from)
+        .filter(|ticks| *ticks > 0)
+        .unwrap_or(LOCK_ON_DEFAULT_TIMEOUT_TICKS)
+}
+
+fn clear_lock_on_session(lock_on: &mut LockOnSession) {
+    lock_on.active_ability = None;
+    lock_on.expires_at_tick = None;
 }
 
 fn clamp_ground_target_position(player_pos: Vec3, point: &Vec3F, max_range: f32) -> Vec3F {
@@ -131,11 +172,7 @@ fn resolve_aim_direction(
     crosshair: &CrosshairAim,
     orbit_yaw: f32,
 ) -> Option<Vec3F> {
-    // Two-stage solve (Production Action-Combat Standard):
-    // 1. The camera trace provides the desired impact point (`aim_position`).
-    //    This is either a true target hit point, or a far convergence fallback.
-    // 2. We solve the vector from the cast origin (the character) to that exact point.
-    if let Some(aim) = &crosshair.aim_position {
+    if let Some(aim) = &crosshair.world_aim_point {
         let dx = aim.x - player_tf.translation.x;
         let dy = aim.y - player_tf.translation.y;
         let dz = aim.z - player_tf.translation.z;
@@ -216,9 +253,9 @@ impl Plugin for InputPlugin {
                 handle_lock_on_input,
                 handle_weapon_swap,
                 handle_interact,
-            ),
+            )
+                .in_set(InputSet::DriveInput),
         );
-        app.add_systems(Update, handle_debug_keys);
     }
 }
 
@@ -291,6 +328,7 @@ fn handle_movement(
     mut diag: ResMut<DiagnosticsState>,
     ack: Res<IntentAckStats>,
     orbit: Res<crate::camera::OrbitState>,
+    mut player_q: Query<(&mut Transform, &mut LastMoveDir), With<LocalPlayer>>,
 ) {
     // Always tick the throttle timer so it keeps a consistent cadence.
     throttle.0.tick(time.delta());
@@ -300,23 +338,14 @@ fn handle_movement(
         return;
     };
 
-    let mut dir = Vec3::ZERO;
-    if keyboard.pressed(KeyCode::KeyW) {
-        dir.z -= 1.0;
-    }
-    if keyboard.pressed(KeyCode::KeyS) {
-        dir.z += 1.0;
-    }
-    if keyboard.pressed(KeyCode::KeyA) {
-        dir.x -= 1.0;
-    }
-    if keyboard.pressed(KeyCode::KeyD) {
-        dir.x += 1.0;
-    }
+    let dir = movement_input_vector(&keyboard);
 
     if dir == Vec3::ZERO {
+        if let Ok((_, mut last_move)) = player_q.get_single_mut() {
+            last_move.world = Vec3::ZERO;
+        }
         // Send Stop on key release (immediate, no throttle).
-        if keyboard.any_just_released([KeyCode::KeyW, KeyCode::KeyS, KeyCode::KeyA, KeyCode::KeyD])
+        if keyboard.any_just_released([KeyCode::KeyE, KeyCode::KeyD, KeyCode::KeyS, KeyCode::KeyF])
         {
             tick_counter.intent_seq += 1;
             submit_intent_logged(
@@ -338,20 +367,22 @@ fn handle_movement(
     }
 
     let dir = dir.normalize();
+    let world_dir = rotated_move_dir(dir, orbit.yaw);
+
+    if let Ok((mut tf, mut last_move)) = player_q.get_single_mut() {
+        let prediction_speed = game_core::stats::base_speed(game_schema::EntityKind::Player);
+        tf.translation += world_dir * prediction_speed * time.delta_secs();
+        last_move.world = world_dir;
+    }
+
     // Submit movement intent at up to 20 Hz.
     if throttle.0.just_finished() {
         tick_counter.intent_seq += 1;
 
-        let yaw = orbit.yaw;
-        let cos_yaw = yaw.cos();
-        let sin_yaw = yaw.sin();
-        let rot_x = dir.x * cos_yaw + dir.z * sin_yaw;
-        let rot_z = -dir.x * sin_yaw + dir.z * cos_yaw;
-
         let move_dir = MoveDir {
-            dir_x: rot_x,
+            dir_x: world_dir.x,
             dir_y: 0.0,
-            dir_z: rot_z,
+            dir_z: world_dir.z,
         };
         submit_intent_logged(
             &stdb,
@@ -370,6 +401,33 @@ fn handle_movement(
             tick_counter.last_tick
         );
     }
+}
+
+fn movement_input_vector(keyboard: &ButtonInput<KeyCode>) -> Vec3 {
+    let mut dir = Vec3::ZERO;
+    if keyboard.pressed(KeyCode::KeyE) {
+        dir.z -= 1.0;
+    }
+    if keyboard.pressed(KeyCode::KeyD) {
+        dir.z += 1.0;
+    }
+    if keyboard.pressed(KeyCode::KeyS) {
+        dir.x -= 1.0;
+    }
+    if keyboard.pressed(KeyCode::KeyF) {
+        dir.x += 1.0;
+    }
+    dir
+}
+
+fn rotated_move_dir(dir: Vec3, yaw: f32) -> Vec3 {
+    let cos_yaw = yaw.cos();
+    let sin_yaw = yaw.sin();
+    Vec3::new(
+        dir.x * cos_yaw + dir.z * sin_yaw,
+        0.0,
+        -dir.x * sin_yaw + dir.z * cos_yaw,
+    )
 }
 
 /// Space = Jump intent (instant, no throttle).
@@ -444,6 +502,73 @@ const SOFT_TARGET_RADIUS: f32 = 0.8;
 const SOFT_TARGET_MAX_DIST: f32 = 60.0;
 /// Ground plane Y coordinate (server ground surface is at Y ≈ 0.1).
 const GROUND_Y: f32 = 0.1;
+const AIM_FALLBACK_DIST: f32 = 50.0;
+
+fn make_vec3f(v: Vec3) -> Vec3F {
+    Vec3F {
+        x: v.x,
+        y: v.y,
+        z: v.z,
+    }
+}
+
+fn select_lock_on_tag_target(crosshair: &CrosshairAim) -> Option<u64> {
+    crosshair.soft_target
+}
+
+fn resolve_crosshair_aim_state(
+    ray_origin: Vec3,
+    ray_dir: Vec3,
+    entity_samples: impl IntoIterator<Item = (u64, Vec3)>,
+    local_id: u64,
+) -> CrosshairAim {
+    let mut crosshair = CrosshairAim::default();
+    let mut best_entity: Option<(u64, f32, Vec3)> = None;
+    for (entity_id, entity_pos) in entity_samples {
+        if entity_id == local_id {
+            continue;
+        }
+        let to_entity = entity_pos - ray_origin;
+        let t = to_entity.dot(ray_dir);
+        if t < 0.0 || t > SOFT_TARGET_MAX_DIST {
+            continue;
+        }
+        let closest = ray_origin + ray_dir * t;
+        let dist_sq = (closest - entity_pos).length_squared();
+        if dist_sq < SOFT_TARGET_RADIUS * SOFT_TARGET_RADIUS {
+            if best_entity.is_none() || t < best_entity.expect("checked is_some").1 {
+                best_entity = Some((entity_id, t, closest));
+            }
+        }
+    }
+
+    let ground_pos = if ray_dir.y.abs() > 1e-6 {
+        let t = (GROUND_Y - ray_origin.y) / ray_dir.y;
+        if t > 0.0 && t < SOFT_TARGET_MAX_DIST {
+            Some(make_vec3f(ray_origin + ray_dir * t))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let Some((entity_id, _, hit_point)) = best_entity {
+        crosshair.world_aim_point = Some(make_vec3f(hit_point));
+        crosshair.soft_target = Some(entity_id);
+        crosshair.aim_source = AimPointSource::EntityHit;
+    } else if let Some(point) = ground_pos.as_ref() {
+        crosshair.world_aim_point = Some(point.clone());
+        crosshair.aim_source = AimPointSource::WorldHit;
+    } else {
+        crosshair.world_aim_point = Some(make_vec3f(ray_origin + ray_dir * AIM_FALLBACK_DIST));
+        crosshair.aim_source = AimPointSource::Fallback;
+    }
+    crosshair.ground_position = ground_pos;
+    crosshair.camera_ray_dir = Some(make_vec3f(ray_dir));
+    crosshair.camera_ray_origin = Some(make_vec3f(ray_origin));
+    crosshair
+}
 
 /// TERA-style reticle: cast a ray from the camera through screen center.
 /// Tests against nearby entity capsule approximations first (sphere test),
@@ -453,6 +578,7 @@ fn update_crosshair(
     player_q: Query<&Transform, (With<LocalPlayer>, Without<GameCamera>)>,
     entity_q: Query<(&Transform, &crate::sync::ServerEntity), Without<GameCamera>>,
     local_player: Res<LocalPlayerEntity>,
+    active_dungeon: Option<Res<crate::dungeon_geometry::ActiveDungeon>>,
     mut crosshair: ResMut<CrosshairAim>,
 ) {
     let Ok((cam_gtf, camera)) = cam_q.get_single() else {
@@ -464,93 +590,43 @@ fn update_crosshair(
         return;
     };
 
-    // Ray from camera through the reticle pixel (matches RETICLE_TOP offset in hud.rs).
+    // Ray from camera through the same reticle anchor the HUD uses.
     let Some(viewport_size) = camera.logical_viewport_size() else {
         *crosshair = CrosshairAim::default();
         return;
     };
-    let reticle = Vec2::new(viewport_size.x * 0.5, viewport_size.y * 0.465);
+    let reticle = reticle_viewport_position(viewport_size);
     let Ok(ray) = camera.viewport_to_world(cam_gtf, reticle) else {
         *crosshair = CrosshairAim::default();
         return;
     };
+    *crosshair = resolve_crosshair_aim_state(
+        ray.origin,
+        ray.direction.as_vec3(),
+        entity_q
+            .iter()
+            .map(|(tf, se)| (se.entity_id, tf.translation)),
+        local_player.entity_id.unwrap_or(u64::MAX),
+    );
 
-    let ray_origin = ray.origin;
-    let ray_dir = ray.direction.as_vec3();
-
-    let local_id = local_player.entity_id.unwrap_or(u64::MAX);
-
-    // 1. Test against entity bounding spheres (capsule approximation).
-    let mut best_entity: Option<(u64, f32, Vec3)> = None;
-    for (tf, se) in entity_q.iter() {
-        if se.entity_id == local_id {
-            continue;
-        }
-        let to_entity = tf.translation - ray_origin;
-        let t = to_entity.dot(ray_dir);
-        if t < 0.0 || t > SOFT_TARGET_MAX_DIST {
-            continue;
-        }
-        let closest = ray_origin + ray_dir * t;
-        let dist_sq = (closest - tf.translation).length_squared();
-        if dist_sq < SOFT_TARGET_RADIUS * SOFT_TARGET_RADIUS {
-            if best_entity.is_none() || t < best_entity.unwrap().1 {
-                best_entity = Some((se.entity_id, t, closest));
+    // When the player is inside a dungeon, refine ground Y from the
+    // embedded heightfield. The plane-intersect above gave XZ at
+    // `GROUND_Y`; we re-sample the true surface at that XZ so AoE rings,
+    // ground-target reticles, and HUD debug lines stop floating through
+    // uneven terrain. The server re-validates GroundTarget placement
+    // regardless, so a miss here is cosmetic.
+    if let Some(active) = active_dungeon.as_deref() {
+        if let Some(g) = &mut crosshair.ground_position {
+            if let Some(y) = crate::dungeon_geometry::sample_terrain_y(active.template, g.x, g.z) {
+                g.y = y;
+                if matches!(crosshair.aim_source, AimPointSource::WorldHit) {
+                    if let Some(w) = &mut crosshair.world_aim_point {
+                        w.y = y;
+                    }
+                }
             }
         }
     }
-
-    // 2. Ground plane intersection (Y = GROUND_Y).
-    let ground_pos = if ray_dir.y.abs() > 1e-6 {
-        let t = (GROUND_Y - ray_origin.y) / ray_dir.y;
-        if t > 0.0 && t < SOFT_TARGET_MAX_DIST {
-            let p = ray_origin + ray_dir * t;
-            Some(Vec3F {
-                x: p.x,
-                y: p.y,
-                z: p.z,
-            })
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    // 3. Resolve aim point: entity hit takes priority.
-    // Note: We deliberately exclude the infinite mathematical ground plane (`ground_pos`)
-    // from this step. If we treated the floor as a raycast hit for directional abilities,
-    // aiming at the ground 5 meters away would cause the character to shoot steeply
-    // downward into the floor (parallax dipping). Instead, if no entity is hit, we
-    // fall back to a far convergence point to keep trajectory parallel with the horizon.
-    if let Some((eid, _t, hit_point)) = best_entity {
-        crosshair.aim_position = Some(Vec3F {
-            x: hit_point.x,
-            y: hit_point.y,
-            z: hit_point.z,
-        });
-        crosshair.soft_target = Some(eid);
-    } else {
-        // Fallback: convergence point 50 units down the camera ray
-        let aim = ray_origin + ray_dir * 50.0;
-        crosshair.aim_position = Some(Vec3F {
-            x: aim.x,
-            y: aim.y,
-            z: aim.z,
-        });
-        crosshair.soft_target = None;
-    }
-    crosshair.ground_position = ground_pos;
-    crosshair.camera_ray_dir = Some(Vec3F {
-        x: ray_dir.x,
-        y: ray_dir.y,
-        z: ray_dir.z,
-    });
-    crosshair.camera_ray_origin = Some(Vec3F {
-        x: ray_origin.x,
-        y: ray_origin.y,
-        z: ray_origin.z,
-    });
 }
 
 /// Lock-on input: ability key presses (open/fire), left-click to tag,
@@ -565,7 +641,6 @@ fn handle_lock_on_input(
     mut diag: ResMut<DiagnosticsState>,
     ack: Res<IntentAckStats>,
     crosshair: Res<CrosshairAim>,
-    lock: Res<TargetLockState>,
     bindings: Res<SkillBindings>,
     mut lock_on: ResMut<LockOnSession>,
 ) {
@@ -573,6 +648,15 @@ fn handle_lock_on_input(
     let Some(entity_id) = local_player.entity_id else {
         return;
     };
+
+    if let (Some(ability_id), Some(expires_at_tick)) =
+        (lock_on.active_ability, lock_on.expires_at_tick)
+    {
+        if tick_counter.last_tick >= expires_at_tick {
+            clear_lock_on_session(&mut lock_on);
+            log::info!("Lock-on timeout: ability {ability_id} expired at tick {expires_at_tick}");
+        }
+    }
 
     let keys = [
         KeyCode::Digit1,
@@ -590,7 +674,7 @@ fn handle_lock_on_input(
     for (i, key) in keys.iter().enumerate() {
         if keyboard.just_pressed(*key) {
             let id = bindings.slots[i];
-            let is_lock_on = ALL_ABILITIES
+            let is_lock_on = all_abilities()
                 .iter()
                 .any(|a| a.id == id && a.targeting == ClientTargetingMode::LockOn);
             if !is_lock_on {
@@ -613,7 +697,7 @@ fn handle_lock_on_input(
                     tick_counter.last_tick,
                     "LockOnFire",
                 );
-                lock_on.active_ability = None;
+                clear_lock_on_session(&mut lock_on);
                 cooldowns.activate(id, tick_counter.last_tick);
                 diag.record_intent();
                 log::info!("Lock-on FIRE: ability {id}");
@@ -630,6 +714,7 @@ fn handle_lock_on_input(
                         tick_counter.last_tick,
                         "LockOnCancelOld",
                     );
+                    lock_on.expires_at_tick = None;
                     log::info!("Lock-on cancel (switching): ability {old}");
                 }
                 // First press → open lock-on session.
@@ -648,6 +733,8 @@ fn handle_lock_on_input(
                     "LockOnOpen",
                 );
                 lock_on.active_ability = Some(id);
+                lock_on.expires_at_tick =
+                    Some(tick_counter.last_tick + lock_on_timeout_ticks_for(id));
                 diag.record_intent();
                 log::info!("Lock-on OPEN: ability {id} — click targets to tag");
             }
@@ -672,14 +759,14 @@ fn handle_lock_on_input(
             tick_counter.last_tick,
             "LockOnCancel",
         );
-        lock_on.active_ability = None;
+        clear_lock_on_session(&mut lock_on);
         log::info!("Lock-on CANCEL: ability {ability_id}");
         return;
     }
 
     // Tag: left-click on a target (hard-lock or soft-target).
     if mouse.just_pressed(MouseButton::Left) {
-        let target = lock.target_entity.or(crosshair.soft_target);
+        let target = select_lock_on_tag_target(&crosshair);
         if let Some(target_id) = target {
             tick_counter.intent_seq += 1;
             submit_intent_logged(
@@ -698,22 +785,6 @@ fn handle_lock_on_input(
     }
 }
 
-/// Debug: F9 triggers fake local-player death to test the death overlay.
-fn handle_debug_keys(
-    keyboard: Res<ButtonInput<KeyCode>>,
-    local_player: Res<LocalPlayerEntity>,
-    mut death_events: EventWriter<crate::vfx::DeathNotification>,
-) {
-    if keyboard.just_pressed(KeyCode::F9) {
-        let entity_id = local_player.entity_id.unwrap_or(0);
-        death_events.send(crate::vfx::DeathNotification {
-            entity_id,
-            is_local_player: true,
-        });
-        log::info!("Debug: F9 — fake death triggered");
-    }
-}
-
 /// E = Interact with target-locked entity.
 fn handle_interact(
     keyboard: Res<ButtonInput<KeyCode>>,
@@ -723,7 +794,7 @@ fn handle_interact(
     ack: Res<IntentAckStats>,
     lock: Res<TargetLockState>,
 ) {
-    if !keyboard.just_pressed(KeyCode::KeyE) {
+    if !keyboard.just_pressed(KeyCode::KeyB) {
         return;
     }
     let Some(stdb) = stdb else { return };
@@ -795,7 +866,7 @@ fn handle_abilities(
             if id == 0 {
                 break;
             }
-            let is_lock_on = ALL_ABILITIES
+            let is_lock_on = all_abilities()
                 .iter()
                 .any(|a| a.id == id && a.targeting == ClientTargetingMode::LockOn);
             if is_lock_on {
@@ -859,7 +930,7 @@ fn handle_abilities(
         if keyboard.just_pressed(*key) {
             let id = bindings.slots[i];
             if id != 0 && id != BLOCK_ABILITY_ID {
-                let is_lock_on = ALL_ABILITIES
+                let is_lock_on = all_abilities()
                     .iter()
                     .any(|a| a.id == id && a.targeting == ClientTargetingMode::LockOn);
                 if !is_lock_on {
@@ -874,8 +945,9 @@ fn handle_abilities(
         return;
     };
 
-    let ability_def = ALL_ABILITIES.iter().find(|a| a.id == ability_id).copied();
+    let ability_def = all_abilities().iter().find(|a| a.id == ability_id).cloned();
     let ability_targeting = ability_def
+        .as_ref()
         .map(|a| a.targeting)
         .unwrap_or(ClientTargetingMode::DirectionTarget);
 
@@ -896,7 +968,7 @@ fn handle_abilities(
             if let Some(pos) = crosshair
                 .ground_position
                 .as_ref()
-                .or(crosshair.aim_position.as_ref())
+                .or(crosshair.world_aim_point.as_ref())
             {
                 let clamped = if let (Some(max_range), Ok(player_tf)) = (
                     ability_def.and_then(|a| a.max_range),
@@ -966,6 +1038,7 @@ fn handle_abilities(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hud::{RETICLE_LEFT, RETICLE_TOP};
 
     #[test]
     fn clamp_ground_target_position_limits_horizontal_range() {
@@ -991,6 +1064,72 @@ mod tests {
             (clamped.y - 0.1).abs() < 0.01,
             "Expected Y to stay on ground plane, got {}",
             clamped.y
+        );
+    }
+
+    #[test]
+    fn movement_direction_matches_edsf_layout() {
+        let mut keyboard = ButtonInput::<KeyCode>::default();
+        keyboard.press(KeyCode::KeyE);
+        keyboard.press(KeyCode::KeyF);
+        let dir = movement_input_vector(&keyboard).normalize();
+        let rotated = rotated_move_dir(dir, 0.0);
+
+        assert!(rotated.x > 0.0);
+        assert!(rotated.z < 0.0);
+    }
+
+    #[test]
+    fn movement_direction_rotates_with_camera_yaw() {
+        let mut keyboard = ButtonInput::<KeyCode>::default();
+        keyboard.press(KeyCode::KeyE);
+        let dir = movement_input_vector(&keyboard).normalize();
+        let rotated = rotated_move_dir(dir, std::f32::consts::FRAC_PI_2);
+
+        assert!(rotated.x < -0.99);
+        assert!(rotated.z.abs() < 0.01);
+    }
+
+    #[test]
+    fn reticle_sampling_uses_same_anchor_as_hud() {
+        let viewport = Vec2::new(1920.0, 1080.0);
+        let reticle = crate::hud::reticle_viewport_position(viewport);
+
+        assert!((reticle.x - viewport.x * (RETICLE_LEFT * 0.01)).abs() < 0.01);
+        assert!((reticle.y - viewport.y * (RETICLE_TOP * 0.01)).abs() < 0.01);
+    }
+
+    #[test]
+    fn lock_on_tag_uses_crosshair_target_only() {
+        let crosshair = CrosshairAim {
+            soft_target: Some(42),
+            ..default()
+        };
+        assert_eq!(select_lock_on_tag_target(&crosshair), Some(42));
+    }
+
+    #[test]
+    fn resolve_aim_direction_preserves_vertical_pitch() {
+        let player_tf = Transform::from_xyz(0.0, 0.0, 0.0);
+        let crosshair = CrosshairAim {
+            world_aim_point: Some(Vec3F {
+                x: 0.0,
+                y: 10.0,
+                z: 10.0,
+            }),
+            ..default()
+        };
+
+        let dir = resolve_aim_direction(&player_tf, &crosshair, 0.0).expect("aim direction");
+        assert!(
+            dir.y > 0.6,
+            "Expected upward pitch to be preserved, got {}",
+            dir.y
+        );
+        assert!(
+            dir.z > 0.6,
+            "Expected forward component to be preserved, got {}",
+            dir.z
         );
     }
 }

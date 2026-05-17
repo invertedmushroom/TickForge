@@ -9,21 +9,24 @@ fn main() {
 
         let config = CoordinatorConfig {
             uri: std::env::var("STDB_URI").unwrap_or_else(|_| "http://localhost:3000".into()),
-            module_name: std::env::var("STDB_MODULE").unwrap_or_else(|_| "jump".into()),
+            module_name: std::env::var("STDB_MODULE").unwrap_or_else(|_| "tickforge".into()),
             auth_token: std::env::var("STDB_TOKEN").ok(),
         };
 
-        info!("Starting coordinator → {}:{}", config.uri, config.module_name);
+        info!(
+            "Starting coordinator → {}:{}",
+            config.uri, config.module_name
+        );
         coordinator::run(config);
     }
 
     #[cfg(not(feature = "connected"))]
     {
-        use simulation_worker::physics::rapier_world::PhysicsWorld;
-        use simulation_worker::physics::collision_groups;
         use game_protocol::entity_id::EntityId;
         use game_protocol::tick::TickConfig;
         use rapier3d::math::Vector;
+        use simulation_worker::physics::collision_groups;
+        use simulation_worker::physics::rapier_world::PhysicsWorld;
 
         let tick_config = TickConfig::default_20hz();
         info!(
@@ -34,7 +37,6 @@ fn main() {
 
         let mut world = PhysicsWorld::new(tick_config.dt);
         info!("Physics world initialized");
-
 
         let ball_id = world.add_dynamic_sphere(
             EntityId(2),
@@ -50,14 +52,21 @@ fn main() {
             world.step();
 
             if tick % 20 == 0
-                && let Some(pos) = world.get_body_position(ball_id) {
-                    info!("Tick {:>3}: ball position = ({:.3}, {:.3}, {:.3})", tick, pos.x, pos.y, pos.z);
-                }
+                && let Some(pos) = world.get_body_position(ball_id)
+            {
+                info!(
+                    "Tick {:>3}: ball position = ({:.3}, {:.3}, {:.3})",
+                    tick, pos.x, pos.y, pos.z
+                );
+            }
         }
 
         // Final position
         if let Some(pos) = world.get_body_position(ball_id) {
-            info!("Final ball position: ({:.3}, {:.3}, {:.3})", pos.x, pos.y, pos.z);
+            info!(
+                "Final ball position: ({:.3}, {:.3}, {:.3})",
+                pos.x, pos.y, pos.z
+            );
             assert!(pos.y < 1.0, "Ball should have fallen near ground (y≈0.5)");
             assert!(pos.y > 0.0, "Ball should rest on ground, not fall through");
             info!("Physics validation passed — ball fell and rested on ground");
@@ -67,7 +76,10 @@ fn main() {
         let ray_origin = Vector::new(0.0, 20.0, 0.0);
         let ray_dir = Vector::new(0.0, -1.0, 0.0);
         if let Some(hit) = world.raycast(ray_origin, ray_dir, 100.0) {
-            info!("Raycast hit at toi={:.3}, collider={:?}", hit.toi, hit.collider);
+            info!(
+                "Raycast hit at toi={:.3}, collider={:?}",
+                hit.toi, hit.collider
+            );
         } else {
             info!("Raycast missed (unexpected)");
         }

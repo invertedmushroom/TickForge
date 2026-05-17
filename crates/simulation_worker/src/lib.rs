@@ -8,6 +8,6 @@ pub mod tick_driver;
 pub mod tick_pipeline;
 
 #[cfg(feature = "connected")]
-pub mod module_bindings;
-#[cfg(feature = "connected")]
 pub mod coordinator;
+#[cfg(feature = "connected")]
+pub mod module_bindings;

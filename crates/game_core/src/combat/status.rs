@@ -170,7 +170,9 @@ impl ActiveBuff {
             buff_kind: template.buff_kind,
             stacks: 1,
             max_stacks: template.max_stacks,
-            expires_at: template.duration_ticks.map(|d| TickId(current_tick.0 + d as u64)),
+            expires_at: template
+                .duration_ticks
+                .map(|d| TickId(current_tick.0 + d as u64)),
             modifiers: template.modifiers,
             last_dot_tick: if template.modifiers.dot_damage.is_some() {
                 Some(current_tick)
@@ -203,7 +205,10 @@ impl ThreatTable {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.source == source) {
             entry.threat += amount;
         } else {
-            self.entries.push(ThreatEntry { source, threat: amount });
+            self.entries.push(ThreatEntry {
+                source,
+                threat: amount,
+            });
         }
     }
 
@@ -222,4 +227,10 @@ impl ThreatTable {
             .max_by(|a, b| a.threat.total_cmp(&b.threat))
             .map(|e| e.source)
     }
+}
+
+/// On-disk serialization format for `data/buffs.ron`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct BuffFile {
+    pub buffs: Vec<BuffTemplate>,
 }

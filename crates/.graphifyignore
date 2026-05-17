@@ -1,0 +1,9 @@
+# User-requested exclusions for crate-level graph builds.
+game_client/**
+game_client_bevy/**
+
+# Giant/noisy tests and fixtures that overwhelm the graph.
+simulation_worker/src/tick_pipeline/tests.rs
+simulation_worker/tests/fixtures/**
+simulation_worker/tests/mock_physics_teardown.rs
+simulation_worker/tests/deterministic_replay.rs

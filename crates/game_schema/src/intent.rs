@@ -18,8 +18,15 @@ pub struct UseAbilityData {
     pub ability_id: u32,
     pub target: AbilityTarget,
     /// Client-side soft-lock hint: the entity the crosshair was over when the
-    /// player pressed the ability key. The server uses this as a tie-breaker
-    /// for aim-assist cone checks, never as an authoritative override.
+    /// player pressed the ability key.
+    ///
+    /// **Authority:** advisory only. The server uses this *exclusively* as a
+    /// tie-breaker for `TargetingMode::AimAssist` cone resolution; all other
+    /// modes (`EntityTarget`, `DirectionTarget`, `GroundTarget`,
+    /// `RaycastStrict`, `LockOn`, `SelfOnly`, `CasterOffset`) ignore it.
+    /// The server never accepts `target_hint` as an authoritative target,
+    /// and never uses it to bypass range, layer, LoS, or team checks.
+    ///
     /// `None` = pure direction aim or self-cast.
     pub target_hint: Option<u64>,
 }
@@ -69,7 +76,7 @@ pub enum IntentAction {
     /// Only valid when the player has an active lock-on session (started by
     /// `UseAbility` for a `TargetingMode::LockOn` ability). The server validates
     /// range, LoS, and max-target count; invalid tags are silently dropped.
-    /// Emits `LockOnWarning` to the tagged entity on success.
+    /// Emits `LockOnAcquired` to the tagged entity on success.
     TagTarget(u64),
 }
 

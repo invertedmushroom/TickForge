@@ -1,15 +1,15 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use regex::Regex;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const MODULE_NAME: &str = "jump";
+const MODULE_NAME: &str = "tickforge";
 const SERVER_ALIAS: &str = "local";
 const SERVER_HOST: &str = "127.0.0.1:3000";
 const MODULE_PATH: &str = "crates/server_module";
@@ -42,28 +42,52 @@ enum TopLevel {
 #[derive(Subcommand)]
 enum DevCmd {
     Server,
+    /// Publish schema and regenerate bindings.
+    /// The WASM module is always built with Cargo's release profile.
     Schema,
     Reset(ResetArgs),
     WorkerRegister(WorkerRegisterArgs),
     Worker(RunWorkerArgs),
-    ClientTest(PassthroughArgs),
-    Client(PassthroughArgs),
+    /// Capture a deterministic replay fixture to a JSON file.
+    CaptureFixture(CaptureFixtureArgs),
+    ClientTest(ClientTestArgs),
+    Client(RunClientArgs),
+    Clients(RunClientsArgs),
+    /// Seed a synthetic terrain set + chunk via admin reducers (§4.8b smoke).
+    /// Pushes one `terrain_set`, one flat `terrain_chunk` (a 20×20 m quad
+    /// at y=0 made of 4 verts + 2 triangles), and a matching
+    /// `terrain_manifest` row, then exits. Bind a `WorldLayerDef` /
+    /// `DungeonTemplate` to the same `terrain_set` name and restart the
+    /// worker to verify the deferred queue end-to-end. Requires the
+    /// `debug` server feature (default on).
+    SeedTerrain(SeedTerrainArgs),
 }
 
 #[derive(Subcommand)]
 enum BuildCmd {
-    Worker,
-    Client,
+    Worker(BuildProfileArgs),
+    Client(BuildProfileArgs),
+    Cli(BuildProfileArgs),
     Wasm,
-    All,
+    All(BuildProfileArgs),
 }
 
 #[derive(Subcommand)]
 enum TestCmd {
     Fast,
     Worker,
-    Cli,
+    Cli(ClientTestArgs),
+    /// Run multi-client integration tests (requires running server + worker)
+    MultiClient(ClientTestArgs),
     Workspace,
+    /// Run the deterministic replay test suite (uses fixtures in crates/simulation_worker/tests/fixtures)
+    Replay(BuildProfileArgs),
+}
+
+#[derive(Args)]
+struct BuildProfileArgs {
+    #[arg(long)]
+    release: bool,
 }
 
 #[derive(Args)]
@@ -80,6 +104,9 @@ struct ResetArgs {
 struct WorkerRegisterArgs {
     #[arg(long)]
     seed_npc: bool,
+
+    #[arg(long)]
+    release: bool,
 }
 
 #[derive(Args)]
@@ -91,9 +118,71 @@ struct RunWorkerArgs {
 }
 
 #[derive(Args)]
-struct PassthroughArgs {
+struct CaptureFixtureArgs {
+    #[arg(
+        long,
+        default_value = "crates/simulation_worker/tests/fixtures/combat_lifecycle_v1.generated.json"
+    )]
+    out: String,
+
+    #[arg(long)]
+    release: bool,
+}
+
+#[derive(Args)]
+struct ClientTestArgs {
+    #[arg(long)]
+    release: bool,
+
     #[arg(last = true)]
     args: Vec<String>,
+}
+
+#[derive(Args)]
+struct RunClientArgs {
+    #[arg(long)]
+    release: bool,
+
+    #[arg(last = true)]
+    args: Vec<String>,
+}
+
+#[derive(Args)]
+struct RunClientsArgs {
+    #[arg(long)]
+    release: bool,
+
+    #[arg(long, default_value = ".client_token_a")]
+    token_a: String,
+
+    #[arg(long, default_value = ".client_token_b")]
+    token_b: String,
+
+    #[arg(last = true)]
+    args: Vec<String>,
+}
+
+#[derive(Args)]
+struct SeedTerrainArgs {
+    /// Name of the `terrain_set` row to upsert. Bind a layer to this
+    /// name (in `data/layers.ron` or a `DungeonTemplate`) to see the
+    /// chunk applied.
+    #[arg(long, default_value = "smoke_floor")]
+    set_name: String,
+
+    /// `terrain_set_id` to use for the chunk + manifest rows. Must
+    /// match the auto-incremented id assigned by the first upsert call;
+    /// for a fresh DB this is typically `1`.
+    #[arg(long, default_value_t = 1)]
+    set_id: u32,
+
+    /// Half-extent of the synthetic flat quad on the X/Z axes (meters).
+    #[arg(long, default_value_t = 10.0)]
+    half_extent: f32,
+
+    /// Y elevation of the synthetic floor (meters).
+    #[arg(long, default_value_t = 0.0)]
+    elevation: f32,
 }
 
 fn main() -> Result<()> {
@@ -112,27 +201,28 @@ fn run_dev(cmd: DevCmd) -> Result<()> {
         DevCmd::Reset(args) => dev_reset(args),
         DevCmd::WorkerRegister(args) => dev_worker_register(args),
         DevCmd::Worker(args) => dev_worker(args),
+        DevCmd::CaptureFixture(args) => dev_capture_fixture(args),
         DevCmd::ClientTest(args) => dev_client_test(args),
         DevCmd::Client(args) => dev_client(args),
+        DevCmd::Clients(args) => dev_clients(args),
+        DevCmd::SeedTerrain(args) => dev_seed_terrain(args),
     }
 }
 
 fn run_build(cmd: BuildCmd) -> Result<()> {
     match cmd {
-        BuildCmd::Worker => run_command(cargo_cmd([
-            "build",
-            "-p",
-            "simulation_worker",
-            "--features",
-            "connected",
-        ])),
-        BuildCmd::Client => run_command(cargo_cmd([
-            "build",
-            "-p",
-            "game_client",
-            "--features",
-            "connected",
-        ])),
+        BuildCmd::Worker(args) => run_command(cargo_build_command(
+            ["-p", "simulation_worker", "--features", "connected"],
+            args.release,
+        )),
+        BuildCmd::Client(args) => run_command(cargo_build_command(
+            ["-p", "game_client_bevy", "--features", "connected"],
+            args.release,
+        )),
+        BuildCmd::Cli(args) => run_command(cargo_build_command(
+            ["-p", "game_client", "--features", "connected"],
+            args.release,
+        )),
         BuildCmd::Wasm => run_command(cargo_cmd([
             "build",
             "-p",
@@ -141,10 +231,17 @@ fn run_build(cmd: BuildCmd) -> Result<()> {
             "wasm32-unknown-unknown",
             "--release",
         ])),
-        BuildCmd::All => {
+        BuildCmd::All(args) => {
             run_build(BuildCmd::Wasm)?;
-            run_build(BuildCmd::Worker)?;
-            run_build(BuildCmd::Client)
+            run_build(BuildCmd::Worker(BuildProfileArgs {
+                release: args.release,
+            }))?;
+            run_build(BuildCmd::Client(BuildProfileArgs {
+                release: args.release,
+            }))?;
+            run_build(BuildCmd::Cli(BuildProfileArgs {
+                release: args.release,
+            }))
         }
     }
 }
@@ -162,21 +259,26 @@ fn run_test(cmd: TestCmd) -> Result<()> {
             "--features",
             "connected",
         ])),
-        TestCmd::Cli => run_command(cargo_cmd([
-            "run",
-            "-p",
-            "game_client",
-            "--features",
-            "connected",
-            "--",
-            "--test",
-        ])),
+        TestCmd::Cli(args) => dev_client_test(args),
+        TestCmd::MultiClient(args) => {
+            let mut command = cargo_run_command(
+                ["-p", "game_client", "--features", "connected"],
+                args.release,
+            );
+            command.args(["--", "--test-multi"]);
+            command.args(args.args);
+            run_command(command)
+        }
         TestCmd::Workspace => run_command(cargo_cmd([
             "test",
             "--workspace",
             "--exclude",
             "server_module",
         ])),
+        TestCmd::Replay(args) => run_command(cargo_test_command(
+            ["-p", "simulation_worker", "--test", "deterministic_replay"],
+            args.release,
+        )),
     }
 }
 
@@ -244,6 +346,8 @@ fn dev_reset(args: ResetArgs) -> Result<()> {
     if reset_tokens {
         remove_if_exists(".worker_token")?;
         remove_if_exists(".client_token")?;
+        remove_if_exists(".client_token_a")?;
+        remove_if_exists(".client_token_b")?;
     }
 
     Ok(())
@@ -254,8 +358,10 @@ fn dev_worker_register(args: WorkerRegisterArgs) -> Result<()> {
         bail!("SpacetimeDB is not running. Start it with `cargo xtask dev server`.");
     }
 
-    run_build(BuildCmd::Worker)?;
-    let identity = capture_worker_identity()?;
+    run_build(BuildCmd::Worker(BuildProfileArgs {
+        release: args.release,
+    }))?;
+    let identity = capture_worker_identity(args.release)?;
     println!("Captured worker identity: {identity}");
 
     let id_json = format!(r#"{{"__identity__":"0x{identity}"}}"#);
@@ -310,39 +416,230 @@ fn dev_worker(args: RunWorkerArgs) -> Result<()> {
     run_command(command)
 }
 
-fn dev_client_test(args: PassthroughArgs) -> Result<()> {
-    let mut command = cargo_cmd([
-        "run",
-        "-p",
-        "game_client",
-        "--features",
-        "connected",
-        "--",
-        "--test",
-    ]);
+fn dev_client_test(args: ClientTestArgs) -> Result<()> {
+    let mut command = cargo_run_command(
+        ["-p", "game_client", "--features", "connected"],
+        args.release,
+    );
+    command.args(["--", "--test"]);
     command.args(args.args);
     run_command(command)
 }
 
-fn dev_client(args: PassthroughArgs) -> Result<()> {
-    let mut command = cargo_cmd([
-        "run",
-        "-p",
-        "game_client_bevy",
-        "--features",
-        "connected",
-        "--",
-    ]);
+fn dev_client(args: RunClientArgs) -> Result<()> {
+    let mut command = cargo_run_command(
+        ["-p", "game_client_bevy", "--features", "connected"],
+        args.release,
+    );
+    command.arg("--");
     command.args(args.args);
     run_command(command)
 }
 
-fn capture_worker_identity() -> Result<String> {
-    let mut child = cargo_cmd(["run", "-p", "simulation_worker", "--features", "connected"])
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
+fn dev_clients(args: RunClientsArgs) -> Result<()> {
+    run_build(BuildCmd::Client(BuildProfileArgs {
+        release: args.release,
+    }))?;
+
+    let client_bin = client_binary_path(args.release).ok_or_else(|| {
+        anyhow!(
+            "Bevy client binary not found in target/{} (expected one of: tickforge_client, game_client_bevy)",
+            if args.release { "release" } else { "debug" }
+        )
+    })?;
+
+    println!(
+        "Launching two Bevy clients with token files '{}' and '{}'",
+        args.token_a, args.token_b
+    );
+    println!("Tip: remove these with `cargo xtask dev reset --tokens` when done.");
+
+    let mut client_a = Command::new(&client_bin);
+    client_a.env("STDB_TOKEN_FILE", &args.token_a);
+    client_a.args(&args.args);
+
+    let mut client_b = Command::new(&client_bin);
+    client_b.env("STDB_TOKEN_FILE", &args.token_b);
+    client_b.args(&args.args);
+
+    let mut child_a = client_a
         .spawn()
-        .context("failed to launch simulation worker")?;
+        .with_context(|| format!("failed to launch client A ({})", client_bin.display()))?;
+    // Tiny stagger keeps first-launch logs readable and avoids startup races.
+    thread::sleep(Duration::from_millis(250));
+    let mut child_b = client_b
+        .spawn()
+        .with_context(|| format!("failed to launch client B ({})", client_bin.display()))?;
+
+    let status_a = child_a.wait().context("client A process failed")?;
+    let status_b = child_b.wait().context("client B process failed")?;
+    if !status_a.success() || !status_b.success() {
+        bail!("one or more Bevy clients exited with an error status");
+    }
+
+    Ok(())
+}
+
+/// Push one synthetic terrain set + one flat chunk + one manifest row
+/// into SpacetimeDB via the admin upsert reducers. Useful as an end-to-
+/// end smoke for §4.8b Phase 5: bind a layer to the same `set_name` and
+/// the worker should hydrate the chunk at the next tick boundary.
+///
+/// Vertices form a flat 2×half_extent square at `elevation` on the
+/// XZ plane, two CCW triangles, suitable for `SharedShape::trimesh`.
+fn dev_seed_terrain(args: SeedTerrainArgs) -> Result<()> {
+    if !is_server_up() {
+        bail!("SpacetimeDB is not running. Start it with `cargo xtask dev server`.");
+    }
+
+    let h = args.half_extent;
+    let y = args.elevation;
+    // 4 verts (xz-quad), CCW from above.
+    let vertices: Vec<f32> = vec![
+        -h, y, -h, // 0
+        h, y, -h, // 1
+        h, y, h, // 2
+        -h, y, h, // 3
+    ];
+    let indices: Vec<u32> = vec![0, 1, 2, 0, 2, 3];
+
+    let verts_json = floats_to_json(&vertices);
+    let idx_json = u32s_to_json(&indices);
+    let chunk_morton: u64 = 0; // single chunk at world origin
+    let lod: u8 = 0;
+    let content_hash = format!("smoke-{:x}-h{:.3}-y{:.3}", chunk_morton, h, y);
+    let version: u32 = 1;
+
+    println!(
+        "Seeding terrain set='{}' (id={}) with one {}×{} m flat chunk at y={}",
+        args.set_name,
+        args.set_id,
+        h * 2.0,
+        h * 2.0,
+        y,
+    );
+
+    // 1) terrain_set_upsert(name, content_hash, version)
+    run_command(command(
+        "spacetime",
+        [
+            "call",
+            MODULE_NAME,
+            "terrain_set_upsert",
+            args.set_name.as_str(),
+            content_hash.as_str(),
+            "1",
+            "-s",
+            SERVER_ALIAS,
+        ],
+    ))?;
+
+    // 2) terrain_chunk_upsert(set_id, morton, vertices, indices, lod)
+    let set_id_str = args.set_id.to_string();
+    let morton_str = chunk_morton.to_string();
+    let lod_str = lod.to_string();
+    run_command(command(
+        "spacetime",
+        [
+            "call",
+            MODULE_NAME,
+            "terrain_chunk_upsert",
+            set_id_str.as_str(),
+            morton_str.as_str(),
+            verts_json.as_str(),
+            idx_json.as_str(),
+            lod_str.as_str(),
+            "-s",
+            SERVER_ALIAS,
+        ],
+    ))?;
+
+    // 3) terrain_manifest_upsert(set_id, morton, content_hash, version)
+    let version_str = version.to_string();
+    run_command(command(
+        "spacetime",
+        [
+            "call",
+            MODULE_NAME,
+            "terrain_manifest_upsert",
+            set_id_str.as_str(),
+            morton_str.as_str(),
+            content_hash.as_str(),
+            version_str.as_str(),
+            "-s",
+            SERVER_ALIAS,
+        ],
+    ))?;
+
+    println!(
+        "Done. Bind a layer to terrain_set=\"{}\" (data/layers.ron or DungeonTemplate) \
+         and restart the worker; look for \"TerrainState: applied N insert(s)\" in the \
+         worker log.",
+        args.set_name,
+    );
+    Ok(())
+}
+
+/// Format a `&[f32]` as a SpacetimeDB CLI JSON array argument.
+fn floats_to_json(xs: &[f32]) -> String {
+    let mut s = String::with_capacity(xs.len() * 6 + 2);
+    s.push('[');
+    for (i, x) in xs.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        // Always emit a decimal point so STDB parses as f32, not int.
+        if x.fract() == 0.0 {
+            s.push_str(&format!("{:.1}", x));
+        } else {
+            s.push_str(&format!("{}", x));
+        }
+    }
+    s.push(']');
+    s
+}
+
+/// Format a `&[u32]` as a SpacetimeDB CLI JSON array argument.
+fn u32s_to_json(xs: &[u32]) -> String {
+    let mut s = String::with_capacity(xs.len() * 4 + 2);
+    s.push('[');
+    for (i, x) in xs.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&x.to_string());
+    }
+    s.push(']');
+    s
+}
+
+fn dev_capture_fixture(args: CaptureFixtureArgs) -> Result<()> {
+    let mut command = cargo_test_command(
+        ["-p", "simulation_worker", "--test", "deterministic_replay"],
+        args.release,
+    );
+    command.args([
+        "capture_combat_lifecycle_fixture_to_json",
+        "--",
+        "--ignored",
+        "--exact",
+        "--nocapture",
+    ]);
+
+    command.env("REPLAY_FIXTURE_OUT", args.out);
+    run_command(command)
+}
+
+fn capture_worker_identity(release: bool) -> Result<String> {
+    let mut child = cargo_run_command(
+        ["-p", "simulation_worker", "--features", "connected"],
+        release,
+    )
+    .env("RUST_LOG", "simulation_worker=info")
+    .stderr(Stdio::piped())
+    .stdout(Stdio::null())
+    .spawn()
+    .context("failed to launch simulation worker")?;
 
     let stderr = child
         .stderr
@@ -399,6 +696,49 @@ fn is_server_up() -> bool {
 
 fn cargo_cmd<const N: usize>(args: [&str; N]) -> Command {
     command("cargo", args)
+}
+
+fn cargo_build_command<const N: usize>(args: [&str; N], release: bool) -> Command {
+    let mut command = cargo_cmd(["build"]);
+    command.args(args);
+    if release {
+        command.arg("--release");
+    }
+    command
+}
+
+fn cargo_run_command<const N: usize>(args: [&str; N], release: bool) -> Command {
+    let mut command = cargo_cmd(["run"]);
+    command.args(args);
+    if release {
+        command.arg("--release");
+    }
+    command
+}
+
+fn cargo_test_command<const N: usize>(args: [&str; N], release: bool) -> Command {
+    let mut command = cargo_cmd(["test"]);
+    command.args(args);
+    if release {
+        command.arg("--release");
+    }
+    command
+}
+
+fn client_binary_path(release: bool) -> Option<PathBuf> {
+    let mut base = PathBuf::from("target");
+    base.push(if release { "release" } else { "debug" });
+
+    let candidates: &[&str] = if cfg!(windows) {
+        &["tickforge_client.exe", "game_client_bevy.exe"]
+    } else {
+        &["tickforge_client", "game_client_bevy"]
+    };
+
+    candidates
+        .iter()
+        .map(|name| base.join(name))
+        .find(|path| path.exists())
 }
 
 fn command<const N: usize>(program: &str, args: [&str; N]) -> Command {
