@@ -1,0 +1,8 @@
+[package]
+name = "game_protocol"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+game_schema = { workspace = true }
+serde = { workspace = true }

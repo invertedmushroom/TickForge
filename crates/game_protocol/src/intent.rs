@@ -1,0 +1,26 @@
+use serde::{Deserialize, Serialize};
+
+use crate::entity_id::EntityId;
+use crate::tick::TickId;
+
+// Shared intent types from game_schema.
+pub use game_schema::{IntentAction, AbilityTarget, MoveDir, UseAbilityData};
+
+/// Client input bound to a specific simulation tick.
+///
+/// Per spec: inputs must be explicitly bound to a tick to prevent drift.
+/// Reducers compute: target_tick = current_tick + 1.
+/// The simulation worker only processes intents where target_tick == current_tick.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlayerIntent {
+    /// Which client sent this.
+    pub client_id: EntityId,
+    /// Client-assigned sequence number for reconciliation and replay protection.
+    pub sequence_id: u64,
+    /// The tick this intent should be processed on.
+    pub target_tick: TickId,
+    /// Client-local timestamp for latency estimation.
+    pub client_time_ms: u64,
+    /// What the player wants to do.
+    pub action: IntentAction,
+}

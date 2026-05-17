@@ -1,0 +1,15 @@
+[package]
+name = "game_schema"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+# Enable SpacetimeType derives for use in the WASM server_module.
+# Native crates (game_protocol, game_core, simulation_worker) use
+# this crate WITHOUT this feature — only serde derives are active.
+spacetimedb = ["dep:spacetimedb"]
+
+[dependencies]
+serde = { workspace = true }
+spacetimedb = { version = "2.0", optional = true }

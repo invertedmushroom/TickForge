@@ -1,0 +1,41 @@
+[workspace]
+members = [
+    "crates/game_schema",
+    "crates/game_protocol",
+    "crates/game_core",
+    "crates/simulation_worker",
+    "crates/server_module",
+]
+default-members = [
+    "crates/game_schema",
+    "crates/game_protocol",
+    "crates/game_core",
+    "crates/simulation_worker",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Internal crates
+game_schema = { path = "crates/game_schema" }
+game_protocol = { path = "crates/game_protocol" }
+game_core = { path = "crates/game_core" }
+
+# Physics
+rapier3d = { version = "0.32", features = ["simd-stable", "parallel", "serde-serialize"] }
+nalgebra = "0.34"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# SpacetimeDB client SDK (must match server spacetimedb version)
+spacetimedb-sdk = "2.0"
