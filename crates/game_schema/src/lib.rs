@@ -10,6 +10,7 @@
 pub mod types;
 pub mod entity;
 pub mod damage;
+pub mod dungeon;
 pub mod equipment;
 pub mod intent;
 pub mod cc;

@@ -109,6 +109,8 @@ pub struct DirectorSpawn {
     pub kind: EntityKind,
     pub max_hp: f32,
     pub position: game_protocol::types::Vec3f,
+    /// Target visibility layer (0 = open world, 100+ = dynamic instance).
+    pub layer: u32,
 }
 
 /// World director state — owns event definitions and per-region player counts.
@@ -189,6 +191,7 @@ impl DirectorState {
                                 y: directive.offset[1],
                                 z: center_z + directive.offset[2],
                             },
+                            layer: 0,
                         });
                     }
                 }

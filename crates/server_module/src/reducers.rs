@@ -461,6 +461,7 @@ pub fn commit_tick_results(
     threat_cleared_entity_ids: Vec<u64>,
     npc_state_updates: Vec<NpcStateUpdate>,
     director_spawns: Vec<DirectorSpawnInput>,
+    interactable_updates: Vec<InteractableUpdate>,
 ) -> Result<(), String> {
     // Accept only trusted worker identities (or module identity in internal calls).
     if !is_trusted_caller(ctx) {
@@ -731,8 +732,23 @@ pub fn commit_tick_results(
             entity_id: eid,
             region_x: (s.pos_x / 50.0).floor() as i32,
             region_z: (s.pos_z / 50.0).floor() as i32,
-            layer: 0,
+            layer: s.layer,
         });
+    }
+
+    // Apply interactable state changes (switch toggled, chest opened, etc.)
+    for u in interactable_updates {
+        if let Some(existing) = ctx.db.interactable_config().entity_id().find(&u.entity_id) {
+            ctx.db.interactable_config().entity_id().update(InteractableConfig {
+                entity_id: existing.entity_id,
+                interact_kind: existing.interact_kind,
+                linked_entity: existing.linked_entity,
+                required_buff: existing.required_buff,
+                required_item: existing.required_item,
+                interact_range: existing.interact_range,
+                state: u.state,
+            });
+        }
     }
 
     // Advance the last_committed_tick cursor used by tick_trigger's backpressure guard.
@@ -860,6 +876,7 @@ pub struct DirectorSpawnInput {
     pub pos_x: f32,
     pub pos_y: f32,
     pub pos_z: f32,
+    pub layer: u32,
 }
 
 // ── Worker Registration ─────────────────────────────────────────────
@@ -1603,6 +1620,19 @@ const INSTANCE_DISCONNECT_GRACE_MICROS: i64 = 120_000_000;
 /// Grace period before ALL-disconnected instance is expired (5 min in microseconds).
 const INSTANCE_ALL_DISCONNECT_GRACE_MICROS: i64 = 300_000_000;
 
+/// Embedded dungeon templates — parsed once per reducer invocation.
+/// Cold path (instance creation is rare), so no caching needed.
+fn load_dungeon_template(template_id: &str) -> Result<game_schema::dungeon::DungeonTemplate, String> {
+    use game_schema::dungeon::DungeonFile;
+    const SRC: &str = include_str!("../../../data/dungeons.ron");
+    let file: DungeonFile = ron::from_str(SRC)
+        .map_err(|e| format!("dungeons.ron parse error: {e}"))?;
+    file.templates
+        .into_iter()
+        .find(|t| t.template_id == template_id)
+        .ok_or_else(|| format!("unknown template_id '{template_id}'"))
+}
+
 #[reducer]
 pub fn create_instance(
     ctx: &ReducerContext,
@@ -1613,11 +1643,18 @@ pub fn create_instance(
         return Err("create_instance: trusted caller only".into());
     }
 
+    let template = load_dungeon_template(&template_id)?;
+
     let mut cfg = ctx.db.module_config().key().find(0)
         .ok_or("ModuleConfig not found")?;
     let layer = cfg.next_instance_layer;
     cfg.next_instance_layer = layer + 1;
     ctx.db.module_config().key().update(cfg);
+
+    let current_tick = ctx.db.sim_tick().iter()
+        .max_by_key(|t| t.tick_id)
+        .map(|t| t.tick_id)
+        .unwrap_or(0);
 
     let now = ctx.timestamp.to_micros_since_unix_epoch();
     // Default expiry: 2 hours.
@@ -1634,9 +1671,74 @@ pub fn create_instance(
         max_players,
     });
 
+    // ── Pass 2: spawn interactable Prop entities ────────────────────
+    // Maps template-scoped local_id → real entity_id for linked_to resolution.
+    let mut local_to_entity: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+
+    // First pass: create all prop entities (so we have real IDs).
+    for def in &template.interactables {
+        let entity = ctx.db.entity().insert(Entity {
+            entity_id: 0,
+            kind: EntityKind::Prop,
+            state: EntityState::Spawning,
+            spawned_at_tick: current_tick,
+            owner_identity: None,
+        });
+        let eid = entity.entity_id;
+        local_to_entity.insert(def.local_id, eid);
+
+        ctx.db.entity_transform().insert(EntityTransform {
+            entity_id: eid,
+            pos_x: def.position[0],
+            pos_y: def.position[1],
+            pos_z: def.position[2],
+            rot_x: 0.0, rot_y: 0.0, rot_z: 0.0, rot_w: 1.0,
+            vel_x: 0.0, vel_y: 0.0, vel_z: 0.0,
+            angvel_x: 0.0, angvel_y: 0.0, angvel_z: 0.0,
+            last_tick: current_tick,
+        });
+
+        ctx.db.entity_health().insert(EntityHealth {
+            entity_id: eid,
+            hp: 1.0,
+            max_hp: 1.0,
+        });
+
+        ctx.db.entity_region().insert(EntityRegion {
+            entity_id: eid,
+            region_x: (def.position[0] / 50.0).floor() as i32,
+            region_z: (def.position[2] / 50.0).floor() as i32,
+            layer,
+        });
+    }
+
+    // Second pass: create interactable_config rows with resolved linked_entity IDs.
+    for def in &template.interactables {
+        let eid = local_to_entity[&def.local_id];
+        let linked_entity = def.linked_to.and_then(|lid| local_to_entity.get(&lid).copied());
+        let interact_kind = match &def.kind {
+            game_schema::dungeon::InteractKindDef::Gate => InteractKind::Gate,
+            game_schema::dungeon::InteractKindDef::Switch => InteractKind::Switch,
+            game_schema::dungeon::InteractKindDef::Chest => InteractKind::Chest,
+            // Boss/NPC spawns get Switch kind — trigger zone activates them.
+            game_schema::dungeon::InteractKindDef::BossSpawn { .. } => InteractKind::Switch,
+            game_schema::dungeon::InteractKindDef::NpcSpawn { .. } => InteractKind::Switch,
+        };
+
+        ctx.db.interactable_config().insert(InteractableConfig {
+            entity_id: eid,
+            interact_kind,
+            linked_entity,
+            required_buff: def.required_buff,
+            required_item: def.required_item,
+            interact_range: def.interact_range.unwrap_or(3.0),
+            state: InteractState::Idle,
+        });
+    }
+
     log::info!(
-        "Instance created: id={} template={} layer={} max_players={}",
-        inst.instance_id, template_id, layer, max_players
+        "Instance created: id={} template={} layer={} props={} max_players={}",
+        inst.instance_id, template_id, layer, template.interactables.len(), max_players
     );
     Ok(())
 }
@@ -1841,40 +1943,9 @@ pub fn expire_instances(ctx: &ReducerContext) -> Result<(), String> {
     Ok(())
 }
 
-/// Update interactable state. Trusted-worker only.
-/// Called by the simulation worker when an interact event changes object state.
-#[reducer]
-pub fn commit_interactable_updates(
-    ctx: &ReducerContext,
-    updates: Vec<InteractableUpdate>,
-) -> Result<(), String> {
-    if !is_trusted_caller(ctx) {
-        return Err("commit_interactable_updates: trusted worker only".into());
-    }
-    for u in updates {
-        if let Some(_existing) = ctx.db.interactable_config().entity_id().find(&u.entity_id) {
-            ctx.db.interactable_config().entity_id().update(InteractableConfig {
-                entity_id: u.entity_id,
-                interact_kind: u.interact_kind,
-                linked_entity: u.linked_entity,
-                required_buff: u.required_buff,
-                required_item: u.required_item,
-                interact_range: u.interact_range,
-                state: u.state,
-            });
-        }
-    }
-    Ok(())
-}
-
 #[derive(spacetimedb::SpacetimeType, Clone, Debug)]
 pub struct InteractableUpdate {
     pub entity_id: u64,
-    pub interact_kind: InteractKind,
-    pub linked_entity: Option<u64>,
-    pub required_buff: Option<u32>,
-    pub required_item: Option<u32>,
-    pub interact_range: f32,
     pub state: InteractState,
 }
 
@@ -2168,6 +2239,8 @@ mod debug_reducers {
                     ability_id_2: None,
                     ability_id_3: None,
                     ability_id_4: None,
+                    leash_radius: 0.0,
+                    aggro_radius: 0.0,
                 }));
                 log::info!("combat scenario: training dummy entity_id={e1}");
 
@@ -2180,6 +2253,8 @@ mod debug_reducers {
                     ability_id_2: None,
                     ability_id_3: None,
                     ability_id_4: None,
+                    leash_radius: 0.0,
+                    aggro_radius: 0.0,
                 }));
                 log::info!("combat scenario: melee NPC entity_id={e2}");
 
@@ -2192,6 +2267,8 @@ mod debug_reducers {
                     ability_id_2: None,
                     ability_id_3: None,
                     ability_id_4: None,
+                    leash_radius: 0.0,
+                    aggro_radius: 0.0,
                 }));
                 log::info!("combat scenario: ranged NPC entity_id={e3}");
 
@@ -2204,6 +2281,8 @@ mod debug_reducers {
                     ability_id_2: Some(2),
                     ability_id_3: None,
                     ability_id_4: None,
+                    leash_radius: 0.0,
+                    aggro_radius: 0.0,
                 }));
                 log::info!("combat scenario: full-combat NPC entity_id={e4}");
 
@@ -2229,6 +2308,8 @@ mod debug_reducers {
                             ability_id_2: None,
                             ability_id_3: None,
                             ability_id_4: None,
+                            leash_radius: 0.0,
+                            aggro_radius: 0.0,
                         }));
                         count += 1;
                     }
@@ -2269,6 +2350,8 @@ mod debug_reducers {
                     ability_id_2: None,
                     ability_id_3: None,
                     ability_id_4: None,
+                    leash_radius: 0.0,
+                    aggro_radius: 0.0,
                 }));
                 spawned += 1;
             }
@@ -2321,6 +2404,8 @@ mod debug_reducers {
                     ability_id_2: None,
                     ability_id_3: None,
                     ability_id_4: None,
+                    leash_radius: 0.0,
+                    aggro_radius: 0.0,
                 }));
                 let id_b = spawn_npc_internal(ctx, EntityKind::Npc, cx + 1.0, 1.0, cz, 1000.0, Some(NpcConfig {
                     entity_id: 0,
@@ -2330,6 +2415,8 @@ mod debug_reducers {
                     ability_id_2: None,
                     ability_id_3: None,
                     ability_id_4: None,
+                    leash_radius: 0.0,
+                    aggro_radius: 0.0,
                 }));
 
                 // Seed mutual aggro via npc_state — the worker restores

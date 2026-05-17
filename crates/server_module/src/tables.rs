@@ -222,6 +222,10 @@ pub struct NpcConfig {
     pub ability_id_2: Option<u32>,
     pub ability_id_3: Option<u32>,
     pub ability_id_4: Option<u32>,
+    /// Max distance from home position before NPC evades back. 0 = no leash.
+    pub leash_radius: f32,
+    /// Proximity aggro radius. Idle/patrol NPCs attack players within this. 0 = disabled.
+    pub aggro_radius: f32,
 }
 
 // ── Event Tables ────────────────────────────────────────────────────

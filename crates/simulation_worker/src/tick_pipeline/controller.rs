@@ -654,6 +654,7 @@ impl TickPipeline {
     }
 
     fn handle_interact(&mut self, entity_id: EntityId, target_id_raw: u64) {
+        use game_core::sim_state::{SimInteractKind, SimInteractState};
         let target = EntityId(target_id_raw);
         if let (Some(actor_t), Some(target_t)) = (
             self.physics.get_transform(entity_id),
@@ -662,9 +663,62 @@ impl TickPipeline {
             let dx = target_t.position.x - actor_t.position.x;
             let dz = target_t.position.z - actor_t.position.z;
             let dist_sq = dx * dx + dz * dz;
-            if dist_sq <= game_core::physics_constants::INTERACT_RADIUS * game_core::physics_constants::INTERACT_RADIUS {
-                self.set_entity_body_facing(entity_id, Vec3f { x: dx, y: 0.0, z: dz }, "interact_face");
-                self.emit_event(entity_id, EventPayload::InteractTriggered { target });
+
+            let max_range = game_core::physics_constants::INTERACT_RADIUS;
+            if dist_sq > max_range * max_range {
+                return;
+            }
+
+            self.set_entity_body_facing(entity_id, Vec3f { x: dx, y: 0.0, z: dz }, "interact_face");
+            self.emit_event(entity_id, EventPayload::InteractTriggered { target });
+
+            // Branch by interactable kind for state mutations.
+            let info = match self.state.interactables.get(&target) {
+                Some(info) => info.clone(),
+                None => return, // Not an interactable — event-only interaction
+            };
+
+            match info.kind {
+                SimInteractKind::Switch => {
+                    // Toggle: Idle ↔ Active
+                    let new_state = match info.state {
+                        SimInteractState::Idle => SimInteractState::Active,
+                        SimInteractState::Active => SimInteractState::Idle,
+                        SimInteractState::Cooldown => return, // Cannot interact during cooldown
+                    };
+
+                    // Update the switch itself.
+                    if let Some(entry) = self.state.interactables.get_mut(&target) {
+                        entry.state = new_state;
+                    }
+                    self.pending_interactable_updates.push((target, new_state));
+
+                    // Toggle linked gate collider.
+                    if let Some(gate_id) = info.linked_entity {
+                        let gate_enabled = new_state == SimInteractState::Active;
+                        // Gate Active = open = collider disabled (passable).
+                        // Gate Idle = closed = collider enabled (blocking).
+                        self.physics.set_collider_enabled(gate_id, !gate_enabled);
+
+                        let gate_state = if gate_enabled { SimInteractState::Active } else { SimInteractState::Idle };
+                        if let Some(entry) = self.state.interactables.get_mut(&gate_id) {
+                            entry.state = gate_state;
+                        }
+                        self.pending_interactable_updates.push((gate_id, gate_state));
+                    }
+                }
+                SimInteractKind::Chest => {
+                    if info.state != SimInteractState::Idle { return; }
+                    // Mark chest as Active (opened). Future: emit loot event.
+                    if let Some(entry) = self.state.interactables.get_mut(&target) {
+                        entry.state = SimInteractState::Active;
+                    }
+                    self.pending_interactable_updates.push((target, SimInteractState::Active));
+                }
+                SimInteractKind::Gate | SimInteractKind::Grab => {
+                    // Gates are not directly interactable (controlled by switches).
+                    // Grab: future implementation.
+                }
             }
         }
     }

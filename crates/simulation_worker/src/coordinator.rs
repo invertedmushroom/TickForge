@@ -67,6 +67,7 @@ fn send_commit(reducers: &RemoteReducers, pkg: CommitPackage, state: Arc<Mutex<C
     let threat_cleared_entity_ids = pkg.threat_cleared_entity_ids.clone();
     let npc_state_updates = wire_npc_state_updates(&pkg);
     let director_spawns = wire_director_spawns(&pkg);
+    let interactable_updates = wire_interactable_updates(&pkg);
 
     let state_for_ack = Arc::clone(&state);
 
@@ -85,6 +86,7 @@ fn send_commit(reducers: &RemoteReducers, pkg: CommitPackage, state: Arc<Mutex<C
         threat_cleared_entity_ids,
         npc_state_updates,
         director_spawns,
+        interactable_updates,
         move |rctx, outcome| {
             let reason = match &outcome {
                 Ok(Ok(())) => {
@@ -412,6 +414,8 @@ pub fn run(config: CoordinatorConfig) {
                     passive: c.passive,
                     no_chase: c.no_chase,
                     ability_ids,
+                    leash_radius: c.leash_radius,
+                    aggro_radius: c.aggro_radius,
                 }
             });
 
@@ -533,11 +537,112 @@ pub fn run(config: CoordinatorConfig) {
         EntitySync::sync_delete(&mut guard.sim, eid);
     });
 
+    // ── Instance lifecycle — spawn/despawn environment colliders ─────
+    // When the server creates an instance, the worker spawns parentless
+    // environment colliders (Pass 1) from the dungeon template. Prop
+    // entities for interactables are already created server-side (Pass 2).
+    let state_for_instance_insert = Arc::clone(&state);
+    conn.db.instance().on_insert(move |ctx, inst| {
+        // Skip initial subscription snapshot — existing instances are already
+        // running (or expired). Only react to live inserts.
+        if matches!(ctx.event, spacetimedb_sdk::Event::SubscribeApplied) {
+            return;
+        }
+        if inst.state != crate::module_bindings::InstanceState::Active
+            && inst.state != crate::module_bindings::InstanceState::Pending
+        {
+            return;
+        }
+        let mut guard = match state_for_instance_insert.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(template) = guard.dungeons.get(&inst.template_id) {
+            let template = template.clone();
+            let layer = inst.layer;
+            for geo in &template.geometry {
+                use game_core::physics_backend::EnvironmentShape;
+                let shape = match &geo.shape {
+                    game_schema::dungeon::ShapeDef::Cuboid { half_x, half_y, half_z } => {
+                        EnvironmentShape::Cuboid { half_x: *half_x, half_y: *half_y, half_z: *half_z }
+                    }
+                    game_schema::dungeon::ShapeDef::Cylinder { half_height, radius } => {
+                        EnvironmentShape::Cylinder { half_height: *half_height, radius: *radius }
+                    }
+                };
+                let pos = game_protocol::types::Vec3f {
+                    x: geo.position[0],
+                    y: geo.position[1],
+                    z: geo.position[2],
+                };
+                guard.sim.physics_mut().add_environment_collider_on_layer(shape, pos, layer);
+            }
+            info!(
+                "Instance {} (template={}): spawned {} environment colliders on layer {}",
+                inst.instance_id, inst.template_id, template.geometry.len(), layer
+            );
+        } else {
+            warn!(
+                "Instance {} references unknown template '{}' — no geometry spawned",
+                inst.instance_id, inst.template_id
+            );
+        }
+    });
+
+    // On instance update → Expired: remove environment colliders for that layer.
+    let state_for_instance_update = Arc::clone(&state);
+    conn.db.instance().on_update(move |_ctx, old_inst, new_inst| {
+        // Only act when state transitions to Expired.
+        if old_inst.state == new_inst.state {
+            return;
+        }
+        if new_inst.state != crate::module_bindings::InstanceState::Expired {
+            return;
+        }
+        let mut guard = match state_for_instance_update.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.sim.physics_mut().remove_environment_colliders_by_layer(new_inst.layer);
+        info!(
+            "Instance {} expired: removed environment colliders from layer {}",
+            new_inst.instance_id, new_inst.layer
+        );
+    });
+
     // ── Equipment bridge ────────────────────────────────────────────
     // Observe player_equipment changes to trigger stat recalculation.
     // These callbacks fire when a client calls equip_item / unequip_item
     // reducers. The coordinator queues a stat recalc on SimulationRunner,
     // which applies it before the next tick's Phase 1.
+
+    // ── Interactable config bridge ──────────────────────────────────
+    // Populate the sim-side interactable map from DB subscription so
+    // handle_interact can branch by kind and toggle gate colliders.
+
+    let state_for_interact_insert = Arc::clone(&state);
+    conn.db.interactable_config().on_insert(move |_ctx, row| {
+        let mut guard = match state_for_interact_insert.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let info = convert_interactable_info(&row);
+        guard.sim.pipeline.state.interactables.insert(EntityId(row.entity_id), info);
+    });
+
+    let state_for_interact_update = Arc::clone(&state);
+    conn.db.interactable_config().on_update(move |_ctx, _old, row| {
+        let mut guard = match state_for_interact_update.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let info = convert_interactable_info(&row);
+        guard.sim.pipeline.state.interactables.insert(EntityId(row.entity_id), info);
+    });
+
+    // TODO: add on_delete callback to remove stale entries from
+    // sim.pipeline.state.interactables when interactable_config rows
+    // are deleted at runtime (e.g. instance teardown).
 
     let state_for_equip_insert = Arc::clone(&state);
     conn.db.player_equipment().on_insert(move |ctx, row| {
@@ -643,6 +748,8 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
             "SELECT * FROM active_buff",
             "SELECT * FROM npc_state",
             "SELECT * FROM player_equipment",
+            "SELECT * FROM instance",
+            "SELECT * FROM interactable_config",
         ]);
 }
 
@@ -993,6 +1100,27 @@ fn convert_npc_ai_state(state: crate::module_bindings::NpcAiState) -> game_schem
         crate::module_bindings::NpcAiState::Combat => game_schema::NpcAiState::Combat,
         crate::module_bindings::NpcAiState::Flee => game_schema::NpcAiState::Flee,
         crate::module_bindings::NpcAiState::Scripted => game_schema::NpcAiState::Scripted,
+        crate::module_bindings::NpcAiState::Evade => game_schema::NpcAiState::Evade,
+    }
+}
+
+fn convert_interactable_info(row: &crate::module_bindings::InteractableConfig) -> game_core::sim_state::InteractableInfo {
+    use game_core::sim_state::{SimInteractKind, SimInteractState, InteractableInfo};
+    let kind = match row.interact_kind {
+        crate::module_bindings::InteractKind::Switch => SimInteractKind::Switch,
+        crate::module_bindings::InteractKind::Gate => SimInteractKind::Gate,
+        crate::module_bindings::InteractKind::Grab => SimInteractKind::Grab,
+        crate::module_bindings::InteractKind::Chest => SimInteractKind::Chest,
+    };
+    let state = match row.state {
+        crate::module_bindings::InteractState::Idle => SimInteractState::Idle,
+        crate::module_bindings::InteractState::Active => SimInteractState::Active,
+        crate::module_bindings::InteractState::Cooldown => SimInteractState::Cooldown,
+    };
+    InteractableInfo {
+        kind,
+        linked_entity: row.linked_entity.map(EntityId),
+        state,
     }
 }
 
@@ -1330,6 +1458,7 @@ fn wire_director_spawns(pkg: &CommitPackage) -> Vec<DirectorSpawnInput> {
             pos_x: s.pos_x,
             pos_y: s.pos_y,
             pos_z: s.pos_z,
+            layer: s.layer,
         })
         .collect()
 }
@@ -1347,6 +1476,23 @@ fn convert_entity_kind_to_wire(
     }
 }
 
+fn wire_interactable_updates(pkg: &CommitPackage) -> Vec<InteractableUpdate> {
+    pkg.interactable_updates
+        .iter()
+        .map(|u| {
+            let new_state = match u.new_state {
+                game_core::sim_state::SimInteractState::Idle => crate::module_bindings::InteractState::Idle,
+                game_core::sim_state::SimInteractState::Active => crate::module_bindings::InteractState::Active,
+                game_core::sim_state::SimInteractState::Cooldown => crate::module_bindings::InteractState::Cooldown,
+            };
+            InteractableUpdate {
+                entity_id: u.entity_id,
+                state: new_state,
+            }
+        })
+        .collect()
+}
+
 fn wire_npc_ai_state(state: game_schema::NpcAiState) -> NpcAiState {
     match state {
         game_schema::NpcAiState::Idle => NpcAiState::Idle,
@@ -1354,6 +1500,7 @@ fn wire_npc_ai_state(state: game_schema::NpcAiState) -> NpcAiState {
         game_schema::NpcAiState::Combat => NpcAiState::Combat,
         game_schema::NpcAiState::Flee => NpcAiState::Flee,
         game_schema::NpcAiState::Scripted => NpcAiState::Scripted,
+        game_schema::NpcAiState::Evade => NpcAiState::Evade,
     }
 }
 

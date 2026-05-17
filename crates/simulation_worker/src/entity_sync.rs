@@ -73,6 +73,8 @@ pub struct NpcSpawnConfig {
     pub passive: bool,
     pub no_chase: bool,
     pub ability_ids: Vec<u32>,
+    pub leash_radius: f32,
+    pub aggro_radius: f32,
 }
 
 /// SDK-free entity lifecycle mirroring logic.

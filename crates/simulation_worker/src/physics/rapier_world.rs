@@ -1279,4 +1279,123 @@ mod tests {
         // e2 still works
         assert!(world.get_body_position(e2).is_some());
     }
+
+    #[test]
+    fn add_and_remove_environment_colliders_by_layer() {
+        use game_core::physics_backend::EnvironmentShape;
+
+        let mut world = PhysicsWorld::new(1.0 / 60.0);
+
+        // Add 3 colliders on layer 100, 1 on layer 101.
+        let h1 = world.add_environment_collider_on_layer(
+            EnvironmentShape::Cuboid { half_x: 5.0, half_y: 1.0, half_z: 5.0 },
+            game_protocol::types::Vec3f::new(0.0, 0.0, 0.0),
+            100,
+        );
+        let h2 = world.add_environment_collider_on_layer(
+            EnvironmentShape::Cuboid { half_x: 1.0, half_y: 3.0, half_z: 0.5 },
+            game_protocol::types::Vec3f::new(10.0, 3.0, 0.0),
+            100,
+        );
+        let h3 = world.add_environment_collider_on_layer(
+            EnvironmentShape::Cylinder { half_height: 2.0, radius: 0.5 },
+            game_protocol::types::Vec3f::new(-5.0, 2.0, -5.0),
+            100,
+        );
+        let h4 = world.add_environment_collider_on_layer(
+            EnvironmentShape::Cuboid { half_x: 2.0, half_y: 1.0, half_z: 2.0 },
+            game_protocol::types::Vec3f::new(0.0, 0.0, 20.0),
+            101,
+        );
+
+        // All handles should be distinct.
+        let handles = [h1, h2, h3, h4];
+        for i in 0..handles.len() {
+            for j in (i + 1)..handles.len() {
+                assert_ne!(handles[i], handles[j], "handles must be unique");
+            }
+        }
+
+        // Verify tracking maps.
+        assert_eq!(world.env_colliders_by_layer.get(&100).map(|v| v.len()), Some(3));
+        assert_eq!(world.env_colliders_by_layer.get(&101).map(|v| v.len()), Some(1));
+        assert_eq!(world.env_collider_handles.len(), 4);
+
+        // Remove layer 100 — should leave layer 101 intact.
+        world.remove_environment_colliders_by_layer(100);
+        assert!(world.env_colliders_by_layer.get(&100).is_none());
+        assert_eq!(world.env_collider_handles.len(), 1);
+        assert_eq!(world.env_colliders_by_layer.get(&101).map(|v| v.len()), Some(1));
+
+        // Remove layer 101.
+        world.remove_environment_colliders_by_layer(101);
+        assert!(world.env_collider_handles.is_empty());
+        assert!(world.env_colliders_by_layer.is_empty());
+
+        // Double-remove is a no-op.
+        world.remove_environment_colliders_by_layer(100);
+    }
+
+    #[test]
+    fn layer_colliders_block_raycast() {
+        use game_core::physics_backend::EnvironmentShape;
+
+        let mut world = PhysicsWorld::new(1.0 / 60.0);
+
+        // Place a wall at x=5.
+        world.add_environment_collider_on_layer(
+            EnvironmentShape::Cuboid { half_x: 0.5, half_y: 5.0, half_z: 5.0 },
+            game_protocol::types::Vec3f::new(5.0, 5.0, 0.0),
+            100,
+        );
+        world.step();
+
+        // Raycast from x=0 toward +x should hit the wall.
+        let hit = world.raycast(
+            Vector::new(0.0, 5.0, 0.0),
+            Vector::new(1.0, 0.0, 0.0),
+            20.0,
+        );
+        assert!(hit.is_some(), "ray should hit the layer collider wall");
+        let toi = hit.unwrap().toi;
+        assert!(toi > 3.0 && toi < 6.0, "hit should be near x=5, got toi={toi}");
+
+        // Remove layer 100 — ray should now pass through.
+        world.remove_environment_colliders_by_layer(100);
+        world.step();
+
+        let hit_after = world.raycast(
+            Vector::new(0.0, 5.0, 0.0),
+            Vector::new(1.0, 0.0, 0.0),
+            20.0,
+        );
+        // Should only hit the far ground or nothing (the ground is at y≈0).
+        // At y=5 shooting horizontally, no ground hit expected within 20 units.
+        assert!(hit_after.is_none(), "ray should pass through after layer removal");
+    }
+
+    #[test]
+    fn set_collider_enabled_toggles_prop() {
+        let mut world = PhysicsWorld::new(1.0 / 60.0);
+        let entity_id = EntityId(10);
+
+        // Spawn a prop (gate). spawn_prop_body creates a body with a collider.
+        let created = world.spawn_prop_body(
+            entity_id,
+            game_protocol::types::Vec3f::new(5.0, 1.0, 0.0),
+            game_protocol::types::Vec3f::new(0.5, 2.0, 2.0),
+            false,
+        );
+        assert!(created, "prop should be created");
+        world.step();
+
+        // Disable the collider (gate opens).
+        assert!(world.set_collider_enabled(entity_id, false));
+
+        // Re-enable (gate closes).
+        assert!(world.set_collider_enabled(entity_id, true));
+
+        // Non-existent entity returns false.
+        assert!(!world.set_collider_enabled(EntityId(999), false));
+    }
 }

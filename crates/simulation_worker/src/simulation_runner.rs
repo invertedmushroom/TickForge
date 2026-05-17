@@ -149,6 +149,12 @@ impl SimulationRunner {
             if cfg.no_chase {
                 self.pipeline.state.ai.npc_no_chase.insert(idx, true);
             }
+            if cfg.leash_radius > 0.0 {
+                self.pipeline.state.ai.npc_leash_radius.insert(idx, cfg.leash_radius);
+            }
+            if cfg.aggro_radius > 0.0 {
+                self.pipeline.state.ai.npc_aggro_radius.insert(idx, cfg.aggro_radius);
+            }
             if !cfg.ability_ids.is_empty() {
                 // Replace default NPC abilities assigned during spawn.
                 self.pipeline.state.ai.npc_ability_ids.remove(idx);
@@ -179,6 +185,11 @@ impl SimulationRunner {
     /// Whether the entity has a live index mapping (not yet fully removed).
     pub fn entity_exists(&self, id: EntityId) -> bool {
         self.pipeline.state.entities.lookup(id).is_some()
+    }
+
+    /// Mutable access to the physics backend (for instance collider management).
+    pub fn physics_mut(&mut self) -> &mut dyn game_core::physics_backend::PhysicsBackend {
+        self.pipeline.physics_mut()
     }
 }
 

@@ -202,6 +202,9 @@ pub fn run_tests(config: ClientConfig) -> i32 {
     // ── M4: Disconnect survival (SpacetimeDB #4648) ───────────────
     run_disconnect_survival_test(&config, &results);
 
+    // ── P1–P4: Party lifecycle ────────────────────────────────────
+    run_party_lifecycle_tests(&config, &results);
+
     // ── Summary ─────────────────────────────────────────────────────
     let r = results.lock().unwrap();
     info!("");
@@ -456,4 +459,302 @@ fn run_disconnect_survival_test(config: &ClientConfig, results: &Arc<Mutex<TestR
     let _ = client_b.conn.reducers().debug_remove_entity(eid_a);
     drop(r);
     pump(&client_b.conn, 300);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// P1–P4: Party Lifecycle
+//
+// Two clients exercise create_party → invite → accept → leave/disband.
+// Requires subscribing to party tables so the client cache is populated.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Connect a client with extended subscriptions including party and instance tables.
+fn connect_party_client(uri: &str, module_name: &str) -> ClientHandle {
+    let sub_applied = Arc::new(AtomicBool::new(false));
+    let entity_id = Arc::new(AtomicU64::new(0));
+
+    let sa = Arc::clone(&sub_applied);
+    let eid = Arc::clone(&entity_id);
+
+    let conn = DbConnection::builder()
+        .with_uri(uri)
+        .with_database_name(module_name)
+        .on_connect(move |ctx: &DbConnection, _identity, _token: &str| {
+            let sa2 = Arc::clone(&sa);
+            let eid2 = Arc::clone(&eid);
+            let identity = ctx.identity();
+
+            let _ = ctx.reducers().spawn_player_then(move |ctx, result| {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) if e.contains("already spawned") => {}
+                    Ok(Err(e)) => warn!("spawn_player error: {e}"),
+                    Err(e) => warn!("spawn_player internal error: {e}"),
+                }
+
+                let my_identity = identity;
+                ctx.subscription_builder()
+                    .on_applied(move |ctx| {
+                        let id = ctx.db.client_sequence()
+                            .client_identity()
+                            .find(&my_identity)
+                            .map(|cs| cs.entity_id)
+                            .unwrap_or(0);
+                        eid2.store(id, Ordering::SeqCst);
+                        sa2.store(true, Ordering::SeqCst);
+                    })
+                    .on_error(|_ctx, err| error!("Subscription error: {err}"))
+                    .subscribe([
+                        "SELECT * FROM my_region",
+                        "SELECT * FROM nearby_transforms",
+                        "SELECT * FROM nearby_entities",
+                        "SELECT * FROM nearby_health",
+                        "SELECT * FROM client_sequence",
+                        "SELECT * FROM sim_tick",
+                        "SELECT * FROM entity",
+                        "SELECT * FROM module_config",
+                        "SELECT * FROM party",
+                        "SELECT * FROM party_member",
+                        "SELECT * FROM party_invite",
+                        "SELECT * FROM instance",
+                        "SELECT * FROM instance_membership",
+                    ]);
+            });
+        })
+        .on_connect_error(|_ctx, err| error!("Connection failed: {err}"))
+        .on_disconnect(|_ctx, _err| {})
+        .build()
+        .expect("Failed to build DbConnection");
+
+    ClientHandle { conn, sub_applied, entity_id }
+}
+
+/// Helper: call a reducer with a _then callback and wait for the result.
+/// Returns Ok(()) on success, Err(msg) on reducer error or timeout.
+fn call_reducer_wait(
+    conn: &DbConnection,
+    timeout_ms: u64,
+    call: impl FnOnce(Arc<AtomicBool>, Arc<Mutex<Result<(), String>>>) -> spacetimedb_sdk::Result<()>,
+) -> Result<(), String> {
+    let done = Arc::new(AtomicBool::new(false));
+    let result: Arc<Mutex<Result<(), String>>> = Arc::new(Mutex::new(Err("timeout".into())));
+    call(Arc::clone(&done), Arc::clone(&result))
+        .map_err(|e| format!("send failed: {e}"))?;
+    let ok = wait_for(conn, timeout_ms, || done.load(Ordering::SeqCst));
+    if !ok {
+        return Err("timed out waiting for reducer callback".into());
+    }
+    result.lock().unwrap().clone()
+}
+
+fn run_party_lifecycle_tests(config: &ClientConfig, results: &Arc<Mutex<TestResults>>) {
+    info!("");
+    info!("── Party Lifecycle Tests ────────────────────────────────────");
+
+    let client_a = connect_party_client(&config.uri, &config.module_name);
+    let client_b = connect_party_client(&config.uri, &config.module_name);
+
+    let sa_a = Arc::clone(&client_a.sub_applied);
+    let sa_b = Arc::clone(&client_b.sub_applied);
+    let both_ready = wait_for_both(
+        &client_a.conn,
+        &client_b.conn,
+        15000,
+        || sa_a.load(Ordering::SeqCst) && sa_b.load(Ordering::SeqCst),
+    );
+
+    let mut r = results.lock().unwrap();
+    if !both_ready {
+        r.fail("P0  timed out waiting for party clients to subscribe");
+        return;
+    }
+    r.pass("P0  both party clients connected and subscribed");
+
+    let eid_a = client_a.entity_id.load(Ordering::SeqCst);
+    let eid_b = client_b.entity_id.load(Ordering::SeqCst);
+    drop(r);
+
+    // ── P1: Create party ──────────────────────────────────────────
+    let create_result = call_reducer_wait(&client_a.conn, 5000, |done, result| {
+        client_a.conn.reducers().create_party_then(move |_ctx, res| {
+            *result.lock().unwrap() = match res {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(format!("{e}")),
+            };
+            done.store(true, Ordering::SeqCst);
+        })
+    });
+
+    pump_both(&client_a.conn, &client_b.conn, 500);
+    let mut r = results.lock().unwrap();
+
+    match create_result {
+        Ok(()) => r.pass("P1  create_party succeeded"),
+        Err(e) => {
+            r.fail(&format!("P1  create_party failed: {e}"));
+            // Cleanup and bail — remaining party tests depend on this.
+            let _ = client_a.conn.reducers().debug_remove_entity(eid_a);
+            let _ = client_b.conn.reducers().debug_remove_entity(eid_b);
+            drop(r);
+            pump_both(&client_a.conn, &client_b.conn, 300);
+            return;
+        }
+    }
+
+    // Verify party_member row exists for A.
+    let a_is_member = client_a.conn.db().party_member().iter()
+        .any(|pm| pm.entity_id == eid_a);
+    if a_is_member {
+        r.pass("P1b  client A appears in party_member table");
+    } else {
+        r.fail("P1b  client A missing from party_member table");
+    }
+    drop(r);
+
+    // ── P2: Invite + Accept ───────────────────────────────────────
+    let invite_result = call_reducer_wait(&client_a.conn, 5000, |done, result| {
+        client_a.conn.reducers().invite_to_party_then(eid_b, move |_ctx, res| {
+            *result.lock().unwrap() = match res {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(format!("{e}")),
+            };
+            done.store(true, Ordering::SeqCst);
+        })
+    });
+
+    pump_both(&client_a.conn, &client_b.conn, 500);
+    let mut r = results.lock().unwrap();
+
+    match invite_result {
+        Ok(()) => r.pass("P2a  invite_to_party succeeded"),
+        Err(e) => {
+            r.fail(&format!("P2a  invite_to_party failed: {e}"));
+            let _ = client_a.conn.reducers().debug_remove_entity(eid_a);
+            let _ = client_b.conn.reducers().debug_remove_entity(eid_b);
+            drop(r);
+            pump_both(&client_a.conn, &client_b.conn, 300);
+            return;
+        }
+    }
+
+    // Client B should see the invite.
+    let invite = client_b.conn.db().party_invite().iter()
+        .find(|inv| inv.invitee_entity == eid_b);
+    let invite_id = match invite {
+        Some(inv) => {
+            r.pass(&format!("P2b  client B sees invite (id={})", inv.invite_id));
+            inv.invite_id
+        }
+        None => {
+            r.fail("P2b  client B does not see party_invite");
+            let _ = client_a.conn.reducers().debug_remove_entity(eid_a);
+            let _ = client_b.conn.reducers().debug_remove_entity(eid_b);
+            drop(r);
+            pump_both(&client_a.conn, &client_b.conn, 300);
+            return;
+        }
+    };
+    drop(r);
+
+    // Accept the invite.
+    let accept_result = call_reducer_wait(&client_b.conn, 5000, |done, result| {
+        client_b.conn.reducers().accept_party_invite_then(invite_id, move |_ctx, res| {
+            *result.lock().unwrap() = match res {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(format!("{e}")),
+            };
+            done.store(true, Ordering::SeqCst);
+        })
+    });
+
+    pump_both(&client_a.conn, &client_b.conn, 500);
+    let mut r = results.lock().unwrap();
+
+    match accept_result {
+        Ok(()) => r.pass("P2c  accept_party_invite succeeded"),
+        Err(e) => r.fail(&format!("P2c  accept_party_invite failed: {e}")),
+    }
+
+    // Both should be members now.
+    let member_count = client_a.conn.db().party_member().iter()
+        .filter(|pm| {
+            // Find A's party_id.
+            client_a.conn.db().party_member().iter()
+                .find(|m| m.entity_id == eid_a)
+                .map(|m| m.party_id == pm.party_id)
+                .unwrap_or(false)
+        })
+        .count();
+    if member_count == 2 {
+        r.pass("P2d  both clients are party members (count=2)");
+    } else {
+        r.warn_msg(&format!("P2d  expected 2 party members, found {member_count}"));
+    }
+    drop(r);
+
+    // ── P3: Leave party ───────────────────────────────────────────
+    let leave_result = call_reducer_wait(&client_b.conn, 5000, |done, result| {
+        client_b.conn.reducers().leave_party_then(move |_ctx, res| {
+            *result.lock().unwrap() = match res {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(format!("{e}")),
+            };
+            done.store(true, Ordering::SeqCst);
+        })
+    });
+
+    pump_both(&client_a.conn, &client_b.conn, 500);
+    let mut r = results.lock().unwrap();
+
+    match leave_result {
+        Ok(()) => r.pass("P3  leave_party succeeded"),
+        Err(e) => r.fail(&format!("P3  leave_party failed: {e}")),
+    }
+
+    let b_still_member = client_b.conn.db().party_member().iter()
+        .any(|pm| pm.entity_id == eid_b);
+    if !b_still_member {
+        r.pass("P3b  client B removed from party_member table");
+    } else {
+        r.fail("P3b  client B still in party_member table after leaving");
+    }
+    drop(r);
+
+    // ── P4: Disband party ─────────────────────────────────────────
+    let disband_result = call_reducer_wait(&client_a.conn, 5000, |done, result| {
+        client_a.conn.reducers().disband_party_then(move |_ctx, res| {
+            *result.lock().unwrap() = match res {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(e) => Err(format!("{e}")),
+            };
+            done.store(true, Ordering::SeqCst);
+        })
+    });
+
+    pump_both(&client_a.conn, &client_b.conn, 500);
+    let mut r = results.lock().unwrap();
+
+    match disband_result {
+        Ok(()) => r.pass("P4  disband_party succeeded"),
+        Err(e) => r.fail(&format!("P4  disband_party failed: {e}")),
+    }
+
+    let a_still_member = client_a.conn.db().party_member().iter()
+        .any(|pm| pm.entity_id == eid_a);
+    if !a_still_member {
+        r.pass("P4b  client A removed from party_member after disband");
+    } else {
+        r.fail("P4b  client A still in party_member after disband");
+    }
+    drop(r);
+
+    // Cleanup.
+    let _ = client_a.conn.reducers().debug_remove_entity(eid_a);
+    let _ = client_b.conn.reducers().debug_remove_entity(eid_b);
+    pump_both(&client_a.conn, &client_b.conn, 300);
 }

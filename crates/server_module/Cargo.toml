@@ -15,3 +15,5 @@ debug = []
 game_schema = { workspace = true, features = ["spacetimedb"] }
 spacetimedb = "2.1"
 log = { workspace = true }
+ron = { workspace = true }
+serde = { workspace = true }

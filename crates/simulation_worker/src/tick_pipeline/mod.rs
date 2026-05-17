@@ -166,6 +166,8 @@ pub struct TickResult {
     /// Entities spawned by the world director this tick.
     /// Coordinator marshals these into DB insert calls so the entities are persisted.
     pub director_spawns: Vec<DirectorSpawn>,
+    /// Interactable state changes this tick (entity_id, new SimInteractState).
+    pub interactable_updates: Vec<(EntityId, game_core::sim_state::SimInteractState)>,
 }
 
 /// The canonical 10-phase simulation tick pipeline per spec.
@@ -274,6 +276,9 @@ pub struct TickPipeline {
     /// Global maximum lag compensation rewind depth (ticks).
     /// Sourced from `TickConfig::global_max_rewind_ticks` at startup.
     pub(super) global_max_rewind_ticks: u32,
+    /// Interactable state changes accumulated this tick.
+    /// Each entry is (entity_id, new_state). Drained in Phase 10 commit.
+    pub(super) pending_interactable_updates: Vec<(EntityId, game_core::sim_state::SimInteractState)>,
 }
 
 impl TickPipeline {
@@ -421,6 +426,7 @@ impl TickPipeline {
             active_lock_on_sessions: HashMap::new(),
             cover_blockers: Vec::new(),
             global_max_rewind_ticks: lag_compensation::MAX_REWIND_TICKS,
+            pending_interactable_updates: Vec::new(),
         }
     }
 
@@ -1076,6 +1082,7 @@ impl TickPipeline {
             npc_state_updates,
             region_updates,
             director_spawns,
+            interactable_updates: std::mem::take(&mut self.pending_interactable_updates),
         };
 
         self.current_tick = self.current_tick.next();

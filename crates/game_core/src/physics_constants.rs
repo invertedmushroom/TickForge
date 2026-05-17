@@ -6,6 +6,7 @@ pub const JUMP_GRAVITY: f32 = GRAVITY;       // alias for clarity in jump code
 pub const FALL_GRAVITY: f32 = GRAVITY;       // alias for clarity when falling
 pub const GROUND_PULL: f32 = 4.0;            // m/s, small downward pull for KCC
 pub const INTERACT_RADIUS: f32 = 3.0;        // meters for proximity interactions
+pub const EVADE_ARRIVE_RADIUS: f32 = 0.5;    // meters — NPC evade arrival threshold
 pub const FALL_DAMAGE_THRESHOLD: f32 = 15.0; // m/s impact speed threshold for fall damage
 pub const FALL_DAMAGE_FACTOR: f32 = 5.0;     // HP per m/s over threshold
 pub const WEAPON_SWAP_COOLDOWN_TICKS: u32 = 20; // ticks (~1s at 20 Hz) between weapon swaps

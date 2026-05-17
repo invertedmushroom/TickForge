@@ -5,10 +5,12 @@ impl TickPipeline {
 
     pub(super) fn phase_ai_decisions(&mut self) {
         use game_core::entity::lifecycle::{EntityKind, NpcAiState};
-        use game_core::combat::status::AiOverride;
+        use game_core::combat::status::{AiOverride, ThreatTable};
 
         let npcs = self.state.active_indices_of_kind(EntityKind::Npc);
         let bosses = self.state.active_indices_of_kind(EntityKind::Boss);
+        // Pre-compute player indices once for proximity aggro scanning.
+        let players = self.state.active_indices_of_kind(EntityKind::Player);
 
         for idx in npcs.iter().chain(bosses.iter()) {
             // Passive NPCs never run AI (training dummies).
@@ -87,6 +89,42 @@ impl TickPipeline {
                                 if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) { *ai = NpcAiState::Combat; }
                                 audit!(self.state, Ai, AiDecisions, 7, None, "to_combat");
                             }
+                        else {
+                            // Proximity aggro: scan for players within aggro_radius.
+                            // TODO: O(NPCs × Players) — replace with spatial partitioning
+                            // (e.g. region-cell query) when populations exceed ~50 idle NPCs.
+                            let aggro = self.state.ai.npc_aggro_radius.get(*idx).copied().unwrap_or(0.0);
+                            if aggro > 0.0 {
+                                let npc_id = self.state.entities.id_of(*idx);
+                                if let Some(npc_t) = self.physics.get_transform(npc_id) {
+                                    let npc_pos = npc_t.position;
+                                    let aggro_sq = aggro * aggro;
+                                    for &p_idx in &players {
+                                        let p_id = self.state.entities.id_of(p_idx);
+                                        if let Some(p_t) = self.physics.get_transform(p_id) {
+                                            let dx = p_t.position.x - npc_pos.x;
+                                            let dz = p_t.position.z - npc_pos.z;
+                                            if dx * dx + dz * dz <= aggro_sq {
+                                                // Add initial threat + enter combat.
+                                                if !self.state.combat.threat_tables.contains(*idx) {
+                                                    self.state.combat.threat_tables.insert(*idx, ThreatTable::default());
+                                                }
+                                                let table = self.state.combat.threat_tables.get_mut(*idx).unwrap();
+                                                if table.entries.iter().all(|e| e.source != p_id) {
+                                                    table.entries.push(game_core::combat::status::ThreatEntry {
+                                                        source: p_id,
+                                                        threat: 1.0,
+                                                    });
+                                                }
+                                                if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) { *ai = NpcAiState::Combat; }
+                                                audit!(self.state, Ai, AiDecisions, 7, Some(npc_id), "aggro_proximity");
+                                                break; // One target is enough to enter combat.
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     NpcAiState::Combat => {
                         // If threat table is empty, return to Idle.
@@ -98,7 +136,21 @@ impl TickPipeline {
                                 audit!(self.state, Ai, AiDecisions, 7, None, "combat_to_idle");
                             }
                             Some(_) => {
-                                // stay in Combat; action execution below will handle movement
+                                // Leash check: if NPC exceeds leash radius from home → Evade.
+                                let leash = self.state.ai.npc_leash_radius.get(*idx).copied().unwrap_or(0.0);
+                                if leash > 0.0 {
+                                    if let Some(&home) = self.state.ai.home_positions.get(*idx) {
+                                        let npc_id = self.state.entities.id_of(*idx);
+                                        if let Some(npc_t) = self.physics.get_transform(npc_id) {
+                                            let dx = npc_t.position.x - home.x;
+                                            let dz = npc_t.position.z - home.z;
+                                            if dx * dx + dz * dz > leash * leash {
+                                                if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) { *ai = NpcAiState::Evade; }
+                                                audit!(self.state, Ai, AiDecisions, 7, Some(npc_id), "leash_evade");
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -114,6 +166,9 @@ impl TickPipeline {
                     }
                     NpcAiState::Scripted => {
                         // No scripted behavior yet — placeholder.
+                    }
+                    NpcAiState::Evade => {
+                        // Evade→Idle: handled in action execution when NPC reaches home.
                     }
                 }
             }
@@ -169,6 +224,38 @@ impl TickPipeline {
                         let npc_id = self.state.entities.id_of(*idx);
                         self.npc_move_toward_pos(npc_id, home, self.dt);
                         audit!(self.state, Transform, AiDecisions, 7, Some(npc_id), "patrol");
+                    }
+                }
+                NpcAiState::Evade => {
+                    // Walk home, clear threat, reset HP on arrival.
+                    let npc_id = self.state.entities.id_of(*idx);
+                    if let Some(&home) = self.state.ai.home_positions.get(*idx) {
+                        self.npc_move_toward_pos(npc_id, home, self.dt);
+                        audit!(self.state, Transform, AiDecisions, 7, Some(npc_id), "evade_walk");
+
+                        // Check arrival.
+                        if let Some(npc_t) = self.physics.get_transform(npc_id) {
+                            let dx = npc_t.position.x - home.x;
+                            let dz = npc_t.position.z - home.z;
+                            const R: f32 = game_core::physics_constants::EVADE_ARRIVE_RADIUS;
+                            if dx * dx + dz * dz <= R * R {
+                                // Arrived home: clear threat, reset HP, return to Idle.
+                                if let Some(table) = self.state.combat.threat_tables.get_mut(*idx) {
+                                    table.entries.clear();
+                                }
+                                let max_hp = self.state.combat.health.max_hp[idx.as_usize()];
+                                self.state.combat.health.hp[idx.as_usize()] = max_hp;
+                                if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) { *ai = NpcAiState::Idle; }
+                                audit!(self.state, Ai, AiDecisions, 7, Some(npc_id), "evade_home");
+                            }
+                        }
+                    } else {
+                        // No home recorded — snap to Idle.
+                        if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) { *ai = NpcAiState::Idle; }
+                    }
+                    // Clear threat each tick while evading so NPC doesn't re-enter combat.
+                    if let Some(table) = self.state.combat.threat_tables.get_mut(*idx) {
+                        table.entries.clear();
                     }
                 }
                 _ => {}

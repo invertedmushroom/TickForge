@@ -266,6 +266,14 @@ pub struct CommitDirectorSpawn {
     pub pos_x: f32,
     pub pos_y: f32,
     pub pos_z: f32,
+    pub layer: u32,
+}
+
+/// Interactable state change for commit.
+#[derive(Clone, Debug)]
+pub struct CommitInteractableUpdate {
+    pub entity_id: u64,
+    pub new_state: game_core::sim_state::SimInteractState,
 }
 
 /// Complete marshalled payload for one tick commit.
@@ -297,6 +305,8 @@ pub struct CommitPackage {
     pub npc_state_updates: Vec<CommitNpcState>,
     /// Entities spawned by the world director that need DB rows created.
     pub director_spawns: Vec<CommitDirectorSpawn>,
+    /// Interactable state changes to commit via `commit_interactable_updates`.
+    pub interactable_updates: Vec<CommitInteractableUpdate>,
 }
 
 /// Build a `CommitPackage` from a `TickResult` and consumed intent IDs.
@@ -434,6 +444,16 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
             pos_x: s.position.x,
             pos_y: s.position.y,
             pos_z: s.position.z,
+            layer: s.layer,
+        })
+        .collect();
+
+    let interactable_updates = result
+        .interactable_updates
+        .iter()
+        .map(|(eid, new_state)| CommitInteractableUpdate {
+            entity_id: eid.0,
+            new_state: *new_state,
         })
         .collect();
 
@@ -452,6 +472,7 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
         threat_cleared_entity_ids,
         npc_state_updates,
         director_spawns,
+        interactable_updates,
     }
 }
 
@@ -930,6 +951,7 @@ mod tests {
             npc_state_updates: Vec::new(),
             region_updates: Vec::new(),
             director_spawns: Vec::new(),
+            interactable_updates: Vec::new(),
         }
     }
 
@@ -1235,6 +1257,7 @@ mod tests {
             npc_state_updates: Vec::new(),
             region_updates: Vec::new(),
             director_spawns: Vec::new(),
+            interactable_updates: Vec::new(),
         };
         let pkg = build(result, Vec::new());
 
@@ -1246,5 +1269,52 @@ mod tests {
         assert!(pkg.consumed_intent_ids.is_empty());
         assert!(pkg.entity_state_updates.is_empty());
         assert!(pkg.region_updates.is_empty());
+    }
+
+    #[test]
+    fn build_marshals_director_spawn_with_layer() {
+        use game_core::director::DirectorSpawn;
+
+        let result = TickResult {
+            tick_id: TickId(50),
+            transforms: Vec::new(),
+            events: Vec::new(),
+            summary: Default::default(),
+            entity_state_updates: Vec::new(),
+            health_updates: Vec::new(),
+            buff_updates: Vec::new(),
+            threat_updates: Vec::new(),
+            npc_state_updates: Vec::new(),
+            region_updates: Vec::new(),
+            director_spawns: vec![
+                DirectorSpawn {
+                    kind: game_schema::EntityKind::Npc,
+                    max_hp: 500.0,
+                    position: Vec3f { x: 10.0, y: 1.0, z: -5.0 },
+                    layer: 105,
+                },
+                DirectorSpawn {
+                    kind: game_schema::EntityKind::Npc,
+                    max_hp: 100.0,
+                    position: Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+                    layer: 0,
+                },
+            ],
+            interactable_updates: Vec::new(),
+        };
+        let pkg = build(result, Vec::new());
+
+        assert_eq!(pkg.director_spawns.len(), 2);
+
+        let s0 = &pkg.director_spawns[0];
+        assert_eq!(s0.kind, game_schema::EntityKind::Npc);
+        assert_eq!(s0.max_hp, 500.0);
+        assert_eq!(s0.pos_x, 10.0);
+        assert_eq!(s0.pos_y, 1.0);
+        assert_eq!(s0.pos_z, -5.0);
+        assert_eq!(s0.layer, 105);
+
+        let s1 = &pkg.director_spawns[1];
+        assert_eq!(s1.layer, 0);
     }
 }
