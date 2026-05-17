@@ -158,6 +158,18 @@ pub fn submit_intent(
         entity_id: seq.entity_id,
     });
 
+    // Rate limit: cap the number of pending (unprocessed) intents per entity.
+    // At 20 Hz a queue depth of 5 = 250 ms of buffered input — enough for normal
+    // gameplay but prevents a buggy or malicious client from flooding DB writes.
+    const MAX_QUEUED_INTENTS: usize = 5;
+    let queued = ctx.db.player_intent()
+        .iter()
+        .filter(|i| i.entity_id == entity_id)
+        .count();
+    if queued >= MAX_QUEUED_INTENTS {
+        return Err("Intent queue full: reduce submission rate".into());
+    }
+
     // Compute target tick: current_tick + 1
     let current_tick = ctx.db.sim_tick().iter()
         .max_by_key(|t| t.tick_id)

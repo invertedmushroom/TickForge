@@ -40,11 +40,13 @@ impl ThreatTable {
         }
     }
 
-    pub fn decay(&mut self, amount: f32) {
+    /// Decay all threat values by a multiplicative factor (e.g. 0.98 per tick).
+    /// Entries that fall below the noise floor are removed to keep the table compact.
+    pub fn decay(&mut self, factor: f32) {
         for entry in &mut self.entries {
-            entry.threat = (entry.threat - amount).max(0.0);
+            entry.threat *= factor;
         }
-        self.entries.retain(|e| e.threat > 0.0);
+        self.entries.retain(|e| e.threat > 0.001);
     }
 
     pub fn top_threat(&self) -> Option<EntityId> {

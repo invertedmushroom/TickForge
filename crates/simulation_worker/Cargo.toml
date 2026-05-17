@@ -17,4 +17,6 @@ rapier3d = { workspace = true }
 nalgebra = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
+serde = { workspace = true }
+ron = { workspace = true }
 spacetimedb-sdk = { workspace = true, optional = true }

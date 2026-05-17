@@ -3,6 +3,7 @@ use game_protocol::tick::TickId;
 use game_schema::{EntityKind, EntityState, NpcAiState};
 
 use crate::combat::hitbox::HitboxStore;
+use crate::combat::skill::AbilityExecutionStore;
 use crate::combat::status::{ActiveBuff, ThreatTable};
 use crate::entity::entity_index::EntityIndex;
 use crate::entity::entity_store::EntityStore;
@@ -77,6 +78,9 @@ pub struct CombatState {
     pub threat_tables: Vec<Option<ThreatTable>>,
     /// Active hitbox colliders — tracks hit dedup, ownership, lifetime.
     pub hitboxes: HitboxStore,
+    /// In-flight ability cast instances — one entry per accepted UseAbility cast,
+    /// carrying resolved targeting and cast-time spatial snapshot.
+    pub executions: AbilityExecutionStore,
 }
 
 /// Buff/debuff status data.
@@ -122,6 +126,7 @@ impl SimState {
                 health: HealthStore::new(),
                 threat_tables: Vec::new(),
                 hitboxes: HitboxStore::new(),
+                executions: AbilityExecutionStore::new(),
             },
             status: StatusState { buffs: Vec::new() },
             ai: AiState { npc_ai: Vec::new() },
@@ -178,6 +183,7 @@ impl SimState {
         if let Some(idx) = self.entities.lookup(id) {
             self.entities.mark_removed(idx);
             self.combat.hitboxes.remove_all_for_entity(id);
+            self.combat.executions.remove_all_for_caster(id);
             true
         } else {
             false

@@ -84,7 +84,7 @@ fn save_token(token: &str) {
 pub fn run(config: CoordinatorConfig) {
     let tick_dt = 1.0 / 20.0; // 20 Hz — must match server TickConfig
     let physics = PhysicsWorld::new(tick_dt);
-    let abilities = build_ability_registry();
+    let abilities = load_abilities();
     let pipeline = TickPipeline::new(TickId(0), Box::new(physics), tick_dt, abilities);
 
     let state = Arc::new(Mutex::new(CoordinatorState {
@@ -348,6 +348,19 @@ pub fn run(config: CoordinatorConfig) {
     conn.db.entity().on_insert(move |ctx, new_entity| {
         let eid = EntityId(new_entity.entity_id);
 
+        // Guard: never spawn entities that have already passed their useful lifecycle.
+        // On worker restart the subscription snapshot contains every row including
+        // Removed and DespawnPending entities. Without this guard they would enter
+        // SimState as Spawning, and Phase 8 would activate them the next tick —
+        // resurrecting dead NPCs and players.
+        match new_entity.state {
+            EntityState::Removed | EntityState::DespawnPending => {
+                debug!("Entity {} is {:?} in DB — skipping spawn", eid.0, new_entity.state);
+                return;
+            }
+            _ => {}
+        }
+
         // Look up companion rows before acquiring the state lock — these reads
         // are from the SDK cache (no contention) and must not be done under the
         // lock to avoid holding it across I/O.
@@ -488,6 +501,37 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
 //   offset 0  → CooldownStart (20 ticks = 1 s cooldown)
 //   offset 1  → ApplyDamageFrame (combat reads hitbox contacts)
 //   offset 2  → RemoveHitbox (sensor freed)
+
+/// On-disk serialization format for `data/abilities.ron`.
+/// Both `AbilityData` and `AbilityTimeline` already derive `serde::Deserialize`.
+#[derive(serde::Deserialize)]
+struct AbilityFile {
+    abilities: Vec<AbilityData>,
+    timelines: Vec<AbilityTimeline>,
+}
+
+/// Load abilities from `data/abilities.ron`.
+/// Falls back to the hardcoded registry if the file is missing or malformed.
+fn load_abilities() -> AbilityRegistry {
+    const PATH: &str = "data/abilities.ron";
+    let result = std::fs::read_to_string(PATH)
+        .map_err(|e| format!("read '{PATH}': {e}"))
+        .and_then(|src| ron::from_str::<AbilityFile>(&src).map_err(|e| format!("parse '{PATH}': {e}")));
+    match result {
+        Ok(file) => {
+            let count = file.abilities.len();
+            let mut reg = AbilityRegistry::new();
+            for a in file.abilities { reg.register(a); }
+            for t in file.timelines { reg.register_timeline(t); }
+            info!("Loaded {count} ability/abilities from {PATH}");
+            reg
+        }
+        Err(e) => {
+            warn!("Could not load {PATH} ({e}) — using hardcoded fallback");
+            build_ability_registry()
+        }
+    }
+}
 
 fn build_ability_registry() -> AbilityRegistry {
     let mut reg = AbilityRegistry::new();

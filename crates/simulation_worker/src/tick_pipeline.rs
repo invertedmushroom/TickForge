@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use game_protocol::event::{EventPayload, SimEvent};
 use game_protocol::intent::{IntentAction, MoveDir, PlayerIntent};
 use game_protocol::tick::TickId;
@@ -6,11 +6,13 @@ use game_protocol::entity_id::EntityId;
 use game_protocol::types::Transform;
 use game_core::physics_backend::{ColliderKind, PhysicsBackend, SensorShape};
 use game_core::combat::skill::{
-    AbilityAction, AbilityTimeline, AbilityRegistry, ScheduledAction, ScheduledActionType, SkillShape,
+    AbilityAction, AbilityTimeline, AbilityRegistry,
+    AbilityExecutionContext, AbilityExecutionId, ResolvedTargeting,
+    ScheduledAction, ScheduledActionType, SkillShape,
 };
 use game_core::entity::entity_index::EntityIndex;
 use game_core::sim_state::SimState;
-use game_protocol::types::Vec3f;
+use game_protocol::types::{Quatf, Vec3f};
 use game_schema::EntityKind;
 
 /// Per-tick statistics for observability. One summary emitted per tick in the coordinator.
@@ -71,8 +73,19 @@ pub struct TickPipeline {
     abilities: AbilityRegistry,
     /// Runtime entity state — lifecycle, health, buffs, threat, AI, contacts.
     pub state: SimState,
-    /// Opaque sensor handles for active hitbox colliders: (entity, ability_id) → physics handle.
-    sensor_handles: HashMap<(EntityId, u32), u64>,
+    /// Opaque sensor handles for active hitbox colliders: execution_id → physics handle.
+    /// Keyed by `AbilityExecutionId` so each cast instance has its own entry;
+    /// two casts of the same ability by the same entity are tracked independently.
+    sensor_handles: HashMap<AbilityExecutionId, u64>,
+    /// Explicit cooldown state — maps (EntityId, ability_id) → tick when the cooldown expires.
+    ///
+    /// The HashMap owns cooldown truth: O(1) lookup in Phase 2, drained in Phase 8 to emit
+    /// CooldownReady events. Retroactive cooldown reduction is a direct mutation of the ready_at
+    /// value. Entity despawn cleaning removes all entries in a single `retain` call.
+    cooldowns: HashMap<(EntityId, u32), TickId>,
+    /// Monotonically increasing counter for `ScheduledAction::id`.
+    /// Assigned at scheduling time; never reused within a session.
+    next_scheduled_id: u64,
     /// Running stats for the current tick — incremented inline, returned in TickResult.
     summary: TickSummary,
 }
@@ -94,6 +107,8 @@ impl TickPipeline {
             abilities,
             state: SimState::new(),
             sensor_handles: HashMap::new(),
+            cooldowns: HashMap::new(),
+            next_scheduled_id: 0,
             summary: TickSummary::default(),
 }
     }
@@ -132,6 +147,13 @@ impl TickPipeline {
         max_hp: f32,
         position: Vec3f,
     ) {
+        // Idempotency guard — the coordinator's on_insert callback already checks
+        // contains() before calling here, but this defence-in-depth prevents a double-
+        // spawn if the call sequence ever regresses (e.g. a second on_insert for the
+        // same entity after a subscription re-apply).
+        if self.state.entities.contains(id) {
+            return;
+        }
         self.state.spawn_entity(id, kind, tick, max_hp);
         match kind {
             EntityKind::Player | EntityKind::Npc | EntityKind::Boss => {
@@ -151,6 +173,9 @@ impl TickPipeline {
 
     /// Schedule all actions from an ability timeline, starting at the given tick.
     ///
+    /// Each `AbilityFrame` action carries `execution_id` so later phases can look up
+    /// the cast-time context (targeting, origin, facing) from `SimState::combat.executions`.
+    ///
     /// Scheduling rules:
     /// - Actions are always scheduled for future ticks (start_tick + offset).
     /// - Multiple actions may land on the same tick; they execute in insertion order.
@@ -161,6 +186,7 @@ impl TickPipeline {
         entity: EntityId,
         timeline: &AbilityTimeline,
         start_tick: TickId,
+        execution_id: AbilityExecutionId,
     ) {
         for scheduled in &timeline.actions {
             let tick_id = TickId(start_tick.0 + scheduled.tick_offset as u64);
@@ -170,9 +196,12 @@ impl TickPipeline {
                 self.current_tick
             );
             self.scheduled_actions.push(ScheduledAction {
+                id: { let id = self.next_scheduled_id; self.next_scheduled_id += 1; id },
                 tick_id,
                 entity,
+                source: Some(execution_id),
                 action_type: ScheduledActionType::AbilityFrame {
+                    execution_id,
                     ability_id: timeline.ability_id,
                     action: scheduled.action.clone(),
                 },
@@ -182,27 +211,32 @@ impl TickPipeline {
         self.scheduled_actions.sort_by_key(|a| a.tick_id);
     }
 
-    /// Schedule a single deferred action (buff expiry, cooldown, etc.).
+    /// Schedule a single deferred action (buff expiry, etc.).
     /// Same rules as `schedule_ability` — future ticks only, not idempotent.
-    pub fn schedule_action(&mut self, action: ScheduledAction) {
+    /// The action's `id` is assigned by the pipeline (caller-provided value is overwritten).
+    pub fn schedule_action(&mut self, mut action: ScheduledAction) {
         debug_assert!(
             action.tick_id >= self.current_tick,
             "scheduled action for past tick {} (current: {})",
             action.tick_id, self.current_tick
         );
+        action.id = self.next_scheduled_id;
+        self.next_scheduled_id += 1;
         self.scheduled_actions.push(action);
         // Maintain sort — binary search for insertion would be faster, but
         // the queue is small enough that a full sort is fine at 20 Hz.
         self.scheduled_actions.sort_by_key(|a| a.tick_id);
     }
 
-    /// Returns true if a CooldownExpire action for this entity+ability is pending.
-    /// Called by phase 2 to reject UseAbility intents for abilities still recovering.
+    /// Returns true if `ability_id` is on cooldown for `entity` this tick.
+    ///
+    /// O(1) — looks up the ready_at tick in the cooldown HashMap. The entry is absent
+    /// (implying not on cooldown) when the ability has never been cast or the cooldown
+    /// already expired and was pruned by `phase_expire_cooldowns`.
     fn is_on_cooldown(&self, entity: EntityId, ability_id: u32) -> bool {
-        self.scheduled_actions.iter().any(|a| {
-            a.entity == entity
-                && matches!(&a.action_type, ScheduledActionType::CooldownExpire { ability_id: id } if *id == ability_id)
-        })
+        self.cooldowns
+            .get(&(entity, ability_id))
+            .map_or(false, |&ready_at| self.current_tick < ready_at)
     }
 
     /// Execute one full simulation tick, returning results for commit.
@@ -242,6 +276,11 @@ impl TickPipeline {
         let health_updates = self.collect_health_updates();
 
         // Phase 8: State finalization
+        // 8a: Drain ready cooldowns — emit CooldownReady events for abilities that became
+        //     available this tick. Must run before 8b so the events land in pending_events
+        //     and are included in this tick’s TickResult.
+        self.phase_expire_cooldowns();
+        // 8b: Entity lifecycle transitions, buff expiry, threat decay, spawning → active.
         let entity_state_updates = self.phase_state_finalization();
 
         // Phase 9: Event emission (collect pending events)
@@ -290,20 +329,30 @@ impl TickPipeline {
         // All parallel component arrays must agree on entity count.
         self.state.debug_assert_coherent();
 
-        // Pipeline-level sensor_handles must mirror HitboxStore one-for-one.
-        // Any mismatch means a SpawnHitbox or RemoveHitbox did not propagate to both.
+        // sensor_handles and HitboxStore must agree exactly on which armed execution IDs exist.
+        // A count-only check hides identity bugs where two different entries swap handles;
+        // the key-set diff catches silent divergence that the count check misses.
+        let sensor_keys: std::collections::HashSet<AbilityExecutionId> =
+            self.sensor_handles.keys().copied().collect();
+        let armed_keys = self.state.combat.hitboxes.armed_execution_ids();
         debug_assert_eq!(
-            self.sensor_handles.len(),
-            self.state.combat.hitboxes.len(),
-            "sensor_handles ({}) and HitboxStore ({}) diverged — hitbox lifecycle bug",
-            self.sensor_handles.len(),
-            self.state.combat.hitboxes.len(),
+            sensor_keys,
+            armed_keys,
+            "sensor_handles key-set and armed HitboxStore key-set diverged — hitbox lifecycle bug\n  sensor_handles: {:?}\n  armed hitboxes: {:?}",
+            sensor_keys,
+            armed_keys,
         );
     }
 
     // ── Phase 2: Controller update ──────────────────────────────
 
     fn phase_controller_update(&mut self, intents: &[&PlayerIntent]) {
+        // Track which (entity, ability) pairs have been cast in this Phase 2 pass.
+        // Without this, two UseAbility intents for the same ability targeting the same
+        // tick both pass is_on_cooldown() — the cooldown map isn’t updated until Phase 3.
+        // This closes the same-tick double-cast exploit before the cooldown state exists.
+        let mut cast_this_tick: HashSet<(EntityId, u32)> = HashSet::new();
+
         for intent in intents {
             let entity_id = intent.client_id;
 
@@ -321,18 +370,74 @@ impl TickPipeline {
                 IntentAction::Stop => {
                     self.apply_stop(entity_id);
                 }
-                IntentAction::FaceTo(_dir) => {
-                    // TODO: Apply rotation to physics body.
+                IntentAction::FaceTo(dir) => {
+                    // Project direction onto the XZ plane for yaw-only rotation.
+                    // Characters don't pitch or roll, so only the Y-axis angle matters.
+                    // Zero-length XZ component means no meaningful facing — skip.
+                    let xz_sq = dir.dir_x * dir.dir_x + dir.dir_z * dir.dir_z;
+                    if xz_sq > 1e-6 {
+                        // atan2(x, z): angle from +Z (forward) toward +X (right).
+                        let yaw = dir.dir_x.atan2(dir.dir_z);
+                        let half_yaw = yaw * 0.5;
+                        let rotation = Quatf {
+                            x: 0.0,
+                            y: half_yaw.sin(),
+                            z: 0.0,
+                            w: half_yaw.cos(),
+                        };
+                        self.physics.set_kinematic_rotation(entity_id, rotation);
+                    }
                 }
                 IntentAction::UseAbility(data) => {
                     let ability_id = data.ability_id;
+                    let cast_key = (entity_id, ability_id);
+                    // Reject if already cast this Phase 2 pass (same-tick double-cast guard).
+                    // The cooldown map insert happens in Phase 3 (CooldownStart action), so
+                    // is_on_cooldown alone cannot catch two UseAbility intents for the same tick.
+                    if cast_this_tick.contains(&cast_key) {
+                        continue;
+                    }
                     // Validate cooldown: skip if a CooldownExpire is queued for this entity+ability.
                     if self.is_on_cooldown(entity_id, ability_id) {
                         continue;
                     }
                     // Clone to release the shared borrow before calling schedule_ability (&mut self).
                     if let Some(timeline) = self.abilities.get_timeline(ability_id).cloned() {
-                        self.schedule_ability(entity_id, &timeline, self.current_tick);
+                        // Resolve wire-format targeting to the runtime variant.
+                        let targeting = match &data.target {
+                            game_schema::AbilityTarget::None => ResolvedTargeting::SelfCast,
+                            game_schema::AbilityTarget::Entity(id) => {
+                                ResolvedTargeting::Entity { target: EntityId(*id) }
+                            }
+                            game_schema::AbilityTarget::Position(p) => {
+                                ResolvedTargeting::Position { point: *p }
+                            }
+                            game_schema::AbilityTarget::Direction(d) => {
+                                ResolvedTargeting::Direction { dir: *d }
+                            }
+                        };
+                        // Snapshot caster position and facing at cast time so later timeline
+                        // phases (ApplyDamageFrame, projectile spawn, etc.) use cast-time
+                        // geometry rather than the caster's current position.
+                        let (origin, facing) = if let Some(t) = self.physics.get_transform(entity_id) {
+                            // Yaw quaternion: (0, sin(θ/2), 0, cos(θ/2)) → facing = (sinθ, 0, cosθ).
+                            let yaw = 2.0 * t.rotation.y.atan2(t.rotation.w);
+                            (t.position, Vec3f { x: yaw.sin(), y: 0.0, z: yaw.cos() })
+                        } else {
+                            (Vec3f::ZERO, Vec3f { x: 0.0, y: 0.0, z: 1.0 })
+                        };
+                        let execution_id = self.state.combat.executions.next_id();
+                        self.state.combat.executions.insert(AbilityExecutionContext {
+                            execution_id,
+                            ability_id,
+                            caster: entity_id,
+                            started_at: self.current_tick,
+                            targeting,
+                            origin,
+                            facing,
+                        });
+                        self.schedule_ability(entity_id, &timeline, self.current_tick, execution_id);
+                        cast_this_tick.insert(cast_key);
                     }
                 }
                 IntentAction::Interact(_target) => {
@@ -382,20 +487,30 @@ impl TickPipeline {
 
         for scheduled in due_actions {
             let entity = scheduled.entity;
+            log::debug!(
+                "dispatch sched={} tick={} entity={} source={:?} action={}",
+                scheduled.id,
+                scheduled.tick_id.0,
+                entity.0,
+                scheduled.source,
+                match &scheduled.action_type {
+                    ScheduledActionType::AbilityFrame { action, .. } => match action {
+                        AbilityAction::SpawnHitbox { .. } => "SpawnHitbox",
+                        AbilityAction::ApplyDamageFrame => "ApplyDamageFrame",
+                        AbilityAction::RemoveHitbox => "RemoveHitbox",
+                        AbilityAction::CooldownStart { .. } => "CooldownStart",
+                    },
+                    ScheduledActionType::BuffExpire { .. } => "BuffExpire",
+                },
+            );
             match scheduled.action_type {
-                ScheduledActionType::AbilityFrame { ability_id, ref action } => {
-                    self.execute_ability_action(entity, ability_id, action);
+                ScheduledActionType::AbilityFrame { execution_id, ability_id, ref action } => {
+                    self.execute_ability_action(entity, ability_id, execution_id, action);
                 }
                 ScheduledActionType::BuffExpire { buff_id } => {
                     self.emit_event(
                         entity,
                         EventPayload::BuffExpired { buff_id },
-                    );
-                }
-                ScheduledActionType::CooldownExpire { ability_id } => {
-                    self.emit_event(
-                        entity,
-                        EventPayload::CooldownReady { ability_id },
                     );
                 }
             }
@@ -406,42 +521,63 @@ impl TickPipeline {
         &mut self,
         entity: EntityId,
         ability_id: u32,
+        execution_id: AbilityExecutionId,
         action: &AbilityAction,
     ) {
         match action {
             AbilityAction::SpawnHitbox { shape, offset } => {
-                self.state.combat.hitboxes.spawn(entity, ability_id, self.current_tick);
-                let sensor_shape = skill_shape_to_sensor(*shape);
-                if let Some(handle) = self.physics.spawn_sensor(
-                    entity,
-                    sensor_shape,
-                    *offset,
-                    ColliderKind::Hitbox(ability_id),
-                ) {
-                    self.sensor_handles.insert((entity, ability_id), handle);
-                }
+                // Declare the hitbox logically — no Rapier sensor yet.
+                //
+                // The sensor is deferred to `ApplyDamageFrame` so that the Rapier
+                // physics step on the damage-frame tick is the first to see the
+                // collider, generating CollisionEvent::started on the correct tick.
+                // Before this fix, SpawnHitbox spawned the sensor immediately, so
+                // Rapier fired contacts one tick early and damage landed on the spawn
+                // tick rather than the intended damage-frame tick.
+                self.state.combat.hitboxes.spawn(execution_id, entity, ability_id, self.current_tick, *shape, *offset);
                 self.emit_event(entity, EventPayload::HitboxSpawned { ability_id });
             }
             AbilityAction::ApplyDamageFrame => {
-                // Marker: combat resolution reads the hitbox store + contacts.
+                // Materialise the Rapier sensor for this hitbox.
+                //
+                // Phase 3 runs before Phase 4 (physics step), so inserting the collider
+                // here means Rapier generates CollisionEvent::started on this same tick.
+                // Phase 6 then resolves the contacts — damage fires exactly when the
+                // timeline says the damage frame is open.
+                let stored = self.state.combat.hitboxes
+                    .get(execution_id)
+                    .map(|hb| (hb.shape, hb.offset));
+                if let Some((shape, offset)) = stored {
+                    if self.state.combat.hitboxes.arm(execution_id) {
+                        let sensor_shape = skill_shape_to_sensor(shape);
+                        if let Some(handle) = self.physics.spawn_sensor(
+                            entity,
+                            sensor_shape,
+                            offset,
+                            ColliderKind::Hitbox(execution_id.0),
+                        ) {
+                            self.sensor_handles.insert(execution_id, handle);
+                        }
+                    }
+                }
                 self.emit_event(entity, EventPayload::DamageFrame { ability_id });
             }
             AbilityAction::RemoveHitbox => {
-                self.state.combat.hitboxes.remove(entity, ability_id);
-                if let Some(handle) = self.sensor_handles.remove(&(entity, ability_id)) {
+                self.state.combat.hitboxes.remove(execution_id);
+                if let Some(handle) = self.sensor_handles.remove(&execution_id) {
                     self.physics.remove_sensor(handle);
                 }
+                // Cast complete — remove the execution context now that its last
+                // physics action has run and no dependent runtime object remains.
+                self.state.combat.executions.remove(execution_id);
                 self.emit_event(entity, EventPayload::HitboxRemoved { ability_id });
             }
             AbilityAction::CooldownStart { duration_ticks } => {
-                let expire_tick = TickId(self.current_tick.0 + *duration_ticks as u64);
-                self.scheduled_actions.push(ScheduledAction {
-                    tick_id: expire_tick,
-                    entity,
-                    action_type: ScheduledActionType::CooldownExpire { ability_id },
-                });
-                // Re-sort after insertion.
-                self.scheduled_actions.sort_by_key(|a| a.tick_id);
+                // Insert directly into the cooldown map — no scheduled action needed.
+                // Phase 8 drains entries where ready_at ≤ current_tick and emits CooldownReady.
+                // Retroactive cooldown reduction: mutate the ready_at value for the entry directly.
+                let ready_at = TickId(self.current_tick.0 + *duration_ticks as u64);
+                self.cooldowns.insert((entity, ability_id), ready_at);
             }
         }
     }
@@ -479,12 +615,12 @@ impl TickPipeline {
 
         for contact in &contacts {
             // Determine attacker/target using collider kinds.
-            let (attacker, ability_id, target) = match (contact.kind1, contact.kind2) {
-                (ColliderKind::Hitbox(aid), ColliderKind::Body | ColliderKind::Hurtbox) => {
-                    (contact.entity1, aid, contact.entity2)
+            let (exec_id, attacker, target) = match (contact.kind1, contact.kind2) {
+                (ColliderKind::Hitbox(eid_raw), ColliderKind::Body | ColliderKind::Hurtbox) => {
+                    (AbilityExecutionId(eid_raw), contact.entity1, contact.entity2)
                 }
-                (ColliderKind::Body | ColliderKind::Hurtbox, ColliderKind::Hitbox(aid)) => {
-                    (contact.entity2, aid, contact.entity1)
+                (ColliderKind::Body | ColliderKind::Hurtbox, ColliderKind::Hitbox(eid_raw)) => {
+                    (AbilityExecutionId(eid_raw), contact.entity2, contact.entity1)
                 }
                 _ => continue, // Not a hitbox-vs-target contact.
             };
@@ -495,11 +631,16 @@ impl TickPipeline {
             }
 
             // Dedup: skip if this hitbox already hit this target.
-            if !self.state.combat.hitboxes.record_hit(attacker, ability_id, target) {
+            if !self.state.combat.hitboxes.record_hit(exec_id, target) {
                 continue;
             }
 
-            // Look up ability data for damage values.
+            // Look up ability data for damage values — get ability_id from the hitbox record.
+            // The hitbox must still exist after record_hit succeeds.
+            let ability_id = match self.state.combat.hitboxes.get(exec_id) {
+                Some(hb) => hb.ability_id,
+                None => continue,
+            };
             let ability = match self.abilities.get(ability_id) {
                 Some(a) => a,
                 None => continue, // Unknown ability — skip.
@@ -605,7 +746,6 @@ impl TickPipeline {
     /// are intentionally included so the DB commit reflects their final health atomically
     /// with the EntityDied event in the same reducer call.
     fn collect_health_updates(&self) -> Vec<(EntityId, f32, f32)> {
-        use std::collections::HashSet;
         let damaged: HashSet<EntityId> = self.pending_events.iter()
             .filter_map(|e| if matches!(&e.payload, EventPayload::Damage { .. }) { Some(e.entity_id) } else { None })
             .collect();
@@ -617,6 +757,27 @@ impl TickPipeline {
     }
 
     // ── Phase 8: State finalization ─────────────────────────────
+
+    /// Phase 8a: Drain the cooldown map of entries that have become ready this tick.
+    ///
+    /// An entry is ready when `ready_at ≤ current_tick`. At that point the ability is
+    /// castable again; we emit a `CooldownReady` event and remove the entry so the map
+    /// only holds in-flight cooldowns. CooldownReady uniqueness is guaranteed by the
+    /// HashMap key — duplicate entries for the same (entity, ability) are impossible.
+    fn phase_expire_cooldowns(&mut self) {
+        let current = self.current_tick;
+        // Collect first so the borrow on `self.cooldowns` ends before `emit_event` borrows `self`.
+        let expired: Vec<(EntityId, u32)> = self
+            .cooldowns
+            .iter()
+            .filter(|&(_, &ready_at)| ready_at <= current)
+            .map(|(&k, _)| k)
+            .collect();
+        for (entity, ability_id) in expired {
+            self.cooldowns.remove(&(entity, ability_id));
+            self.emit_event(entity, EventPayload::CooldownReady { ability_id });
+        }
+    }
 
     fn phase_state_finalization(&mut self) -> Vec<(EntityId, game_schema::EntityState)> {
         use game_core::entity::lifecycle::EntityState;
@@ -652,14 +813,17 @@ impl TickPipeline {
             self.summary.despawns += 1;
             self.emit_event(id, EventPayload::EntityDespawned);
             // Clear our sensor tracking before body removal (body removal cascades to colliders).
-            let hitbox_aids: Vec<u32> = self.state.combat.hitboxes
+            let hitbox_exec_ids: Vec<AbilityExecutionId> = self.state.combat.hitboxes
                 .hitboxes_for(id)
                 .iter()
-                .map(|hb| hb.ability_id)
+                .map(|hb| hb.execution_id)
                 .collect();
-            for aid in hitbox_aids {
-                self.sensor_handles.remove(&(id, aid));
+            for exec_id in hitbox_exec_ids {
+                self.sensor_handles.remove(&exec_id);
             }
+            // Remove any in-flight cooldowns for this entity so the map doesn't grow
+            // unboundedly if entities are frequently spawned and killed.
+            self.cooldowns.retain(|&(eid, _), _| eid != id);
             self.state.remove_entity(id);
             self.physics.remove_entity(id);
             state_updates.push((id, EntityState::Removed));
@@ -671,10 +835,12 @@ impl TickPipeline {
             self.emit_event(entity_id, EventPayload::BuffExpired { buff_id });
         }
 
-        // Decay threat tables.
-        const THREAT_DECAY_PER_TICK: f32 = 0.5;
+        // Decay threat tables multiplicatively — all values scale by factor each tick.
+        // Multiplicative decay prevents runaway target switching when entries are near-equal,
+        // and allows large accumulated threat to bleed down gracefully.
+        const THREAT_DECAY_FACTOR: f32 = 0.98;
         for table in self.state.combat.threat_tables.iter_mut().flatten() {
-            table.decay(THREAT_DECAY_PER_TICK);
+            table.decay(THREAT_DECAY_FACTOR);
         }
 
         // Activate any Spawning entities (they've had one tick to set up physics).
@@ -686,6 +852,21 @@ impl TickPipeline {
             let id = self.state.entities.id_of(idx);
             self.state.entities.activate(idx);
             state_updates.push((id, EntityState::Active));
+        }
+
+        // Dedup: if an entity transitions DespawnPending → Removed within the same tick
+        // (the normal combat-death path), drop the intermediate DespawnPending entry.
+        // Sending both causes two entity.on_update callbacks on the coordinator and two
+        // DB writes, but the final state is the same. Pruning here reduces churn.
+        {
+            let removed_ids: HashSet<EntityId> = state_updates
+                .iter()
+                .filter(|(_, s)| *s == game_schema::EntityState::Removed)
+                .map(|(id, _)| *id)
+                .collect();
+            state_updates.retain(|(id, s)| {
+                !(*s == game_schema::EntityState::DespawnPending && removed_ids.contains(id))
+            });
         }
 
         state_updates
@@ -795,14 +976,15 @@ mod tests {
         // NOW add the hitbox sensor (after entities are Active).
         // Use spawn_sensor (the trait method) so PhysicsWorld.sensor_handles and
         // TickPipeline.sensor_handles are both populated — matching what execute_ability_action does.
+        let exec_id = AbilityExecutionId(1);
         let sensor = pipeline.physics.spawn_sensor(
             attacker_id,
             SensorShape::Sphere { radius: 1.0 },
             Vec3f { x: 0.0, y: 0.0, z: 0.0 },
-            ColliderKind::Hitbox(1),
+            ColliderKind::Hitbox(exec_id.0),
         ).expect("attacker has a body — spawn_sensor must succeed");
-        pipeline.sensor_handles.insert((attacker_id, 1), sensor);
-        pipeline.state.combat.hitboxes.spawn(attacker_id, 1, TickId(1));
+        pipeline.sensor_handles.insert(exec_id, sensor);
+        pipeline.state.combat.hitboxes.spawn_armed(exec_id, attacker_id, 1, TickId(1), SkillShape::Sphere, Vec3f { x: 0.0, y: 0.0, z: 0.0 });
 
         // Tick 1: physics step detects hitbox↔hurtbox overlap,
         // combat resolution applies damage.
@@ -886,14 +1068,15 @@ mod tests {
 
         // Add lethal hitbox after entities are Active.
         // Use spawn_sensor so all three state structures stay in sync (invariant).
+        let exec_id = AbilityExecutionId(1);
         let sensor = pipeline.physics.spawn_sensor(
             attacker,
             SensorShape::Sphere { radius: 1.0 },
             Vec3f { x: 0.0, y: 0.0, z: 0.0 },
-            ColliderKind::Hitbox(10),
+            ColliderKind::Hitbox(exec_id.0),
         ).expect("attacker has a body — spawn_sensor must succeed");
-        pipeline.sensor_handles.insert((attacker, 10), sensor);
-        pipeline.state.combat.hitboxes.spawn(attacker, 10, TickId(1));
+        pipeline.sensor_handles.insert(exec_id, sensor);
+        pipeline.state.combat.hitboxes.spawn_armed(exec_id, attacker, 10, TickId(1), SkillShape::Sphere, Vec3f { x: 0.0, y: 0.0, z: 0.0 });
 
         // Tick 1: damage kills victim in same tick (entities already Active).
         let result1 = pipeline.run_tick(&[]);
@@ -938,7 +1121,10 @@ mod tests {
         assert!(pipeline.state.is_active(target), "target should be Active after tick 0");
 
         // Tick 1: send UseAbility intent.
-        // Phase 2 → schedule_ability → Phase 3 spawns hitbox in physics → Phase 4 steps.
+        // Phase 2 creates AbilityExecutionContext + schedules timeline actions.
+        // Phase 3 fires SpawnHitbox (offset 0) — registers the hitbox logically only,
+        // no Rapier sensor yet. CooldownStart also queued at offset 0.
+        // The Rapier sensor will be spawned in Phase 3 of tick 2 (ApplyDamageFrame, offset 1).
         let cast_intent = PlayerIntent {
             client_id: attacker,
             sequence_id: 1,
@@ -1002,14 +1188,15 @@ mod tests {
 
         // Add hitbox sensor at the same position as target so they overlap.
         // Use spawn_sensor so all three state structures stay in sync (invariant).
+        let exec_id = AbilityExecutionId(1);
         let sensor = pipeline.physics.spawn_sensor(
             attacker_id,
             SensorShape::Sphere { radius: 1.0 },
             Vec3f { x: 0.0, y: 0.0, z: 0.0 },
-            ColliderKind::Hitbox(1),
+            ColliderKind::Hitbox(exec_id.0),
         ).expect("attacker has a body — spawn_sensor must succeed");
-        pipeline.sensor_handles.insert((attacker_id, 1), sensor);
-        pipeline.state.combat.hitboxes.spawn(attacker_id, 1, TickId(1));
+        pipeline.sensor_handles.insert(exec_id, sensor);
+        pipeline.state.combat.hitboxes.spawn_armed(exec_id, attacker_id, 1, TickId(1), SkillShape::Sphere, Vec3f { x: 0.0, y: 0.0, z: 0.0 });
 
         // Tick 1: hitbox overlaps hurtbox — damage fires, health_updates should be populated.
         let result1 = pipeline.run_tick(&[]);
@@ -1055,14 +1242,15 @@ mod tests {
         pipeline.run_tick(&[]); // warm-up — entities go Active
 
         // Use spawn_sensor so all three state structures stay in sync (invariant).
+        let exec_id = AbilityExecutionId(1);
         let sensor = pipeline.physics.spawn_sensor(
             attacker,
             SensorShape::Sphere { radius: 1.0 },
             Vec3f { x: 0.0, y: 0.0, z: 0.0 },
-            ColliderKind::Hitbox(10),
+            ColliderKind::Hitbox(exec_id.0),
         ).expect("attacker has a body — spawn_sensor must succeed");
-        pipeline.sensor_handles.insert((attacker, 10), sensor);
-        pipeline.state.combat.hitboxes.spawn(attacker, 10, TickId(1));
+        pipeline.sensor_handles.insert(exec_id, sensor);
+        pipeline.state.combat.hitboxes.spawn_armed(exec_id, attacker, 10, TickId(1), SkillShape::Sphere, Vec3f { x: 0.0, y: 0.0, z: 0.0 });
 
         let result = pipeline.run_tick(&[]);
 
@@ -1075,25 +1263,21 @@ mod tests {
         assert_eq!(*hp, 0.0, "Killed entity hp must be 0 in health update");
     }
 
-    /// Regression test for kinematic-kinematic collision detection.
+    /// SpawnHitbox declares the hitbox logically but must NOT deal damage before the
+    /// ApplyDamageFrame action materialises the Rapier sensor on the damage-frame tick.
     ///
-    /// In the live server, both player and NPC bodies are `kinematic_position_based`.
-    /// Rapier's default `ActiveCollisionTypes` excludes KINEMATIC_KINEMATIC, so without
-    /// explicitly enabling it, hitbox sensors attached to the player's kinematic body
-    /// would never detect contacts against the NPC's kinematic body or hurtbox sensor.
-    ///
-    /// This test uses `spawn_character_body` (which calls `add_kinematic_capsule`) for
-    /// both entities — exactly mirroring the live server path — and verifies that a
-    /// UseAbility intent produces damage.
+    /// Uses the full live-server path (kinematic bodies, UseAbility intent) so this
+    /// test directly validates the timeline semantics and physics event model together:
+    ///   SpawnHitbox (tick 1) = declare intent  →  no collision, no damage
+    ///   ApplyDamageFrame (tick 2) = materialise sensor  →  Rapier fires contact → damage
     #[test]
-    fn hitbox_damages_kinematic_npc_through_intent() {
+    fn hitbox_does_not_damage_before_damage_frame() {
         let reg = setup_ability_registry();
         let mut pipeline = make_pipeline(reg);
 
         let player = EntityId(1);
         let npc = EntityId(2);
 
-        // Spawn both entities using the same path as the live server.
         pipeline.spawn_entity_from_snapshot(
             player,
             EntityKind::Player,
@@ -1109,13 +1293,14 @@ mod tests {
             game_schema::Vec3f { x: 0.0, y: 1.0, z: 0.0 },
         );
 
-        // Tick 0: warm-up — Spawning → Active for both entities.
+        // Tick 0: warm-up — Spawning → Active.
         pipeline.run_tick(&[]);
-        assert!(pipeline.state.is_active(player), "player must be Active after warm-up");
-        assert!(pipeline.state.is_active(npc), "npc must be Active after warm-up");
+        assert!(pipeline.state.is_active(player));
+        assert!(pipeline.state.is_active(npc));
 
-        // Tick 1: UseAbility(1) intent → Phase 2 schedules Slash → Phase 3 spawns hitbox
-        // → Phase 4 physics step → Phase 5 drains contacts → Phase 6 applies damage.
+        // Tick 1: UseAbility → Phase 2 schedules Slash timeline → Phase 3 fires
+        // SpawnHitbox (offset 0): logical hitbox only, no Rapier sensor inserted.
+        // No sensor → no collision event → no damage this tick.
         let slash_intent = PlayerIntent {
             client_id: player,
             sequence_id: 1,
@@ -1126,19 +1311,316 @@ mod tests {
                 target: game_schema::AbilityTarget::None,
             }),
         };
-        let result = pipeline.run_tick(&[slash_intent]);
+        let result1 = pipeline.run_tick(&[slash_intent]);
 
-        // Verify damage was applied — NPC hp must be below max.
+        // HitboxSpawned event must fire (logical registration happened).
+        assert!(
+            result1.events.iter().any(|e| matches!(&e.payload, EventPayload::HitboxSpawned { ability_id: 1 })),
+            "HitboxSpawned must emit on cast tick (logical declaration)"
+        );
+        // But no damage — the Rapier sensor is not yet live.
+        assert!(
+            !result1.events.iter().any(|e| matches!(&e.payload, EventPayload::Damage { .. })),
+            "No damage must occur on the SpawnHitbox tick — sensor is not yet materialised"
+        );
+        assert_eq!(
+            pipeline.state.hp_of(npc).unwrap(), 100.0,
+            "NPC hp must be unchanged on the cast/spawn tick"
+        );
+    }
+
+    /// Full-path test: UseAbility → SpawnHitbox (logical, tick 1) →
+    /// ApplyDamageFrame (sensor materialised, tick 2) → damage on the damage-frame tick.
+    ///
+    /// This is the canonical test encoding the intended timeline semantics:
+    ///   SpawnHitbox  = declare hitbox intent (no collision yet)
+    ///   ApplyDamageFrame = bring sensor live → Rapier fires contact → Phase 6 damages
+    ///
+    /// Uses `spawn_character_body` (`add_kinematic_capsule`) for both entities,
+    /// mirroring the live server path and verifying KINEMATIC_KINEMATIC contacts.
+    #[test]
+    fn hitbox_damages_on_damage_frame_tick() {
+        let reg = setup_ability_registry();
+        let mut pipeline = make_pipeline(reg);
+
+        let player = EntityId(1);
+        let npc = EntityId(2);
+
+        pipeline.spawn_entity_from_snapshot(
+            player,
+            EntityKind::Player,
+            TickId(0),
+            100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+        );
+        pipeline.spawn_entity_from_snapshot(
+            npc,
+            EntityKind::Npc,
+            TickId(0),
+            100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+        );
+
+        // Tick 0: warm-up.
+        pipeline.run_tick(&[]);
+
+        // Tick 1: UseAbility → SpawnHitbox registered logically. No damage.
+        let slash_intent = PlayerIntent {
+            client_id: player,
+            sequence_id: 1,
+            target_tick: TickId(1),
+            client_time_ms: 0,
+            action: IntentAction::UseAbility(game_schema::UseAbilityData {
+                ability_id: 1,
+                target: game_schema::AbilityTarget::None,
+            }),
+        };
+        pipeline.run_tick(&[slash_intent]);
+
+        // Tick 2: ApplyDamageFrame (offset 1 in the Slash timeline) → Phase 3 arms the
+        // hitbox and inserts the Rapier sensor → Phase 4 physics step detects the
+        // overlap → Phase 5 drains CollisionEvent::started → Phase 6 resolves damage.
+        let result2 = pipeline.run_tick(&[]);
+
         let npc_hp = pipeline.state.hp_of(npc).unwrap();
         assert!(
             npc_hp < 100.0,
-            "Kinematic NPC must take damage from Slash via UseAbility intent; hp={npc_hp}"
+            "NPC must take damage on the ApplyDamageFrame tick; hp={npc_hp}"
         );
 
-        // Verify Damage event was emitted.
-        let has_damage = result.events.iter().any(|e| {
+        let has_damage = result2.events.iter().any(|e| {
             matches!(&e.payload, EventPayload::Damage { source, .. } if *source == player)
         });
-        assert!(has_damage, "Damage event must be emitted for kinematic NPC hit");
+        assert!(has_damage, "Damage event must be emitted on the ApplyDamageFrame tick");
+    }
+
+    #[test]
+    fn face_to_intent_rotates_kinematic_body() {
+        let reg = setup_ability_registry();
+        let mut pipeline = make_pipeline(reg);
+
+        let player = EntityId(1);
+
+        // Spawn via the live server path so there's a kinematic body in the physics world.
+        pipeline.spawn_entity_from_snapshot(
+            player,
+            EntityKind::Player,
+            TickId(0),
+            100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+        );
+
+        // Tick 0: warm-up — entity transitions Spawning → Active.
+        pipeline.run_tick(&[]);
+        assert!(pipeline.state.is_active(player), "player must be Active after warm-up");
+
+        // Snapshot initial rotation (should be identity: w=1).
+        let initial = pipeline.physics.get_transform(player).unwrap();
+
+        // Tick 1: FaceTo intent pointing right (+X direction = 90° yaw from +Z forward).
+        let face_right = PlayerIntent {
+            client_id: player,
+            sequence_id: 1,
+            target_tick: TickId(1),
+            client_time_ms: 0,
+            action: IntentAction::FaceTo(game_schema::MoveDir {
+                dir_x: 1.0,
+                dir_y: 0.0,
+                dir_z: 0.0,
+            }),
+        };
+        pipeline.run_tick(&[face_right]);
+
+        let after = pipeline.physics.get_transform(player).unwrap();
+
+        // Rotation must have changed from identity (w went from 1.0 to ~0.707).
+        assert!(
+            (after.rotation.w - initial.rotation.w).abs() > 0.01,
+            "FaceTo must rotate the body: before w={}, after w={}",
+            initial.rotation.w, after.rotation.w,
+        );
+
+        // For a pure right (+X) direction: yaw = atan2(1, 0) = π/2.
+        // Resulting quaternion: (x=0, y=sin(π/4)≈0.707, z=0, w=cos(π/4)≈0.707).
+        assert!(
+            (after.rotation.y - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01,
+            "FaceTo right: expected y≈0.707, got y={}",
+            after.rotation.y,
+        );
+        assert!(
+            (after.rotation.w - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01,
+            "FaceTo right: expected w≈0.707, got w={}",
+            after.rotation.w,
+        );
+
+        // Position must be preserved.
+        assert!(
+            (after.position.y - 1.0).abs() < 0.1,
+            "FaceTo must not change entity position; y={}",
+            after.position.y,
+        );
+
+        // Zero-length direction must be a no-op (no panic, rotation unchanged).
+        let face_zero = PlayerIntent {
+            client_id: player,
+            sequence_id: 2,
+            target_tick: TickId(2),
+            client_time_ms: 0,
+            action: IntentAction::FaceTo(game_schema::MoveDir {
+                dir_x: 0.0,
+                dir_y: 0.0,
+                dir_z: 0.0,
+            }),
+        };
+        let result_zero = pipeline.run_tick(&[face_zero]);
+        // No crash is sufficient; verify the tick still produced output.
+        assert_eq!(result_zero.tick_id.0, 2, "Pipeline must not stall on zero-direction FaceTo");
+    }
+
+    /// Regression test for the same-tick double-cast exploit (BUG 2).
+    ///
+    /// Two `UseAbility` intents for the same `(entity, ability)` pair passed to a single
+    /// `run_tick` call must only schedule the ability once. Without the `cast_this_tick`
+    /// HashSet guard, both intents pass `is_on_cooldown` because `CooldownExpire` isn't
+    /// inserted until Phase 3 — after Phase 2 has already processed both.
+    #[test]
+    fn same_tick_double_cast_is_rejected() {
+        let reg = setup_ability_registry();
+        let mut pipeline = make_pipeline(reg);
+
+        let attacker = EntityId(1);
+        let target = EntityId(2);
+
+        pipeline.spawn_entity_from_snapshot(
+            attacker,
+            EntityKind::Player,
+            TickId(0),
+            100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+        );
+        pipeline.spawn_entity_from_snapshot(
+            target,
+            EntityKind::Npc,
+            TickId(0),
+            100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+        );
+
+        // Tick 0: warm-up.
+        pipeline.run_tick(&[]);
+        assert!(pipeline.state.is_active(attacker));
+        assert!(pipeline.state.is_active(target));
+
+        // Tick 1: submit two identical UseAbility intents in the same tick slice.
+        // They differ only in sequence_id (as a client might if it sent two queued intents).
+        let cast_a = PlayerIntent {
+            client_id: attacker,
+            sequence_id: 1,
+            target_tick: TickId(1),
+            client_time_ms: 0,
+            action: IntentAction::UseAbility(game_schema::UseAbilityData {
+                ability_id: 1,
+                target: game_schema::AbilityTarget::None,
+            }),
+        };
+        let cast_b = PlayerIntent {
+            client_id: attacker,
+            sequence_id: 2,
+            target_tick: TickId(1),
+            client_time_ms: 0,
+            action: IntentAction::UseAbility(game_schema::UseAbilityData {
+                ability_id: 1,
+                target: game_schema::AbilityTarget::None,
+            }),
+        };
+        let result = pipeline.run_tick(&[cast_a, cast_b]);
+
+        // Exactly one HitboxSpawned event must fire — not two.
+        let hitbox_spawned_count = result.events.iter().filter(|e| {
+            matches!(&e.payload, EventPayload::HitboxSpawned { ability_id: 1 })
+        }).count();
+        assert_eq!(
+            hitbox_spawned_count, 1,
+            "Same-tick double-cast must produce exactly one HitboxSpawned event, got {hitbox_spawned_count}"
+        );
+    }
+
+    /// Regression test for the state-update dedup patch (BUG 3).
+    ///
+    /// When an entity dies and is despawned in the same tick (the normal combat-death path),
+    /// `entity_state_updates` must contain only the final `Removed` entry — not both
+    /// `DespawnPending` and `Removed`. Sending both causes two `entity.on_update` callbacks
+    /// in the coordinator and two DB writes for the same field.
+    #[test]
+    fn death_in_single_tick_emits_only_removed_state_update() {
+        let mut reg = AbilityRegistry::new();
+        reg.register(AbilityData {
+            ability_id: 10,
+            name: "OneShot".to_string(),
+            base_damage: 999.0,
+            damage_type: DamageType::True,
+            shape: SkillShape::Sphere,
+            threat_multiplier: 1.0,
+        });
+        let mut pipeline = make_pipeline(reg);
+
+        let attacker = EntityId(1);
+        let victim = EntityId(2);
+
+        pipeline.spawn_entity_from_snapshot(
+            attacker,
+            EntityKind::Player,
+            TickId(0),
+            100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+        );
+        pipeline.spawn_entity_from_snapshot(
+            victim,
+            EntityKind::Npc,
+            TickId(0),
+            50.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+        );
+
+        // Tick 0: warm-up — both entities become Active.
+        pipeline.run_tick(&[]);
+        assert!(pipeline.state.is_active(attacker));
+        assert!(pipeline.state.is_active(victim));
+
+        // Add a lethal hitbox sensor directly (bypasses the intent path so the one-shot
+        // hits in the very next tick without any cooldown scheduling complexity).
+        let exec_id = AbilityExecutionId(1);
+        let sensor = pipeline.physics.spawn_sensor(
+            attacker,
+            SensorShape::Sphere { radius: 1.0 },
+            Vec3f { x: 0.0, y: 0.0, z: 0.0 },
+            ColliderKind::Hitbox(exec_id.0),
+        ).expect("attacker has a body");
+        pipeline.sensor_handles.insert(exec_id, sensor);
+        pipeline.state.combat.hitboxes.spawn_armed(exec_id, attacker, 10, TickId(1), SkillShape::Sphere, Vec3f { x: 0.0, y: 0.0, z: 0.0 });
+
+        // Tick 1: one-shot kills victim.
+        let result = pipeline.run_tick(&[]);
+
+        // The victim must be gone from SimState.
+        assert!(
+            !pipeline.state.entities.contains(victim),
+            "Victim should be fully removed from SimState after one-shot kill"
+        );
+
+        // entity_state_updates for the victim must contain ONLY Removed, not DespawnPending.
+        let victim_updates: Vec<_> = result.entity_state_updates.iter()
+            .filter(|(id, _)| *id == victim)
+            .collect();
+
+        assert_eq!(
+            victim_updates.len(), 1,
+            "Victim should appear exactly once in entity_state_updates, got: {:?}", victim_updates
+        );
+        assert_eq!(
+            victim_updates[0].1,
+            game_schema::EntityState::Removed,
+            "Single victim state update must be Removed, not DespawnPending"
+        );
     }
 }

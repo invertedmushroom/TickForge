@@ -1,0 +1,42 @@
+// Ability definitions for Jump.
+// Loaded at coordinator startup via AbilityRegistry::load_abilities().
+// Edit this file to tune damage, cooldowns, and hitbox shapes without recompiling.
+//
+// Field reference:
+//   ability_id      — must be unique; matched by UseAbility intent and CooldownExpire
+//   base_damage     — raw damage before any multipliers
+//   damage_type     — Physical | Magical | True
+//   shape           — Sphere | Cone | CapsuleSweep | Projectile | LineSweep | HazardZone
+//   threat_multiplier — 1.0 = threat equals damage dealt
+//
+// Timeline actions (tick_offset is relative to cast tick):
+//   SpawnHitbox(shape, offset)     — spawn sensor collider in entity-local space
+//   CooldownStart(duration_ticks)  — start cooldown; 20 ticks = 1 second at 20 Hz
+//   ApplyDamageFrame               — mark contacts from this tick as authoritative damage frame
+//   RemoveHitbox                   — despawn the skill sensor collider
+(
+    abilities: [
+        (
+            ability_id: 1,
+            name: "Slash",
+            base_damage: 25.0,
+            damage_type: Physical,
+            shape: CapsuleSweep,
+            threat_multiplier: 1.0,
+        ),
+    ],
+    timelines: [
+        (
+            ability_id: 1,
+            actions: [
+                // tick 0: spawn hitbox + start 1-second cooldown simultaneously
+                (tick_offset: 0, action: SpawnHitbox(shape: CapsuleSweep, offset: (x: 0.0, y: 0.0, z: 0.0))),
+                (tick_offset: 0, action: CooldownStart(duration_ticks: 20)),
+                // tick 1: damage frame — contacts this tick deal damage
+                (tick_offset: 1, action: ApplyDamageFrame),
+                // tick 2: hitbox gone
+                (tick_offset: 2, action: RemoveHitbox),
+            ],
+        ),
+    ],
+)

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use game_protocol::entity_id::EntityId;
 use game_protocol::tick::TickId;
-use game_schema::DamageType;
+use game_schema::{DamageType, Vec3f};
 use serde::{Deserialize, Serialize};
 
 /// Skill shape taxonomy per spec.
@@ -59,18 +59,38 @@ pub enum AbilityAction {
 ///
 /// The simulation tick consumes due actions each frame, enabling
 /// clean overlap of cast windows, hit frames, and cooldown expirations.
+///
+/// `id` is a pipeline-scoped monotonic counter assigned at scheduling time.
+/// `source` is the execution that caused this action — `None` for non-ability
+/// deferred work such as buff expiry. Together they form the causal chain for
+/// replay tracing and double-schedule / missed-expiry investigations.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScheduledAction {
+    /// Monotonically increasing ID assigned by the pipeline at scheduling time.
+    /// Unique within a single worker session; use for log correlation and replay.
+    pub id: u64,
     pub tick_id: TickId,
     pub entity: EntityId,
+    /// The ability execution that caused this action, if any.
+    /// `None` for buff expiry and other non-ability deferred actions.
+    pub source: Option<AbilityExecutionId>,
     pub action_type: ScheduledActionType,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ScheduledActionType {
-    AbilityFrame { ability_id: u32, action: AbilityAction },
+    AbilityFrame {
+        /// Identity of the cast instance that spawned this action.
+        /// Look up `AbilityExecutionContext` by this ID to get cast-time targeting
+        /// and spatial snapshot — do not re-derive from current world state.
+        execution_id: AbilityExecutionId,
+        ability_id: u32,
+        action: AbilityAction,
+    },
     BuffExpire { buff_id: u32 },
-    CooldownExpire { ability_id: u32 },
+    // CooldownExpire removed — cooldown expiry is now owned by TickPipeline::cooldowns.
+    // Phase 8 drains the HashMap each tick and emits CooldownReady events directly,
+    // making this variant unnecessary and eliminating the O(n) queue scan in is_on_cooldown.
 }
 
 /// Static definition of an ability — damage, shape, timing metadata.
@@ -117,5 +137,109 @@ impl AbilityRegistry {
     /// Look up the timeline for an ability. Required by UseAbility wiring.
     pub fn get_timeline(&self, ability_id: u32) -> Option<&AbilityTimeline> {
         self.timelines.get(&ability_id)
+    }
+}
+
+// ── Ability execution context ────────────────────────────────
+
+/// Monotonically increasing identity for one concrete cast of an ability.
+///
+/// Two casts of ability 1 by entity A have different `AbilityExecutionId` values,
+/// so per-cast state is unambiguous even when the same ability fires twice in quick
+/// succession or spawns multiple simultaneous effects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AbilityExecutionId(pub u64);
+
+/// Targeting resolved and validated at cast time.
+///
+/// Stored on `AbilityExecutionContext` so later timeline phases use the targeting
+/// intent from Phase 2, not whatever the current world state happens to be.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ResolvedTargeting {
+    /// Self-cast or PBAoE — no external target.
+    SelfCast,
+    /// Validated entity target.
+    Entity { target: EntityId },
+    /// World-position target (stationary AoEs, ground-targeted abilities).
+    Position { point: Vec3f },
+    /// Normalised direction (cones, line sweeps).
+    Direction { dir: Vec3f },
+    /// Lock-on acquired target — re-validated at execution time.
+    LockOn { target: EntityId },
+}
+
+/// Runtime record for one specific cast of an ability.
+///
+/// Created in Phase 2 when `UseAbility` is accepted, referenced by all later
+/// timeline phases for this cast, and removed when the cast's last action completes.
+///
+/// Rules:
+/// - Cast-time geometry (origin, facing) is snapshotted here in Phase 2.
+/// - Damage values and stats come from `AbilityRegistry` at execution time.
+/// - Mutable gameplay truth (positions, health) stays in `SimState`.
+#[derive(Clone, Debug)]
+pub struct AbilityExecutionContext {
+    pub execution_id: AbilityExecutionId,
+    pub ability_id: u32,
+    pub caster: EntityId,
+    pub started_at: TickId,
+    /// Resolved and validated targeting intent.
+    pub targeting: ResolvedTargeting,
+    /// Caster world position at cast time.
+    pub origin: Vec3f,
+    /// Caster facing direction (XZ-plane, unit length) at cast time.
+    pub facing: Vec3f,
+}
+
+/// Sparse store for all in-flight ability executions.
+///
+/// One entry per active cast, removed on completion. Keyed by `AbilityExecutionId`
+/// rather than entity index because casts span multiple ticks and are not dense
+/// enough to benefit from a flat array.
+#[derive(Debug, Default)]
+pub struct AbilityExecutionStore {
+    next_id: u64,
+    active: HashMap<AbilityExecutionId, AbilityExecutionContext>,
+}
+
+impl AbilityExecutionStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Allocate the next execution ID without inserting a context.
+    /// Call this before building the context so the ID can be embedded in
+    /// the context struct and passed to `schedule_ability` in the same Phase 2 block.
+    pub fn next_id(&mut self) -> AbilityExecutionId {
+        let id = AbilityExecutionId(self.next_id);
+        self.next_id += 1;
+        id
+    }
+
+    /// Insert a context built with the ID returned by `next_id()`.
+    pub fn insert(&mut self, ctx: AbilityExecutionContext) {
+        self.active.insert(ctx.execution_id, ctx);
+    }
+
+    pub fn get(&self, id: AbilityExecutionId) -> Option<&AbilityExecutionContext> {
+        self.active.get(&id)
+    }
+
+    /// Remove a single execution (called when its last timeline action completes).
+    pub fn remove(&mut self, id: AbilityExecutionId) -> bool {
+        self.active.remove(&id).is_some()
+    }
+
+    /// Remove all executions for a given caster (called on entity despawn).
+    pub fn remove_all_for_caster(&mut self, caster: EntityId) {
+        self.active.retain(|_, ctx| ctx.caster != caster);
+    }
+
+    pub fn len(&self) -> usize {
+        self.active.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.active.is_empty()
     }
 }

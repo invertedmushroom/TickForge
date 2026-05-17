@@ -426,7 +426,7 @@ impl PhysicsWorld {
         Some(super::conversions::body_to_transform(body))
     }
 
-    /// Set the position of a kinematic body.
+    /// Set the position of a kinematic body, preserving current rotation.
     pub fn set_kinematic_position(
         &mut self,
         entity_id: EntityId,
@@ -435,6 +435,25 @@ impl PhysicsWorld {
         if let Some(handle) = self.entity_to_body.get(&entity_id) {
             if let Some(body) = self.bodies.get_mut(*handle) {
                 let rotation = *body.rotation();
+                body.set_next_kinematic_position(Pose::from_parts(
+                    position,
+                    rotation,
+                ));
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Set the rotation of a kinematic body, preserving current position.
+    pub fn set_kinematic_rotation(
+        &mut self,
+        entity_id: EntityId,
+        rotation: Rotation,
+    ) -> bool {
+        if let Some(handle) = self.entity_to_body.get(&entity_id) {
+            if let Some(body) = self.bodies.get_mut(*handle) {
+                let position = body.translation();
                 body.set_next_kinematic_position(Pose::from_parts(
                     position,
                     rotation,
@@ -556,6 +575,15 @@ impl PhysicsBackend for PhysicsWorld {
     ) -> bool {
         let v = Vector::new(position.x, position.y, position.z);
         PhysicsWorld::set_kinematic_position(self, entity_id, v)
+    }
+
+    fn set_kinematic_rotation(
+        &mut self,
+        entity_id: EntityId,
+        rotation: game_protocol::types::Quatf,
+    ) -> bool {
+        let r = super::conversions::quatf_to_rotation(rotation);
+        PhysicsWorld::set_kinematic_rotation(self, entity_id, r)
     }
 
     fn set_linear_velocity(

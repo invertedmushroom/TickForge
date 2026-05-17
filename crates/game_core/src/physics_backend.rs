@@ -1,7 +1,7 @@
 use std::any::Any;
 
 use game_protocol::entity_id::EntityId;
-use game_protocol::types::{Transform, Vec3f};
+use game_protocol::types::{Quatf, Transform, Vec3f};
 use game_schema::EntityKind;
 
 /// What role a collider plays on an entity.
@@ -11,8 +11,8 @@ pub enum ColliderKind {
     Body,
     /// Vulnerable region — receives damage.
     Hurtbox,
-    /// Active attack region — deals damage. Carries an ability id.
-    Hitbox(u32),
+    /// Active attack region — deals damage. Carries an `AbilityExecutionId.0` (opaque u64).
+    Hitbox(u64),
     /// Directional block region. Carries a block id.
     BlockCone(u32),
     /// Passive proximity region (aggro, buff pulse). Carries an aura id.
@@ -81,6 +81,13 @@ pub trait PhysicsBackend: Send {
 
     /// Set the next kinematic position for a position-based kinematic body.
     fn set_kinematic_position(&mut self, entity_id: EntityId, position: Vec3f) -> bool;
+
+    /// Set the next kinematic rotation for a position-based kinematic body.
+    ///
+    /// `rotation` is a unit quaternion representing the desired orientation.
+    /// The body's current translation is preserved; only rotation changes.
+    /// Returns true if the entity exists and the body was updated, false otherwise.
+    fn set_kinematic_rotation(&mut self, entity_id: EntityId, rotation: Quatf) -> bool;
 
     /// Set the linear velocity of a dynamic body.
     fn set_linear_velocity(&mut self, entity_id: EntityId, velocity: Vec3f) -> bool;
