@@ -63,6 +63,11 @@ pub struct PhysicsWorld {
     env_collider_counter: u64,
     env_collider_handles: HashMap<u64, ColliderHandle>,
     env_colliders_by_layer: HashMap<u32, Vec<u64>>,
+
+    // Disabled character body pool — bodies with colliders intact but disabled.
+    // Keyed by EntityKind so NPC bodies are reused for NPCs, etc.
+    // All character kinds currently share identical capsule geometry (0.5, 0.3).
+    disabled_pool: Vec<(RigidBodyHandle, EntityKind)>,
 }
 
 /// Result of a raycast query.
@@ -109,6 +114,7 @@ impl PhysicsWorld {
             env_collider_counter: 0,
             env_collider_handles: HashMap::new(),
             env_colliders_by_layer: HashMap::new(),
+            disabled_pool: Vec::new(),
         };
 
         // Default ground plane — every world has a floor.
@@ -416,21 +422,18 @@ impl PhysicsWorld {
         if let Some(body_handle) = self.entity_to_body.remove(&entity_id) {
             self.body_to_entity.remove(&body_handle);
             // Clean up collider metadata for all colliders attached to this body.
-            // Rapier's body removal cascades to colliders, so we mirror that.
-            let attached: std::collections::HashSet<ColliderHandle> = self.collider_kinds
-                .keys()
-                .filter(|ch| {
-                    self.colliders.get(**ch)
-                        .and_then(|c| c.parent()) == Some(body_handle)
-                })
-                .copied()
-                .collect();
+            // Use body.colliders() for O(attached) instead of scanning all colliders.
+            let attached: Vec<ColliderHandle> = self.bodies.get(body_handle)
+                .map(|b| b.colliders().to_vec())
+                .unwrap_or_default();
+            let attached_set: std::collections::HashSet<ColliderHandle> =
+                attached.iter().copied().collect();
 
             // Remove any opaque sensor handles pointing at colliders attached to this body
             // so the internal `sensor_handles` map does not grow unbounded.
-            self.sensor_handles.retain(|_, ch| !attached.contains(ch));
+            self.sensor_handles.retain(|_, ch| !attached_set.contains(ch));
 
-            for ch in attached.iter() {
+            for ch in &attached {
                 self.collider_kinds.remove(ch);
             }
 
@@ -448,6 +451,139 @@ impl PhysicsWorld {
             true
         } else {
             false
+        }
+    }
+
+    /// Disable a character body and pool it for reuse instead of destroying it.
+    ///
+    /// Removes the entity from lookup maps and disables the rigid body and all
+    /// attached colliders so they no longer participate in broadphase queries or
+    /// collision detection. The body+colliders remain allocated in Rapier's sets
+    /// and can be re-enabled cheaply by `reuse_or_spawn_character`.
+    ///
+    /// Returns `true` if the entity was found and pooled.
+    pub fn disable_entity(&mut self, entity_id: EntityId, kind: EntityKind) -> bool {
+        if let Some(body_handle) = self.entity_to_body.remove(&entity_id) {
+            self.body_to_entity.remove(&body_handle);
+
+            // Clean up sensor and collider-kind metadata exactly as remove_entity does,
+            // but keep the body+colliders alive in Rapier.
+            let attached: Vec<ColliderHandle> = self.bodies.get(body_handle)
+                .map(|b| b.colliders().to_vec())
+                .unwrap_or_default();
+            let attached_set: HashSet<ColliderHandle> = attached.iter().copied().collect();
+            self.sensor_handles.retain(|_, ch| !attached_set.contains(ch));
+            for ch in &attached {
+                self.collider_kinds.remove(ch);
+            }
+            self.world_sensor_owners.retain(|_, &mut owner| owner != entity_id);
+
+            // Disable body — removes from island/broadphase, zero cost per step.
+            if let Some(body) = self.bodies.get_mut(body_handle) {
+                body.set_enabled(false);
+            }
+            // Disable all attached colliders so they don't appear in any query.
+            for &ch in &attached {
+                if let Some(collider) = self.colliders.get_mut(ch) {
+                    collider.set_enabled(false);
+                }
+            }
+
+            self.disabled_pool.push((body_handle, kind));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Try to reuse a pooled character body, or fall back to creating a fresh one.
+    ///
+    /// Looks for a disabled body matching `kind` in the pool. If found, re-enables
+    /// it, resets position/velocity, updates collision groups for the target kind,
+    /// and maps it to the new entity. If the pool is empty for that kind, delegates
+    /// to `add_kinematic_capsule` for a fresh allocation.
+    ///
+    /// Returns `true` if the entity now has a body (always succeeds).
+    pub fn reuse_or_spawn_character(
+        &mut self,
+        entity_id: EntityId,
+        position: Vector,
+        kind: EntityKind,
+    ) -> bool {
+        if self.entity_to_body.contains_key(&entity_id) {
+            return false;
+        }
+
+        // Find a pooled body matching this kind (pop from back for O(1)).
+        let pool_idx = self.disabled_pool.iter().rposition(|(_, k)| *k == kind);
+        if let Some(idx) = pool_idx {
+            let (body_handle, _) = self.disabled_pool.swap_remove(idx);
+
+            // Re-enable body and reset its state.
+            if let Some(body) = self.bodies.get_mut(body_handle) {
+                body.set_enabled(true);
+                body.set_next_kinematic_position(Pose::from_parts(position, Default::default()));
+                body.set_linvel(Vector::new(0.0, 0.0, 0.0), false);
+                body.set_angvel(Vector::new(0.0, 0.0, 0.0), false);
+                body.reset_forces(false);
+            }
+
+            // Re-enable all attached colliders and restore collider_kinds metadata.
+            let attached: Vec<ColliderHandle> = self.bodies.get(body_handle)
+                .map(|b| b.colliders().to_vec())
+                .unwrap_or_default();
+
+            let groups = match kind {
+                EntityKind::Player => collision_groups::player_body_groups(),
+                EntityKind::Npc | EntityKind::Boss => collision_groups::npc_body_groups(),
+                _ => collision_groups::player_body_groups(),
+            };
+
+            for (i, &ch) in attached.iter().enumerate() {
+                if let Some(collider) = self.colliders.get_mut(ch) {
+                    collider.set_enabled(true);
+                    // First collider = Body, second = Hurtbox (per add_kinematic_capsule layout).
+                    if i == 0 {
+                        collider.set_collision_groups(groups);
+                        self.collider_kinds.insert(ch, ColliderKind::Body);
+                    } else {
+                        collider.set_collision_groups(collision_groups::skill_hurtbox_groups());
+                        self.collider_kinds.insert(ch, ColliderKind::Hurtbox);
+                    }
+                }
+            }
+
+            self.entity_to_body.insert(entity_id, body_handle);
+            self.body_to_entity.insert(body_handle, entity_id);
+            true
+        } else {
+            // Pool empty for this kind — create fresh.
+            let groups = match kind {
+                EntityKind::Player => collision_groups::player_body_groups(),
+                EntityKind::Npc | EntityKind::Boss => collision_groups::npc_body_groups(),
+                _ => collision_groups::player_body_groups(),
+            };
+            self.add_kinematic_capsule(entity_id, position, 0.5, 0.3, groups);
+            true
+        }
+    }
+
+    /// Remove excess pooled bodies to bound memory usage.
+    ///
+    /// Keeps at most `max_idle` bodies in the pool; fully removes the rest
+    /// from Rapier's body/collider sets. Call after bulk despawn ticks.
+    pub fn drain_pool(&mut self, max_idle: usize) {
+        while self.disabled_pool.len() > max_idle {
+            let (handle, _) = self.disabled_pool.pop().unwrap();
+            // Fully destroy the body and its colliders.
+            self.bodies.remove(
+                handle,
+                &mut self.islands,
+                &mut self.colliders,
+                &mut self.impulse_joints,
+                &mut self.multibody_joints,
+                true,
+            );
         }
     }
 
@@ -561,6 +697,14 @@ impl PhysicsWorld {
 
     pub fn body_count(&self) -> usize {
         self.bodies.len()
+    }
+
+    pub fn has_entity_body(&self, entity_id: EntityId) -> bool {
+        self.entity_to_body.contains_key(&entity_id)
+    }
+
+    pub fn pool_size(&self) -> usize {
+        self.disabled_pool.len()
     }
 
     pub fn entity_for_body(&self, handle: RigidBodyHandle) -> Option<EntityId> {
@@ -1146,6 +1290,24 @@ impl PhysicsBackend for PhysicsWorld {
             }
         }
         false
+    }
+
+    fn disable_entity(&mut self, entity_id: EntityId, kind: EntityKind) -> bool {
+        PhysicsWorld::disable_entity(self, entity_id, kind)
+    }
+
+    fn reuse_or_spawn_character(
+        &mut self,
+        entity_id: EntityId,
+        position: game_protocol::types::Vec3f,
+        kind: EntityKind,
+    ) -> bool {
+        let pos = Vector::new(position.x, position.y, position.z);
+        PhysicsWorld::reuse_or_spawn_character(self, entity_id, pos, kind)
+    }
+
+    fn drain_pool(&mut self, max_idle: usize) {
+        PhysicsWorld::drain_pool(self, max_idle);
     }
 }
 

@@ -152,11 +152,6 @@ pub struct TickResult {
     /// (entity_id, Vec<ActiveBuff>). Written as delete-all-then-insert
     /// per entity in the reducer.
     pub buff_updates: Vec<(EntityId, Vec<game_core::combat::status::ActiveBuff>)>,
-    /// Threat persistence snapshots for NPCs/bosses.
-    ///
-    /// At most one entry (the current aggro holder) is emitted per NPC, and only
-    /// when that holder changes or clears. Full threat ordering remains in-memory.
-    pub threat_updates: Vec<(EntityId, Vec<game_core::combat::status::ThreatEntry>)>,
     /// NPC AI state snapshot for all active NPCs/bosses.
     /// Each entry is (entity_id, NpcAiState, top_threat target).
     pub npc_state_updates: Vec<(EntityId, game_schema::NpcAiState, Option<EntityId>)>,
@@ -299,10 +294,23 @@ impl TickPipeline {
     /// Returns `true` if an entity was actually removed from `SimState`, `false` if it
     /// was not present.
     pub fn force_remove_entity(&mut self, id: EntityId) -> bool {
-        use std::collections::HashSet;
+        self.force_remove_entities(&[id]) > 0
+    }
 
-        // 1) Determine all execution IDs owned by this caster so we can fully
-        //    remove any dependent runtime objects (scheduled actions, sensors, hitboxes).
+    /// Batch hard teardown for multiple entities. Performs each cleanup pass once
+    /// against a `HashSet` of removed IDs instead of per-entity, converting
+    /// O(N × world) into O(world) for threat tables, fear references, cooldowns, etc.
+    ///
+    /// Returns the number of entities actually removed from `SimState`.
+    pub fn force_remove_entities(&mut self, ids: &[EntityId]) -> usize {
+        if ids.is_empty() {
+            return 0;
+        }
+
+        let removed_set: HashSet<EntityId> = ids.iter().copied().collect();
+
+        // 1) Determine all execution IDs owned by ANY removed caster so we can
+        //    fully remove dependent runtime objects (scheduled actions, sensors, hitboxes).
         let execs_to_remove: HashSet<AbilityExecutionId> = self
             .state
             .combat
@@ -314,16 +322,15 @@ impl TickPipeline {
                     .combat
                     .executions
                     .get(eid)
-                    .map(|ctx| ctx.caster == id)
+                    .map(|ctx| removed_set.contains(&ctx.caster))
                     .unwrap_or(false)
             })
             .collect();
 
-        // 2) Remove any future actions that target this entity OR are sourced from
-        //    an execution owned by this entity (prevents orphaned actions referencing
-        //    dead executions). Use retain to keep only actions that are unrelated.
+        // 2) Remove any future actions that target a removed entity OR are sourced
+        //    from an execution owned by a removed entity.
         self.scheduled_actions.retain(|a| {
-            if a.entity == id {
+            if removed_set.contains(&a.entity) {
                 return false;
             }
             match a.source {
@@ -332,45 +339,42 @@ impl TickPipeline {
             }
         });
 
-        // 3) Remove cooldown entries for this entity
-        self.cooldowns.retain(|&(eid, _), _| eid != id);
+        // 3) Single-pass cooldown cleanup.
+        self.cooldowns.retain(|&(eid, _), _| !removed_set.contains(&eid));
 
-        // 4) Remove follow-up windows for this entity.
-        self.state.combat.active_windows.retain(|&(eid, _), _| eid != id);
-        self.state.combat.charging.remove(&id);
-
-        // 4b) Scrub this entity from all NPC threat tables so they acquire new targets.
-        // Leaving a removed entity in threat tables can cause NPCs to lock onto a
-        // non-existent target and no-op during movement (physics transform missing).
-        for (_, table) in self.state.combat.threat_tables.iter_mut() {
-            table.entries.retain(|e| e.source != id);
+        // 4) Single-pass follow-up windows + charging cleanup.
+        self.state.combat.active_windows.retain(|&(eid, _), _| !removed_set.contains(&eid));
+        for id in &removed_set {
+            self.state.combat.charging.remove(id);
         }
 
-        // 4c) Clear fear_source references so feared entities don't freeze in place.
-        // Without this, a feared entity whose fear source dies becomes fully stuck:
-        // drive_fear_movement skips movement when get_transform(fear_source) returns None,
-        // but FEARED flag keeps is_cc_disabled() returning true, blocking all intents.
-        //
+        // 4b) Single-pass threat table scrub — one iteration of all NPC threat
+        //     tables, retaining only entries whose source is not in the removed set.
+        for (_, table) in self.state.combat.threat_tables.iter_mut() {
+            table.entries.retain(|e| !removed_set.contains(&e.source));
+        }
+
+        // 4c) Single-pass fear cleanup — one scan of all tactical slots.
         // Collect affected slot indices first, then remove debuffs in a second pass
         // (tactical and status live in separate fields, so we can't do both in one loop).
         let mut fear_cleared_slots: Vec<usize> = Vec::new();
         for (i, t) in self.state.combat.tactical.iter_mut().enumerate() {
-            if t.fear_source == Some(id) {
-                t.fear_source = None;
-                t.movement_conditions.remove(
-                    game_core::combat::tactical::MovementConditions::FEARED,
-                );
-                fear_cleared_slots.push(i);
+            if let Some(src) = t.fear_source {
+                if removed_set.contains(&src) {
+                    t.fear_source = None;
+                    t.movement_conditions.remove(
+                        game_core::combat::tactical::MovementConditions::FEARED,
+                    );
+                    fear_cleared_slots.push(i);
+                }
             }
         }
-        // Remove the fear debuff (buff 504) only for entities whose fear_source
-        // pointed at the removed entity — not from every entity in the world.
         for slot in fear_cleared_slots {
             let idx = self.state.entities.index_at(slot);
             self.state.status.remove_cc_debuff(idx, game_schema::CCEffect::Fear);
         }
 
-        // 5) Remove hitbox sensors and execution contexts owned by this entity
+        // 5) Remove hitbox sensors and execution contexts owned by removed entities.
         for exec_id in execs_to_remove.iter().copied() {
             if let Some(handle) = self
                 .state
@@ -385,26 +389,44 @@ impl TickPipeline {
             self.state.combat.executions.remove(exec_id);
         }
 
-        // 6) Drop region tracking and dirty-tracking for this entity.
-        self.entity_regions.remove(&id);
-        self.last_committed_transforms.remove(&id);
-        self.npc_state_prev.remove(&id);
-        self.equipment_modifiers.remove(&id);
-        self.weapon_swap_cooldowns.remove(&id);
+        // 6) Drop region tracking and dirty-tracking for each removed entity.
+        for id in &removed_set {
+            self.entity_regions.remove(id);
+            self.last_committed_transforms.remove(id);
+            self.npc_state_prev.remove(id);
+            self.equipment_modifiers.remove(id);
+            self.weapon_swap_cooldowns.remove(id);
+        }
 
-        // 6b) Cancel any active lock-on session owned by this entity.
-        // Emit LockOnCanceled for every tagged target so clients clear their indicators.
-        if let Some(session) = self.active_lock_on_sessions.remove(&id) {
-            for target in &session.tagged {
-                self.emit_event(id, EventPayload::LockOnCanceled { source: id, target: *target });
+        // 6b) Cancel any active lock-on sessions owned by removed entities.
+        for &id in &removed_set {
+            if let Some(session) = self.active_lock_on_sessions.remove(&id) {
+                for target in &session.tagged {
+                    self.emit_event(id, EventPayload::LockOnCanceled { source: id, target: *target });
+                }
             }
         }
 
-        // 7) Finally, remove entity from SimState and physics world
-        let removed = self.state.remove_entity(id);
-        // Always attempt to remove physics body; remove_entity is idempotent there.
-        self.physics.remove_entity(id);
-        removed
+        // 7) Remove entities from SimState and physics world.
+        //    Character bodies (Player/NPC/Boss) are pooled via disable_entity
+        //    for cheap reuse on respawn. Other kinds are fully removed.
+        let mut count = 0usize;
+        for &id in &removed_set {
+            let kind = self.state.entities.lookup(id)
+                .map(|idx| self.state.entities.kinds[idx.as_usize()]);
+            if self.state.remove_entity(id) {
+                count += 1;
+            }
+            match kind {
+                Some(EntityKind::Player | EntityKind::Npc | EntityKind::Boss) => {
+                    self.physics.disable_entity(id, kind.unwrap());
+                }
+                _ => {
+                    self.physics.remove_entity(id);
+                }
+            }
+        }
+        count
     }
 
     pub fn new(
@@ -448,6 +470,29 @@ impl TickPipeline {
 
     pub fn physics_mut(&mut self) -> &mut dyn PhysicsBackend {
         &mut *self.physics
+    }
+
+    // ── Test support accessors ──────────────────────────────────
+    //
+    // Expose internals that integration tests need to set up encounter
+    // scenarios. Not part of the public API contract.
+
+    /// Direct access to `SimState` for test setup (e.g. manipulating HP).
+    #[doc(hidden)]
+    pub fn state_mut(&mut self) -> &mut SimState {
+        &mut self.state
+    }
+
+    /// Direct access to the encounter map for test registration.
+    #[doc(hidden)]
+    pub fn encounters_mut(&mut self) -> &mut HashMap<EntityId, game_core::encounter::EncounterState> {
+        &mut self.encounters
+    }
+
+    /// Read-only access to encounters for assertions.
+    #[doc(hidden)]
+    pub fn encounters(&self) -> &HashMap<EntityId, game_core::encounter::EncounterState> {
+        &self.encounters
     }
 
     pub fn set_current_tick(&mut self, tick: TickId) {
@@ -496,7 +541,7 @@ impl TickPipeline {
         self.state.spawn_entity(id, kind, tick, max_hp);
         match kind {
             EntityKind::Player | EntityKind::Npc | EntityKind::Boss => {
-                self.physics.spawn_character_body(id, position, kind);
+                self.physics.reuse_or_spawn_character(id, position, kind);
             }
             EntityKind::Prop => {
                 // Props get a dynamic box body; default half-extents 0.5m cube.
@@ -526,7 +571,6 @@ impl TickPipeline {
     pub fn seed_runtime_state(
         &mut self,
         buffs: &[(EntityId, Vec<game_core::combat::status::ActiveBuff>)],
-        threats: &[(EntityId, Vec<game_core::combat::status::ThreatEntry>)],
         npc_states: &[(EntityId, game_schema::NpcAiState, Option<EntityId>)],
     ) {
         for (eid, entity_buffs) in buffs {
@@ -537,16 +581,19 @@ impl TickPipeline {
                 self.stats_dirty.insert(*eid);
             }
         }
-        for (eid, entries) in threats {
-            if let Some(idx) = self.state.entities.lookup(*eid)
-                && let Some(table) = self.state.combat.threat_tables.get_mut(idx) {
-                    table.entries = entries.clone();
-                }
-        }
-        for (eid, ai_state, _target) in npc_states {
+        for (eid, ai_state, target) in npc_states {
             if let Some(idx) = self.state.entities.lookup(*eid) {
                 if let Some(ai) = self.state.ai.npc_ai.get_mut(idx) {
                     *ai = *ai_state;
+                }
+                // Reconstruct a minimal in-memory threat table from npc_state.target_entity
+                // so restart recovery preserves the current aggro holder.
+                if let Some(target_id) = target {
+                    if let Some(table) = self.state.combat.threat_tables.get_mut(idx) {
+                        if table.entries.is_empty() {
+                            table.add_threat(*target_id, 1.0);
+                        }
+                    }
                 }
             }
         }
@@ -1094,7 +1141,6 @@ impl TickPipeline {
         self.summary.scheduled_actions_len = self.scheduled_actions.len();
         // Collect runtime domain snapshots for persistence.
         let buff_updates = self.collect_buff_updates();
-        let threat_updates = self.collect_threat_updates();
         let npc_state_updates = self.collect_npc_state_updates();
 
         let all_transforms = self.physics.get_all_transforms();
@@ -1119,7 +1165,6 @@ impl TickPipeline {
             entity_state_updates,
             health_updates,
             buff_updates,
-            threat_updates,
             npc_state_updates,
             region_updates,
             director_spawns,

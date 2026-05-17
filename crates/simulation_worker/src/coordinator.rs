@@ -64,8 +64,6 @@ fn send_commit(reducers: &RemoteReducers, pkg: CommitPackage, state: Arc<Mutex<C
     let region_updates = wire_region_updates(&pkg);
     let buff_updates = wire_buff_updates(&pkg);
     let buff_cleared_entity_ids = pkg.buff_cleared_entity_ids.clone();
-    let threat_updates = wire_threat_updates(&pkg);
-    let threat_cleared_entity_ids = pkg.threat_cleared_entity_ids.clone();
     let npc_state_updates = wire_npc_state_updates(&pkg);
     let director_spawns = wire_director_spawns(&pkg);
     let interactable_updates = wire_interactable_updates(&pkg);
@@ -85,8 +83,6 @@ fn send_commit(reducers: &RemoteReducers, pkg: CommitPackage, state: Arc<Mutex<C
         region_updates,
         buff_updates,
         buff_cleared_entity_ids,
-        threat_updates,
-        threat_cleared_entity_ids,
         npc_state_updates,
         director_spawns,
         interactable_updates,
@@ -1550,17 +1546,6 @@ fn wire_buff_updates(pkg: &CommitPackage) -> Vec<BuffUpdate> {
             mod_ai_override_target: b.mod_ai_override_target,
             mod_root: b.mod_root,
             mod_stealth: b.mod_stealth,
-        })
-        .collect()
-}
-
-fn wire_threat_updates(pkg: &CommitPackage) -> Vec<ThreatUpdate> {
-    pkg.threat_updates
-        .iter()
-        .map(|t| ThreatUpdate {
-            npc_entity: t.npc_entity,
-            source_entity: t.source_entity,
-            threat: t.threat,
         })
         .collect()
 }

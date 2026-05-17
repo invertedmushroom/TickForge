@@ -178,20 +178,6 @@ pub struct ActiveBuff {
     pub mod_stealth: Option<bool>,
 }
 
-// ── Aggro ───────────────────────────────────────────────────────────
-// Single writer: combat system.
-
-#[table(accessor = threat_entry, public)]
-pub struct ThreatEntry {
-    #[primary_key]
-    #[auto_inc]
-    pub threat_id: u64,
-    #[index(btree)]
-    pub npc_entity: u64,
-    pub source_entity: u64,
-    pub threat: f32,
-}
-
 // ── NPC State ───────────────────────────────────────────────────────
 // Single writer: AI system. NpcAiState is in game_schema.
 

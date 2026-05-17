@@ -200,6 +200,29 @@ pub trait PhysicsBackend: Send {
         let _ = (entity_id, enabled);
         false
     }
+
+    /// Disable a character body and pool it for later reuse instead of destroying it.
+    ///
+    /// The body and its colliders stay allocated but are removed from broadphase
+    /// and collision detection. `kind` is used as the pool key so bodies are
+    /// reused within the same entity kind (matching collider geometry).
+    ///
+    /// Default: falls back to `remove_entity` (no pooling).
+    fn disable_entity(&mut self, entity_id: EntityId, _kind: EntityKind) -> bool {
+        self.remove_entity(entity_id)
+    }
+
+    /// Try to reuse a pooled character body for `entity_id`, or create a fresh one.
+    ///
+    /// Default: falls back to `spawn_character_body` (no pooling).
+    fn reuse_or_spawn_character(&mut self, entity_id: EntityId, position: Vec3f, kind: EntityKind) -> bool {
+        self.spawn_character_body(entity_id, position, kind)
+    }
+
+    /// Remove excess pooled bodies above `max_idle` to bound memory.
+    ///
+    /// Default: no-op (no pool to drain).
+    fn drain_pool(&mut self, _max_idle: usize) {}
 }
 
 /// Abstract shape for environment colliders (walls, floors, pillars).

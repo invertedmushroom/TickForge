@@ -1371,8 +1371,6 @@ fn run_f6_unauthorized_commit(conn: &DbConnection, r: &mut TestResults) {
         vec![],     // region_updates
         vec![],     // buff_updates
         vec![],     // buff_cleared_entity_ids
-        vec![],     // threat_updates
-        vec![],     // threat_cleared_entity_ids
         vec![],     // npc_state_updates
         vec![],     // director_spawns
         vec![],     // interactable_updates
@@ -1413,7 +1411,7 @@ fn run_f7_cursor_safety(conn: &DbConnection, r: &mut TestResults) {
     let _ = conn.reducers().commit_tick_results_then(
         fake_tick,
         vec![], vec![], vec![], vec![], vec![], vec![], vec![],
-        vec![], vec![], vec![], vec![], vec![],
+        vec![], vec![], vec![],
         vec![], // director_spawns
         vec![], // interactable_updates
         move |_ctx, _result| {

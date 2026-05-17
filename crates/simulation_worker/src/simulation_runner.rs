@@ -128,10 +128,9 @@ impl SimulationRunner {
     pub fn seed_runtime_state(
         &mut self,
         buffs: &[(EntityId, Vec<game_core::combat::status::ActiveBuff>)],
-        threats: &[(EntityId, Vec<game_core::combat::status::ThreatEntry>)],
         npc_states: &[(EntityId, game_schema::NpcAiState, Option<EntityId>)],
     ) {
-        self.pipeline.seed_runtime_state(buffs, threats, npc_states);
+        self.pipeline.seed_runtime_state(buffs, npc_states);
     }
 
     /// Hard teardown for an entity from all runtime stores.

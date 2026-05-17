@@ -19,6 +19,7 @@ impl Plugin for SyncPlugin {
             sync_health_bars,
             sync_target_lock_indicator,
             sync_npc_state_color,
+            sync_interactables,
         ).chain());
     }
 }
@@ -91,6 +92,7 @@ struct EntityMeshes {
     projectile_mat: Handle<StandardMaterial>,
     hazard_mat: Handle<StandardMaterial>,
     prop_mat: Handle<StandardMaterial>,
+    prop_active_mat: Handle<StandardMaterial>,
 }
 
 impl FromWorld for EntityMeshes {
@@ -143,6 +145,11 @@ impl FromWorld for EntityMeshes {
             base_color: Color::srgb(0.6, 0.4, 0.2),
             ..default()
         });
+        let prop_active_mat = materials.add(StandardMaterial {
+            base_color: Color::srgba(0.6, 0.4, 0.2, 0.2),
+            alpha_mode: AlphaMode::Blend,
+            ..default()
+        });
 
         EntityMeshes {
             player_mesh,
@@ -160,6 +167,7 @@ impl FromWorld for EntityMeshes {
             projectile_mat,
             hazard_mat,
             prop_mat,
+            prop_active_mat,
         }
     }
 }
@@ -472,5 +480,33 @@ fn sync_npc_state_color(
         };
 
         commands.entity(bevy_entity).insert(MeshMaterial3d(mat));
+    }
+}
+
+// ── Interactable state sync ─────────────────────────────────────────
+
+/// Update interactable meshes based on their current state (e.g., gates opening).
+fn sync_interactables(
+    stdb: Option<Res<StdbConnection>>,
+    entity_map: Res<EntityMap>,
+    entity_meshes: Option<Res<EntityMeshes>>,
+    mut commands: Commands,
+) {
+    let Some(stdb) = stdb else { return };
+    let Some(meshes) = entity_meshes else { return };
+
+    for interactable in stdb.conn.db.interactable_config().iter() {
+        if let Some(&bevy_entity) = entity_map.map.get(&interactable.entity_id) {
+            let mat = match interactable.state {
+                game_client::module_bindings::InteractState::Active => meshes.prop_active_mat.clone(),
+                _ => meshes.prop_mat.clone(), // Idle and Cooldown use default solid material
+            };
+            
+            // Specifically handling Gate and Chest kinds as visible props
+            if matches!(interactable.interact_kind, game_client::module_bindings::InteractKind::Gate | game_client::module_bindings::InteractKind::Chest) {
+                // By updating the material here, gates and chests will become transparent when Active (open)
+                commands.entity(bevy_entity).insert(MeshMaterial3d(mat));
+            }
+        }
     }
 }

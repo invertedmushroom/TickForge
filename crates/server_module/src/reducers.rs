@@ -546,8 +546,6 @@ pub fn commit_tick_results(
     region_updates: Vec<RegionUpdate>,
     buff_updates: Vec<BuffUpdate>,
     buff_cleared_entity_ids: Vec<u64>,
-    threat_updates: Vec<ThreatUpdate>,
-    threat_cleared_entity_ids: Vec<u64>,
     npc_state_updates: Vec<NpcStateUpdate>,
     director_spawns: Vec<DirectorSpawnInput>,
     interactable_updates: Vec<InteractableUpdate>,
@@ -671,9 +669,9 @@ pub fn commit_tick_results(
                 ctx.db.instance_membership().entity_id().delete(&u.entity_id);
                 ctx.db.interactable_config().entity_id().delete(&u.entity_id);
                 // Note: death_state is NOT deleted here — players need it for respawn.
-                // Buffs and threat rows for Removed entities are already cleaned
-                // up by the buff_cleared / threat_cleared sections below — the
-                // worker explicitly adds Removed entity IDs to those lists.
+                // Buff rows for Removed entities are already cleaned up by the
+                // buff_cleared section below — the worker explicitly adds Removed
+                // entity IDs to that list.
                 log::info!(
                     "commit_tick_results tick={}: entity {} removed — companion rows deleted",
                     tick_id, u.entity_id
@@ -751,24 +749,6 @@ pub fn commit_tick_results(
             } else {
                 ctx.db.stealthed_entity().entity_id().delete(&entity_id);
             }
-        }
-    }
-
-    // Persist threat: delete all rows for NPCs present in threat_cleared_entity_ids, then re-insert.
-    // threat_cleared_entity_ids always includes every non-Removed NPC/Boss entity so stale rows
-    // are reliably cleared when all threat decays to zero in a single tick.
-    {
-        // threat_cleared_entity_ids drives deletes; threat_updates drives inserts.
-        for npc_entity in &threat_cleared_entity_ids {
-            ctx.db.threat_entry().npc_entity().delete(npc_entity);
-        }
-        for t in threat_updates {
-            ctx.db.threat_entry().insert(ThreatEntry {
-                threat_id: 0, // auto_inc
-                npc_entity: t.npc_entity,
-                source_entity: t.source_entity,
-                threat: t.threat,
-            });
         }
     }
 
@@ -942,13 +922,6 @@ pub struct BuffUpdate {
     pub mod_ai_override_target: Option<u64>,
     pub mod_root: Option<bool>,
     pub mod_stealth: Option<bool>,
-}
-
-#[derive(spacetimedb::SpacetimeType, Clone, Debug)]
-pub struct ThreatUpdate {
-    pub npc_entity: u64,
-    pub source_entity: u64,
-    pub threat: f32,
 }
 
 #[derive(spacetimedb::SpacetimeType, Clone, Debug)]
@@ -2247,7 +2220,7 @@ mod debug_reducers {
     }
 
     /// Force-remove an entity. Deletes companion rows (transform, health,
-    /// region, npc_state, buffs, threat, pending inputs, and client ownership).
+    /// region, npc_state, buffs, pending inputs, and client ownership).
     /// Use to clean up stuck or unwanted entities during testing.
     #[reducer]
     pub fn debug_remove_entity(
@@ -2287,18 +2260,6 @@ mod debug_reducers {
 
         // Buffs.
         ctx.db.active_buff().entity_id().delete(&entity_id);
-
-        // Threat (as NPC or as source).
-        ctx.db.threat_entry().npc_entity().delete(&entity_id);
-        // Also remove threat rows where this entity is listed as a source.
-        let source_threat_ids: Vec<u64> = ctx.db.threat_entry()
-            .iter()
-            .filter(|t| t.source_entity == entity_id)
-            .map(|t| t.threat_id)
-            .collect();
-        for id in source_threat_ids {
-            ctx.db.threat_entry().threat_id().delete(&id);
-        }
 
         // Party, boss phase, death state, NPC goals, instances, interactables.
         ctx.db.party_member().entity_id().delete(&entity_id);
@@ -2659,6 +2620,59 @@ mod debug_reducers {
             });
         }
         log::info!("debug_set_team: entity={entity_id} team_id={team_id}");
+        Ok(())
+    }
+
+    /// Join an instance without the party membership requirement.
+    /// Identical to `join_instance` but skips the party check, allowing
+    /// solo testing of dungeon flows from the CLI.
+    #[reducer]
+    pub fn debug_join_instance(
+        ctx: &ReducerContext,
+        instance_id: u64,
+    ) -> Result<(), String> {
+        if !is_module_admin(ctx) && !is_debug_caller(ctx) {
+            return Err("debug_join_instance: admin only".into());
+        }
+        let caller = ctx.sender();
+        let seq = ctx.db.client_sequence().client_identity().find(&caller)
+            .ok_or("Not registered")?;
+        let entity_id = seq.entity_id;
+
+        let instance = ctx.db.instance().instance_id().find(&instance_id)
+            .ok_or("Instance not found")?;
+        if instance.state != InstanceState::Active && instance.state != InstanceState::Pending {
+            return Err(format!("Instance is {:?} — cannot join", instance.state));
+        }
+
+        if ctx.db.instance_membership().entity_id().find(&entity_id).is_some() {
+            return Err("Already in an instance".into());
+        }
+
+        let member_count = ctx.db.instance_membership().instance_id().filter(&instance_id).count() as u32;
+        if member_count >= instance.max_players {
+            return Err("Instance is full".into());
+        }
+
+        ctx.db.instance_membership().insert(InstanceMembership {
+            entity_id,
+            instance_id,
+            disconnect_at: None,
+        });
+
+        if let Some(er) = ctx.db.entity_region().entity_id().find(&entity_id) {
+            ctx.db.entity_region().entity_id().update(EntityRegion {
+                entity_id,
+                region_x: er.region_x,
+                region_z: er.region_z,
+                layer: instance.layer,
+            });
+        }
+
+        log::info!(
+            "debug_join_instance: entity {} joined instance {} (layer {}) — party check skipped",
+            entity_id, instance_id, instance.layer
+        );
         Ok(())
     }
 }

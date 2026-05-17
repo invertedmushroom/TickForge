@@ -70,43 +70,6 @@ impl TickPipeline {
         out
     }
 
-    /// Snapshot current aggro holders for persistence.
-    ///
-    /// The simulation keeps the full threat table in memory for AI decisions, but
-    /// the DB only needs a coarse recovery checkpoint: who currently has aggro.
-    /// Emit at most one threat entry (the current top target) when that holder
-    /// changes, or an empty snapshot when aggro clears so stale DB rows are deleted.
-    pub(super) fn collect_threat_updates(&mut self) -> Vec<(EntityId, Vec<game_core::combat::status::ThreatEntry>)> {
-        let mut out = Vec::new();
-        for (idx, table) in self.state.combat.threat_tables.iter() {
-            if self.state.entities.states[idx.as_usize()] == game_core::entity::lifecycle::EntityState::Removed {
-                continue;
-            }
-            let eid = self.state.entities.id_of(idx);
-            let current_top = table.top_threat();
-            let previous_top = self.npc_state_prev
-                .get(&eid)
-                .map(|(_, target)| *target)
-                .flatten();
-
-            if current_top == previous_top {
-                continue;
-            }
-
-            match current_top {
-                Some(source) => {
-                    let threat = table.entries.iter()
-                        .find(|entry| entry.source == source)
-                        .cloned()
-                        .unwrap_or(game_core::combat::status::ThreatEntry { source, threat: 1.0 });
-                    out.push((eid, vec![threat]));
-                }
-                None => out.push((eid, Vec::new())),
-            }
-        }
-        out
-    }
-
     /// Snapshot NPC AI state — only emits when state or target changed.
     pub(super) fn collect_npc_state_updates(&mut self) -> Vec<(EntityId, game_schema::NpcAiState, Option<EntityId>)> {
         let mut out = Vec::new();

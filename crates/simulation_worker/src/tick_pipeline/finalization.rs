@@ -118,16 +118,32 @@ impl TickPipeline {
         }
 
         // Clean up DespawnPending entities.
-        let despawning = self.state.despawn_pending();
-        for id in despawning {
+        // DespawnPending entities are already inert (filtered in views, skipped by
+        // simulation), so capping removals per tick is safe — excess entities stay
+        // DespawnPending and are cleaned up in subsequent ticks.
+        const MAX_REMOVALS_PER_TICK: usize = 500;
+        let all_despawning = self.state.despawn_pending();
+        let despawning: Vec<EntityId> = if all_despawning.len() > MAX_REMOVALS_PER_TICK {
+            log::info!(
+                "Staggering removal: {} pending, processing {} this tick",
+                all_despawning.len(),
+                MAX_REMOVALS_PER_TICK,
+            );
+            all_despawning[..MAX_REMOVALS_PER_TICK].to_vec()
+        } else {
+            all_despawning
+        };
+        // Emit per-entity events before batch teardown (events reference entity state
+        // that force_remove_entities will destroy).
+        for &id in &despawning {
             self.summary.despawns += 1;
             self.emit_event(id, EventPayload::EntityDespawned);
-            // Hard teardown for this entity from all runtime stores and the physics backend.
-            // Centralised here so external removal paths can call the same behaviour.
-            self.force_remove_entity(id);
             audit!(self.state, Lifecycle, Lifecycle, 8, Some(id), "remove");
             state_updates.push((id, EntityState::Removed));
         }
+        // Batch teardown — O(world) instead of O(N × world).
+        self.force_remove_entities(&despawning);
+        let bulk_despawn_count = despawning.len();
 
         // Expire buffs. Clear CC flags for any expired debuff that tracked a CC effect,
         // preventing stale SLEEPING/SILENCED/FEARED flags from persisting after natural expiry.
@@ -241,14 +257,16 @@ impl TickPipeline {
             self.emit_event(id, EventPayload::EntityDied { killer });
         }
         // Clean up DoT-killed DespawnPending entities.
+        // DoT deaths are typically few, but still use batch path for consistency.
         let dot_despawning = self.state.despawn_pending();
-        for id in dot_despawning {
+        for &id in &dot_despawning {
             self.summary.despawns += 1;
             self.emit_event(id, EventPayload::EntityDespawned);
-            self.force_remove_entity(id);
             audit!(self.state, Lifecycle, Lifecycle, 8, Some(id), "dot_remove");
             state_updates.push((id, EntityState::Removed));
         }
+        let dot_count = dot_despawning.len();
+        self.force_remove_entities(&dot_despawning);
 
         // Decay threat tables multiplicatively — all values scale by factor each tick.
         // Multiplicative decay prevents runaway target switching when entries are near-equal,
@@ -287,6 +305,20 @@ impl TickPipeline {
             self.state.entities.activate(idx);
             audit!(self.state, Lifecycle, Lifecycle, 8, Some(id), "activate");
             state_updates.push((id, EntityState::Active));
+        }
+
+        // Shrink over-allocated HashMaps after bulk removal to reclaim memory.
+        // retain() does not reduce capacity, so maps that held thousands of entries
+        // keep their allocation. shrink_to_fit after mass-despawn ticks prevents
+        // long-lived excess capacity.
+        let total_despawns = bulk_despawn_count + dot_count;
+        if total_despawns > 100 {
+            self.cooldowns.shrink_to_fit();
+            self.state.combat.active_windows.shrink_to_fit();
+            self.weapon_swap_cooldowns.shrink_to_fit();
+            // Cap the physics body pool so disabled bodies don't accumulate
+            // unbounded after large encounter wipes.
+            self.physics.drain_pool(200);
         }
 
         // Dedup: if an entity transitions DespawnPending → Removed within the same tick

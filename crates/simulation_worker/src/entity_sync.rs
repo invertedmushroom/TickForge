@@ -8,7 +8,7 @@
 //!
 //! This module has no SpacetimeDB dependency and is testable offline.
 
-use game_core::combat::status::{ActiveBuff, ThreatEntry};
+use game_core::combat::status::ActiveBuff;
 use game_protocol::entity_id::EntityId;
 use game_protocol::tick::TickId;
 use game_protocol::types::Vec3f;
@@ -56,12 +56,12 @@ pub enum SyncDeleteResult {
 
 /// Runtime state recovered from the DB for seeding after a spawn.
 ///
-/// Groups the three optional restoration payloads (buffs, threats, NPC AI)
-/// that `sync_insert` passes to `SimulationRunner::seed_runtime_state`.
+/// Groups the optional restoration payloads (buffs, NPC AI) that
+/// `sync_insert` passes to `SimulationRunner::seed_runtime_state`.
+/// Threat is reconstructed from `npc_state.target_entity` at seed time.
 #[derive(Default)]
 pub struct RuntimeSnapshot {
     pub buffs: Vec<ActiveBuff>,
-    pub threats: Vec<ThreatEntry>,
     pub npc_state: Option<(NpcAiState, Option<EntityId>)>,
     /// NPC spawn config: (passive, no_chase, ability_ids).
     pub npc_config: Option<NpcSpawnConfig>,
@@ -127,28 +127,18 @@ impl EntitySync {
 
         let RuntimeSnapshot {
             buffs,
-            mut threats,
             npc_state,
             npc_config,
         } = snapshot;
 
-        // `npc_state.target_entity` is the exported aggro view. When no persisted
-        // threat rows are provided, reconstruct a minimal in-memory threat table so
-        // restart recovery preserves the current aggro holder without subscribing to
-        // `threat_entry`.
-        if threats.is_empty()
-            && let Some((_, Some(target))) = npc_state.as_ref() {
-                threats.push(ThreatEntry { source: *target, threat: 1.0 });
-            }
-
         // Restore runtime state from DB rows (noops if slices are empty).
+        // Threat is reconstructed from npc_state.target_entity inside seed_runtime_state.
         let buff_pairs = if buffs.is_empty() { vec![] } else { vec![(id, buffs)] };
-        let threat_pairs = if threats.is_empty() { vec![] } else { vec![(id, threats)] };
         let npc_pairs: Vec<(EntityId, NpcAiState, Option<EntityId>)> = npc_state
             .map(|(ai, tgt)| vec![(id, ai, tgt)])
             .unwrap_or_default();
-        if !buff_pairs.is_empty() || !threat_pairs.is_empty() || !npc_pairs.is_empty() {
-            sim.seed_runtime_state(&buff_pairs, &threat_pairs, &npc_pairs);
+        if !buff_pairs.is_empty() || !npc_pairs.is_empty() {
+            sim.seed_runtime_state(&buff_pairs, &npc_pairs);
         }
 
         // Apply NPC spawn config (passive, no_chase, custom abilities).

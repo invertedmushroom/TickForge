@@ -242,14 +242,6 @@ pub struct CommitBuff {
     pub mod_stealth: Option<bool>,
 }
 
-/// One threat entry for persistence. Mirrors the `threat_entry` DB table.
-#[derive(Clone, Debug)]
-pub struct CommitThreat {
-    pub npc_entity: u64,
-    pub source_entity: u64,
-    pub threat: f32,
-}
-
 /// NPC AI state for persistence. Mirrors the `npc_state` DB table.
 #[derive(Clone, Debug)]
 pub struct CommitNpcState {
@@ -296,11 +288,6 @@ pub struct CommitPackage {
     /// Entity IDs whose buff rows should be fully replaced this tick.
     /// Includes entities with zero buffs so stale rows are cleared when all buffs expire.
     pub buff_cleared_entity_ids: Vec<u64>,
-    /// Aggro-holder snapshot — delete-all-then-insert per changed NPC in the reducer.
-    pub threat_updates: Vec<CommitThreat>,
-    /// NPC/Boss entity IDs whose threat rows should be fully replaced this tick.
-    /// Includes entities with zero threat so stale rows are cleared when aggro drops.
-    pub threat_cleared_entity_ids: Vec<u64>,
     /// NPC AI state snapshot — upsert by entity PK in the reducer.
     pub npc_state_updates: Vec<CommitNpcState>,
     /// Entities spawned by the world director that need DB rows created.
@@ -394,18 +381,6 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
         })
         .collect();
 
-    let threat_updates = result
-        .threat_updates
-        .iter()
-        .flat_map(|(eid, entries)| {
-            entries.iter().map(move |e| CommitThreat {
-                npc_entity: eid.0,
-                source_entity: e.source.0,
-                threat: e.threat,
-            })
-        })
-        .collect();
-
     let npc_state_updates = result
         .npc_state_updates
         .iter()
@@ -418,15 +393,12 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
 
     let mut buff_cleared_entity_ids: Vec<u64> =
         result.buff_updates.iter().map(|(eid, _)| eid.0).collect();
-    let mut threat_cleared_entity_ids: Vec<u64> =
-        result.threat_updates.iter().map(|(eid, _)| eid.0).collect();
 
-    // Removed entities are excluded from buff/threat update snapshots, but their
-    // stale DB rows still need to be deleted. Include them in the cleared lists.
+    // Removed entities are excluded from buff update snapshots, but their
+    // stale DB rows still need to be deleted. Include them in the cleared list.
     for (eid, state) in &result.entity_state_updates {
         if *state == game_schema::EntityState::Removed {
             buff_cleared_entity_ids.push(eid.0);
-            threat_cleared_entity_ids.push(eid.0);
         }
     }
 
@@ -474,8 +446,6 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
         region_updates,
         buff_updates,
         buff_cleared_entity_ids,
-        threat_updates,
-        threat_cleared_entity_ids,
         npc_state_updates,
         director_spawns,
         interactable_updates,
@@ -955,7 +925,6 @@ mod tests {
             ],
             health_updates: vec![(EntityId(100), 75.0, 100.0)],
             buff_updates: Vec::new(),
-            threat_updates: Vec::new(),
             npc_state_updates: Vec::new(),
             region_updates: Vec::new(),
             director_spawns: Vec::new(),
@@ -1263,7 +1232,6 @@ mod tests {
             entity_state_updates: Vec::new(),
             health_updates: Vec::new(),
             buff_updates: Vec::new(),
-            threat_updates: Vec::new(),
             npc_state_updates: Vec::new(),
             region_updates: Vec::new(),
             director_spawns: Vec::new(),
@@ -1295,7 +1263,6 @@ mod tests {
             entity_state_updates: Vec::new(),
             health_updates: Vec::new(),
             buff_updates: Vec::new(),
-            threat_updates: Vec::new(),
             npc_state_updates: Vec::new(),
             region_updates: Vec::new(),
             director_spawns: vec![
