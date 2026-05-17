@@ -4,3 +4,4 @@ pub mod encounter;
 pub mod entity;
 pub mod physics_backend;
 pub mod sim_state;
+pub mod stats;

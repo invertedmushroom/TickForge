@@ -110,6 +110,9 @@ pub struct CommitCombatEvent {
 pub enum CommitWorldEventKind {
     EntityDespawned,
     PickupCollected(u32),
+    /// Player entity interacted with a world object within proximity range.
+    /// Payload is the target entity_id.
+    InteractTriggered(u64),
 }
 
 /// A single world event ready for commit.
@@ -370,6 +373,13 @@ fn classify_events(events: &[SimEvent]) -> (Vec<CommitCombatEvent>, Vec<CommitWo
                     entity_id: e.entity_id.0,
                     event_sequence: e.event_sequence,
                     event_kind: CommitWorldEventKind::PickupCollected(*item_id),
+                });
+            }
+            EventPayload::InteractTriggered { target } => {
+                world_events.push(CommitWorldEvent {
+                    entity_id: e.entity_id.0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CommitWorldEventKind::InteractTriggered(target.0),
                 });
             }
             // Internal pipeline events — not committed to DB.

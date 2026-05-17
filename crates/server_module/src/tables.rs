@@ -214,6 +214,9 @@ pub enum WorldEventKind {
     EntitySpawned(EntityKind),
     EntityDespawned,
     PickupCollected(u32),
+    /// Player entity interacted with a world object within proximity range.
+    /// Payload is the target entity_id.
+    InteractTriggered(u64),
 }
 
 // ── AOI / Spatial ───────────────────────────────────────────────────

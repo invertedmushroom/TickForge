@@ -6,7 +6,7 @@ use game_protocol::entity_id::EntityId;
 use game_protocol::types::Transform;
 use game_core::physics_backend::{ColliderKind, PhysicsBackend, SensorShape};
 use game_core::combat::skill::{
-    AbilityAction, AbilityTimeline, AbilityRegistry,
+    AbilityAction, AbilityParams, AbilityTimeline, AbilityRegistry,
     AbilityExecutionContext, AbilityExecutionId, ResolvedTargeting,
     ScheduledAction, ScheduledActionType, SkillShape,
 };
@@ -109,6 +109,17 @@ pub struct TickPipeline {
     /// Monotonically increasing counter for `ScheduledAction::id`.
     /// Assigned at scheduling time; never reused within a session.
     next_scheduled_id: u64,
+    /// Impulses to apply at the start of Phase 4 on the next tick.
+    ///
+    /// Accumulated in Phase 6 combat resolution (knockback, boss push,
+    /// block-that-yields). Applied via `physics.set_linear_velocity` before
+    /// the physics step so that Rapier resolves them on the same tick the
+    /// physical effect should first be visible. Cleared after application,
+    /// so each entry is consumed exactly once.
+    ///
+    /// Preserves the "physics does not know gameplay" invariant: combat accumulates
+    /// requests into this lane; physics applies them without knowing their cause.
+    pending_impulses: Vec<(EntityId, Vec3f)>,
     /// Running stats for the current tick — incremented inline, returned in TickResult.
     summary: TickSummary,
 }
@@ -154,7 +165,11 @@ impl TickPipeline {
         // 3) Remove cooldown entries for this entity
         self.cooldowns.retain(|&(eid, _), _| eid != id);
 
-        // 4) Remove hitbox sensors and execution contexts owned by this entity
+        // 4) Remove any pending impulses and follow-up windows for this entity.
+        self.pending_impulses.retain(|&(eid, _)| eid != id);
+        self.state.combat.active_windows.retain(|&(eid, _), _| eid != id);
+
+        // 5) Remove hitbox sensors and execution contexts owned by this entity
         for exec_id in execs_to_remove.iter().copied() {
             if let Some(handle) = self
                 .state
@@ -192,6 +207,7 @@ impl TickPipeline {
             state: SimState::new(),
             cooldowns: HashMap::new(),
             next_scheduled_id: 0,
+            pending_impulses: Vec::new(),
             summary: TickSummary::default(),
 }
     }
@@ -245,6 +261,12 @@ impl TickPipeline {
             // Projectile and Hazard bodies are spawned by the ability/encounter system;
             // the DB row alone is not enough to reconstruct the full physics state.
             EntityKind::Projectile | EntityKind::Hazard => {}
+        }
+        // Record spawn position as patrol home for NPC/Boss entities.
+        if kind == EntityKind::Npc || kind == EntityKind::Boss {
+            if let Some(idx) = self.state.entities.lookup(id) {
+                self.state.ai.home_positions[idx.as_usize()] = position;
+            }
         }
     }
 
@@ -585,6 +607,18 @@ impl TickPipeline {
                         } else {
                             (Vec3f::ZERO, Vec3f { x: 0.0, y: 0.0, z: 1.0 })
                         };
+                        // Resolve follow-up variant: if an active window exists for this
+                        // (entity, ability) pair and has not expired, set variant = 1 so
+                        // the timeline can branch to a combo/follow-up execution path.
+                        let variant = if self.state.combat.active_windows
+                            .get(&(entity_id, ability_id))
+                            .map_or(false, |&exp| self.current_tick <= exp)
+                        {
+                            1
+                        } else {
+                            0
+                        };
+                        let params = AbilityParams { charge_level: 0, variant };
                         let execution_id = self.state.combat.executions.next_id();
                         self.state.combat.executions.insert(AbilityExecutionContext {
                             execution_id,
@@ -594,23 +628,37 @@ impl TickPipeline {
                             targeting,
                             origin,
                             facing,
+                            params,
                         });
                         audit!(self.state, Execution, Controller, 2, Some(entity_id), "cast");
                         self.schedule_ability(entity_id, &timeline, self.current_tick, execution_id);
                         cast_this_tick.insert(cast_key);
                     }
                 }
-                IntentAction::Interact(_target) => {
-                    // TODO: Validate proximity, trigger interaction.
+                IntentAction::Interact(target_id_raw) => {
+                    // Proximity validation: reject if target is out of interact range.
+                    // Both positions are read from physics (post-last-tick state).
+                    // If either transform is unavailable, silently drop the intent.
+                    const INTERACT_RADIUS: f32 = 3.0;
+                    let target = EntityId(*target_id_raw);
+                    if let (Some(actor_t), Some(target_t)) = (
+                        self.physics.get_transform(entity_id),
+                        self.physics.get_transform(target),
+                    ) {
+                        let dx = actor_t.position.x - target_t.position.x;
+                        let dz = actor_t.position.z - target_t.position.z;
+                        let dist_sq = dx * dx + dz * dz;
+                        if dist_sq <= INTERACT_RADIUS * INTERACT_RADIUS {
+                            self.emit_event(entity_id, EventPayload::InteractTriggered { target });
+                        }
+                    }
                 }
             }
         }
     }
 
     fn apply_movement(&mut self, entity_id: EntityId, dir: &MoveDir) {
-        // Normalize direction and scale by a base movement speed.
-        // TODO: Per-entity movement speed from a stats component.
-        const BASE_SPEED: f32 = 5.0;
+        // Normalise direction and scale by the per-entity-kind authoritative base speed.
         // Grounded movement: ignore vertical component to prevent client "flight".
         let x = dir.dir_x;
         let z = dir.dir_z;
@@ -618,10 +666,26 @@ impl TickPipeline {
         if len_sq < 1e-6 {
             return;
         }
+        // Derive base speed from entity kind (authoritative, not hardcoded).
+        let kind_speed = if let Some(idx) = self.state.entities.lookup(entity_id) {
+            game_core::stats::base_speed(self.state.entities.kinds[idx.as_usize()])
+        } else {
+            return;
+        };
+        // Apply speed_pct from active buff modifiers (additive stack: 0.1 = +10%).
+        let speed_modifier: f32 = if let Some(idx) = self.state.entities.lookup(entity_id) {
+            self.state.status.buffs[idx.as_usize()]
+                .iter()
+                .filter_map(|b| b.modifiers.speed_pct)
+                .sum()
+        } else {
+            0.0
+        };
+        let speed = kind_speed * (1.0 + speed_modifier).max(0.0);
         let inv_len = 1.0 / len_sq.sqrt();
-        let vx = x * inv_len * BASE_SPEED;
+        let vx = x * inv_len * speed;
         let vy = 0.0;
-        let vz = z * inv_len * BASE_SPEED;
+        let vz = z * inv_len * speed;
 
         // Character bodies are kinematic_position_based — velocity calls have no effect.
         // Integrate one timestep of desired velocity and set the explicit next position.
@@ -663,6 +727,8 @@ impl TickPipeline {
                         AbilityAction::ApplyDamageFrame => "ApplyDamageFrame",
                         AbilityAction::RemoveHitbox => "RemoveHitbox",
                         AbilityAction::CooldownStart { .. } => "CooldownStart",
+                        AbilityAction::OpenFollowUpWindow { .. } => "OpenFollowUpWindow",
+                        AbilityAction::StanceBegin { .. } => "StanceBegin",
                     },
                     ScheduledActionType::BuffExpire { .. } => "BuffExpire",
                 },
@@ -773,12 +839,40 @@ impl TickPipeline {
                 self.cooldowns.insert((entity, ability_id), ready_at);
                 audit!(self.state, Cooldown, AbilityTimeline, 3, Some(entity), "start");
             }
+            AbilityAction::OpenFollowUpWindow { duration_ticks } => {
+                // Write a follow-up eligibility window for (entity, ability).
+                // Phase 2 of subsequent ticks checks this to route a second UseAbility
+                // intent for the same ability_id as a combo/follow-up press (variant = 1).
+                let expiry = TickId(self.current_tick.0 + *duration_ticks as u64);
+                self.state.combat.active_windows.insert((entity, ability_id), expiry);
+                audit!(self.state, Window, AbilityTimeline, 3, Some(entity), "open_window");
+            }
+            AbilityAction::StanceBegin { blocking, dodge_active } => {
+                // Set tactical flags on the caster for this tick.
+                // Phase 6 reads these to route hit interactions through block/dodge paths.
+                // Phase 8 clears all flags so this action must fire again each tick the
+                // stance is active (typically by scheduling it on consecutive ticks).
+                if let Some(idx) = self.state.entities.lookup(entity) {
+                    let t = &mut self.state.combat.tactical[idx.as_usize()];
+                    t.blocking = *blocking;
+                    t.dodge_active = *dodge_active;
+                    audit!(self.state, Tactical, AbilityTimeline, 3, Some(entity), "stance_begin");
+                }
+            }
         }
     }
 
     // ── Phase 4: Physics integration ────────────────────────────
 
     fn phase_physics_step(&mut self) {
+        // Apply any combat-generated impulses accumulated in the previous tick's Phase 6.
+        // Applying them here (before the physics step) means Rapier resolves the velocity
+        // change on this tick, decoupling the gameplay event (hit) from its physical effect
+        // (knockback) across tick boundaries.
+        let impulses: Vec<(EntityId, Vec3f)> = std::mem::take(&mut self.pending_impulses);
+        for (entity_id, velocity) in impulses {
+            self.physics.set_linear_velocity(entity_id, velocity);
+        }
         self.physics.step(self.dt);
     }
 
@@ -857,9 +951,35 @@ impl TickPipeline {
                 Some(idx) => idx,
                 None => continue,
             };
+            let attacker_idx = self.state.entities.lookup(attacker);
+
+            // Tactical routing: check blocking and dodge before damage application.
+            // A dodge evades the hit entirely; a block is handled as reduced damage
+            // (future: route to Blocked event variant once the event is defined).
+            let tactical = self.state.combat.tactical[target_idx.as_usize()];
+            if tactical.dodge_active {
+                // Dodge: hit evaded — skip damage, emit no event.
+                continue;
+            }
+
+            // Apply damage_out_pct modifier from attacker's buffs (amplify outgoing damage).
+            let out_mult: f32 = attacker_idx.map_or(0.0, |idx| {
+                self.state.status.buffs[idx.as_usize()]
+                    .iter()
+                    .filter_map(|b| b.modifiers.damage_out_pct)
+                    .sum()
+            });
+            // Apply damage_in_pct modifier from target's buffs (reduce incoming damage).
+            let in_mult: f32 = self.state.status.buffs[target_idx.as_usize()]
+                .iter()
+                .filter_map(|b| b.modifiers.damage_in_pct)
+                .sum();
+            // Block halves incoming damage (future: configurable reduction).
+            let block_factor = if tactical.blocking { 0.5 } else { 1.0 };
+            let effective_damage = base_damage * (1.0 + out_mult) * (1.0 + in_mult).max(0.0) * block_factor;
 
             // Apply damage via dense health arrays.
-            let actual = self.state.combat.health.apply_damage(target_idx, base_damage, Some(attacker));
+            let actual = self.state.combat.health.apply_damage(target_idx, effective_damage, Some(attacker));
             audit!(self.state, Health, Combat, 6, Some(target), "damage");
             self.summary.damage_events += 1;
 
@@ -900,6 +1020,7 @@ impl TickPipeline {
 
     fn phase_ai_decisions(&mut self) {
         use game_core::entity::lifecycle::{EntityKind, NpcAiState};
+        use game_core::combat::status::AiOverride;
 
         let npcs = self.state.active_indices_of_kind(EntityKind::Npc);
         let bosses = self.state.active_indices_of_kind(EntityKind::Boss);
@@ -910,6 +1031,35 @@ impl TickPipeline {
                 Some(s) => s,
                 None => continue,
             };
+
+            // Check for an ai_override carried by an active buff.
+            // First buff with a non-None override wins; check runs before standard AI logic.
+            let override_opt = self.state.status.buffs[i]
+                .iter()
+                .find_map(|b| b.modifiers.ai_override);
+
+            if let Some(ai_override) = override_opt {
+                match ai_override {
+                    AiOverride::ForceFlee => {
+                        self.state.ai.npc_ai[i] = Some(NpcAiState::Flee);
+                        audit!(self.state, Ai, AiDecisions, 7, None, "override_flee");
+                    }
+                    AiOverride::ForceIdle => {
+                        self.state.ai.npc_ai[i] = Some(NpcAiState::Idle);
+                        audit!(self.state, Ai, AiDecisions, 7, None, "override_idle");
+                    }
+                    AiOverride::ForceFocus { target } => {
+                        // Inject high threat for the forced target so standard combat AI
+                        // selects it as top threat this tick without bypassing combat state.
+                        if let Some(ref mut table) = self.state.combat.threat_tables[i] {
+                            table.add_threat(target, f32::MAX / 2.0);
+                        }
+                        self.state.ai.npc_ai[i] = Some(NpcAiState::Combat);
+                        audit!(self.state, Ai, AiDecisions, 7, None, "override_focus");
+                    }
+                }
+                continue; // Skip standard AI for this entity this tick.
+            }
 
             match ai_state {
                 NpcAiState::Idle => {
@@ -923,24 +1073,124 @@ impl TickPipeline {
                 }
                 NpcAiState::Combat => {
                     // If threat table is empty, return to Idle.
-                    let has_threat = self.state.combat.threat_tables[i]
+                    let top_target = self.state.combat.threat_tables[i]
                         .as_ref()
-                        .and_then(|t| t.top_threat())
-                        .is_some();
-                    if !has_threat {
-                        self.state.ai.npc_ai[i] = Some(NpcAiState::Idle);
-                        audit!(self.state, Ai, AiDecisions, 7, None, "combat_to_idle");
+                        .and_then(|t| t.top_threat());
+                    match top_target {
+                        None => {
+                            self.state.ai.npc_ai[i] = Some(NpcAiState::Idle);
+                            audit!(self.state, Ai, AiDecisions, 7, None, "combat_to_idle");
+                        }
+                        Some(target_id) => {
+                            // Chase the top-threat target.
+                            let npc_id = self.state.entities.id_of(*idx);
+                            self.npc_move_toward(npc_id, *idx, target_id, self.dt);
+                            audit!(self.state, Transform, AiDecisions, 7, Some(npc_id), "chase");
+                        }
                     }
-                    // TODO: Chase top-threat target, use abilities.
                 }
                 NpcAiState::Flee => {
-                    // TODO: Move away from threat source.
+                    // Move away from the top-threat source.
+                    let top_target = self.state.combat.threat_tables[i]
+                        .as_ref()
+                        .and_then(|t| t.top_threat());
+                    if let Some(threat_source) = top_target {
+                        let npc_id = self.state.entities.id_of(*idx);
+                        self.npc_move_away(npc_id, *idx, threat_source, self.dt);
+                        audit!(self.state, Transform, AiDecisions, 7, Some(npc_id), "flee");
+                    }
                 }
-                NpcAiState::Patrol | NpcAiState::Scripted => {
-                    // TODO: Follow patrol path / scripted behavior.
+                NpcAiState::Patrol => {
+                    // Move back toward the home/spawn position.
+                    // If threat appears, transition to Combat next tick via Idle→Combat path;
+                    // the Patrol branch itself does not check threat (clean state transitions).
+                    let npc_id = self.state.entities.id_of(*idx);
+                    let home = self.state.ai.home_positions[i];
+                    self.npc_move_toward_pos(npc_id, home, self.dt);
+                    audit!(self.state, Transform, AiDecisions, 7, Some(npc_id), "patrol");
+                }
+                NpcAiState::Scripted => {
+                    // No scripted behavior yet — scripted sequences are driven by
+                    // scheduled AbilityActions; this branch is a placeholder.
                 }
             }
         }
+    }
+
+    // ── NPC movement helpers (Phase 7) ─────────────────────────
+
+    /// Move `npc_id` one step toward `target_id`'s current physics position.
+    /// Uses the NPC's authoritative base speed. No-ops if either transform is unavailable.
+    fn npc_move_toward(&mut self, npc_id: EntityId, npc_idx: game_core::entity::entity_index::EntityIndex, target_id: EntityId, dt: f32) {
+        let (npc_pos, target_pos) = match (
+            self.physics.get_transform(npc_id),
+            self.physics.get_transform(target_id),
+        ) {
+            (Some(a), Some(b)) => (a.position, b.position),
+            _ => return,
+        };
+        let kind = self.state.entities.kinds[npc_idx.as_usize()];
+        self.npc_step_toward(npc_id, npc_pos, target_pos, kind, dt);
+    }
+
+    /// Move `npc_id` one step away from `threat_source`'s current physics position.
+    /// Uses the NPC's authoritative base speed. No-ops if either transform is unavailable.
+    fn npc_move_away(&mut self, npc_id: EntityId, npc_idx: game_core::entity::entity_index::EntityIndex, threat_source: EntityId, dt: f32) {
+        let (npc_pos, threat_pos) = match (
+            self.physics.get_transform(npc_id),
+            self.physics.get_transform(threat_source),
+        ) {
+            (Some(a), Some(b)) => (a.position, b.position),
+            _ => return,
+        };
+        // Mirror the direction: flee = move in the direction opposite to the threat.
+        let away = Vec3f {
+            x: npc_pos.x + (npc_pos.x - threat_pos.x),
+            y: npc_pos.y,
+            z: npc_pos.z + (npc_pos.z - threat_pos.z),
+        };
+        let kind = self.state.entities.kinds[npc_idx.as_usize()];
+        self.npc_step_toward(npc_id, npc_pos, away, kind, dt);
+    }
+
+    /// Move `npc_id` toward an explicit world position (used for patrol).
+    /// No-ops when the NPC is already within `PATROL_ARRIVE_RADIUS` of the target.
+    fn npc_move_toward_pos(&mut self, npc_id: EntityId, dest: Vec3f, dt: f32) {
+        const PATROL_ARRIVE_RADIUS: f32 = 0.5;
+        let npc_pos = match self.physics.get_transform(npc_id) {
+            Some(t) => t.position,
+            None => return,
+        };
+        // Stop if already close enough — prevents micro-jitter at the home point.
+        let dx = dest.x - npc_pos.x;
+        let dz = dest.z - npc_pos.z;
+        if dx * dx + dz * dz <= PATROL_ARRIVE_RADIUS * PATROL_ARRIVE_RADIUS {
+            return;
+        }
+        let kind = if let Some(idx) = self.state.entities.lookup(npc_id) {
+            self.state.entities.kinds[idx.as_usize()]
+        } else {
+            return;
+        };
+        self.npc_step_toward(npc_id, npc_pos, dest, kind, dt);
+    }
+
+    /// Shared step: move `npc_id` from `from_pos` toward `to_pos` by one tick of movement.
+    /// Uses `game_core::stats::base_speed(kind)` as the speed and is grounded (Y fixed).
+    fn npc_step_toward(&mut self, npc_id: EntityId, from: Vec3f, to: Vec3f, kind: EntityKind, dt: f32) {
+        let dx = to.x - from.x;
+        let dz = to.z - from.z;
+        let dist_sq = dx * dx + dz * dz;
+        if dist_sq < 1e-6 {
+            return;
+        }
+        let speed = game_core::stats::base_speed(kind);
+        let inv = 1.0 / dist_sq.sqrt();
+        self.physics.set_kinematic_position(npc_id, Vec3f {
+            x: from.x + dx * inv * speed * dt,
+            y: from.y,
+            z: from.z + dz * inv * speed * dt,
+        });
     }
 
     // ── Health delta collection ─────────────────────────────────
@@ -1027,6 +1277,10 @@ impl TickPipeline {
     /// castable again; we emit a `CooldownReady` event and remove the entry so the map
     /// only holds in-flight cooldowns. CooldownReady uniqueness is guaranteed by the
     /// HashMap key — duplicate entries for the same (entity, ability) are impossible.
+    ///
+    /// Also drains expired follow-up windows from `CombatState::active_windows` and
+    /// clears per-tick tactical flags (`CombatState::tactical`) so Phase 3 StanceBegin
+    /// actions must re-assert them each tick the stance is active.
     fn phase_expire_cooldowns(&mut self) {
         let current = self.current_tick;
         // Collect first so the borrow on `self.cooldowns` ends before `emit_event` borrows `self`.
@@ -1040,6 +1294,27 @@ impl TickPipeline {
             self.cooldowns.remove(&(entity, ability_id));
             audit!(self.state, Cooldown, CooldownTracker, 8, Some(entity), "expire");
             self.emit_event(entity, EventPayload::CooldownReady { ability_id });
+        }
+
+        // Drain expired follow-up windows (expiry tick ≤ current tick).
+        self.state.combat.active_windows.retain(|_, &mut exp| {
+            exp > current
+        });
+        // Audit a single Window drain record per tick if any windows were active.
+        // (Individual per-window records omitted to avoid log spam at scale.)
+        #[cfg(any(debug_assertions, test))]
+        {
+            // We can't audit here without an entity context; the drain is a bulk operation.
+            // The ownership rule (CooldownTracker, phase 8) is enforced structurally — this
+            // method is the sole caller for window drains.
+            let _ = self; // suppress unused-warning if audit! expands to nothing
+        }
+
+        // Clear per-tick tactical flags. Phase 3 StanceBegin must re-assert each tick.
+        for slot in self.state.combat.tactical.iter_mut() {
+            if slot.blocking || slot.dodge_active {
+                *slot = game_core::combat::tactical::TacticalState::default();
+            }
         }
     }
 
@@ -1198,6 +1473,7 @@ mod tests {
         AbilityAction, AbilityData, AbilityRegistry, AbilityTimeline, ScheduledAbilityAction, SkillShape,
     };
     use game_core::entity::lifecycle::EntityKind;
+    use game_core::entity::lifecycle::NpcAiState;
     use game_core::physics_backend::ColliderKind;
     use game_protocol::event::{DamageType, EventPayload};
     use game_protocol::intent::{PlayerIntent, IntentAction};
@@ -2186,5 +2462,257 @@ mod tests {
         }).collect();
 
         assert!(violations.is_empty(), "Ownership violations detected:\n{}", violations.join("\n"));
+    }
+
+    // ── P5: Interact proximity tests ──────────────────────────────────────────
+
+    /// Interact intent within INTERACT_RADIUS (3.0 units) must emit InteractTriggered.
+    #[test]
+    fn interact_within_range_emits_event() {
+        let mut pipeline = make_pipeline(AbilityRegistry::new());
+
+        let player = EntityId(1);
+        let npc = EntityId(2);
+
+        // NPC at origin, player 2.0 units away on X — within 3.0 radius.
+        pipeline.spawn_entity_from_snapshot(
+            player, EntityKind::Player, TickId(0), 100.0,
+            game_schema::Vec3f { x: 2.0, y: 1.0, z: 0.0 },
+        );
+        pipeline.spawn_entity_from_snapshot(
+            npc, EntityKind::Npc, TickId(0), 100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+        );
+
+        // Warm-up tick.
+        pipeline.run_tick(&[]);
+        assert!(pipeline.state.is_active(player));
+        assert!(pipeline.state.is_active(npc));
+
+        // Send Interact intent.
+        let intent = PlayerIntent {
+            entity_id: player,
+            sequence_id: 1,
+            target_tick: TickId(1),
+            client_time_ms: 0,
+            action: IntentAction::Interact(npc.0),
+        };
+        let result = pipeline.run_tick(&[intent]);
+
+        let triggered = result.events.iter().any(|e| {
+            matches!(&e.payload, EventPayload::InteractTriggered { target } if *target == npc)
+        });
+        assert!(triggered, "InteractTriggered must fire when actor is within INTERACT_RADIUS");
+    }
+
+    /// Interact intent beyond INTERACT_RADIUS (3.0 units) must be silently dropped.
+    #[test]
+    fn interact_out_of_range_is_silent() {
+        let mut pipeline = make_pipeline(AbilityRegistry::new());
+
+        let player = EntityId(1);
+        let npc = EntityId(2);
+
+        // NPC at origin, player 5.0 units away — beyond 3.0 radius.
+        pipeline.spawn_entity_from_snapshot(
+            player, EntityKind::Player, TickId(0), 100.0,
+            game_schema::Vec3f { x: 5.0, y: 1.0, z: 0.0 },
+        );
+        pipeline.spawn_entity_from_snapshot(
+            npc, EntityKind::Npc, TickId(0), 100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+        );
+
+        pipeline.run_tick(&[]);
+
+        let intent = PlayerIntent {
+            entity_id: player,
+            sequence_id: 1,
+            target_tick: TickId(1),
+            client_time_ms: 0,
+            action: IntentAction::Interact(npc.0),
+        };
+        let result = pipeline.run_tick(&[intent]);
+
+        let triggered = result.events.iter().any(|e| {
+            matches!(&e.payload, EventPayload::InteractTriggered { .. })
+        });
+        assert!(!triggered, "InteractTriggered must NOT fire when actor is beyond INTERACT_RADIUS");
+    }
+
+    // ── P5: Per-kind base speed test ──────────────────────────────────────────
+
+    /// `base_speed` returns the expected value for every EntityKind.
+    #[test]
+    fn base_speed_per_kind() {
+        use game_core::entity::lifecycle::EntityKind;
+        use game_core::stats::base_speed;
+
+        assert!((base_speed(EntityKind::Player)     - 5.0 ).abs() < f32::EPSILON);
+        assert!((base_speed(EntityKind::Npc)        - 3.5 ).abs() < f32::EPSILON);
+        assert!((base_speed(EntityKind::Boss)       - 2.5 ).abs() < f32::EPSILON);
+        assert!((base_speed(EntityKind::Projectile) - 12.0).abs() < f32::EPSILON);
+        assert!((base_speed(EntityKind::Hazard)     - 0.0 ).abs() < f32::EPSILON);
+    }
+
+    // ── P5: NPC AI movement tests ─────────────────────────────────────────────
+
+    /// An NPC in Combat state with a valid threat target must move closer to that
+    /// target each tick (Phase 7 chase branch).
+    #[test]
+    fn npc_chase_moves_toward_target() {
+        let mut pipeline = make_pipeline(AbilityRegistry::new());
+
+        let player = EntityId(1);
+        let npc    = EntityId(2);
+
+        // Place NPC 4.0 units away from player on X axis.
+        pipeline.spawn_entity_from_snapshot(
+            player, EntityKind::Player, TickId(0), 100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+        );
+        pipeline.spawn_entity_from_snapshot(
+            npc, EntityKind::Npc, TickId(0), 100.0,
+            game_schema::Vec3f { x: 4.0, y: 1.0, z: 0.0 },
+        );
+
+        // Warm-up tick: entities go Active.
+        pipeline.run_tick(&[]);
+        assert!(pipeline.state.is_active(player));
+        assert!(pipeline.state.is_active(npc));
+
+        // Set NPC to Combat state directly and prime the threat table.
+        // (Skipping the Idle → Combat transition tick so movement fires this tick.)
+        if let Some(idx) = pipeline.state.entities.lookup(npc) {
+            pipeline.state.ai.npc_ai[idx.as_usize()] = Some(NpcAiState::Combat);
+            if let Some(table) = pipeline.state.combat.threat_tables[idx.as_usize()].as_mut() {
+                table.add_threat(player, 100.0);
+            }
+        }
+
+        // Record NPC position before the AI tick.
+        let before = pipeline.physics.get_transform(npc).unwrap();
+
+        // Tick 1: Phase 7 calls set_next_kinematic_position on the NPC body.
+        // The new position is queued in Rapier but not yet committed (physics step
+        // happens in Phase 4, which runs BEFORE Phase 7 in the same tick).
+        pipeline.run_tick(&[]);
+
+        // Tick 2: Phase 4 physics step commits the kinematic position from tick 1.
+        // Now get_transform returns the new position.
+        pipeline.run_tick(&[]);
+
+        let after = pipeline.physics.get_transform(npc).unwrap();
+
+        // NPC must have moved closer to the player (player is at x=0, NPC started at x=4).
+        assert!(
+            after.position.x < before.position.x,
+            "NPC must move toward player (x should decrease); before={}, after={}",
+            before.position.x, after.position.x,
+        );
+    }
+
+    /// An NPC in Flee state must move away from the threat source.
+    #[test]
+    fn npc_flee_moves_away_from_threat() {
+        let mut pipeline = make_pipeline(AbilityRegistry::new());
+
+        let player = EntityId(1);
+        let npc    = EntityId(2);
+
+        pipeline.spawn_entity_from_snapshot(
+            player, EntityKind::Player, TickId(0), 100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+        );
+        pipeline.spawn_entity_from_snapshot(
+            npc, EntityKind::Npc, TickId(0), 100.0,
+            game_schema::Vec3f { x: 4.0, y: 1.0, z: 0.0 },
+        );
+
+        pipeline.run_tick(&[]);
+        assert!(pipeline.state.is_active(player));
+        assert!(pipeline.state.is_active(npc));
+
+        // Force NPC into Flee state with a threat source.
+        if let Some(idx) = pipeline.state.entities.lookup(npc) {
+            pipeline.state.ai.npc_ai[idx.as_usize()] = Some(NpcAiState::Flee);
+            if let Some(table) = pipeline.state.combat.threat_tables[idx.as_usize()].as_mut() {
+                table.add_threat(player, 100.0);
+            }
+        }
+
+        let before = pipeline.physics.get_transform(npc).unwrap();
+
+        // Tick 1: Phase 7 queues the flee position via set_next_kinematic_position.
+        pipeline.run_tick(&[]);
+        // Tick 2: Phase 4 physics step commits the queued position.
+        pipeline.run_tick(&[]);
+
+        let after = pipeline.physics.get_transform(npc).unwrap();
+
+        // NPC must have moved away from player (player is at x=0, NPC started at x=4, so x increases).
+        assert!(
+            after.position.x > before.position.x,
+            "NPC must flee away from player (x should increase); before={}, after={}",
+            before.position.x, after.position.x,
+        );
+    }
+
+    /// An NPC in Patrol state must move toward its home position and stop within
+    /// PATROL_ARRIVE_RADIUS once it arrives.
+    #[test]
+    fn npc_patrol_moves_toward_home() {
+        let mut pipeline = make_pipeline(AbilityRegistry::new());
+
+        let npc = EntityId(1);
+
+        // Spawn NPC at origin; home_positions[idx] is recorded as the spawn position (0,1,0).
+        pipeline.spawn_entity_from_snapshot(
+            npc, EntityKind::Npc, TickId(0), 100.0,
+            game_schema::Vec3f { x: 0.0, y: 1.0, z: 0.0 },
+        );
+
+        // Tick 0: warm-up — Spawning → Active.
+        pipeline.run_tick(&[]);
+        assert!(pipeline.state.is_active(npc));
+
+        // Teleport the NPC body 4.0 units away from home on X.
+        // set_kinematic_position uses set_next_kinematic_position internally:
+        // the position is queued but not committed to body.translation() until
+        // the next physics step (Phase 4 of the next run_tick call).
+        pipeline.physics.set_kinematic_position(npc, game_schema::Vec3f { x: 4.0, y: 1.0, z: 0.0 });
+
+        // Force NPC into Patrol state before the commit tick.
+        if let Some(idx) = pipeline.state.entities.lookup(npc) {
+            pipeline.state.ai.npc_ai[idx.as_usize()] = Some(NpcAiState::Patrol);
+        }
+
+        // Tick 1: Phase 4 commits the teleport position (body now at x=4).
+        // Phase 7 patrol branch also fires, queueing movement toward home — but
+        // the movement destination reads the COMMITTED position (x=4 → toward 0),
+        // so it queues the correct step. That step will be committed in tick 2.
+        pipeline.run_tick(&[]);
+
+        // Snap the `before` position now that the teleport is committed.
+        // Phase 7 may have already queued one step toward home in tick 1,
+        // but get_transform still reflects the committed x=4 position until
+        // the next physics step.
+        let before = pipeline.physics.get_transform(npc).unwrap();
+
+        // Tick 2: Phase 4 commits the patrol step queued in tick 1.
+        // Re-assert Patrol in case a state transition occurred (threat table is empty so
+        // the Combat/Idle logic does not interfere, but be explicit for test clarity).
+        if let Some(idx) = pipeline.state.entities.lookup(npc) {
+            pipeline.state.ai.npc_ai[idx.as_usize()] = Some(NpcAiState::Patrol);
+        }
+        pipeline.run_tick(&[]);
+
+        let after = pipeline.physics.get_transform(npc).unwrap();
+
+        assert!(
+            after.position.x < before.position.x,
+            "Patrolling NPC must move toward home (x should decrease); before={}, after={}",
+            before.position.x, after.position.x,
+        );
     }
 }

@@ -22,6 +22,20 @@ pub enum SkillShape {
     HazardZone,
 }
 
+/// Runtime parameters for a single ability cast.
+///
+/// Created in Phase 2 alongside `AbilityExecutionContext` so that a single
+/// `ability_id` can produce different execution paths (charge tiers, follow-up
+/// variants, etc.) without requiring separate ability IDs.
+///
+/// `charge_level`: 0 = base cast, higher values = extended hold time.
+/// `variant`: 0 = first press, 1+ = follow-up / combo press (resolved from `active_windows`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbilityParams {
+    pub charge_level: u8,
+    pub variant: u8,
+}
+
 /// Ability timing model — TERA-style frame windows.
 ///
 /// Each ability defines explicit frame windows:
@@ -53,6 +67,20 @@ pub enum AbilityAction {
     ApplyDamageFrame,
     RemoveHitbox,
     CooldownStart { duration_ticks: u32 },
+    /// Open a follow-up / combo eligibility window for this ability.
+    ///
+    /// Phase 3 writes the window into `CombatState::active_windows` so that a
+    /// second UseAbility intent for the same `ability_id` in a later tick is
+    /// recognised as a follow-up press and dispatched with `AbilityParams::variant = 1`.
+    /// Phase 8 drains expired entries alongside cooldowns.
+    OpenFollowUpWindow { duration_ticks: u32 },
+    /// Set tactical blocking/dodge flags on the caster for this tick.
+    ///
+    /// Phase 3 writes flags into `CombatState::tactical`; Phase 8 clears all
+    /// flags so a new `StanceBegin` action must re-assert them each tick the
+    /// stance is active. This keeps stance state as data flow rather than
+    /// toggle logic.
+    StanceBegin { blocking: bool, dodge_active: bool },
 }
 
 /// Per-entity scheduled action for the ability scheduler.
@@ -189,6 +217,9 @@ pub struct AbilityExecutionContext {
     pub origin: Vec3f,
     /// Caster facing direction (XZ-plane, unit length) at cast time.
     pub facing: Vec3f,
+    /// Runtime parameters for this cast (charge tier, follow-up variant, etc.).
+    /// Resolved in Phase 2 from intent data and `CombatState::active_windows`.
+    pub params: AbilityParams,
 }
 
 /// Sparse store for all in-flight ability executions.

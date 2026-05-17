@@ -67,6 +67,10 @@ pub enum EventPayload {
     PickupCollected {
         item_id: u32,
     },
+    /// Player interacted with a world object (entity) within proximity range.
+    InteractTriggered {
+        target: EntityId,
+    },
 
     // ── System events ──────────────────────────────────
     TickBoundary,

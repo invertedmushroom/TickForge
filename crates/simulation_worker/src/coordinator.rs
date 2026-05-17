@@ -315,6 +315,7 @@ pub fn run(config: CoordinatorConfig) {
                 // value is restored next time this buff is applied from combat.
                 max_stacks: u32::MAX,
                 expires_at: b.expires_at_tick.map(game_protocol::tick::TickId),
+                modifiers: Default::default(),
             })
             .collect();
 
@@ -656,6 +657,7 @@ fn wire_world_events(pkg: &CommitPackage) -> Vec<WorldEventInput> {
             event_kind: match &e.event_kind {
                 CommitWorldEventKind::EntityDespawned => WorldEventKind::EntityDespawned,
                 CommitWorldEventKind::PickupCollected(id) => WorldEventKind::PickupCollected(*id),
+                CommitWorldEventKind::InteractTriggered(target) => WorldEventKind::InteractTriggered(*target),
             },
         })
         .collect()

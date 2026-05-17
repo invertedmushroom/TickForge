@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use game_protocol::entity_id::EntityId;
 use game_protocol::tick::TickId;
+use game_protocol::types::Vec3f;
 use game_schema::{EntityKind, EntityState, NpcAiState};
 
 use crate::combat::hitbox::HitboxStore;
 use crate::combat::skill::AbilityExecutionStore;
 use crate::combat::status::{ActiveBuff, ThreatTable};
+use crate::combat::tactical::TacticalState;
 use crate::entity::entity_index::EntityIndex;
 use crate::entity::entity_store::EntityStore;
 use crate::physics_backend::CollisionEvent;
@@ -38,6 +41,10 @@ pub enum AuditDomain {
     Threat,
     Buff,
     Ai,
+    /// Follow-up eligibility windows (`CombatState::active_windows`).
+    Window,
+    /// Per-tick blocking/dodge flags (`CombatState::tactical`).
+    Tactical,
 }
 
 /// A single audit record for one mutation event.
@@ -68,6 +75,8 @@ pub struct MutationAudit {
     pub threat_writes: u32,
     pub buff_writes: u32,
     pub ai_writes: u32,
+    pub window_writes: u32,
+    pub tactical_writes: u32,
     /// Detailed records for debugging. Only populated when `record_details` is true.
     pub records: Vec<AuditRecord>,
     pub record_details: bool,
@@ -90,6 +99,8 @@ impl MutationAudit {
         self.threat_writes = 0;
         self.buff_writes = 0;
         self.ai_writes = 0;
+        self.window_writes = 0;
+        self.tactical_writes = 0;
         self.records.clear();
     }
 
@@ -120,6 +131,8 @@ impl MutationAudit {
             AuditDomain::Threat => self.threat_writes += 1,
             AuditDomain::Buff => self.buff_writes += 1,
             AuditDomain::Ai => self.ai_writes += 1,
+            AuditDomain::Window => self.window_writes += 1,
+            AuditDomain::Tactical => self.tactical_writes += 1,
         }
         if self.record_details {
             self.records.push(AuditRecord { domain, subsystem, phase, entity, detail });
@@ -131,15 +144,17 @@ impl MutationAudit {
         self.transform_writes + self.health_writes + self.lifecycle_writes
             + self.cooldown_writes + self.hitbox_writes + self.execution_writes
             + self.threat_writes + self.buff_writes + self.ai_writes
+            + self.window_writes + self.tactical_writes
     }
 
     /// Print a one-line summary of mutation counts.
     pub fn summary_line(&self) -> String {
         format!(
-            "audit: transform={} health={} lifecycle={} cooldown={} hitbox={} exec={} threat={} buff={} ai={}",
+            "audit: transform={} health={} lifecycle={} cooldown={} hitbox={} exec={} threat={} buff={} ai={} window={} tactical={}",
             self.transform_writes, self.health_writes, self.lifecycle_writes,
             self.cooldown_writes, self.hitbox_writes, self.execution_writes,
             self.threat_writes, self.buff_writes, self.ai_writes,
+            self.window_writes, self.tactical_writes,
         )
     }
 }
@@ -164,7 +179,10 @@ pub fn is_ownership_allowed(domain: AuditDomain, subsystem: AuditSubsystem, phas
     match domain {
         AuditDomain::Health => subsystem == AuditSubsystem::Combat && phase == 6,
         AuditDomain::Threat => subsystem == AuditSubsystem::Combat && phase == 6,
-        AuditDomain::Transform => subsystem == AuditSubsystem::Controller && phase == 2,
+        AuditDomain::Transform => {
+            (subsystem == AuditSubsystem::Controller && phase == 2)
+                || (subsystem == AuditSubsystem::AiDecisions && phase == 7)
+        }
         AuditDomain::Lifecycle => subsystem == AuditSubsystem::Lifecycle && phase == 8,
         AuditDomain::Hitbox => subsystem == AuditSubsystem::AbilityTimeline && phase == 3,
         AuditDomain::Execution => {
@@ -177,6 +195,16 @@ pub fn is_ownership_allowed(domain: AuditDomain, subsystem: AuditSubsystem, phas
         }
         AuditDomain::Buff => subsystem == AuditSubsystem::StatusEffects && phase == 8,
         AuditDomain::Ai => subsystem == AuditSubsystem::AiDecisions && phase == 7,
+        // Window: AbilityTimeline writes in phase 3, CooldownTracker drains in phase 8.
+        AuditDomain::Window => {
+            (subsystem == AuditSubsystem::AbilityTimeline && phase == 3)
+                || (subsystem == AuditSubsystem::CooldownTracker && phase == 8)
+        }
+        // Tactical: AbilityTimeline writes in phase 3, CooldownTracker clears in phase 8.
+        AuditDomain::Tactical => {
+            (subsystem == AuditSubsystem::AbilityTimeline && phase == 3)
+                || (subsystem == AuditSubsystem::CooldownTracker && phase == 8)
+        }
     }
 }
 
@@ -259,6 +287,18 @@ pub struct CombatState {
     /// In-flight ability cast instances — one entry per accepted UseAbility cast,
     /// carrying resolved targeting and cast-time spatial snapshot.
     pub executions: AbilityExecutionStore,
+    /// Follow-up eligibility windows: maps (EntityId, ability_id) → expiry tick.
+    ///
+    /// Written by `OpenFollowUpWindow` timeline actions in Phase 3.
+    /// Phase 2 checks this to set `AbilityParams::variant` for combo presses.
+    /// Phase 8 drains entries whose expiry tick ≤ current tick.
+    pub active_windows: HashMap<(EntityId, u32), TickId>,
+    /// Per-entity tactical flags for this tick (blocking, dodge).
+    ///
+    /// Written by `StanceBegin` timeline actions in Phase 3.
+    /// Phase 6 checks flags before routing hits through the damage path.
+    /// Phase 8 clears all flags so `StanceBegin` must re-assert each tick.
+    pub tactical: Vec<TacticalState>,
 }
 
 /// Buff/debuff status data.
@@ -271,6 +311,9 @@ pub struct StatusState {
 pub struct AiState {
     /// NPC AI state — `Some` for NPCs/bosses, `None` for other entity kinds.
     pub npc_ai: Vec<Option<NpcAiState>>,
+    /// Spawn position used as the patrol home point for NPCs/bosses.
+    /// Non-NPC slots hold `Vec3f::ZERO` and are never read.
+    pub home_positions: Vec<Vec3f>,
 }
 
 /// Runtime simulation state for one region.
@@ -308,9 +351,11 @@ impl SimState {
                 threat_tables: Vec::new(),
                 hitboxes: HitboxStore::new(),
                 executions: AbilityExecutionStore::new(),
+                active_windows: HashMap::new(),
+                tactical: Vec::new(),
             },
             status: StatusState { buffs: Vec::new() },
-            ai: AiState { npc_ai: Vec::new() },
+            ai: AiState { npc_ai: Vec::new(), home_positions: Vec::new() },
             #[cfg(any(debug_assertions, test))]
             audit: MutationAudit::new(),
         }
@@ -324,8 +369,10 @@ impl SimState {
         debug_assert_eq!(self.combat.health.max_hp.len(), n, "health.max_hp desync");
         debug_assert_eq!(self.combat.health.last_damage_source.len(), n, "health.last_damage_source desync");
         debug_assert_eq!(self.combat.threat_tables.len(), n, "threat_tables desync");
+        debug_assert_eq!(self.combat.tactical.len(), n, "tactical desync");
         debug_assert_eq!(self.status.buffs.len(), n, "buffs desync");
         debug_assert_eq!(self.ai.npc_ai.len(), n, "npc_ai desync");
+        debug_assert_eq!(self.ai.home_positions.len(), n, "home_positions desync");
     }
 
     /// Register a new entity, returning its dense index.
@@ -343,6 +390,8 @@ impl SimState {
         let is_npc = kind == EntityKind::Npc || kind == EntityKind::Boss;
         self.combat.threat_tables.push(if is_npc { Some(ThreatTable::default()) } else { None });
         self.ai.npc_ai.push(if is_npc { Some(NpcAiState::Idle) } else { None });
+        self.ai.home_positions.push(Vec3f::ZERO);
+        self.combat.tactical.push(TacticalState::default());
         idx
     }
 
@@ -589,6 +638,7 @@ mod tests {
             stacks: 1,
             max_stacks: 1,
             expires_at: Some(TickId(10)),
+            modifiers: Default::default(),
         });
         state.status.buffs[idx.as_usize()].push(ActiveBuff {
             buff_id: 43,
@@ -597,6 +647,7 @@ mod tests {
             stacks: 1,
             max_stacks: 1,
             expires_at: None, // permanent
+            modifiers: Default::default(),
         });
 
         let expired = state.expire_buffs(TickId(10));
@@ -614,6 +665,7 @@ mod tests {
         assert!(is_ownership_allowed(AuditDomain::Health, AuditSubsystem::Combat, 6));
         assert!(is_ownership_allowed(AuditDomain::Threat, AuditSubsystem::Combat, 6));
         assert!(is_ownership_allowed(AuditDomain::Transform, AuditSubsystem::Controller, 2));
+        assert!(is_ownership_allowed(AuditDomain::Transform, AuditSubsystem::AiDecisions, 7));
         assert!(is_ownership_allowed(AuditDomain::Lifecycle, AuditSubsystem::Lifecycle, 8));
         assert!(is_ownership_allowed(AuditDomain::Hitbox, AuditSubsystem::AbilityTimeline, 3));
         assert!(is_ownership_allowed(AuditDomain::Execution, AuditSubsystem::Controller, 2));
