@@ -98,7 +98,7 @@ pub struct EntityLayer {
 // owning boss and the tags assigned at spawn time. Worker subscribes to
 // rebuild in-memory `add_to_boss` and `entity_tags` so encounter rules
 // like `OnEntityDied { tag }` can fire deterministically in production.
-// The subscription and reducer paths both rely on this pairing invariant.
+// See `docs/contracts/spawn_add_membership_contract.md`.
 //
 // Primary writer: `commit_tick_results` reducer (insert at spawn time).
 // Cleanup writer: `commit_tick_results` reducer when the add or its boss
@@ -256,6 +256,7 @@ pub struct NpcConfig {
     pub entity_id: u64,
     /// Encounter rules key used by worker boss registration. None => fallback behavior.
     pub encounter_name: Option<String>,
+    pub archetype_id: Option<String>,
     /// Training dummy — never enters combat, ignores threat.
     pub passive: bool,
     /// Fights back but does not chase (stationary turret).
@@ -317,6 +318,11 @@ pub struct BuffAppliedData {
 pub struct CastStartData {
     pub ability_id: u32,
     pub cast_duration_ticks: u32,
+    /// Cooldown duration in ticks after applying server-side
+    /// reductions. Counts forward from the tick of the parent
+    /// `combat_event` row. `0` if the ability has no cooldown.
+    /// See `docs/contracts/ability_cast_lifecycle_contract.md`.
+    pub effective_cooldown_ticks: u32,
 }
 
 #[derive(SpacetimeType, Clone, Debug)]
@@ -374,6 +380,30 @@ pub enum CombatEventKind {
     Cleansed(CleansedData),
     Stunbreak,
     CCImmune(CCImmuneData),
+    /// An in-flight cast or charge was cancelled.
+    /// **Append-only**: this MUST stay at the tail of the enum to
+    /// preserve discriminants for existing client decoders.
+    AbilityCancelled(AbilityCancelledData),
+}
+
+#[derive(SpacetimeType, Clone, Debug)]
+pub struct AbilityCancelledData {
+    pub ability_id: u32,
+    pub reason: AbilityCancelReasonWire,
+}
+
+/// Wire mirror of `game_protocol::event::AbilityCancelReason`.
+///
+/// **Append-only**: variant order matches the in-memory enum. New
+/// reasons must be appended in both enums simultaneously.
+#[derive(SpacetimeType, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbilityCancelReasonWire {
+    Death,
+    HardCC,
+    Manual,
+    Movement,
+    Damage,
+    Replaced,
 }
 
 #[derive(SpacetimeType, Clone, Debug)]
@@ -643,6 +673,33 @@ pub struct Bank {
     pub quantity: u32,
 }
 
+#[table(accessor = loot_pile, public)]
+pub struct LootPile {
+    #[primary_key]
+    #[auto_inc]
+    pub loot_pile_id: u64,
+    pub corpse_entity: u64,
+    #[index(btree)]
+    pub layer: u32,
+    pub pos_x: f32,
+    pub pos_y: f32,
+    pub pos_z: f32,
+    pub eligible_claimants: Vec<u64>,
+    pub created_at_tick: u64,
+    pub expires_at_tick: u64,
+}
+
+#[table(accessor = loot_pile_item, public)]
+pub struct LootPileItem {
+    #[primary_key]
+    #[auto_inc]
+    pub loot_pile_item_id: u64,
+    #[index(btree)]
+    pub loot_pile_id: u64,
+    pub item_id: u32,
+    pub quantity: u32,
+}
+
 // ── Party System ────────────────────────────────────────────────────
 // Party tables enable group play, required for dungeon entry.
 // Single writer: client-facing party reducers (validated per-player).
@@ -686,8 +743,9 @@ pub struct PartyInvite {
 }
 
 // ── Boss Phase (ADR-0002 Tier 1) ────────────────────────────────────
-// Tracks current phase for boss encounters. Written by commit_boss_phase
-// reducer (trusted worker). Worker detects HP thresholds and transitions.
+// Tracks current phase for boss encounters. Written inline by
+// commit_tick_results from trusted-worker boss_phase_updates. Worker detects
+// HP thresholds and transitions.
 
 #[table(accessor = boss_phase, public)]
 pub struct BossPhase {
@@ -698,9 +756,17 @@ pub struct BossPhase {
 }
 
 // ── Zone Counter (ADR-0002 Tier 1) ──────────────────────────────────
-// Per-zone counters incremented on kill/damage events. Written by
-// increment_zone_counter reducer (trusted worker). Used by world_clock
-// to evaluate phase transitions.
+// Per-zone counters incremented on kill/damage events. Worker tick output
+// writes through commit_tick_results zone_counter_deltas; increment_zone_counter
+// remains as a trusted/admin helper. Used by world_clock to evaluate phase
+// transitions.
+//
+// Logical uniqueness on `(layer, region_x, region_z, counter_name)` is
+// enforced by `reducers::upsert_zone_counter` — SpacetimeDB v2 cannot
+// express composite uniqueness in storage (see the `terrain_set` comment
+// below for the workspace pattern). All writers route through that
+// helper; `world_clock` additionally sums same-name counters per zone
+// defensively in case a legacy bug ever produced a duplicate row.
 
 #[table(accessor = zone_counter, public, index(accessor = by_zone, btree(columns = [layer, region_x, region_z])))]
 pub struct ZoneCounter {
@@ -727,16 +793,77 @@ pub struct WorldPhase {
     pub metadata: String,
 }
 
+// ── World Activity Event (messaging spine — step 4 of the 2026-06-09 review) ─
+// Scope-keyed Tier 2 event row used to gate director spawns on both a
+// scope state transition AND an explicit player-presence requirement.
+//
+// `WorldPhase` says "this zone reached phase X"; `WorldActivityEvent`
+// says "an authored event tagged Y is currently Active in scope Z and
+// requires at least N players present to spawn". Together they let
+// Tier 2 progression continue (durable counters, timers, world_phase)
+// while preventing director spawns from firing offscreen — see
+// `docs/contracts/world_activity_policy_contract.md` "no offscreen
+// combat" rule and Finding #4 from the 2026-06-09 messaging review.
+//
+// V1 tags (no payload yet):
+//   - `boss_ready` : produced by world_clock alongside the
+//                    `world_phase = "boss_ready"` transition.
+//   - `completed`  : produced alongside `world_phase = "completed"`.
+// Future kinds (timer / chain / escalation) extend through `payload`
+// without a schema migration.
+//
+// Logical uniqueness on `(scope_layer, scope_region_x, scope_region_z,
+// tag)` is enforced by `reducers::upsert_world_activity_event` (same
+// workspace pattern as `zone_counter`).
+//
+// Distinct from the legacy per-tick `world_event` table above, which is
+// a transient game-event log keyed by `(tick_id, event_sequence)`. The
+// two intentionally do not share a row type.
+//
+// `WorldActivityEventState` itself lives in `game_schema::world_activity`
+// so the simulation worker's director can match against the same enum
+// the server reducer writes.
+
+pub use game_schema::WorldActivityEventState;
+
+#[table(
+    accessor = world_activity_event,
+    public,
+    index(accessor = by_scope, btree(columns = [scope_layer, scope_region_x, scope_region_z]))
+)]
+pub struct WorldActivityEvent {
+    #[primary_key]
+    #[auto_inc]
+    pub event_id: u64,
+    /// Activity scope: layer + region cell. Open-world events use
+    /// `scope_layer = 0` with the real `(rx, rz)`; instance events use
+    /// `scope_layer = instance.layer` with `(rx, rz) = (0, 0)`, matching
+    /// the canonical zone-keying convention used by `zone_counter` and
+    /// `world_phase`.
+    pub scope_layer: u32,
+    pub scope_region_x: i32,
+    pub scope_region_z: i32,
+    /// Event identifier within the scope. Logically unique together with
+    /// the scope key; enforced by `upsert_world_activity_event`.
+    pub tag: String,
+    pub state: WorldActivityEventState,
+    /// Minimum number of active (non-disconnected) players required in
+    /// the event's scope before director triggers gated on this row
+    /// fire. `0` means no presence requirement.
+    pub required_players: u32,
+    pub started_at: i64,
+    /// Versioned JSON payload for kind-specific data. Empty for v1
+    /// `boss_ready` / `completed` events.
+    pub payload: String,
+}
+
 // ── NPC Goal (ADR-0002 Tier 2) ──────────────────────────────────────
-// High-level NPC directives written by world_clock. Worker subscribes
-// read-only; Phase 7 AI reads before decisions.
+// High-level NPC directives for Phase 7 AI. There is intentionally at most
+// one directive per entity; the table has no producer until Tier 2 lands.
 
 #[table(accessor = npc_goal, public)]
 pub struct NpcGoal {
     #[primary_key]
-    #[auto_inc]
-    pub goal_id: u64,
-    #[index(btree)]
     pub entity_id: u64,
     pub goal_kind: String,
     /// JSON-encoded waypoints.
@@ -827,8 +954,9 @@ pub struct InstanceMembership {
 }
 
 // ── Interactable Config ─────────────────────────────────────────────
-// Per-entity config for interactive world objects (gates, switches,
-// chests, grabs). Sim worker subscribes for physics-driven interactions.
+// Per-entity config for interactive world objects and spawn markers (gates,
+// switches, chests, grabs, BossSpawn, NpcSpawn). Sim worker subscribes for
+// physics-driven interactions and metadata.
 // Single writer: instance spawn path (create_instance) and
 // commit_tick_results reducer (trusted worker, inline interactable updates).
 
@@ -838,6 +966,8 @@ pub enum InteractKind {
     Gate,
     Grab,
     Chest,
+    BossSpawn,
+    NpcSpawn,
 }
 
 #[derive(SpacetimeType, Clone, Copy, Debug, PartialEq, Eq)]

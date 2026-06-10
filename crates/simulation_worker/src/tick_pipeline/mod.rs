@@ -10,7 +10,7 @@ pub(super) use game_core::entity::entity_index::EntityIndex;
 pub(super) use game_core::physics_backend::{ColliderKind, PhysicsBackend, SensorShape};
 pub(super) use game_core::sim_state::SimState;
 pub(super) use game_protocol::entity_id::EntityId;
-pub(super) use game_protocol::event::{EventPayload, SimEvent};
+pub(super) use game_protocol::event::{AbilityCancelReason, EventPayload, SimEvent};
 pub(super) use game_protocol::intent::{IntentAction, MoveDir, PlayerIntent};
 pub(super) use game_protocol::tick::TickId;
 pub(super) use game_protocol::types::Transform;
@@ -28,11 +28,28 @@ mod controller;
 mod encounter_runtime;
 mod finalization;
 mod skill_dispatch;
-#[cfg(test)]
-mod tests;
+
 mod volumes;
 
-pub(super) use archetype::NpcArchetypeRegistry;
+pub(super) use archetype::{NpcArchetypeDirectorConfigExt, NpcArchetypeRegistry};
+
+fn load_builtin_behavior_trees() -> game_core::ai::behavior_tree::BehaviorTreeRegistry {
+    game_core::ai::behavior_tree::BehaviorTreeRegistry::from_ron(include_str!(
+        "../../../../data/behavior_trees.ron"
+    ))
+    .unwrap_or_else(|err| {
+        warn!("Failed to load data/behavior_trees.ron: {err}");
+        game_core::ai::behavior_tree::BehaviorTreeRegistry::new()
+    })
+}
+
+fn load_builtin_routes() -> game_core::ai::routes::RouteRegistry {
+    game_core::ai::routes::RouteRegistry::from_ron(include_str!("../../../../data/npc_routes.ron"))
+        .unwrap_or_else(|err| {
+            warn!("Failed to load data/npc_routes.ron: {err}");
+            game_core::ai::routes::RouteRegistry::new()
+        })
+}
 
 // ── Region / AOI constants ──────────────────────────────────────────
 
@@ -214,6 +231,7 @@ pub struct TickResult {
     pub director_spawns: Vec<DirectorSpawn>,
     /// Encounter-add membership entries, one per encounter-spawned add.
     /// `spawn_index` references the corresponding slot in `director_spawns`.
+    /// See `docs/contracts/spawn_add_membership_contract.md`.
     pub encounter_memberships: Vec<game_core::director::PendingAddMembership>,
     /// Interactable state changes this tick (entity_id, new SimInteractState).
     pub interactable_updates: Vec<(EntityId, game_core::sim_state::SimInteractState)>,
@@ -224,6 +242,9 @@ pub struct TickResult {
     /// Player death rows produced this tick by Phase 8b. The reducer inserts
     /// these into `death_state` verbatim (it does not derive them).
     pub death_state_inserts: Vec<DeathStateInsertEntry>,
+    /// Loot rolls produced this tick by Phase 8b. The reducer persists these
+    /// verbatim as loot piles/items in the same commit as `EntityDied`.
+    pub loot_rolls: Vec<game_core::loot::LootRollOutput>,
     /// Diagnostic warnings from the pipeline this tick. Each message is shipped
     /// to the DB as a `SimLog` event row (level=Warn) by the coordinator.
     pub sim_warnings: Vec<String>,
@@ -275,6 +296,12 @@ pub struct TickPipeline {
     pub(super) dt: f32,
     /// Per-entity scheduled actions, sorted by tick_id ascending.
     pub(super) scheduled_actions: Vec<ScheduledAction>,
+    /// Reusable Phase 3 buffer for due scheduled actions.
+    pub(super) scheduled_action_scratch: Vec<ScheduledAction>,
+    /// Reusable Phase 3 set of execution IDs that still own future scheduled work.
+    pub(super) scheduled_sources_scratch: HashSet<AbilityExecutionId>,
+    /// Reusable Phase 3 buffer for execution contexts that can be culled.
+    pub(super) execution_cull_scratch: Vec<AbilityExecutionId>,
     /// Static ability definitions — looked up during combat resolution.
     pub(super) abilities: AbilityRegistry,
     /// Buff templates — looked up by ID when applying buffs from abilities.
@@ -329,9 +356,33 @@ pub struct TickPipeline {
     /// World phase projections from the DB — keyed by zone_id → phase_name.
     /// Updated by coordinator callbacks when world_phase rows change.
     pub(super) world_phases: HashMap<u32, String>,
+    /// World activity event projections from the DB — keyed by
+    /// `(scope_layer, scope_region_x, scope_region_z, tag)` → state.
+    /// Updated by coordinator callbacks when `world_activity_event` rows
+    /// change. Consumed by `DirectorTrigger::WorldActivityEventActive`
+    /// to gate spawns on both event state and per-region presence
+    /// (Finding #4 of the 2026-06-09 messaging-spine review).
+    pub(super) world_activity_events:
+        HashMap<game_schema::WorldActivityEventKey, game_schema::WorldActivityEventState>,
     /// NPC goal directives from the DB (Tier 2 world_clock output).
     /// Keyed by entity_id → (goal_kind, priority). Phase 7 AI reads before decisions.
     pub(super) npc_goals: HashMap<EntityId, (String, u32)>,
+    /// Player entities currently in instance-reconnect grace
+    /// (`InstanceMembership.disconnect_at.is_some()`). Mirrored from the
+    /// `instance_membership` subscription by the coordinator. Phase 7.5
+    /// excludes these from the active-player region count so encounters,
+    /// the director, and AI don't continue to progress around players who
+    /// have left the world — see `docs/contracts/world_activity_policy_contract.md`
+    /// "no offscreen combat" rule. Cleaned on entity removal so a reused
+    /// dense slot cannot inherit a prior occupant's disconnect state.
+    pub(super) disconnected_players: HashSet<EntityId>,
+    /// Optional per-entity Behavior Tree decision policies.
+    ///
+    /// Absent means the current `FsmAiPolicy` owns decision-making. Present is
+    /// explicit opt-in for authored/test scripted AI. Cleaned on entity removal
+    /// so a reused dense slot cannot inherit a prior occupant's behavior tree.
+    pub(super) ai_behavior_trees:
+        HashMap<EntityId, game_core::ai::behavior_tree::BehaviorTreePolicy>,
     /// Active boss encounters — keyed by boss entity ID.
     /// Phase 7.5 evaluates encounter rules after director spawns.
     pub(crate) encounters: HashMap<EntityId, game_core::encounter::EncounterState>,
@@ -342,6 +393,26 @@ pub struct TickPipeline {
     /// NPC archetype registry — resolves `EncounterOutput::SpawnAdds`
     /// archetype names to spawn profiles for the director.
     pub(crate) npc_archetypes: NpcArchetypeRegistry,
+    /// Behavior tree registry loaded from checked-in authoring data.
+    pub(crate) behavior_trees: game_core::ai::behavior_tree::BehaviorTreeRegistry,
+    /// Authored NPC route registry loaded from checked-in authoring data.
+    pub(crate) routes: game_core::ai::routes::RouteRegistry,
+    /// Per-entity route-follow runtime state. Keyed by stable EntityId so slot
+    /// reuse cannot inherit route progress.
+    pub(super) ai_route_follow: HashMap<EntityId, game_core::ai::routes::RouteFollowState>,
+    /// Reusable scratch buffer for Phase 7 AI decision output. Cleared and
+    /// refilled per entity so policies never allocate a fresh `Vec` per tick.
+    pub(super) ai_action_scratch: Vec<game_core::ai::decision::DesiredAiAction>,
+    /// Reusable Phase 7 active NPC/Boss index snapshot.
+    pub(super) ai_actor_indices_scratch: Vec<EntityIndex>,
+    /// Reusable Phase 7 active Player index snapshot for proximity aggro.
+    pub(super) ai_player_indices_scratch: Vec<EntityIndex>,
+    /// Reusable Phase 7 actor skip set for overrides that fully handle a tick.
+    pub(super) ai_skip_decision_scratch: HashSet<EntityIndex>,
+    /// Reusable Phase 7 chase slots, sorted as `(target, actor)` pairs.
+    pub(super) ai_chase_slot_scratch: Vec<(EntityId, EntityId)>,
+    /// Reusable Phase 7 action ranges into `ai_action_scratch`.
+    pub(super) ai_action_ranges_scratch: Vec<(EntityIndex, usize, usize)>,
     /// Per-encounter (boss-keyed) gameplay volumes. Each `VolumeStore` owns
     /// its world sensors; entries are dropped when the owning boss is
     /// removed via `force_remove_entity`. Volume edge events accumulated
@@ -417,6 +488,13 @@ pub struct TickPipeline {
     /// when `apply_spawn_adds` resolves the spawn and forwarded into the
     /// owning encounter's bus on death. Cleared on force_remove_entities.
     pub(crate) add_to_boss: HashMap<EntityId, EntityId>,
+    /// Static loot table registry loaded from `data/loot_tables.ron`.
+    pub(crate) loot_registry: game_core::loot::LootRegistry,
+    /// Entity → loot table id. Populated for bosses/NPCs whose authoring
+    /// resolved a loot table, and removed with the entity runtime slot.
+    pub(crate) entity_loot_tables: HashMap<EntityId, String>,
+    /// Loot rolls emitted by Phase 8b. Drained into `TickResult.loot_rolls`.
+    pub(super) pending_loot_rolls: Vec<game_core::loot::LootRollOutput>,
     /// Tier-2 encounter outputs (ChangeBossPhase / IncrementZoneCounter)
     /// produced by `cleanup_encounter_for_boss_removal` after the normal
     /// Phase 7.5b dispatch has already executed this tick. Cleanup runs
@@ -424,8 +502,7 @@ pub struct TickPipeline {
     /// be carried forward and merged into the current tick's
     /// `boss_phase_updates` / `zone_counter_deltas` before TickResult is
     /// assembled.
-    pub(super) pending_cleanup_commit_outputs:
-        Vec<game_core::encounter::EncounterOutput>,
+    pub(super) pending_cleanup_commit_outputs: Vec<game_core::encounter::EncounterOutput>,
     /// Director spawn requests emitted by mechanic stop-emissions during
     /// `cleanup_encounter_for_boss_removal`. Merged into the current
     /// tick's `director_spawns` after Phase 8b.
@@ -433,8 +510,7 @@ pub struct TickPipeline {
     /// Pending add memberships emitted by mechanic stop-emissions during
     /// `cleanup_encounter_for_boss_removal`. `spawn_index` values are
     /// local to `pending_cleanup_spawns` and must be shifted at drain time.
-    pub(super) pending_cleanup_memberships:
-        Vec<game_core::director::PendingAddMembership>,
+    pub(super) pending_cleanup_memberships: Vec<game_core::director::PendingAddMembership>,
 }
 
 impl TickPipeline {
@@ -571,10 +647,15 @@ impl TickPipeline {
             self.entity_regions.remove(id);
             self.last_committed_transforms.remove(id);
             self.npc_state_prev.remove(id);
+            self.ai_behavior_trees.remove(id);
+            self.ai_route_follow.remove(id);
+            self.npc_goals.remove(id);
+            self.disconnected_players.remove(id);
             self.equipment_modifiers.remove(id);
             self.weapon_swap_cooldowns.remove(id);
             self.entity_tags.remove(id);
             self.add_to_boss.remove(id);
+            self.entity_loot_tables.remove(id);
             self.entity_body_shapes.remove(id);
         }
 
@@ -655,6 +736,9 @@ impl TickPipeline {
             physics,
             dt,
             scheduled_actions: Vec::new(),
+            scheduled_action_scratch: Vec::new(),
+            scheduled_sources_scratch: HashSet::new(),
+            execution_cull_scratch: Vec::new(),
             abilities,
             buff_registry,
             state: SimState::new(),
@@ -670,10 +754,22 @@ impl TickPipeline {
             transform_history: TransformHistory::new(),
             director: DirectorState::new(),
             world_phases: HashMap::new(),
+            world_activity_events: HashMap::new(),
             npc_goals: HashMap::new(),
+            disconnected_players: HashSet::new(),
+            ai_behavior_trees: HashMap::new(),
             encounters: HashMap::new(),
             mechanics: game_core::encounter::MechanicRegistry::with_builtins(),
             npc_archetypes: NpcArchetypeRegistry::with_builtins(),
+            behavior_trees: load_builtin_behavior_trees(),
+            routes: load_builtin_routes(),
+            ai_route_follow: HashMap::new(),
+            ai_action_scratch: Vec::new(),
+            ai_actor_indices_scratch: Vec::new(),
+            ai_player_indices_scratch: Vec::new(),
+            ai_skip_decision_scratch: HashSet::new(),
+            ai_chase_slot_scratch: Vec::new(),
+            ai_action_ranges_scratch: Vec::new(),
             volumes: HashMap::new(),
             pending_volume_events: HashMap::new(),
             stats_dirty: HashSet::new(),
@@ -692,10 +788,55 @@ impl TickPipeline {
             pending_death_state_inserts: Vec::new(),
             entity_tags: HashMap::new(),
             add_to_boss: HashMap::new(),
+            loot_registry: game_core::loot::LootRegistry::new(),
+            entity_loot_tables: HashMap::new(),
+            pending_loot_rolls: Vec::new(),
             pending_cleanup_commit_outputs: Vec::new(),
             pending_cleanup_spawns: Vec::new(),
             pending_cleanup_memberships: Vec::new(),
         }
+    }
+
+    pub fn set_loot_registry(&mut self, registry: game_core::loot::LootRegistry) {
+        self.loot_registry = registry;
+    }
+
+    pub fn set_entity_loot_table(&mut self, entity: EntityId, loot_table_id: Option<String>) {
+        match loot_table_id {
+            Some(id) if !id.is_empty() => {
+                self.entity_loot_tables.insert(entity, id);
+            }
+            _ => {
+                self.entity_loot_tables.remove(&entity);
+            }
+        }
+    }
+
+    pub fn set_ai_behavior_tree(
+        &mut self,
+        entity: EntityId,
+        policy: Option<game_core::ai::behavior_tree::BehaviorTreePolicy>,
+    ) {
+        match policy {
+            Some(policy) => {
+                self.ai_behavior_trees.insert(entity, policy);
+            }
+            None => {
+                self.ai_behavior_trees.remove(&entity);
+            }
+        }
+    }
+
+    pub fn set_behavior_tree_registry(
+        &mut self,
+        registry: game_core::ai::behavior_tree::BehaviorTreeRegistry,
+    ) {
+        self.behavior_trees = registry;
+    }
+
+    pub fn set_route_registry(&mut self, registry: game_core::ai::routes::RouteRegistry) {
+        self.routes = registry;
+        self.ai_route_follow.clear();
     }
 
     pub fn physics_mut(&mut self) -> &mut dyn PhysicsBackend {
@@ -767,7 +908,8 @@ impl TickPipeline {
     /// bus as `EncounterEvent::EntityDied`. Optionally tags the add with
     /// `tag` for `OnEntityDied { tag }` matching.
     ///
-    /// Cross-layer registrations are rejected with a warning: the maps
+    /// Per `docs/contracts/dungeon_layer_propagation_contract.md` rule #4,
+    /// cross-layer registrations are rejected with a warning: the maps
     /// remain unchanged and the spawn proceeds without encounter
     /// membership. Existing teardown removes the orphan add.
     pub fn register_encounter_add(
@@ -793,6 +935,7 @@ impl TickPipeline {
 
     /// Multi-tag variant used by the production `encounter_add.on_insert`
     /// subscription path. Each tag is applied via `set_entity_tag`.
+    /// See `docs/contracts/spawn_add_membership_contract.md`.
     ///
     /// Layer-match enforcement for Spec C rule #4 lives in the
     /// `commit_tick_results` reducer, where both layers are visible
@@ -815,11 +958,117 @@ impl TickPipeline {
         }
     }
 
+    pub fn register_encounter_add_with_archetype(
+        &mut self,
+        add_entity: EntityId,
+        boss_entity: EntityId,
+        archetype: &str,
+        tags: &[String],
+    ) {
+        self.register_encounter_add_with_tags(add_entity, boss_entity, tags);
+        let Some(profile) = self.npc_archetypes.lookup(archetype).cloned() else {
+            warn!(
+                "register_encounter_add_with_archetype: unknown archetype '{}'",
+                archetype
+            );
+            return;
+        };
+        if !profile.usage.allows_encounter_add() {
+            warn!(
+                "register_encounter_add_with_archetype: archetype '{}' has usage {:?}; skipping profile install",
+                archetype, profile.usage
+            );
+            return;
+        }
+        self.apply_npc_archetype_profile(add_entity, archetype, &profile);
+    }
+
+    pub fn apply_npc_archetype_to_entity(&mut self, entity: EntityId, archetype: &str) {
+        let Some(profile) = self.npc_archetypes.lookup(archetype).cloned() else {
+            warn!(
+                "apply_npc_archetype_to_entity: unknown archetype '{}'",
+                archetype
+            );
+            return;
+        };
+        if !profile.usage.allows_actor_spawn() {
+            warn!(
+                "apply_npc_archetype_to_entity: archetype '{}' has usage {:?}; skipping profile install",
+                archetype, profile.usage
+            );
+            return;
+        }
+        self.apply_npc_archetype_profile(entity, archetype, &profile);
+    }
+
+    fn apply_npc_archetype_profile(
+        &mut self,
+        entity: EntityId,
+        archetype: &str,
+        profile: &game_schema::NpcArchetype,
+    ) {
+        if let Some(goal_kind) = profile
+            .default_goal
+            .as_deref()
+            .filter(|goal| !goal.is_empty())
+        {
+            self.npc_goals.insert(entity, (goal_kind.to_string(), 0));
+        }
+
+        if let Some(table_id) = profile.loot_table_id.as_deref().filter(|id| !id.is_empty()) {
+            if self.loot_registry.get(table_id).is_some() {
+                self.set_entity_loot_table(entity, Some(table_id.to_string()));
+            } else {
+                warn!(
+                    "apply_npc_archetype_profile: archetype '{}' references unknown loot_table_id '{}'",
+                    archetype, table_id
+                );
+            }
+        }
+
+        let mut installed_policy = false;
+        if let Some(tree_id) = profile
+            .behavior_tree_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        {
+            match self.behavior_trees.policy(tree_id) {
+                Some(policy) => {
+                    self.set_ai_behavior_tree(entity, Some(policy));
+                    installed_policy = true;
+                }
+                None => warn!(
+                    "apply_npc_archetype_profile: archetype '{}' references unknown behavior_tree_id '{}'",
+                    archetype, tree_id
+                ),
+            }
+        }
+
+        if let Some(route_id) = profile.route_id.as_deref().filter(|id| !id.is_empty()) {
+            if self.routes.get(route_id).is_none() {
+                warn!(
+                    "apply_npc_archetype_profile: archetype '{}' references unknown route_id '{}'",
+                    archetype, route_id
+                );
+            } else if !installed_policy {
+                self.set_ai_behavior_tree(
+                    entity,
+                    Some(game_core::ai::behavior_tree::BehaviorTreePolicy::new(
+                        game_core::ai::behavior_tree::BehaviorNode::Action(
+                            game_core::ai::behavior_tree::ActionNode::FollowRoute(route_id.into()),
+                        ),
+                    )),
+                );
+            }
+        }
+    }
+
     /// Symmetric counterpart of `register_encounter_add_with_tags`, driven
     /// by the `encounter_add.on_delete` subscription callback.
     ///
-    /// The reducer cascade-deletes `encounter_add` rows in two cases: by
-    /// `add_entity` when the add itself is removed, and by `by_boss()` when the boss is
+    /// The reducer cascade-deletes `encounter_add` rows in two cases (see
+    /// `docs/contracts/spawn_add_membership_contract.md`): by `add_entity`
+    /// when the add itself is removed, and by `by_boss()` when the boss is
     /// removed. The first case is already covered by `force_remove_entities`
     /// clearing `add_to_boss` / `entity_tags` on worker-side entity removal;
     /// the second case can leave add entities briefly outliving their
@@ -837,6 +1086,17 @@ impl TickPipeline {
     #[doc(hidden)]
     pub fn world_phases_mut(&mut self) -> &mut HashMap<u32, String> {
         &mut self.world_phases
+    }
+
+    /// Direct access to the `world_activity_event` projection map for
+    /// test setup (normally written by the coordinator on
+    /// `world_activity_event` DB inserts).
+    #[doc(hidden)]
+    pub fn world_activity_events_mut(
+        &mut self,
+    ) -> &mut HashMap<game_schema::WorldActivityEventKey, game_schema::WorldActivityEventState>
+    {
+        &mut self.world_activity_events
     }
 
     pub fn set_current_tick(&mut self, tick: TickId) {
@@ -989,10 +1249,9 @@ impl TickPipeline {
 
         match kind {
             EntityKind::Player | EntityKind::Npc | EntityKind::Boss => {
-                let shape = body_shape
-                    .unwrap_or_else(|| {
-                        game_core::physics_backend::BodyShape::default_capsule_for_kind(kind)
-                    });
+                let shape = body_shape.unwrap_or_else(|| {
+                    game_core::physics_backend::BodyShape::default_capsule_for_kind(kind)
+                });
                 self.entity_body_shapes.insert(id, shape);
                 self.physics
                     .reuse_or_spawn_character_shaped(id, position, shape);
@@ -1429,11 +1688,33 @@ impl TickPipeline {
             .max()
             .unwrap_or(0)
             + 1;
+        // Compute the effective cooldown duration that the Phase 3
+        // `CooldownStart` handler will insert into `self.cooldowns`,
+        // and ship it to clients on the same tick as the cast itself
+        // (see `docs/contracts/ability_cast_lifecycle_contract.md`).
+        // Single source of truth: `game_core::stats::apply_cooldown_reduction`.
+        let base_cooldown_ticks: u32 = timeline
+            .actions
+            .iter()
+            .find_map(|a| match &a.action {
+                AbilityAction::CooldownStart { duration_ticks } => Some(*duration_ticks),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let cd_reduce: f32 = self
+            .state
+            .entities
+            .lookup(caster)
+            .map(|idx| self.state.stats.get(idx).cooldown_reduce_pct)
+            .unwrap_or(0.0);
+        let effective_cooldown_ticks =
+            game_core::stats::apply_cooldown_reduction(base_cooldown_ticks, cd_reduce);
         self.emit_event(
             caster,
             EventPayload::CastStart {
                 ability_id: resolved_id,
                 cast_duration_ticks,
+                effective_cooldown_ticks,
             },
         );
         self.schedule_ability(caster, &timeline, self.current_tick, execution_id);
@@ -1469,6 +1750,140 @@ impl TickPipeline {
 
     pub(super) fn release_ability_reservation(&mut self, entity: EntityId, ability_id: u32) {
         self.ability_cast_reservations.remove(&(entity, ability_id));
+    }
+
+    /// Cancel every active cast and charge owned by `entity`.
+    ///
+    /// Emits one `AbilityCancelled` event per active ability id, then removes the
+    /// runtime objects that would otherwise keep executing future frames.
+    pub(super) fn cancel_entity_abilities(
+        &mut self,
+        entity: EntityId,
+        reason: AbilityCancelReason,
+    ) -> bool {
+        self.cancel_entity_abilities_matching(entity, reason, |_| true)
+    }
+
+    pub(super) fn cancel_entity_interruptible_abilities(
+        &mut self,
+        entity: EntityId,
+        reason: AbilityCancelReason,
+    ) -> bool {
+        let mut interruptible_ability_ids: HashSet<u32> = self
+            .state
+            .combat
+            .executions
+            .active_ids()
+            .into_iter()
+            .filter_map(|exec_id| self.state.combat.executions.get(exec_id))
+            .filter(|ctx| ctx.caster == entity)
+            .map(|ctx| ctx.ability_id)
+            .filter(|&ability_id| {
+                self.abilities
+                    .get(ability_id)
+                    .map_or(true, |ability| !ability.usable_while_cc)
+            })
+            .collect();
+
+        if let Some(charging) = self.state.combat.charging.get(&entity) {
+            if self
+                .abilities
+                .get(charging.ability_id)
+                .map_or(true, |ability| !ability.usable_while_cc)
+            {
+                interruptible_ability_ids.insert(charging.ability_id);
+            }
+        }
+
+        self.cancel_entity_abilities_matching(entity, reason, |ability_id| {
+            interruptible_ability_ids.contains(&ability_id)
+        })
+    }
+
+    fn cancel_entity_abilities_matching(
+        &mut self,
+        entity: EntityId,
+        reason: AbilityCancelReason,
+        mut should_cancel: impl FnMut(u32) -> bool,
+    ) -> bool {
+        let execs_to_remove: HashSet<AbilityExecutionId> = self
+            .state
+            .combat
+            .executions
+            .active_ids()
+            .into_iter()
+            .filter(|&exec_id| {
+                self.state
+                    .combat
+                    .executions
+                    .get(exec_id)
+                    .is_some_and(|ctx| ctx.caster == entity && should_cancel(ctx.ability_id))
+            })
+            .collect();
+
+        let mut cancelled_ability_ids: Vec<u32> = execs_to_remove
+            .iter()
+            .filter_map(|&exec_id| self.state.combat.executions.get(exec_id))
+            .map(|ctx| ctx.ability_id)
+            .collect();
+
+        let cancel_charge = self
+            .state
+            .combat
+            .charging
+            .get(&entity)
+            .is_some_and(|charging| should_cancel(charging.ability_id));
+        if cancel_charge {
+            if let Some(charging) = self.state.combat.charging.get(&entity) {
+                cancelled_ability_ids.push(charging.ability_id);
+            }
+        }
+
+        cancelled_ability_ids.sort_unstable();
+        cancelled_ability_ids.dedup();
+
+        if cancelled_ability_ids.is_empty() {
+            return false;
+        }
+
+        for ability_id in cancelled_ability_ids {
+            self.emit_event(
+                entity,
+                EventPayload::AbilityCancelled { ability_id, reason },
+            );
+        }
+
+        if !execs_to_remove.is_empty() {
+            self.scheduled_actions.retain(|action| {
+                action
+                    .source
+                    .map_or(true, |source| !execs_to_remove.contains(&source))
+            });
+
+            for exec_id in execs_to_remove {
+                if let Some(handle) = self
+                    .state
+                    .combat
+                    .hitboxes
+                    .get(exec_id)
+                    .and_then(|hitbox| hitbox.sensor_handle)
+                {
+                    self.physics.remove_sensor(handle);
+                }
+                self.state.combat.hitboxes.remove(exec_id);
+                self.state.combat.executions.remove(exec_id);
+            }
+        }
+
+        if cancel_charge && self.state.combat.charging.remove(&entity).is_some() {
+            if let Some(tactical) = self.tactical_mut(entity) {
+                tactical
+                    .movement_conditions
+                    .remove(game_core::combat::tactical::MovementConditions::INPUT_LOCK);
+            }
+        }
+
+        true
     }
 
     /// Test-visible alias for `is_on_cooldown`. Production code uses the private method
@@ -1565,7 +1980,10 @@ impl TickPipeline {
                     self.set_interactable_state_runtime_inner(linked_entity, gate_state, visited);
                 }
             }
-            SimInteractKind::Chest | SimInteractKind::Grab => {}
+            SimInteractKind::Chest
+            | SimInteractKind::Grab
+            | SimInteractKind::BossSpawn
+            | SimInteractKind::NpcSpawn => {}
         }
     }
 
@@ -1779,6 +2197,7 @@ impl TickPipeline {
         self.pending_events.clear();
         self.ability_cast_reservations.clear();
         self.pending_heals.clear();
+        self.pending_loot_rolls.clear();
         // Defensive symmetry with `pending_heals.clear()`: the buffer is
         // normally drained via `mem::take` in commit assembly, but an
         // early-return path between Phase 8b and result assembly would
@@ -1939,8 +2358,7 @@ impl TickPipeline {
         }
         if !self.pending_cleanup_spawns.is_empty() {
             let cleanup_offset = director_spawns.len() as u32;
-            let mut cleanup_memberships =
-                std::mem::take(&mut self.pending_cleanup_memberships);
+            let mut cleanup_memberships = std::mem::take(&mut self.pending_cleanup_memberships);
             if cleanup_offset > 0 {
                 for m in &mut cleanup_memberships {
                     m.spawn_index = m.spawn_index.saturating_add(cleanup_offset);
@@ -1955,14 +2373,11 @@ impl TickPipeline {
         }
 
         // Aggregate by (layer, region_x, region_z, counter_name) so multiple
-        // kills in the same region cell collapse into a single secondary
-        // reducer call. The coordinator dispatches one `increment_zone_counter`
-        // reducer per entry after the main commit, so an unaggregated N-death
-        // wave produced N sequential round-trips; on 10k clustered NPC deaths
-        // that serial fan-out was the dominant commit-latency tail. Counters
-        // are additive, so summing deltas per key preserves the final row
-        // value exactly. Also improves retry semantics: a failing write
-        // contributes a single entry to `pending_secondary` instead of N.
+        // kills in the same region cell collapse into a single inline
+        // `ZoneCounterDeltaInput` entry. Counters are additive, so summing
+        // deltas per key preserves the final row value exactly while keeping
+        // commit work proportional to distinct cell/counter keys rather than
+        // entity deaths.
         if zone_counter_deltas.len() > 1 {
             let mut agg: HashMap<(u32, i32, i32, String), f64> =
                 HashMap::with_capacity(zone_counter_deltas.len());
@@ -2035,6 +2450,7 @@ impl TickPipeline {
             boss_phase_updates,
             zone_counter_deltas,
             death_state_inserts: std::mem::take(&mut self.pending_death_state_inserts),
+            loot_rolls: std::mem::take(&mut self.pending_loot_rolls),
             sim_warnings,
         };
 

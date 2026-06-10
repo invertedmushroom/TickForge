@@ -64,7 +64,8 @@ pub struct WorldLayerDef {
     /// Optional reference to a baked voxel terrain set. When Some,
     /// the worker also loads the matching `terrain_chunk` rows and
     /// adds them as TriMesh colliders on this layer. Authoring of
-    /// terrain rows is offline / editor-side.
+    /// terrain rows is offline / editor-side — see
+    /// `docs/plan/plan.md` §4.8b.
     #[serde(default)]
     pub terrain_set: Option<String>,
     /// Optional client-side visual mesh override. The Bevy client loads
@@ -94,9 +95,10 @@ pub struct WorldLayerDef {
 /// tagged with the instance's assigned layer so they can be bulk-removed when
 /// the instance expires.
 ///
-/// Interactables are spawned as Prop entities with an `interactable_config`
-/// companion row.  Gates are kinematic bodies whose collider is toggled via
-/// `set_collider_enabled()`.
+/// Interactables are spawned with an `interactable_config` companion row. Gates,
+/// switches, and chests are Prop entities. BossSpawn and NpcSpawn entries are
+/// spawned as Boss/Npc actors while preserving their authored interactable kind
+/// for metadata and runtime classification.
 #[derive(Clone, Debug, Deserialize)]
 pub struct DungeonTemplate {
     pub template_id: String,
@@ -124,7 +126,7 @@ pub struct DungeonTemplate {
     /// the worker materialises the matching `terrain_chunk` rows on the
     /// instance's layer in addition to `geometry` above. Many instances
     /// can share one terrain set; rows live once and are referenced by
-    /// id.
+    /// id. See `docs/plan/plan.md` §4.8b.
     #[serde(default)]
     pub terrain_set: Option<String>,
 }
@@ -173,7 +175,8 @@ pub enum ShapeDef {
     /// Used for editor-baked open-world / cave geometry. Hand-authored
     /// dungeon RON files normally use `Cuboid`, `Cylinder`, or
     /// `Heightfield`; `TriMesh` is here so the same `ShapeDef` enum
-    /// can describe terrain colliders sourced from the voxel pipeline.
+    /// can describe terrain colliders sourced from the voxel pipeline
+    /// (see `docs/plan/plan.md` §4.8b).
     TriMesh {
         vertices: Vec<f32>,
         indices: Vec<u32>,
@@ -224,6 +227,9 @@ impl BodyShapeDef {
 #[derive(Clone, Debug, Deserialize)]
 pub struct InteractableDef {
     pub local_id: u32,
+    /// Optional stable selector for this placed entity. Distinct from actor
+    /// `archetype_id`: scripts use this to find the placement, not to configure
+    /// HP, body, abilities, BT, route, or loot.
     #[serde(default)]
     pub script_id: Option<String>,
     #[serde(default)]
@@ -241,9 +247,11 @@ pub struct InteractableDef {
     #[serde(default)]
     pub puzzle_window_ticks: Option<u32>,
     /// Optional explicit body shape. When `None`, the dungeon loader
-    /// picks a default from `kind` (Gate → GateCuboid, Switch →
-    /// SwitchCuboid, Chest → ChestCuboid, BossSpawn → BossCapsule,
-    /// NpcSpawn → NpcCapsule).
+    /// picks a default from `kind` (Gate -> GateCuboid, Switch ->
+    /// SwitchCuboid, Chest -> ChestCuboid, BossSpawn -> BossCapsule,
+    /// NpcSpawn -> NpcCapsule). Overrides are validated at instance
+    /// creation: actor spawns must use actor capsule shapes, props must
+    /// use cuboid prop shapes.
     #[serde(default)]
     pub body_shape: Option<BodyShapeDef>,
 }
@@ -252,12 +260,29 @@ pub struct InteractableDef {
 pub enum InteractKindDef {
     Gate,
     Switch,
+    /// Spawn a boss actor and attach an interactable metadata row.
+    ///
+    /// `npc_name` is currently a display/log label. `encounter_name`, when
+    /// set, selects encounter runtime rules; otherwise the reducer falls back
+    /// to `npc_name` as the encounter key. `archetype_id`, when set, resolves
+    /// HP/body/team/abilities and worker-side BT/route/goal/loot behavior from
+    /// `data/npc_archetypes.ron`; omitted legacy rows default to `None`.
     BossSpawn {
         npc_name: String,
+        #[serde(default)]
         encounter_name: Option<String>,
+        #[serde(default)]
+        archetype_id: Option<String>,
     },
+    /// Spawn a generic NPC actor and attach an interactable metadata row.
+    ///
+    /// `npc_name` is currently a display/log label. `archetype_id`, when set,
+    /// resolves HP/body/team/abilities and worker-side BT/route/goal/loot
+    /// behavior from `data/npc_archetypes.ron`.
     NpcSpawn {
         npc_name: String,
+        #[serde(default)]
+        archetype_id: Option<String>,
     },
     Chest,
 }

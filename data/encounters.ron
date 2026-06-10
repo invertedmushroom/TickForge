@@ -69,8 +69,8 @@
                 ),
             ],
         ),
-        // Sandbox encounter that exercises every leaf-effect variant Step 2
-        // wires up. Used by data-driven smoke tests.
+        // Sandbox encounter that exercises the core runtime action surface.
+        // Used by data-driven smoke tests.
         (
             name: "runtime_actions_demo",
             rules: [
@@ -92,7 +92,7 @@
                     id: "swap_kit",
                     when: OnAfter(ticks: 65),
                     cond: Always,
-                    effects: [ReplaceAbilityList(ability_ids: [124, 31])],
+                    effects: [ReplaceAbilityList(ability_ids: [124, 125])],
                     repeat: Once,
                 ),
                 (
@@ -105,9 +105,9 @@
                     ],
                     repeat: Once,
                 ),
-                // Counter feedback example: spawning adds bumps a kill counter
-                // (would be done by an OnEntityDied rule in Step 3); here we
-                // just demonstrate the Effect leaf and the OnCounter trigger.
+                // Counter feedback example: a real fight would often bump this
+                // from an OnEntityDied rule; here we demonstrate the Effect
+                // leaf and the OnCounter trigger directly.
                 (
                     id: "bump_counter",
                     when: OnAfter(ticks: 25),
@@ -127,7 +127,7 @@
         // ── First real fight ────────────────────────────────────
         //
         // The Crucible Warden is the integration acceptance test for the
-        // Step 3 encounter surface. It exercises every new primitive end
+        // Encounter runtime surface. It exercises the primitive set end
         // to end:
         //
         //   • Phase 1 — FollowBoss aura volume (`warden_aura`) tracks the
@@ -150,6 +150,7 @@
         // the archetype name they request.
         (
             name: "crucible_warden",
+            loot_table_id: Some("warden_boss_drops"),
             rules: [
                 // ── Phase 1 ─────────────────────────────────────
                 (

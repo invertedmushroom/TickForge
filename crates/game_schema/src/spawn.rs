@@ -66,6 +66,16 @@ pub enum SpawnTrigger {
     WorldPhase { phase_name: String },
     /// Fires when the region's active player count meets the threshold.
     PlayerCountAtLeast { threshold: u32 },
+    /// Fires when a `world_activity_event` row tagged `tag` is in state
+    /// `Active` in the rule's region scope AND at least `min_players`
+    /// active (non-disconnected) players are in the region. Preferred
+    /// over bare `WorldPhase` for actor-spawning rules, because the
+    /// `world_activity_event` row carries the authored
+    /// `required_players` value and the worker's effective region count
+    /// already excludes reconnect-grace players. Closes the "WorldPhase
+    /// spawns offscreen" gap (Finding #4 of the 2026-06-09 messaging
+    /// review).
+    WorldActivityEventActive { tag: String, min_players: u32 },
     /// Fires when a named event is raised (reserved for future use; e.g. on
     /// instance creation or an encounter-script callback).
     OnEvent { event_name: String },
@@ -78,9 +88,6 @@ pub struct SpawnEntityDef {
     pub max_hp: f32,
     /// Offset from the region-cell center (or dungeon anchor) in world units.
     pub offset: [f32; 3],
-    /// Optional encounter-script template id to bind on spawn.
-    #[serde(default)]
-    pub encounter_template: Option<String>,
 }
 
 /// How spawns scale with player count and/or player level.

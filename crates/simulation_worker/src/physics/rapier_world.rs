@@ -122,8 +122,8 @@ fn ud_stamp(user_data: u128, entity_id: EntityId, kind: &ColliderKind) -> u128 {
 /// Active-hooks flag bundle stamped on every entity/environment collider so
 /// the layer-aware `PhysicsHooks` impl below is invoked for both solid
 /// contacts and sensor intersections.
-const LAYER_HOOKS: ActiveHooks = ActiveHooks::FILTER_CONTACT_PAIRS
-    .union(ActiveHooks::FILTER_INTERSECTION_PAIR);
+const LAYER_HOOKS: ActiveHooks =
+    ActiveHooks::FILTER_CONTACT_PAIRS.union(ActiveHooks::FILTER_INTERSECTION_PAIR);
 
 /// `PhysicsHooks` impl that enforces strict same-layer contact/intersection
 /// at the solver level.
@@ -836,9 +836,7 @@ impl PhysicsWorld {
                 EntityKind::Npc | EntityKind::Boss => collision_groups::npc_body_groups(),
                 _ => collision_groups::player_body_groups(),
             };
-            let (half_height, radius) = shape
-                .capsule_dims()
-                .unwrap_or((0.5, 0.3));
+            let (half_height, radius) = shape.capsule_dims().unwrap_or((0.5, 0.3));
             self.add_kinematic_capsule(entity_id, position, half_height, radius, groups);
             self.entity_shapes.insert(entity_id, shape);
             true
@@ -1191,7 +1189,9 @@ impl PhysicsBackend for PhysicsWorld {
             return false;
         }
         let pos = Vector::new(position.x, position.y, position.z);
-        // Standard character capsule: half_height=0.5, radius=0.3.
+        let half_height = game_core::physics_constants::CAPSULE_HALF_HEIGHT;
+        let radius = game_core::physics_constants::CAPSULE_RADIUS;
+        // Standard character capsule shared with the generated client contract.
         // Select the correct collision layer based on entity kind (bug #14 fix).
         let groups = match kind {
             EntityKind::Player => collision_groups::player_body_groups(),
@@ -1201,7 +1201,7 @@ impl PhysicsBackend for PhysicsWorld {
                 collision_groups::player_body_groups()
             }
         };
-        self.add_kinematic_capsule(entity_id, pos, 0.5, 0.3, groups);
+        self.add_kinematic_capsule(entity_id, pos, half_height, radius, groups);
         self.entity_shapes
             .insert(entity_id, BodyShape::default_capsule_for_kind(kind));
         true
@@ -1262,8 +1262,6 @@ impl PhysicsBackend for PhysicsWorld {
         entity_id: EntityId,
         desired_translation: game_protocol::types::Vec3f,
     ) -> Option<MoveResult> {
-        const KCC_OFFSET_REL: f32 = 0.02;
-
         let handle = *self.entity_to_body.get(&entity_id)?;
         let desired_vec = Vector::new(
             desired_translation.x,
@@ -1314,19 +1312,29 @@ impl PhysicsBackend for PhysicsWorld {
                 filter,
             );
             let controller = KinematicCharacterController {
-                offset: CharacterLength::Relative(KCC_OFFSET_REL),
+                offset: CharacterLength::Relative(
+                    game_core::physics_constants::KCC_OFFSET_RELATIVE,
+                ),
                 autostep: Some(CharacterAutostep {
-                    max_height: CharacterLength::Relative(0.15),
-                    min_width: CharacterLength::Relative(0.2),
-                    include_dynamic_bodies: false,
+                    max_height: CharacterLength::Relative(
+                        game_core::physics_constants::KCC_AUTOSTEP_MAX_HEIGHT_RELATIVE,
+                    ),
+                    min_width: CharacterLength::Relative(
+                        game_core::physics_constants::KCC_AUTOSTEP_MIN_WIDTH_RELATIVE,
+                    ),
+                    include_dynamic_bodies:
+                        game_core::physics_constants::KCC_AUTOSTEP_INCLUDE_DYNAMIC_BODIES,
                 }),
-                snap_to_ground: Some(CharacterLength::Relative(0.2)),
-                normal_nudge_factor: 1.0e-3,
+                snap_to_ground: Some(CharacterLength::Relative(
+                    game_core::physics_constants::KCC_SNAP_TO_GROUND_RELATIVE,
+                )),
+                normal_nudge_factor: game_core::physics_constants::KCC_NORMAL_NUDGE_FACTOR,
+                max_slope_climb_angle: game_core::physics_constants::KCC_MAX_SLOPE_CLIMB_RADIANS,
                 ..Default::default()
             };
             let mut hits: Vec<ColliderHandle> = Vec::new();
             let mv = controller.move_shape(
-                0.0, // dt=0: server controls Y; no gravity/slope friction needed
+                game_core::physics_constants::KCC_MOVE_SHAPE_DT_SECONDS,
                 &queries,
                 shape,
                 &current_pos,
@@ -1396,7 +1404,7 @@ impl PhysicsBackend for PhysicsWorld {
                     + (game_core::physics_constants::CAPSULE_HALF_HEIGHT
                         + game_core::physics_constants::CAPSULE_RADIUS)
                         * 2.0
-                        * KCC_OFFSET_REL;
+                        * game_core::physics_constants::KCC_OFFSET_RELATIVE;
                 let snap_delta = rest_y - new_pos.y;
                 if snap_delta.abs() <= MAX_GROUNDED_SNAP_DELTA {
                     new_pos.y = rest_y;
@@ -2084,8 +2092,9 @@ mod tests {
     #[test]
     fn move_character_stays_on_flat_trimesh_surface() {
         use game_core::physics_backend::{EnvironmentShape, PhysicsBackend};
-        use game_core::physics_constants::{CAPSULE_HALF_HEIGHT, CAPSULE_RADIUS, GROUND_PULL};
-        const KCC_OFFSET_REL: f32 = 0.02;
+        use game_core::physics_constants::{
+            CAPSULE_HALF_HEIGHT, CAPSULE_RADIUS, GROUND_PULL, KCC_OFFSET_RELATIVE,
+        };
 
         let dt = 0.05;
         let mut world = PhysicsWorld::new(dt);
@@ -2115,7 +2124,7 @@ mod tests {
 
         let expected_y = CAPSULE_HALF_HEIGHT
             + CAPSULE_RADIUS
-            + (CAPSULE_HALF_HEIGHT + CAPSULE_RADIUS) * 2.0 * KCC_OFFSET_REL;
+            + (CAPSULE_HALF_HEIGHT + CAPSULE_RADIUS) * 2.0 * KCC_OFFSET_RELATIVE;
         let mut last_x = -10.0;
 
         for _ in 0..120 {
@@ -2694,11 +2703,7 @@ mod tests {
 
         // Player on layer 101 just above Q.
         let player = EntityId(3);
-        world.reuse_or_spawn_character(
-            player,
-            Vector::new(0.0, 3.0, 0.0),
-            EntityKind::Player,
-        );
+        world.reuse_or_spawn_character(player, Vector::new(0.0, 3.0, 0.0), EntityKind::Player);
         world.set_entity_layer(player, 101);
 
         // Step long enough for gravity to settle everything.

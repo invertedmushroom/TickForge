@@ -528,8 +528,7 @@ fn sync_entities(
                     .and_then(|c| BodyShape::from_u8(c.body_shape)),
                 EntityKind::Projectile | EntityKind::Hazard => None,
             };
-            let shape_mesh = authored_shape
-                .and_then(|s| meshes.body_shape_meshes.get(&s).cloned());
+            let shape_mesh = authored_shape.and_then(|s| meshes.body_shape_meshes.get(&s).cloned());
             let (mesh, mat) = match kind {
                 EntityKind::Player if is_local => (
                     shape_mesh.unwrap_or_else(|| meshes.player_mesh.clone()),

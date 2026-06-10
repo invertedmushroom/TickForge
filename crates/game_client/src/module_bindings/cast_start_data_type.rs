@@ -9,6 +9,7 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 pub struct CastStartData {
     pub ability_id: u32,
     pub cast_duration_ticks: u32,
+    pub effective_cooldown_ticks: u32,
 }
 
 impl __sdk::InModule for CastStartData {

@@ -12,5 +12,6 @@ default = []
 spacetimedb = ["dep:spacetimedb"]
 
 [dependencies]
+ron = { workspace = true }
 serde = { workspace = true }
-spacetimedb = { version = "2.1", optional = true }
+spacetimedb = { workspace = true, optional = true }

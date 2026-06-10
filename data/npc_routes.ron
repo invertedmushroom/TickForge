@@ -1,0 +1,21 @@
+// NPC route definitions loaded by the simulation worker.
+//
+// These are authored waypoint paths, not navmesh paths. Phase 7 follows them
+// one waypoint at a time through the existing KCC movement path.
+
+(
+    routes: [
+        (
+            route_id: "training_patrol_loop",
+            layer_scope: None,
+            waypoints: [
+                (x: 0.0, y: 1.0, z: 0.0),
+                (x: 4.0, y: 1.0, z: 0.0),
+                (x: 4.0, y: 1.0, z: 4.0),
+                (x: 0.0, y: 1.0, z: 4.0),
+            ],
+            looped: true,
+            arrive_radius: 0.5,
+        ),
+    ],
+)

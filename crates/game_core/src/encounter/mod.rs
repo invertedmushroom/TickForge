@@ -187,7 +187,6 @@ pub enum Target {
     /// Boss's current top-threat target.
     TopThreat,
     /// A pseudo-random player (worker resolves with a deterministic tick seed).
-    /// Step 3 will refine this.
     RandomPlayer,
     /// All players in the encounter.
     AllPlayers,
@@ -334,13 +333,14 @@ impl Default for EncounterCueShape {
     }
 }
 
-// ── Effects (leaves only — composers reserved for Step 3) ───────
+// ── Effects (leaves + composers) ─────────────────────────────────
 
-/// Leaf actions emitted by rule evaluation.
+/// Actions emitted by rule evaluation.
 ///
-/// Composers (`Sequence`/`Parallel`/`Wait`) are deliberately not yet present.
-/// `Vec<Effect>` on `Rule` already provides same-tick sequencing; multi-tick
-/// continuations require per-rule state and are part of Step 3.
+/// Leaf effects become `EncounterOutput`s or in-memory counter mutations.
+/// Composer effects (`Sequence`/`Parallel`/`Wait`) are live: a `Sequence`
+/// parks its tail at the first `Wait` and resumes it on a later `evaluate()`
+/// call, while `Parallel` applies every step in the current tick.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Effect {
     ChangePhase {
@@ -363,15 +363,16 @@ pub enum Effect {
     },
     /// Spawn `count` scripted adds of the named NPC archetype, each
     /// labelled with `tags` so downstream rules (`OnEntityDied { tag }`,
-    /// `WhenAdds { tag, … }`) can match.
+    /// `WhenAdds { tag, … }`) can match. See
+    /// `docs/contracts/spawn_add_membership_contract.md`.
     SpawnAdds {
         archetype: String,
         count: u32,
         #[serde(default)]
         tags: Vec<String>,
     },
-    /// Visual telegraph stub — emits log + reserved `EncounterOutput::Telegraph`
-    /// so the worker can wire `TelegraphWarning` events when it's ready.
+    /// Visual telegraph request. The worker resolves the target and emits
+    /// `TelegraphWarning` / area telegraph events when the target is valid.
     Telegraph {
         skill_id: u32,
         target: Target,
@@ -421,7 +422,8 @@ pub enum Effect {
         name: String,
         delta: i64,
     },
-    /// Mutate the world `zone_counter` table (committed Tier-2).
+    /// Mutate the world `zone_counter` table through the tick-immediate
+    /// commit path. Tier 2 (`world_clock`) consumes the counter later.
     IncrementZoneCounter {
         layer: u32,
         region_x: i32,
@@ -429,8 +431,8 @@ pub enum Effect {
         counter_name: String,
         delta: f64,
     },
-    /// Step 3 hook — pushed into the encounter event bus when it lands; for
-    /// now this is just a log line.
+    /// Push a free-form event into the encounter bus. `OnEvent` triggers can
+    /// consume it on the next rule evaluation pass.
     EmitEncounterEvent {
         name: String,
     },
@@ -670,7 +672,7 @@ pub trait MechanicCtx {
         self.emit_effect(Effect::ReplaceAbilityList { ability_ids });
     }
 
-    /// Telegraph an upcoming cast (Step 3 will wire `TelegraphWarning`).
+    /// Telegraph an upcoming cast through the worker warning-event path.
     fn telegraph(&mut self, skill_id: u32, target: Target, lead_ticks: u32) {
         self.emit_effect(Effect::Telegraph {
             skill_id,
@@ -679,8 +681,8 @@ pub trait MechanicCtx {
         });
     }
 
-    /// Free-form encounter log line (placeholder until the event bus
-    /// lands in Step 3). Defaults to `EmitEncounterEvent`.
+    /// Free-form encounter event. Defaults to `EmitEncounterEvent`, which
+    /// feeds `OnEvent` rules through the encounter bus.
     fn log_event(&mut self, event_name: &str) {
         self.emit_effect(Effect::EmitEncounterEvent {
             name: event_name.to_string(),
@@ -1016,8 +1018,8 @@ pub enum EncounterOutput {
         count: u32,
         tags: Vec<String>,
     },
-    /// Reserved telegraph output — currently log-only; Step 3 will wire it
-    /// to a real `TelegraphWarning` event.
+    /// Telegraph output resolved by the worker into entity-target warnings or
+    /// area telegraph events.
     Telegraph {
         boss_entity_id: EntityId,
         skill_id: u32,
@@ -1794,12 +1796,20 @@ pub struct EncounterFile {
 #[derive(Clone, Debug, Deserialize)]
 pub struct EncounterScript {
     pub name: String,
+    #[serde(default)]
+    pub loot_table_id: Option<String>,
     pub rules: Vec<Rule>,
+}
+
+#[derive(Clone, Debug)]
+struct EncounterDefinition {
+    rules: Vec<Rule>,
+    loot_table_id: Option<String>,
 }
 
 /// Registry of encounter scripts keyed by name.
 pub struct EncounterRegistry {
-    defs: HashMap<String, Vec<Rule>>,
+    defs: HashMap<String, EncounterDefinition>,
 }
 
 impl EncounterRegistry {
@@ -1810,15 +1820,40 @@ impl EncounterRegistry {
     }
 
     pub fn register(&mut self, name: String, rules: Vec<Rule>) {
-        self.defs.insert(name, rules);
+        self.register_with_loot(name, rules, None);
+    }
+
+    pub fn register_script(&mut self, script: EncounterScript) {
+        self.register_with_loot(script.name, script.rules, script.loot_table_id);
+    }
+
+    pub fn register_with_loot(
+        &mut self,
+        name: String,
+        rules: Vec<Rule>,
+        loot_table_id: Option<String>,
+    ) {
+        self.defs.insert(
+            name,
+            EncounterDefinition {
+                rules,
+                loot_table_id,
+            },
+        );
     }
 
     pub fn get(&self, name: &str) -> Option<&Vec<Rule>> {
-        self.defs.get(name)
+        self.defs.get(name).map(|def| &def.rules)
     }
 
     pub fn rules_for(&self, name: &str) -> Option<Vec<Rule>> {
-        self.defs.get(name).cloned()
+        self.defs.get(name).map(|def| def.rules.clone())
+    }
+
+    pub fn loot_table_for(&self, name: &str) -> Option<&str> {
+        self.defs
+            .get(name)
+            .and_then(|def| def.loot_table_id.as_deref())
     }
 
     pub fn len(&self) -> usize {
@@ -1854,6 +1889,30 @@ mod tests {
             hp_threshold_armed: true,
             counter_was_true: false,
         }
+    }
+
+    #[test]
+    fn register_script_preserves_loot_table_metadata() {
+        let mut registry = EncounterRegistry::new();
+        registry.register_script(EncounterScript {
+            name: "crucible_warden".to_string(),
+            loot_table_id: Some("warden_boss_drops".to_string()),
+            rules: vec![rule(
+                "p2",
+                Trigger::OnHpBelow { percent: 0.5 },
+                vec![Effect::ChangePhase {
+                    phase: BossPhase::Phase2,
+                }],
+                RepeatPolicy::Once,
+            )],
+        });
+
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry.loot_table_for("crucible_warden"),
+            Some("warden_boss_drops")
+        );
+        assert_eq!(registry.get("crucible_warden").expect("rules").len(), 1);
     }
 
     #[test]

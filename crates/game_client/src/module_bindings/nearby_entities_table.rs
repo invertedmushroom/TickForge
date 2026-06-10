@@ -80,9 +80,57 @@ impl<'ctx> __sdk::Table for NearbyEntitiesTableHandle<'ctx> {
     }
 }
 
+pub struct NearbyEntitiesUpdateCallbackId(__sdk::CallbackId);
+
+impl<'ctx> __sdk::TableWithPrimaryKey for NearbyEntitiesTableHandle<'ctx> {
+    type UpdateCallbackId = NearbyEntitiesUpdateCallbackId;
+
+    fn on_update(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row, &Self::Row) + Send + 'static,
+    ) -> NearbyEntitiesUpdateCallbackId {
+        NearbyEntitiesUpdateCallbackId(self.imp.on_update(Box::new(callback)))
+    }
+
+    fn remove_on_update(&self, callback: NearbyEntitiesUpdateCallbackId) {
+        self.imp.remove_on_update(callback.0)
+    }
+}
+
+/// Access to the `entity_id` unique index on the table `nearby_entities`,
+/// which allows point queries on the field of the same name
+/// via the [`NearbyEntitiesEntityIdUnique::find`] method.
+///
+/// Users are encouraged not to explicitly reference this type,
+/// but to directly chain method calls,
+/// like `ctx.db.nearby_entities().entity_id().find(...)`.
+pub struct NearbyEntitiesEntityIdUnique<'ctx> {
+    imp: __sdk::UniqueConstraintHandle<Entity, u64>,
+    phantom: std::marker::PhantomData<&'ctx super::RemoteTables>,
+}
+
+impl<'ctx> NearbyEntitiesTableHandle<'ctx> {
+    /// Get a handle on the `entity_id` unique index on the table `nearby_entities`.
+    pub fn entity_id(&self) -> NearbyEntitiesEntityIdUnique<'ctx> {
+        NearbyEntitiesEntityIdUnique {
+            imp: self.imp.get_unique_constraint::<u64>("entity_id"),
+            phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'ctx> NearbyEntitiesEntityIdUnique<'ctx> {
+    /// Find the subscribed row whose `entity_id` column value is equal to `col_val`,
+    /// if such a row is present in the client cache.
+    pub fn find(&self, col_val: &u64) -> Option<Entity> {
+        self.imp.find(col_val)
+    }
+}
+
 #[doc(hidden)]
 pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::RemoteModule>) {
     let _table = client_cache.get_or_make_table::<Entity>("nearby_entities");
+    _table.add_unique_constraint::<u64>("entity_id", |row| &row.entity_id);
 }
 
 #[doc(hidden)]

@@ -31,8 +31,6 @@ pub enum SyncInsertResult {
 /// Result of a `sync_update` call.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SyncUpdateResult {
-    /// Entity was marked DespawnPending in the simulation.
-    MarkedDespawn,
     /// Entity was force-removed from the simulation.
     Removed,
     /// Removal was a no-op (entity not present).
@@ -170,7 +168,7 @@ impl EntitySync {
     /// The simulation is authoritative for `Spawning→Active` (Phase 8) and
     /// normal combat deaths, so we only act on transitions that the pipeline
     /// didn't initiate:
-    /// - `Active → DespawnPending`: external force-despawn.
+    /// - `_ → DespawnPending`: external terminal/force-despawn.
     /// - `_ → Removed`: hard removal by a server-side reducer.
     pub fn sync_update(
         sim: &mut SimulationRunner,
@@ -179,33 +177,20 @@ impl EntitySync {
         new_state: EntityState,
     ) -> SyncUpdateResult {
         match (old_state, new_state) {
-            // External reducer set DespawnPending without going through combat death.
-            (EntityState::Active, EntityState::DespawnPending) => {
-                if sim.is_active(id) {
-                    sim.mark_despawn(id);
-                    info!(
-                        "Entity {} externally marked DespawnPending — mirrored to simulation",
-                        id.0
-                    );
-                    SyncUpdateResult::MarkedDespawn
-                } else {
-                    SyncUpdateResult::Ignored
-                }
-            }
-            // Hard removal by a server-side reducer; skip if already cleaned up.
-            (_, EntityState::Removed) => {
+            // Terminal lifecycle update by a server-side reducer; skip if already cleaned up.
+            (_, EntityState::DespawnPending | EntityState::Removed) => {
                 if sim.entity_exists(id) {
                     let removed = sim.force_remove_entity(id);
                     if removed {
                         info!(
-                            "Entity {} externally set Removed — cleaned up from simulation",
-                            id.0
+                            "Entity {} externally set {:?} — cleaned up from simulation",
+                            id.0, new_state
                         );
                         SyncUpdateResult::Removed
                     } else {
                         info!(
-                            "Entity {} externally set Removed — no-op (not present)",
-                            id.0
+                            "Entity {} externally set {:?} — no-op (not present)",
+                            id.0, new_state
                         );
                         SyncUpdateResult::RemoveNoop
                     }
@@ -538,7 +523,7 @@ mod tests {
     // ── sync_update tests ───────────────────────────────────────
 
     #[test]
-    fn update_mirrors_active_to_despawn_pending() {
+    fn update_despawn_pending_force_removes_tracked_spawning_entity() {
         let mut sim = test_runner();
         let id = EntityId(400);
         EntitySync::sync_insert(
@@ -556,17 +541,16 @@ mod tests {
             0,
             Default::default(),
         );
-        // Activate the entity so is_active() returns true.
-        sim.mark_despawn(id); // Spawning doesn't become Active without a tick,
-        // so test the branch where is_active() is false:
+        assert!(sim.contains(id));
+
         let result = EntitySync::sync_update(
             &mut sim,
             id,
-            EntityState::Active,
+            EntityState::Spawning,
             EntityState::DespawnPending,
         );
-        // Entity was Spawning (not Active), so is_active() returns false → Ignored.
-        assert_eq!(result, SyncUpdateResult::Ignored);
+        assert_eq!(result, SyncUpdateResult::Removed);
+        assert!(!sim.contains(id));
     }
 
     #[test]

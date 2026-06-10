@@ -10,6 +10,8 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 regex = "1"
 gltf = { version = "1.4", default-features = false, features = ["import", "utils", "names"] }
+game_core = { workspace = true }
+game_protocol = { workspace = true }
 game_schema = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

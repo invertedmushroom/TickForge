@@ -69,7 +69,11 @@
                 // Switch that opens the gate
                 (local_id: 2, script_id: Some("arena_switch"), tags: ["arena_switch", "lever"], kind: Switch, position: (5.0, 1.0, -8.0), linked_to: Some(1), required_buff: None, required_item: None, interact_range: Some(3.0)),
                 // Boss spawn on player side of the gate for unobstructed combat testing
-                (local_id: 3, script_id: Some("manayas_core_demo"), tags: ["boss", "crucible_warden"], kind: BossSpawn(npc_name: "Cruicible Warden", encounter_name: Some("manayas_core_demo")), position: (0.0, 1.0, -5.0), linked_to: None, required_buff: None, required_item: None, interact_range: None),
+                (local_id: 3, script_id: Some("crucible_warden"), tags: ["boss", "crucible_warden"], kind: BossSpawn(npc_name: "Crucible Warden", encounter_name: Some("crucible_warden"), archetype_id: Some("boss")), position: (0.0, 1.0, -5.0), linked_to: None, required_buff: None, required_item: None, interact_range: None),
+                // Routed NPC proof. `script_id` names this placed entity for
+                // encounter/interactable selectors; `archetype_id` selects the
+                // actor profile that provides route/goal/AI config.
+                (local_id: 4, script_id: Some("route_test_guard_01"), tags: ["npc", "route_test"], kind: NpcSpawn(npc_name: "Training Patrol Guard", archetype_id: Some("training_patrol_guard")), position: (0.0, 1.0, 0.0), linked_to: None, required_buff: None, required_item: None, interact_range: None),
             ],
         ),
     ],

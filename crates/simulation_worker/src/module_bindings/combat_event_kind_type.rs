@@ -4,6 +4,7 @@
 #![allow(unused, clippy::all)]
 use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
+use super::ability_cancelled_data_type::AbilityCancelledData;
 use super::area_telegraph_data_type::AreaTelegraphData;
 use super::blocked_data_type::BlockedData;
 use super::buff_applied_data_type::BuffAppliedData;
@@ -114,6 +115,8 @@ pub enum CombatEventKind {
     Stunbreak,
 
     CcImmune(CcImmuneData),
+
+    AbilityCancelled(AbilityCancelledData),
 }
 
 impl __sdk::InModule for CombatEventKind {

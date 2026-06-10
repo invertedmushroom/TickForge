@@ -804,10 +804,37 @@ impl AbilityExecutionStore {
         self.active.retain(|_, ctx| ctx.caster != caster);
     }
 
+    /// Collect `ability_id`s of every in-flight execution owned by `caster`.
+    ///
+    /// Used by cancellation paths to emit `AbilityCancelled` events for
+    /// every cast belonging to a caster before runtime cleanup removes
+    /// the contexts. IDs are **deduplicated** —
+    /// rich abilities (e.g. Impact Grenade) can have multiple concurrent
+    /// execution contexts under one `ability_id` (parent + contact-spawned
+    /// children), and the v1 `AbilityCancelled` wire shape carries only
+    /// `ability_id`, so duplicates would be indistinguishable on the
+    /// client. See `docs/contracts/ability_cast_lifecycle_contract.md`.
+    pub fn ability_ids_for_caster(&self, caster: EntityId) -> Vec<u32> {
+        let mut ids: Vec<u32> = self
+            .active
+            .values()
+            .filter(|ctx| ctx.caster == caster)
+            .map(|ctx| ctx.ability_id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// Returns a snapshot of all currently active execution IDs.
     /// Used by the culling pass in `phase_skill_scheduling` to find leaking contexts.
     pub fn active_ids(&self) -> Vec<AbilityExecutionId> {
         self.active.keys().copied().collect()
+    }
+
+    /// Iterate all currently active execution IDs without allocating a snapshot.
+    pub fn active_ids_iter(&self) -> impl Iterator<Item = AbilityExecutionId> + '_ {
+        self.active.keys().copied()
     }
 
     pub fn len(&self) -> usize {

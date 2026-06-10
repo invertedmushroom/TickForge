@@ -1278,17 +1278,12 @@ impl TickPipeline {
     fn resolve_hits(&mut self) {
         use game_core::physics_backend::ColliderKind;
 
-        // Process sensor contacts — hitbox vs hurtbox overlaps.
-        let contacts: Vec<_> = self
-            .state
-            .physics
-            .contacts
-            .iter()
-            .filter(|c| c.started && c.is_sensor)
-            .cloned()
-            .collect();
+        // Process sensor contacts — hitbox vs hurtbox overlaps. Contacts are
+        // single-tick Phase 5 input, so consume them instead of cloning a
+        // started-contact subset for Phase 6.
+        let contacts = std::mem::take(&mut self.state.physics.contacts);
 
-        for contact in &contacts {
+        for contact in contacts.iter().filter(|c| c.started && c.is_sensor) {
             // Normalise the pair: acting collider (Hitbox, future: Projectile) first.
             // Eliminates duplicate match arms — each interaction rule is stated once.
             let (acting, receiving, attacker, target) = normalize_contact_pair(
@@ -1365,13 +1360,7 @@ impl TickPipeline {
 
         // Second pass: process Stopped sensor events to clear already_hit for
         // reentry-capable hitboxes and remove from overlapping set.
-        for contact in self
-            .state
-            .physics
-            .contacts
-            .iter()
-            .filter(|c| !c.started && c.is_sensor)
-        {
+        for contact in contacts.iter().filter(|c| !c.started && c.is_sensor) {
             let (acting, _receiving, _attacker, target) = normalize_contact_pair(
                 contact.kind1,
                 contact.entity1,
@@ -1419,16 +1408,7 @@ impl TickPipeline {
                 .into_iter()
                 .collect();
 
-            let exited: Vec<EntityId> = previous_targets
-                .difference(&current_targets)
-                .copied()
-                .collect();
-            let entered: Vec<EntityId> = current_targets
-                .difference(&previous_targets)
-                .copied()
-                .collect();
-
-            for target in exited {
+            for target in previous_targets.difference(&current_targets).copied() {
                 self.state.combat.hitboxes.clear_hit(exec_id, target);
                 self.state
                     .combat
@@ -1436,7 +1416,7 @@ impl TickPipeline {
                     .remove_overlapping(exec_id, target);
             }
 
-            for target in entered {
+            for target in current_targets.difference(&previous_targets).copied() {
                 if target == attacker {
                     continue;
                 }
@@ -1577,6 +1557,7 @@ impl TickPipeline {
             u32,
         )> = Vec::new();
         let mut hit_projectiles: Vec<AbilityExecutionId> = Vec::new();
+        let mut candidates: Vec<(EntityId, Vec3f)> = Vec::new();
 
         for (
             exec_id,
@@ -1624,9 +1605,10 @@ impl TickPipeline {
             let half_travel = 0.5 * (dx * dx + dz * dz).sqrt();
             let query_radius =
                 lag_compensation::hitbox_candidate_radius(hitbox_shape) + half_travel;
-            let candidates = snapshot.nearby_positions(mid, query_radius);
+            candidates.clear();
+            snapshot.nearby_positions_into(mid, query_radius, &mut candidates);
 
-            for (target_id, candidate_pos) in candidates {
+            for &(target_id, candidate_pos) in &candidates {
                 if target_id == attacker {
                     continue;
                 }
@@ -1750,6 +1732,7 @@ impl TickPipeline {
             AbilityExecutionId,
             u32,
         )> = Vec::new();
+        let mut candidates: Vec<(EntityId, Vec3f)> = Vec::new();
 
         for (exec_id, attacker, ability_id, shape, offset, rewind_ticks, max_rewind_override) in
             compensated
@@ -1791,10 +1774,11 @@ impl TickPipeline {
             };
 
             let candidate_radius = lag_compensation::hitbox_candidate_radius(hitbox_shape);
-            let candidates = snapshot.nearby_positions(hitbox_pos, candidate_radius);
+            candidates.clear();
+            snapshot.nearby_positions_into(hitbox_pos, candidate_radius, &mut candidates);
 
             // Test each entity in the snapshot for overlap with the hitbox.
-            for (target_id, historical_pos) in candidates {
+            for &(target_id, historical_pos) in &candidates {
                 // Skip self-hits.
                 if target_id == attacker {
                     continue;

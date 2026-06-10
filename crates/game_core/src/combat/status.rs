@@ -213,6 +213,8 @@ pub struct ThreatTable {
     pub entries: Vec<ThreatEntry>,
 }
 
+pub const DEFAULT_THREAT_SWITCH_ADVANTAGE: f32 = 0.15;
+
 impl ThreatTable {
     pub fn add_threat(&mut self, source: EntityId, amount: f32) {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.source == source) {
@@ -240,6 +242,55 @@ impl ThreatTable {
             .max_by(|a, b| a.threat.total_cmp(&b.threat))
             .map(|e| e.source)
     }
+
+    pub fn top_threat_with_value(&self) -> Option<(EntityId, f32)> {
+        self.entries
+            .iter()
+            .filter(|entry| threat_value_is_targetable(entry.threat))
+            .max_by(|a, b| a.threat.total_cmp(&b.threat))
+            .map(|entry| (entry.source, entry.threat))
+    }
+
+    pub fn threat_of(&self, source: EntityId) -> Option<f32> {
+        self.entries
+            .iter()
+            .find(|entry| entry.source == source)
+            .map(|entry| entry.threat)
+            .filter(|threat| threat_value_is_targetable(*threat))
+    }
+
+    /// Select a target with stickiness for the current target.
+    ///
+    /// `switch_advantage` is the fractional lead a challenger needs over the
+    /// current target before the target changes. `0.15` means "switch only when
+    /// the challenger has more than 15% extra threat".
+    pub fn select_target_with_hysteresis(
+        &self,
+        current_target: Option<EntityId>,
+        switch_advantage: f32,
+    ) -> Option<EntityId> {
+        let (top_target, top_threat) = self.top_threat_with_value()?;
+        let Some(current_target) = current_target else {
+            return Some(top_target);
+        };
+        if current_target == top_target {
+            return Some(current_target);
+        }
+        let Some(current_threat) = self.threat_of(current_target) else {
+            return Some(top_target);
+        };
+
+        let advantage = switch_advantage.max(0.0);
+        if top_threat > current_threat * (1.0 + advantage) {
+            Some(top_target)
+        } else {
+            Some(current_target)
+        }
+    }
+}
+
+fn threat_value_is_targetable(threat: f32) -> bool {
+    threat.is_finite() && threat > 0.001
 }
 
 /// On-disk serialization format for `data/buffs.ron`.
@@ -259,6 +310,63 @@ mod tests {
         assert!(
             file.buffs.iter().any(|buff| buff.buff_id == 802),
             "Manaya boss-lock buff should stay authored in data/buffs.ron"
+        );
+    }
+
+    #[test]
+    fn threat_hysteresis_keeps_current_target_when_challenger_is_close() {
+        let current = EntityId(1);
+        let challenger = EntityId(2);
+        let mut table = ThreatTable::default();
+        table.add_threat(current, 100.0);
+        table.add_threat(challenger, 110.0);
+
+        assert_eq!(
+            table.select_target_with_hysteresis(Some(current), DEFAULT_THREAT_SWITCH_ADVANTAGE),
+            Some(current)
+        );
+    }
+
+    #[test]
+    fn threat_hysteresis_switches_when_challenger_leads_enough() {
+        let current = EntityId(1);
+        let challenger = EntityId(2);
+        let mut table = ThreatTable::default();
+        table.add_threat(current, 100.0);
+        table.add_threat(challenger, 116.0);
+
+        assert_eq!(
+            table.select_target_with_hysteresis(Some(current), DEFAULT_THREAT_SWITCH_ADVANTAGE),
+            Some(challenger)
+        );
+    }
+
+    #[test]
+    fn threat_hysteresis_ignores_invalid_current_target() {
+        let current = EntityId(1);
+        let challenger = EntityId(2);
+        let mut table = ThreatTable::default();
+        table.add_threat(challenger, 10.0);
+
+        assert_eq!(
+            table.select_target_with_hysteresis(Some(current), DEFAULT_THREAT_SWITCH_ADVANTAGE),
+            Some(challenger)
+        );
+    }
+
+    #[test]
+    fn threat_hysteresis_ignores_non_finite_and_non_positive_values() {
+        let invalid_nan = EntityId(1);
+        let invalid_zero = EntityId(2);
+        let valid = EntityId(3);
+        let mut table = ThreatTable::default();
+        table.add_threat(invalid_nan, f32::NAN);
+        table.add_threat(invalid_zero, 0.0);
+        table.add_threat(valid, 1.0);
+
+        assert_eq!(
+            table.select_target_with_hysteresis(Some(invalid_nan), DEFAULT_THREAT_SWITCH_ADVANTAGE),
+            Some(valid)
         );
     }
 }

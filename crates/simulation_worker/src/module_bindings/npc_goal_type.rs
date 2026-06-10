@@ -7,7 +7,6 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
 #[sats(crate = __lib)]
 pub struct NpcGoal {
-    pub goal_id: u64,
     pub entity_id: u64,
     pub goal_kind: String,
     pub waypoints: String,
@@ -22,7 +21,6 @@ impl __sdk::InModule for NpcGoal {
 ///
 /// Provides typed access to columns for query building.
 pub struct NpcGoalCols {
-    pub goal_id: __sdk::__query_builder::Col<NpcGoal, u64>,
     pub entity_id: __sdk::__query_builder::Col<NpcGoal, u64>,
     pub goal_kind: __sdk::__query_builder::Col<NpcGoal, String>,
     pub waypoints: __sdk::__query_builder::Col<NpcGoal, String>,
@@ -33,7 +31,6 @@ impl __sdk::__query_builder::HasCols for NpcGoal {
     type Cols = NpcGoalCols;
     fn cols(table_name: &'static str) -> Self::Cols {
         NpcGoalCols {
-            goal_id: __sdk::__query_builder::Col::new(table_name, "goal_id"),
             entity_id: __sdk::__query_builder::Col::new(table_name, "entity_id"),
             goal_kind: __sdk::__query_builder::Col::new(table_name, "goal_kind"),
             waypoints: __sdk::__query_builder::Col::new(table_name, "waypoints"),
@@ -47,7 +44,6 @@ impl __sdk::__query_builder::HasCols for NpcGoal {
 /// Provides typed access to indexed columns for query building.
 pub struct NpcGoalIxCols {
     pub entity_id: __sdk::__query_builder::IxCol<NpcGoal, u64>,
-    pub goal_id: __sdk::__query_builder::IxCol<NpcGoal, u64>,
 }
 
 impl __sdk::__query_builder::HasIxCols for NpcGoal {
@@ -55,7 +51,6 @@ impl __sdk::__query_builder::HasIxCols for NpcGoal {
     fn ix_cols(table_name: &'static str) -> Self::IxCols {
         NpcGoalIxCols {
             entity_id: __sdk::__query_builder::IxCol::new(table_name, "entity_id"),
-            goal_id: __sdk::__query_builder::IxCol::new(table_name, "goal_id"),
         }
     }
 }

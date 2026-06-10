@@ -78,9 +78,57 @@ impl<'ctx> __sdk::Table for NearbyHealthTableHandle<'ctx> {
     }
 }
 
+pub struct NearbyHealthUpdateCallbackId(__sdk::CallbackId);
+
+impl<'ctx> __sdk::TableWithPrimaryKey for NearbyHealthTableHandle<'ctx> {
+    type UpdateCallbackId = NearbyHealthUpdateCallbackId;
+
+    fn on_update(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row, &Self::Row) + Send + 'static,
+    ) -> NearbyHealthUpdateCallbackId {
+        NearbyHealthUpdateCallbackId(self.imp.on_update(Box::new(callback)))
+    }
+
+    fn remove_on_update(&self, callback: NearbyHealthUpdateCallbackId) {
+        self.imp.remove_on_update(callback.0)
+    }
+}
+
+/// Access to the `entity_id` unique index on the table `nearby_health`,
+/// which allows point queries on the field of the same name
+/// via the [`NearbyHealthEntityIdUnique::find`] method.
+///
+/// Users are encouraged not to explicitly reference this type,
+/// but to directly chain method calls,
+/// like `ctx.db.nearby_health().entity_id().find(...)`.
+pub struct NearbyHealthEntityIdUnique<'ctx> {
+    imp: __sdk::UniqueConstraintHandle<EntityHealth, u64>,
+    phantom: std::marker::PhantomData<&'ctx super::RemoteTables>,
+}
+
+impl<'ctx> NearbyHealthTableHandle<'ctx> {
+    /// Get a handle on the `entity_id` unique index on the table `nearby_health`.
+    pub fn entity_id(&self) -> NearbyHealthEntityIdUnique<'ctx> {
+        NearbyHealthEntityIdUnique {
+            imp: self.imp.get_unique_constraint::<u64>("entity_id"),
+            phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'ctx> NearbyHealthEntityIdUnique<'ctx> {
+    /// Find the subscribed row whose `entity_id` column value is equal to `col_val`,
+    /// if such a row is present in the client cache.
+    pub fn find(&self, col_val: &u64) -> Option<EntityHealth> {
+        self.imp.find(col_val)
+    }
+}
+
 #[doc(hidden)]
 pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::RemoteModule>) {
     let _table = client_cache.get_or_make_table::<EntityHealth>("nearby_health");
+    _table.add_unique_constraint::<u64>("entity_id", |row| &row.entity_id);
 }
 
 #[doc(hidden)]

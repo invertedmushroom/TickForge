@@ -14,11 +14,17 @@ Rust workspace for an action MMO game server built on SpacetimeDB with Rapier3D 
 | `game_client` | SDK test client (AOI tests, smoke/fault/denial validation) — feature-gated `connected` |
 | `game_client_bevy` | Bevy 0.15 3D client (WASD movement, ability bar, inventory, dungeon instances) |
 
+## App Layout
+
+| App | Purpose |
+|-----|---------|
+| `apps/web` | Browser showcase client (Vite, TypeScript, three.js, Rapier WASM, SpacetimeDB TS SDK) |
+
 ## Prerequisites
 
 - [Rust toolchain](https://rustup.rs/) (edition 2024)
 - WASM target: `rustup target add wasm32-unknown-unknown`
-- [SpacetimeDB CLI](https://spacetimedb.com/install) v2.1+, with `spacetime` available on `PATH`
+- [SpacetimeDB CLI](https://spacetimedb.com/install) v2.4+, with `spacetime` available on `PATH`
 
 ## Build & Test (Offline — No Server)
 
@@ -96,6 +102,17 @@ cargo xtask dev clients
 cargo xtask test cli
 ```
 
+# Terminal 5 (browser client)
+
+```bash
+cargo xtask dev web-contract --skip-schema
+# Then from `apps/web`:
+npm install
+npm run dev
+# or from project root
+cargo xtask dev web
+```
+
 Useful one-shot commands:
 
 ```sh
@@ -116,6 +133,7 @@ cargo xtask build wasm
 cargo xtask build worker
 cargo xtask build client         # Bevy client (game_client_bevy)
 cargo xtask build cli            # headless SDK client (game_client)
+cargo xtask build web            # browser client (apps/web)
 cargo xtask build all            # wasm + worker + Bevy client + CLI client
 cargo xtask build all --release
 
@@ -126,6 +144,7 @@ cargo xtask test worker --release
 cargo xtask test workspace       # all crates except server_module
 cargo xtask test cli             # single-client smoke test; requires running server + worker
 cargo xtask test multi-client    # multi-client integration tests; requires running server + worker
+cargo xtask test web             # browser client CI lane
 cargo xtask test replay          # deterministic replay fixtures
 cargo xtask test replay --release
 
@@ -172,14 +191,14 @@ cargo xtask dev import-terrain --gltf path/to/level.glb --set-name level1 \
 
 After import, bind a layer (`data/layers.ron`) or a `DungeonTemplate` to the same `--set-name` and restart the worker. The deferred terrain edit queue applies the new chunks at the next tick boundary; look for `TerrainState: applied N insert(s)` in the worker log.
 
-**Asset convention for the Bevy client visual** (see `wiki/bevy_presentation_client.md`):
+**Asset convention for the client visual** (see `wiki/bevy_presentation_client.md` and `wiki/web_map_assets.md`):
 ```
 crates/game_client_bevy/assets/terrain/{stem}/{stem}.gltf  ← visual mesh
 crates/game_client_bevy/assets/terrain/{stem}/{stem}.bin   ← buffer (URI inside .gltf must match)
 crates/game_client_bevy/assets/terrain/{stem}/textures/... ← PBR textures
 ```
 
-By default `{stem}` is the same string as the layer's `terrain_set` (server) and the importer's `--set-name`. To decouple the client visual from server collision, set `client_visual: Some("...")` on the `WorldLayerDef` in `data/layers.ron` — the Bevy client will use that stem instead, while the worker keeps loading the `terrain_set` collision chunks. Useful when the artist-authored mesh is higher poly than the baked collision, or when several collision sets share one visual.
+By default `{stem}` is the same string as the layer's `terrain_set` (server) and the importer's `--set-name`. To decouple the client visual from server collision, set `client_visual: Some("...")` on the `WorldLayerDef` in `data/layers.ron` — the Bevy and Web clients will use that stem instead, while the worker keeps loading the `terrain_set` collision chunks. Useful when the artist-authored mesh is higher poly than the baked collision, or when several collision sets share one visual.
 
 **Scale gotcha:** glTF assets exported from Unreal/FBX often carry a baked `0.01` cm→m conversion in their root node `matrix`. The importer applies node transforms before the `--scale` flag, so passing `--scale 0.01` on top double-scales the mesh. Inspect node `matrix`/`scale` first; only pass `--scale` when the source coordinates are still in raw centimetres.
 
@@ -194,6 +213,22 @@ cargo xtask dev import-terrain \
 ```sh
 cargo xtask dev import-terrain --gltf crates/game_client_bevy/assets/terrain/hills_terrain/hills_terrain.gltf --set-name hills_terrain --chunk-size 32
 cargo xtask dev import-terrain --gltf crates/game_client_bevy/assets/terrain/biome_terrain/biome_terrain.gltf --set-name biome_terrain --chunk-size 32
+```
+
+**Web**
+```sh
+npm --prefix apps/web install
+cargo xtask dev web-contract --skip-schema
+cargo xtask dev web
+```
+
+For production deployment of assets, configure `VITE_ASSET_BASE_URL` in the environment to point to your CDN (e.g. `VITE_ASSET_BASE_URL=https://cdn.example/assets/`). In development, Vite middleware automatically mounts generated assets under `/__dive_assets__/`.
+
+Useful web checks:
+
+```sh
+cargo xtask build web
+cargo xtask test web
 ```
 
 PowerShell is now a thin compatibility shim that forwards to xtask:
@@ -386,6 +421,8 @@ spacetime call tickforge debug_spawn_many 500 2.0 -s local
 # Spawn entities
 spacetime call tickforge debug_spawn_prop 0.0 10.0 0.0 -s local
 spacetime call tickforge debug_spawn_boss 0.0 5.0 0.0 5000.0 -s local
+# Spawn an encounter-configured boss near an existing entity on that entity's layer
+spacetime call tickforge debug_spawn_encounter_boss 1 '"manayas_core_demo"' 0.0 0.0 8.0 5000.0 -s local
 
 # Entity manipulation
 spacetime call tickforge debug_set_hp 1 500.0 1000.0 -s local
@@ -398,6 +435,7 @@ spacetime call tickforge debug_set_team 1 10 -s local
 
 # Dungeon instances
 spacetime call tickforge debug_create_instance 1 -s local
+spacetime call tickforge debug_create_instance_for_template 1 '"test_dungeon_01"' 4 -s local
 spacetime call tickforge debug_join_instance 1 1 -s local
 
 # Buffs and items
@@ -438,6 +476,9 @@ spacetime subscribe tickforge "SELECT * FROM entity_layer" -s local
 spacetime subscribe tickforge "SELECT * FROM entity_transform" -s local
 spacetime subscribe tickforge "SELECT * FROM entity_health" -s local
 spacetime subscribe tickforge "SELECT * FROM combat_event" -s local
+spacetime subscribe tickforge "SELECT * FROM interactable_config" -s local
+spacetime subscribe tickforge "SELECT * FROM loot_pile" -s local
+spacetime subscribe tickforge "SELECT * FROM loot_pile_item" -s local
 ```
 
 
@@ -447,11 +488,22 @@ No local web dashboard in standalone mode. The web dashboard (metrics, table bro
 
 All integration tests run via the Rust SDK client in `crates/game_client/src/smoke_test.rs`, gated behind `#[cfg(feature = "connected")]`. They require a running SpacetimeDB instance with the module deployed and a simulation worker connected.
 
+Reward-loop smoke uses the same connected SDK identity:
+
+```sh
+RUST_LOG=info cargo run -p game_client --features connected -- --loot-smoke
+cargo run -p game_client --features connected -- --claim-loot <loot_pile_id> <item_id> <target_slot>
+```
+
+Use the SDK client for `claim_loot`; calling it through `spacetime call` runs as the CLI/admin identity and is expected to fail client registration validation.
+
 ## Project Structure
 
 ```
 tickforge/
 ├── Cargo.toml                          # Workspace root
+├── apps/
+│   └── web/                            # Browser client (Vite + TypeScript + three.js)
 ├── data/
 │   ├── abilities.ron                   # Data-driven ability definitions
 │   ├── buffs.ron                       # Buff/debuff definitions

@@ -51,7 +51,7 @@ fn can_view_entity(
 // Returns the caller's own region assignment.  The client learns which
 // cell it occupies without being able to see anyone else's region.
 
-#[view(accessor = my_region, public)]
+#[view(accessor = my_region, public, primary_key = entity_id)]
 fn my_region(ctx: &ViewContext) -> Option<RegionInfo> {
     let seq = ctx
         .db
@@ -82,7 +82,7 @@ fn my_region(ctx: &ViewContext) -> Option<RegionInfo> {
 //   er.entity_id         → stealthed_entity PK (u64)  ← stealth check
 //   er.entity_id         → entity_transform PK  (u64)
 
-#[view(accessor = nearby_transforms, public)]
+#[view(accessor = nearby_transforms, public, primary_key = entity_id)]
 fn nearby_transforms(ctx: &ViewContext) -> Vec<EntityTransform> {
     let Some(seq) = ctx
         .db
@@ -135,7 +135,7 @@ fn nearby_transforms(ctx: &ViewContext) -> Vec<EntityTransform> {
 // Access path: identical to nearby_transforms, final lookup is
 //   er.entity_id → entity_health PK  (u64)
 
-#[view(accessor = nearby_health, public)]
+#[view(accessor = nearby_health, public, primary_key = entity_id)]
 fn nearby_health(ctx: &ViewContext) -> Vec<EntityHealth> {
     let Some(seq) = ctx
         .db
@@ -186,7 +186,7 @@ fn nearby_health(ctx: &ViewContext) -> Vec<EntityHealth> {
 // Access path: identical to nearby_transforms, final lookup is
 //   er.entity_id → entity PK  (u64)
 
-#[view(accessor = nearby_entities, public)]
+#[view(accessor = nearby_entities, public, primary_key = entity_id)]
 fn nearby_entities(ctx: &ViewContext) -> Vec<Entity> {
     let Some(seq) = ctx
         .db

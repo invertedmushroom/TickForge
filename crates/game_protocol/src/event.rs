@@ -100,6 +100,12 @@ pub enum EventPayload {
         ability_id: u32,
         /// Total timeline duration in ticks (max tick_offset + 1).
         cast_duration_ticks: u32,
+        /// Cooldown duration in ticks after applying server-side
+        /// reductions (buffs, equipment, stats). Counts forward from
+        /// the tick of this `CastStart` event. `0` if the ability has
+        /// no `CooldownStart` action in its timeline. See
+        /// `docs/contracts/ability_cast_lifecycle_contract.md`.
+        effective_cooldown_ticks: u32,
     },
     /// An entity began charging a hold-to-release ability.
     /// The client should show a charge bar that fills toward `max_ticks`.
@@ -341,4 +347,43 @@ pub enum EventPayload {
         volume_id: u64,
         entity: EntityId,
     },
+    /// An in-flight cast or charge was terminated by a non-natural cause.
+    ///
+    /// **Append-only**: kept at the tail of the enum so existing serde
+    /// ordinals stay stable for replay fixtures and on-disk traces.
+    ///
+    /// Current emitted reasons are `Death` and `HardCC`. Other variants
+    /// are reserved so client `match` statements are exhaustive ahead of
+    /// future source-side emission work. See
+    /// `docs/contracts/ability_cast_lifecycle_contract.md`.
+    AbilityCancelled {
+        ability_id: u32,
+        reason: AbilityCancelReason,
+    },
+}
+
+/// Why an in-flight ability cast or charge was cancelled.
+///
+/// Wire-shared with the SpacetimeDB `AbilityCancelReasonWire` enum in
+/// `server_module::tables`. Variant order must stay in sync with that
+/// wire enum's discriminants — append new variants at the end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AbilityCancelReason {
+    /// The caster transitioned to `DespawnPending` this tick.
+    Death,
+    /// An interruptible cast or charge was cancelled because the caster
+    /// is hard-CC disabled. Abilities flagged `usable_while_cc` are not
+    /// cancelled by this sweep.
+    HardCC,
+    /// Reserved: caster issued a manual cancel intent. Not yet emitted.
+    Manual,
+    /// Reserved: caster moved outside the allowed movement envelope.
+    /// Not yet emitted.
+    Movement,
+    /// Reserved: caster took damage that breaks the cast. Not yet
+    /// emitted.
+    Damage,
+    /// Reserved: a new cast / charge replaced this one. Not yet
+    /// emitted.
+    Replaced,
 }

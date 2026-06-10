@@ -13,6 +13,7 @@ use super::encounter_add_membership_input_type::EncounterAddMembershipInput;
 use super::entity_state_update_type::EntityStateUpdate;
 use super::health_update_type::HealthUpdate;
 use super::interactable_update_type::InteractableUpdate;
+use super::loot_roll_input_type::LootRollInput;
 use super::npc_state_update_type::NpcStateUpdate;
 use super::region_update_type::RegionUpdate;
 use super::sim_log_input_type::SimLogInput;
@@ -38,6 +39,7 @@ pub(super) struct CommitTickResultsArgs {
     pub encounter_memberships: Vec<EncounterAddMembershipInput>,
     pub interactable_updates: Vec<InteractableUpdate>,
     pub death_state_inserts: Vec<DeathStateInsertInput>,
+    pub loot_rolls: Vec<LootRollInput>,
     pub sim_log_entries: Vec<SimLogInput>,
     pub boss_phase_updates: Vec<BossPhaseUpdateInput>,
     pub zone_counter_deltas: Vec<ZoneCounterDeltaInput>,
@@ -61,6 +63,7 @@ impl From<CommitTickResultsArgs> for super::Reducer {
             encounter_memberships: args.encounter_memberships,
             interactable_updates: args.interactable_updates,
             death_state_inserts: args.death_state_inserts,
+            loot_rolls: args.loot_rolls,
             sim_log_entries: args.sim_log_entries,
             boss_phase_updates: args.boss_phase_updates,
             zone_counter_deltas: args.zone_counter_deltas,
@@ -100,6 +103,7 @@ pub trait commit_tick_results {
         encounter_memberships: Vec<EncounterAddMembershipInput>,
         interactable_updates: Vec<InteractableUpdate>,
         death_state_inserts: Vec<DeathStateInsertInput>,
+        loot_rolls: Vec<LootRollInput>,
         sim_log_entries: Vec<SimLogInput>,
         boss_phase_updates: Vec<BossPhaseUpdateInput>,
         zone_counter_deltas: Vec<ZoneCounterDeltaInput>,
@@ -120,6 +124,7 @@ pub trait commit_tick_results {
             encounter_memberships,
             interactable_updates,
             death_state_inserts,
+            loot_rolls,
             sim_log_entries,
             boss_phase_updates,
             zone_counter_deltas,
@@ -150,6 +155,7 @@ pub trait commit_tick_results {
         encounter_memberships: Vec<EncounterAddMembershipInput>,
         interactable_updates: Vec<InteractableUpdate>,
         death_state_inserts: Vec<DeathStateInsertInput>,
+        loot_rolls: Vec<LootRollInput>,
         sim_log_entries: Vec<SimLogInput>,
         boss_phase_updates: Vec<BossPhaseUpdateInput>,
         zone_counter_deltas: Vec<ZoneCounterDeltaInput>,
@@ -178,6 +184,7 @@ impl commit_tick_results for super::RemoteReducers {
         encounter_memberships: Vec<EncounterAddMembershipInput>,
         interactable_updates: Vec<InteractableUpdate>,
         death_state_inserts: Vec<DeathStateInsertInput>,
+        loot_rolls: Vec<LootRollInput>,
         sim_log_entries: Vec<SimLogInput>,
         boss_phase_updates: Vec<BossPhaseUpdateInput>,
         zone_counter_deltas: Vec<ZoneCounterDeltaInput>,
@@ -203,6 +210,7 @@ impl commit_tick_results for super::RemoteReducers {
                 encounter_memberships,
                 interactable_updates,
                 death_state_inserts,
+                loot_rolls,
                 sim_log_entries,
                 boss_phase_updates,
                 zone_counter_deltas,

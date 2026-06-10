@@ -189,8 +189,8 @@ impl MutationAudit {
 /// Check whether a (domain, subsystem, phase) triple is a valid ownership combination.
 ///
 /// Returns `true` if the subsystem is the documented owner for the given domain in the
-/// given phase. The allowed triples match the in-memory ownership matrix.
-/// Enforcement is active in debug/test builds only —
+/// given phase. The allowed triples match the in-memory ownership matrix from
+/// `docs/architecture.md`. Enforcement is active in debug/test builds only —
 /// `MutationAudit::record()` calls this and panics on violation.
 ///
 /// **Documented exceptions wired into the rules:**
@@ -632,6 +632,8 @@ pub enum SimInteractKind {
     Gate,
     Grab,
     Chest,
+    BossSpawn,
+    NpcSpawn,
 }
 
 /// Runtime interactable state (mirrors the DB InteractState).
@@ -897,12 +899,20 @@ impl SimState {
 
     /// Get indices of all active entities of a given kind.
     pub fn active_indices_of_kind(&self, kind: EntityKind) -> Vec<EntityIndex> {
-        (0..self.entities.len())
-            .filter(|&i| {
-                self.entities.kinds[i] == kind && self.entities.states[i] == EntityState::Active
-            })
-            .map(|i| self.entities.index_at(i))
-            .collect()
+        let mut indices = Vec::new();
+        self.extend_active_indices_of_kind(kind, &mut indices);
+        indices
+    }
+
+    /// Append indices of active entities of a given kind into an existing buffer.
+    pub fn extend_active_indices_of_kind(&self, kind: EntityKind, out: &mut Vec<EntityIndex>) {
+        out.extend(
+            (0..self.entities.len())
+                .filter(|&i| {
+                    self.entities.kinds[i] == kind && self.entities.states[i] == EntityState::Active
+                })
+                .map(|i| self.entities.index_at(i)),
+        );
     }
 
     /// Get all active entity ids of a given kind.

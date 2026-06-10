@@ -9,6 +9,7 @@ use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 pub struct NpcConfig {
     pub entity_id: u64,
     pub encounter_name: Option<String>,
+    pub archetype_id: Option<String>,
     pub passive: bool,
     pub no_chase: bool,
     pub ability_id_1: Option<u32>,
@@ -30,6 +31,7 @@ impl __sdk::InModule for NpcConfig {
 pub struct NpcConfigCols {
     pub entity_id: __sdk::__query_builder::Col<NpcConfig, u64>,
     pub encounter_name: __sdk::__query_builder::Col<NpcConfig, Option<String>>,
+    pub archetype_id: __sdk::__query_builder::Col<NpcConfig, Option<String>>,
     pub passive: __sdk::__query_builder::Col<NpcConfig, bool>,
     pub no_chase: __sdk::__query_builder::Col<NpcConfig, bool>,
     pub ability_id_1: __sdk::__query_builder::Col<NpcConfig, Option<u32>>,
@@ -47,6 +49,7 @@ impl __sdk::__query_builder::HasCols for NpcConfig {
         NpcConfigCols {
             entity_id: __sdk::__query_builder::Col::new(table_name, "entity_id"),
             encounter_name: __sdk::__query_builder::Col::new(table_name, "encounter_name"),
+            archetype_id: __sdk::__query_builder::Col::new(table_name, "archetype_id"),
             passive: __sdk::__query_builder::Col::new(table_name, "passive"),
             no_chase: __sdk::__query_builder::Col::new(table_name, "no_chase"),
             ability_id_1: __sdk::__query_builder::Col::new(table_name, "ability_id_1"),

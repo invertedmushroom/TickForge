@@ -9,9 +9,11 @@ impl TickPipeline {
         let split_idx = self
             .scheduled_actions
             .partition_point(|a| a.tick_id <= current);
-        let due_actions: Vec<_> = self.scheduled_actions.drain(..split_idx).collect();
+        let mut due_actions = std::mem::take(&mut self.scheduled_action_scratch);
+        due_actions.clear();
+        due_actions.extend(self.scheduled_actions.drain(..split_idx));
 
-        for scheduled in due_actions {
+        for scheduled in due_actions.drain(..) {
             let entity = scheduled.entity;
             log::debug!(
                 "dispatch sched={} tick={} entity={} source={:?} action={}",
@@ -61,6 +63,7 @@ impl TickPipeline {
                 }
             }
         }
+        self.scheduled_action_scratch = due_actions;
 
         // Cull execution contexts for casts that no longer own any runtime effect.
         //
@@ -71,22 +74,23 @@ impl TickPipeline {
         // The `execution_is_alive` predicate defines what "still owning an effect"
         // means.  Extend that method when new effect types (projectiles, buffs) are
         // introduced — no changes here are needed.
-        let scheduled_sources: HashSet<AbilityExecutionId> = self
-            .scheduled_actions
-            .iter()
-            .filter_map(|a| a.source)
-            .collect();
-        let dead: Vec<AbilityExecutionId> = self
-            .state
-            .combat
-            .executions
-            .active_ids()
-            .into_iter()
-            .filter(|&id| {
-                !Self::execution_is_alive(id, &scheduled_sources, &self.state.combat.hitboxes)
-            })
-            .collect();
-        for id in dead {
+        let mut scheduled_sources = std::mem::take(&mut self.scheduled_sources_scratch);
+        scheduled_sources.clear();
+        scheduled_sources.extend(self.scheduled_actions.iter().filter_map(|a| a.source));
+
+        let mut dead = std::mem::take(&mut self.execution_cull_scratch);
+        dead.clear();
+        dead.extend(
+            self.state
+                .combat
+                .executions
+                .active_ids_iter()
+                .filter(|&id| {
+                    !Self::execution_is_alive(id, &scheduled_sources, &self.state.combat.hitboxes)
+                }),
+        );
+
+        for id in dead.drain(..) {
             if let Some(_ctx) = self.state.combat.executions.get(id) {
                 audit!(
                     self.state,
@@ -99,6 +103,9 @@ impl TickPipeline {
             }
             self.state.combat.executions.remove(id);
         }
+        scheduled_sources.clear();
+        self.scheduled_sources_scratch = scheduled_sources;
+        self.execution_cull_scratch = dead;
     }
 
     fn spawn_logical_hitbox(
@@ -761,9 +768,13 @@ impl TickPipeline {
                     .lookup(entity)
                     .map(|idx| self.state.stats.get(idx).cooldown_reduce_pct)
                     .unwrap_or(0.0);
-                let effective_duration =
-                    ((*duration_ticks as f32) * (1.0 - cd_reduce)).ceil() as u64;
-                let ready_at = TickId(self.current_tick.0 + effective_duration.max(1));
+                // Same formula as the Phase 2 `CastStart` emit site —
+                // shared helper guarantees the wire-visible
+                // `effective_cooldown_ticks` cannot drift from the
+                // value actually written into the cooldown map.
+                let effective_ticks =
+                    game_core::stats::apply_cooldown_reduction(*duration_ticks, cd_reduce);
+                let ready_at = TickId(self.current_tick.0 + effective_ticks.max(1) as u64);
                 self.cooldowns.insert((entity, ability_id), ready_at);
                 audit!(
                     self.state,

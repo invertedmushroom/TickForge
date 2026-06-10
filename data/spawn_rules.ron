@@ -14,7 +14,10 @@
 // Reserved but intentionally not authored here yet:
 //   - SpawnTrigger::OnEvent
 //   - SpawnScaling::per_level_hp_mult / level_source
-//   - SpawnEntityDef::encounter_template
+//     (Player-level / down-scaling: deferred until a level system lands.
+//      See docs/contracts/world_activity_policy_contract.md "Deferred"
+//      section. When levels exist, this field activates without code
+//      changes; until then, scaling is player-count-only.)
 //
 // Hot-reload is NOT supported; rules are read once in coordinator startup.
 
@@ -22,17 +25,63 @@
     rules: [
         // Origin-area open-world boss spawn proof.
         // Mirrors the hardcoded 3x3 grid previously registered in
-        // `coordinator.rs` on_applied. Fires when zone phase flips to
-        // "boss_ready" (driven by the 5-kills world_clock rule).
+        // `coordinator.rs` on_applied. Gated on the `boss_ready`
+        // world_activity_event row being Active AND ≥1 active
+        // (non-disconnected) player in the cell, so the boss never
+        // spawns into an empty region just because world_clock flipped
+        // the phase. Closes Finding #4 of the 2026-06-09 messaging
+        // review.
+        //
+        // HP scales modestly per extra player to make a 5-player attempt
+        // ~2× as durable as a solo attempt without trivializing the
+        // first kill. Spawn count is locked at 1 — for "more enemies
+        // when more players show up" use the multi-tier pattern
+        // demonstrated by `open_world_origin_boss_reinforcements`
+        // below.
         (
             rule_id: "open_world_origin_boss",
             scope: OpenWorldAny(rx_min: -1, rx_max: 1, rz_min: -1, rz_max: 1),
-            trigger: WorldPhase(phase_name: "boss_ready"),
+            trigger: WorldActivityEventActive(tag: "boss_ready", min_players: 1),
             spawns: [
                 (kind: Boss, max_hp: 500.0, offset: (0.0, 1.0, 0.0)),
             ],
             cooldown_ticks: 100,
             max_activations: 1,
+            scaling: Some((
+                per_player_hp_mult: 0.25,
+                per_player_count: 0.0,
+                per_level_hp_mult: 0.0,
+                level_source: None,
+            )),
+        ),
+
+        // Multi-tier escalation: a second rule on the same
+        // `boss_ready` event with a higher player-count gate. Fires
+        // once when ≥3 players are in the cell, adding scaled
+        // reinforcements alongside the boss. The two rules together
+        // demonstrate the "small-form Option B" pattern from the
+        // 2026-06-09 messaging review: zero new code, pure RON
+        // authoring drives "more players → bigger event".
+        //
+        // Activation matrix (single attempt, max_activations = 1 per rule):
+        //   - 1-2 players when event flips Active: boss only (HP 500–625).
+        //   - 3 players: boss + 2 minions @ 168 HP each.
+        //   - 5 players: boss (HP 1000) + 3 minions @ 240 HP each.
+        (
+            rule_id: "open_world_origin_boss_reinforcements",
+            scope: OpenWorldAny(rx_min: -1, rx_max: 1, rz_min: -1, rz_max: 1),
+            trigger: WorldActivityEventActive(tag: "boss_ready", min_players: 3),
+            spawns: [
+                (kind: Npc, max_hp: 120.0, offset: (3.0, 1.0, 0.0)),
+            ],
+            cooldown_ticks: 100,
+            max_activations: 1,
+            scaling: Some((
+                per_player_hp_mult: 0.4,
+                per_player_count: 0.5,
+                per_level_hp_mult: 0.0,
+                level_source: None,
+            )),
         ),
 
         // Single-cell trash/patrol proof. Fires when at least one player is

@@ -8,8 +8,8 @@ impl TickPipeline {
     /// For each boss encounter:
     /// 1. Tick active mechanics with `WorkerMechanicCtx`.
     /// 2. Evaluate rules → `Vec<EncounterOutput>`.
-    /// 3. Forward `ChangeBossPhase` / `IncrementZoneCounter` to the commit
-    ///    pipeline (Tier-2 reducer-owned tables).
+    /// 3. Forward `ChangeBossPhase` / `IncrementZoneCounter` to the main
+    ///    commit pipeline as inline Tier 1 tick outputs.
     /// 4. Apply worker-owned effects directly: ability list replacement,
     ///    spawn-add requests, scripted casts, telegraph log lines, mechanic
     ///    start/stop.

@@ -90,6 +90,22 @@ fn current_entity_id(conn: &DbConnection) -> Option<u64> {
     current_client_sequence(conn).map(|seq| seq.entity_id)
 }
 
+fn latest_sim_tick(conn: &DbConnection) -> u64 {
+    conn.db()
+        .sim_tick()
+        .iter()
+        .map(|tick| tick.tick_id)
+        .max()
+        .unwrap_or(0)
+}
+
+fn has_queued_intent(conn: &DbConnection, entity_id: u64, sequence_id: u64) -> bool {
+    conn.db()
+        .player_intent()
+        .iter()
+        .any(|intent| intent.entity_id == entity_id && intent.sequence_id == sequence_id)
+}
+
 fn latest_live_npc_id(conn: &DbConnection) -> u64 {
     conn.db()
         .nearby_entities()
@@ -1086,6 +1102,7 @@ fn run_smoke_tests(conn: &DbConnection, r: &mut TestResults) {
         .unwrap()
         .as_millis() as u64;
 
+    let move_observed_tick = latest_sim_tick(conn);
     let move_result = conn.reducers().submit_intent(
         entity_id,
         seq_base,
@@ -1094,10 +1111,27 @@ fn run_smoke_tests(conn: &DbConnection, r: &mut TestResults) {
             dir_y: 0.0,
             dir_z: 1.0,
         }),
-        0,
+        move_observed_tick,
     );
     if move_result.is_ok() {
         r.pass("S3  Move intent accepted");
+        let cursor = wait_for_cursor(conn, seq_base, 3000);
+        if cursor >= seq_base {
+            r.pass(&format!(
+                "S3a  normal intent advanced cursor with observed_tick={move_observed_tick}"
+            ));
+        } else {
+            r.fail(&format!(
+                "S3a  normal intent did not advance cursor to {seq_base}; got {cursor}"
+            ));
+        }
+
+        let consumed = wait_for(conn, 3000, || !has_queued_intent(conn, entity_id, seq_base));
+        if consumed {
+            r.pass("S3b  normal intent was consumed by worker commit");
+        } else {
+            r.fail("S3b  normal intent remained queued after processing window");
+        }
     } else {
         r.fail(&format!(
             "S3  Move intent rejected: {:?}",
@@ -1606,7 +1640,7 @@ fn run_b7_gap_preservation(
         entity_id,
         seq_base + 1,
         IntentAction::Stop,
-        seq_base,
+        0,
         move |_ctx, _r| sd.store(true, Ordering::SeqCst),
     );
     wait_for(conn, 3000, || single_done.load(Ordering::SeqCst));
@@ -1652,7 +1686,7 @@ fn run_b7_gap_preservation(
         entity_id,
         seq_base + 2,
         IntentAction::Stop,
-        seq_base,
+        0,
         move |_ctx, result| {
             if let Ok(Err(e)) = &result {
                 if e.contains("Stale sequence") {
@@ -1852,7 +1886,7 @@ fn run_f1_stale_sequence(conn: &DbConnection, r: &mut TestResults, entity_id: u6
         entity_id,
         last_seq,
         IntentAction::Stop,
-        seq_base,
+        0,
         move |_ctx, result| {
             if let Ok(Err(e)) = &result {
                 if e.contains("Stale sequence") {
@@ -1880,7 +1914,7 @@ fn run_f1_stale_sequence(conn: &DbConnection, r: &mut TestResults, entity_id: u6
         entity_id,
         seq_base + 100,
         IntentAction::Stop,
-        seq_base,
+        0,
         move |_ctx, result| {
             if let Ok(Ok(())) = result {
                 vo.store(true, Ordering::SeqCst);
@@ -1927,7 +1961,7 @@ fn run_f2_ownership(conn: &DbConnection, r: &mut TestResults, seq_base: u64) {
         foreign_id,
         seq_base + 200,
         IntentAction::Stop,
-        seq_base,
+        0,
         move |_ctx, result| {
             if let Ok(Err(e)) = &result {
                 if e.contains("does not own") || e.contains("not registered") {
@@ -1990,7 +2024,7 @@ fn run_f4_queue_overflow(conn: &DbConnection, r: &mut TestResults, entity_id: u6
             entity_id,
             seq_base + 300 + i,
             IntentAction::Stop,
-            seq_base,
+            0,
             move |_ctx, result| {
                 match result {
                     Ok(Err(e)) if e.contains("queue full") || e.contains("Intent queue full") => {
@@ -2148,6 +2182,7 @@ fn run_f6_unauthorized_commit(conn: &DbConnection, r: &mut TestResults) {
         vec![],     // encounter_memberships
         vec![],     // interactable_updates
         vec![],     // death_state_inserts
+        vec![],     // loot_rolls
         vec![],     // sim_log_inputs
         vec![],     // boss_phase_updates
         vec![],     // zone_counter_deltas
@@ -2204,6 +2239,7 @@ fn run_f7_cursor_safety(conn: &DbConnection, r: &mut TestResults) {
         vec![], // encounter_memberships
         vec![], // interactable_updates
         vec![], // death_state_inserts
+        vec![], // loot_rolls
         vec![], // sim_log_inputs
         vec![], // boss_phase_updates
         vec![], // zone_counter_deltas

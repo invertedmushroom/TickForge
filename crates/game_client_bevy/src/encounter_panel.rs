@@ -2,8 +2,8 @@ use bevy::prelude::*;
 use game_client::module_bindings::*;
 use spacetimedb_sdk::Table;
 
-use crate::spacetime::{LocalPlayerEntity, StdbConnection, TickCounter};
 use crate::encounter_cues::ActiveEncounterCues;
+use crate::spacetime::{LocalPlayerEntity, StdbConnection, TickCounter};
 
 /// Legacy F8 debug panel for boss/encounter visibility.
 ///

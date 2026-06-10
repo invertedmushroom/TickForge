@@ -9,6 +9,10 @@ impl TickPipeline {
         // (the entity is also rooted, so apply_movement would early-exit anyway).
         self.drive_arc_movement();
 
+        // Sub-step: interrupt in-flight ability runtime for entities that are now
+        // hard-CC disabled. This runs before charge advancement/auto-release.
+        self.cancel_cc_disabled_abilities();
+
         // Sub-step: advance charge timers, detect tier crossings, auto-release.
         // Runs before intent processing so auto-releases fire before new intents.
         self.drive_charging();
@@ -641,6 +645,40 @@ impl TickPipeline {
         }
     }
 
+    fn cancel_cc_disabled_abilities(&mut self) {
+        let mut cc_disabled_entities: HashSet<EntityId> = self
+            .state
+            .combat
+            .charging
+            .keys()
+            .copied()
+            .filter(|&entity| {
+                self.state
+                    .entities
+                    .lookup(entity)
+                    .is_some_and(|idx| self.is_cc_disabled(idx))
+            })
+            .collect();
+
+        for exec_id in self.state.combat.executions.active_ids() {
+            let Some(ctx) = self.state.combat.executions.get(exec_id) else {
+                continue;
+            };
+            if self
+                .state
+                .entities
+                .lookup(ctx.caster)
+                .is_some_and(|idx| self.is_cc_disabled(idx))
+            {
+                cc_disabled_entities.insert(ctx.caster);
+            }
+        }
+
+        for entity in cc_disabled_entities {
+            self.cancel_entity_interruptible_abilities(entity, AbilityCancelReason::HardCC);
+        }
+    }
+
     /// Advance charge timers for all entities currently charging a hold-release ability.
     ///
     /// For each charging entity:
@@ -649,31 +687,6 @@ impl TickPipeline {
     /// 3. If elapsed >= last tier's `min_ticks`, auto-release the ability at max tier.
     /// 4. Re-assert `rooted` so movement stays blocked while charging.
     fn drive_charging(&mut self) {
-        // Cancel charges for CC-disabled entities before advancing timers.
-        // A stunned/knocked-down/floating entity cannot continue charging.
-        // Collect separately to avoid borrow conflicts with the main loop.
-        let cc_cancelled: Vec<EntityId> = self
-            .state
-            .combat
-            .charging
-            .keys()
-            .copied()
-            .filter(|&eid| {
-                self.state
-                    .entities
-                    .lookup(eid)
-                    .is_some_and(|idx| self.is_cc_disabled(idx))
-            })
-            .collect();
-        for entity_id in cc_cancelled {
-            self.state.combat.charging.remove(&entity_id);
-            if let Some(idx) = self.state.entities.lookup(entity_id) {
-                self.state.combat.tactical[idx.as_usize()]
-                    .movement_conditions
-                    .remove(game_core::combat::tactical::MovementConditions::INPUT_LOCK);
-            }
-        }
-
         // Collect auto-releases to process after iteration (avoids borrow issues).
         let mut auto_releases: Vec<(EntityId, ChargingState, u8)> = Vec::new();
         // Collect tier-up events to emit.
@@ -892,9 +905,12 @@ impl TickPipeline {
                     // Mark chest as Active (opened). Future: emit loot event.
                     self.set_interactable_state_runtime(target, SimInteractState::Active);
                 }
-                SimInteractKind::Gate | SimInteractKind::Grab => {
+                SimInteractKind::Gate
+                | SimInteractKind::Grab
+                | SimInteractKind::BossSpawn
+                | SimInteractKind::NpcSpawn => {
                     // Gates are not directly interactable (controlled by switches).
-                    // Grab: future implementation.
+                    // Grab/spawn marker interactions are metadata-only for now.
                 }
             }
         }

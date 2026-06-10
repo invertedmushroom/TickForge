@@ -50,6 +50,12 @@ pub fn rule_to_dynamic_event(
         SpawnTrigger::PlayerCountAtLeast { threshold } => DirectorTrigger::PlayerCountAtLeast {
             threshold: *threshold,
         },
+        SpawnTrigger::WorldActivityEventActive { tag, min_players } => {
+            DirectorTrigger::WorldActivityEventActive {
+                tag: tag.clone(),
+                min_players: *min_players,
+            }
+        }
         SpawnTrigger::OnEvent { .. } => return None,
     };
 

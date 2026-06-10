@@ -4,7 +4,7 @@
 //! coordinator maps 1:1 into generated reducer binding types.
 #[cfg(test)]
 use game_protocol::entity_id::EntityId;
-use game_protocol::event::{EventPayload, SimEvent};
+use game_protocol::event::{AbilityCancelReason, EventPayload, SimEvent};
 use game_schema::DamageType;
 
 use crate::tick_pipeline::TickResult;
@@ -83,6 +83,8 @@ pub enum CommitCombatEventKind {
     CastStart {
         ability_id: u32,
         cast_duration_ticks: u32,
+        /// See `EventPayload::CastStart::effective_cooldown_ticks`.
+        effective_cooldown_ticks: u32,
     },
     ChargeStart {
         ability_id: u32,
@@ -229,6 +231,13 @@ pub enum CommitCombatEventKind {
         cc_effect: game_schema::CCEffect,
         source: u64,
     },
+    /// An in-flight cast or charge was cancelled.
+    /// Appended at the tail — variant order is matched 1:1 with
+    /// `CombatEventKind::AbilityCancelled` in `server_module`.
+    AbilityCancelled {
+        ability_id: u32,
+        reason: AbilityCancelReason,
+    },
 }
 
 /// A single combat event ready for commit.
@@ -290,6 +299,18 @@ pub struct CommitDirectorSpawn {
     pub pos_y: f32,
     pub pos_z: f32,
     pub layer: u32,
+    pub npc_config: Option<CommitDirectorNpcConfig>,
+    pub team_id: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CommitDirectorNpcConfig {
+    pub passive: bool,
+    pub no_chase: bool,
+    pub ability_ids: Vec<u32>,
+    pub leash_radius: f32,
+    pub aggro_radius: f32,
+    pub body_shape: Option<u8>,
 }
 
 /// Interactable state change for commit.
@@ -310,9 +331,27 @@ pub struct CommitDeathStateInsert {
     pub death_pos_z: f32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitLootRollItem {
+    pub item_id: u32,
+    pub quantity: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommitLootRoll {
+    pub corpse_entity: u64,
+    pub layer: u32,
+    pub pos_x: f32,
+    pub pos_y: f32,
+    pub pos_z: f32,
+    pub eligible_claimants: Vec<u64>,
+    pub claim_window_ticks: u64,
+    pub items: Vec<CommitLootRollItem>,
+}
+
 /// Encounter-add membership entry paired with a `CommitDirectorSpawn` by
 /// `spawn_index`. Mirrors `game_core::director::PendingAddMembership` in
-/// SDK-free form.
+/// SDK-free form. See `docs/contracts/spawn_add_membership_contract.md`.
 #[derive(Clone, Debug)]
 pub struct CommitEncounterAddMembership {
     pub spawn_index: u32,
@@ -360,6 +399,9 @@ pub struct CommitPackage {
     /// Authoritative player-death rows. Inserted verbatim by the reducer
     /// (no derivation from observed lifecycle transitions).
     pub death_state_inserts: Vec<CommitDeathStateInsert>,
+    /// Worker-produced loot rolls. Inserted verbatim as loot piles/items by
+    /// the reducer in the same commit as the matching death event.
+    pub loot_rolls: Vec<CommitLootRoll>,
     /// Simulation-pipeline diagnostic messages for this tick.
     /// Forwarded to the `sim_log` event table via `commit_tick_results`.
     /// Populated from `TickResult::sim_warnings`; level is always Warn (2).
@@ -483,6 +525,15 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
             pos_y: s.position.y,
             pos_z: s.position.z,
             layer: s.layer,
+            npc_config: s.npc_config.as_ref().map(|cfg| CommitDirectorNpcConfig {
+                passive: cfg.passive,
+                no_chase: cfg.no_chase,
+                ability_ids: cfg.ability_ids.clone(),
+                leash_radius: cfg.leash_radius,
+                aggro_radius: cfg.aggro_radius,
+                body_shape: cfg.body_shape,
+            }),
+            team_id: s.team_id,
         })
         .collect();
 
@@ -519,6 +570,32 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
         })
         .collect();
 
+    let loot_rolls = result
+        .loot_rolls
+        .iter()
+        .map(|roll| CommitLootRoll {
+            corpse_entity: roll.corpse_entity.0,
+            layer: roll.layer,
+            pos_x: roll.position.x,
+            pos_y: roll.position.y,
+            pos_z: roll.position.z,
+            eligible_claimants: roll
+                .eligible_claimants
+                .iter()
+                .map(|entity| entity.0)
+                .collect(),
+            claim_window_ticks: roll.claim_window_ticks,
+            items: roll
+                .rolled_items
+                .iter()
+                .map(|item| CommitLootRollItem {
+                    item_id: item.item_id,
+                    quantity: item.quantity,
+                })
+                .collect(),
+        })
+        .collect();
+
     CommitPackage {
         tick_id,
         transforms,
@@ -537,6 +614,7 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
         boss_phase_updates: result.boss_phase_updates,
         zone_counter_deltas: result.zone_counter_deltas,
         death_state_inserts,
+        loot_rolls,
         sim_logs: result.sim_warnings,
     }
 }
@@ -751,6 +829,7 @@ fn classify_events(events: &[SimEvent]) -> (Vec<CommitCombatEvent>, Vec<CommitWo
             EventPayload::CastStart {
                 ability_id,
                 cast_duration_ticks,
+                effective_cooldown_ticks,
             } => {
                 combat_events.push(CommitCombatEvent {
                     source_entity: e.entity_id.0,
@@ -759,6 +838,7 @@ fn classify_events(events: &[SimEvent]) -> (Vec<CommitCombatEvent>, Vec<CommitWo
                     event_kind: CommitCombatEventKind::CastStart {
                         ability_id: *ability_id,
                         cast_duration_ticks: *cast_duration_ticks,
+                        effective_cooldown_ticks: *effective_cooldown_ticks,
                     },
                 });
             }
@@ -1113,6 +1193,17 @@ fn classify_events(events: &[SimEvent]) -> (Vec<CommitCombatEvent>, Vec<CommitWo
                     },
                 });
             }
+            EventPayload::AbilityCancelled { ability_id, reason } => {
+                combat_events.push(CommitCombatEvent {
+                    source_entity: e.entity_id.0,
+                    target_entity: 0,
+                    event_sequence: e.event_sequence,
+                    event_kind: CommitCombatEventKind::AbilityCancelled {
+                        ability_id: *ability_id,
+                        reason: *reason,
+                    },
+                });
+            }
         }
     }
 
@@ -1175,6 +1266,7 @@ mod tests {
             boss_phase_updates: Vec::new(),
             zone_counter_deltas: Vec::new(),
             death_state_inserts: Vec::new(),
+            loot_rolls: Vec::new(),
             sim_warnings: Vec::new(),
         }
     }
@@ -1540,6 +1632,7 @@ mod tests {
             boss_phase_updates: Vec::new(),
             zone_counter_deltas: Vec::new(),
             death_state_inserts: Vec::new(),
+            loot_rolls: Vec::new(),
             sim_warnings: Vec::new(),
         };
         let pkg = build(result, Vec::new());
@@ -1552,6 +1645,41 @@ mod tests {
         assert!(pkg.consumed_intent_ids.is_empty());
         assert!(pkg.entity_state_updates.is_empty());
         assert!(pkg.region_updates.is_empty());
+    }
+
+    #[test]
+    fn build_marshals_loot_rolls() {
+        let mut result = make_tick_result(12);
+        result.loot_rolls.push(game_core::loot::LootRollOutput {
+            corpse_entity: EntityId(500),
+            layer: 101,
+            position: Vec3f {
+                x: 4.0,
+                y: 1.5,
+                z: -2.0,
+            },
+            rolled_items: vec![game_core::loot::LootRollItem {
+                item_id: 5,
+                quantity: 2,
+            }],
+            eligible_claimants: vec![EntityId(10), EntityId(11)],
+            claim_window_ticks: 6000,
+        });
+
+        let pkg = build(result, Vec::new());
+
+        assert_eq!(pkg.loot_rolls.len(), 1);
+        let roll = &pkg.loot_rolls[0];
+        assert_eq!(roll.corpse_entity, 500);
+        assert_eq!(roll.layer, 101);
+        assert_eq!(roll.pos_x, 4.0);
+        assert_eq!(roll.pos_y, 1.5);
+        assert_eq!(roll.pos_z, -2.0);
+        assert_eq!(roll.eligible_claimants, vec![10, 11]);
+        assert_eq!(roll.claim_window_ticks, 6000);
+        assert_eq!(roll.items.len(), 1);
+        assert_eq!(roll.items[0].item_id, 5);
+        assert_eq!(roll.items[0].quantity, 2);
     }
 
     #[test]
@@ -1578,6 +1706,15 @@ mod tests {
                         z: -5.0,
                     },
                     layer: 105,
+                    npc_config: Some(game_core::director::DirectorNpcConfig {
+                        passive: false,
+                        no_chase: true,
+                        ability_ids: vec![1, 124],
+                        leash_radius: 20.0,
+                        aggro_radius: 8.0,
+                        body_shape: Some(game_schema::dungeon::BodyShapeDef::NpcCapsule.to_u8()),
+                    }),
+                    team_id: Some(2),
                 },
                 DirectorSpawn {
                     kind: game_schema::EntityKind::Npc,
@@ -1588,6 +1725,8 @@ mod tests {
                         z: 0.0,
                     },
                     layer: 0,
+                    npc_config: None,
+                    team_id: None,
                 },
             ],
             encounter_memberships: Vec::new(),
@@ -1595,6 +1734,7 @@ mod tests {
             boss_phase_updates: Vec::new(),
             zone_counter_deltas: Vec::new(),
             death_state_inserts: Vec::new(),
+            loot_rolls: Vec::new(),
             sim_warnings: Vec::new(),
         };
         let pkg = build(result, Vec::new());
@@ -1608,8 +1748,18 @@ mod tests {
         assert_eq!(s0.pos_y, 1.0);
         assert_eq!(s0.pos_z, -5.0);
         assert_eq!(s0.layer, 105);
+        assert_eq!(s0.team_id, Some(2));
+        let cfg = s0.npc_config.as_ref().expect("npc config should marshal");
+        assert_eq!(cfg.ability_ids, vec![1, 124]);
+        assert!(cfg.no_chase);
+        assert_eq!(
+            cfg.body_shape,
+            Some(game_schema::dungeon::BodyShapeDef::NpcCapsule.to_u8())
+        );
 
         let s1 = &pkg.director_spawns[1];
         assert_eq!(s1.layer, 0);
+        assert!(s1.npc_config.is_none());
+        assert_eq!(s1.team_id, None);
     }
 }

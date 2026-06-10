@@ -95,30 +95,30 @@ impl<'ctx> __sdk::TableWithPrimaryKey for NpcGoalTableHandle<'ctx> {
     }
 }
 
-/// Access to the `goal_id` unique index on the table `npc_goal`,
+/// Access to the `entity_id` unique index on the table `npc_goal`,
 /// which allows point queries on the field of the same name
-/// via the [`NpcGoalGoalIdUnique::find`] method.
+/// via the [`NpcGoalEntityIdUnique::find`] method.
 ///
 /// Users are encouraged not to explicitly reference this type,
 /// but to directly chain method calls,
-/// like `ctx.db.npc_goal().goal_id().find(...)`.
-pub struct NpcGoalGoalIdUnique<'ctx> {
+/// like `ctx.db.npc_goal().entity_id().find(...)`.
+pub struct NpcGoalEntityIdUnique<'ctx> {
     imp: __sdk::UniqueConstraintHandle<NpcGoal, u64>,
     phantom: std::marker::PhantomData<&'ctx super::RemoteTables>,
 }
 
 impl<'ctx> NpcGoalTableHandle<'ctx> {
-    /// Get a handle on the `goal_id` unique index on the table `npc_goal`.
-    pub fn goal_id(&self) -> NpcGoalGoalIdUnique<'ctx> {
-        NpcGoalGoalIdUnique {
-            imp: self.imp.get_unique_constraint::<u64>("goal_id"),
+    /// Get a handle on the `entity_id` unique index on the table `npc_goal`.
+    pub fn entity_id(&self) -> NpcGoalEntityIdUnique<'ctx> {
+        NpcGoalEntityIdUnique {
+            imp: self.imp.get_unique_constraint::<u64>("entity_id"),
             phantom: std::marker::PhantomData,
         }
     }
 }
 
-impl<'ctx> NpcGoalGoalIdUnique<'ctx> {
-    /// Find the subscribed row whose `goal_id` column value is equal to `col_val`,
+impl<'ctx> NpcGoalEntityIdUnique<'ctx> {
+    /// Find the subscribed row whose `entity_id` column value is equal to `col_val`,
     /// if such a row is present in the client cache.
     pub fn find(&self, col_val: &u64) -> Option<NpcGoal> {
         self.imp.find(col_val)
@@ -128,7 +128,7 @@ impl<'ctx> NpcGoalGoalIdUnique<'ctx> {
 #[doc(hidden)]
 pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::RemoteModule>) {
     let _table = client_cache.get_or_make_table::<NpcGoal>("npc_goal");
-    _table.add_unique_constraint::<u64>("goal_id", |row| &row.goal_id);
+    _table.add_unique_constraint::<u64>("entity_id", |row| &row.entity_id);
 }
 
 #[doc(hidden)]

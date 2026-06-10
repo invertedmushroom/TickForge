@@ -894,6 +894,7 @@ fn handle_lock_on_input(
     let Some(entity_id) = local_player.entity_id else {
         return;
     };
+    cooldowns.current_tick = tick_counter.last_tick;
 
     if let (Some(ability_id), Some(expires_at_tick)) =
         (lock_on.active_ability, lock_on.expires_at_tick)
@@ -920,15 +921,19 @@ fn handle_lock_on_input(
     for (i, key) in keys.iter().enumerate() {
         if keyboard.just_pressed(*key) {
             let id = bindings.slots[i];
-            let is_lock_on = all_abilities()
-                .iter()
-                .any(|a| a.id == id && a.targeting == ClientTargetingMode::LockOn);
-            if !is_lock_on {
+            let Some(def) = all_abilities().iter().find(|a| a.id == id) else {
+                break;
+            };
+            if def.targeting != ClientTargetingMode::LockOn {
                 break;
             }
 
             if lock_on.active_ability == Some(id) {
                 // Second press of same lock-on ability → fire on tagged targets.
+                if !cooldowns.activate_local(id, tick_counter.last_tick, def.cooldown_ticks) {
+                    log::debug!("Lock-on FIRE suppressed: ability {id} is on cooldown");
+                    return;
+                }
                 tick_counter.intent_seq += 1;
                 submit_intent_logged(
                     &stdb,
@@ -944,10 +949,13 @@ fn handle_lock_on_input(
                     "LockOnFire",
                 );
                 clear_lock_on_session(&mut lock_on);
-                cooldowns.activate(id, tick_counter.last_tick);
                 diag.record_intent();
                 log::info!("Lock-on FIRE: ability {id}");
             } else {
+                if cooldowns.remaining(id, def.cooldown_ticks) > 0 {
+                    log::debug!("Lock-on OPEN suppressed: ability {id} is on cooldown");
+                    return;
+                }
                 // Cancel any existing lock-on session for a different ability.
                 if let Some(old) = lock_on.active_ability.take() {
                     tick_counter.intent_seq += 1;
@@ -1091,6 +1099,7 @@ fn handle_abilities(
     let Some(entity_id) = local_player.entity_id else {
         return;
     };
+    cooldowns.current_tick = tick_counter.last_tick;
 
     let keys = [
         KeyCode::Digit1,
@@ -1191,11 +1200,14 @@ fn handle_abilities(
         return;
     };
 
-    let ability_def = all_abilities().iter().find(|a| a.id == ability_id).cloned();
-    let ability_targeting = ability_def
-        .as_ref()
-        .map(|a| a.targeting)
-        .unwrap_or(ClientTargetingMode::DirectionTarget);
+    let Some(ability_def) = all_abilities().iter().find(|a| a.id == ability_id).cloned() else {
+        return;
+    };
+    if cooldowns.remaining(ability_id, ability_def.cooldown_ticks) > 0 {
+        log::debug!("UseAbility suppressed: ability {ability_id} is on cooldown");
+        return;
+    }
+    let ability_targeting = ability_def.targeting;
 
     let target_and_hint = match ability_targeting {
         ClientTargetingMode::SelfOnly | ClientTargetingMode::CasterOffset => {
@@ -1216,10 +1228,9 @@ fn handle_abilities(
                 .as_ref()
                 .or(crosshair.world_aim_point.as_ref())
             {
-                let clamped = if let (Some(max_range), Ok(player_tf)) = (
-                    ability_def.and_then(|a| a.max_range),
-                    player_q_aim.get_single(),
-                ) {
+                let clamped = if let (Some(max_range), Ok(player_tf)) =
+                    (ability_def.max_range, player_q_aim.get_single())
+                {
                     clamp_ground_target_position(player_tf.translation, pos, max_range)
                 } else {
                     pos.clone()
@@ -1252,6 +1263,14 @@ fn handle_abilities(
 
     // FaceTo is no longer sent — character facing is driven by WASD movement
     // direction on the server, so we only need to send UseAbility here.
+    if !cooldowns.activate_local(
+        ability_id,
+        tick_counter.last_tick,
+        ability_def.cooldown_ticks,
+    ) {
+        log::debug!("UseAbility suppressed: ability {ability_id} is on cooldown");
+        return;
+    }
     tick_counter.intent_seq += 1;
     submit_intent_logged(
         &stdb,
@@ -1267,8 +1286,8 @@ fn handle_abilities(
         "UseAbility",
     );
 
-    // Record cooldown + diagnostics + VFX flash.
-    cooldowns.activate(ability_id, tick_counter.last_tick);
+    // Record diagnostics + VFX flash. Cooldown was recorded immediately
+    // before submit so duplicate presses cannot restart the local timer.
     diag.record_intent();
     if let Ok((bevy_entity, mat_handle)) = player_q.get_single() {
         crate::vfx::trigger_flash(

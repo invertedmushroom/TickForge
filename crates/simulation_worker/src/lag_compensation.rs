@@ -106,12 +106,23 @@ impl TransformSnapshot {
 
     /// Return snapshot positions in buckets intersecting a horizontal query radius.
     pub fn nearby_positions(&self, center: Vec3f, radius: f32) -> Vec<(EntityId, Vec3f)> {
+        let mut out = Vec::new();
+        self.nearby_positions_into(center, radius, &mut out);
+        out
+    }
+
+    /// Append snapshot positions in buckets intersecting a horizontal query radius.
+    pub fn nearby_positions_into(
+        &self,
+        center: Vec3f,
+        radius: f32,
+        out: &mut Vec<(EntityId, Vec3f)>,
+    ) {
         let min_x = Self::cell_coord(center.x - radius);
         let max_x = Self::cell_coord(center.x + radius);
         let min_z = Self::cell_coord(center.z - radius);
         let max_z = Self::cell_coord(center.z + radius);
 
-        let mut out = Vec::new();
         for cell_x in min_x..=max_x {
             for cell_z in min_z..=max_z {
                 let Some(indices) = self.spatial_bins.get(&(cell_x, cell_z)) else {
@@ -120,7 +131,6 @@ impl TransformSnapshot {
                 out.extend(indices.iter().map(|&i| self.positions[i]));
             }
         }
-        out
     }
 }
 

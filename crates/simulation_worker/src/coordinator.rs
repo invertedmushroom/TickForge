@@ -76,6 +76,7 @@ fn send_commit(reducers: &RemoteReducers, pkg: CommitPackage, state: Arc<Mutex<C
     let encounter_memberships = wire_encounter_memberships(&pkg);
     let interactable_updates = wire_interactable_updates(&pkg);
     let death_state_inserts = wire_death_state_inserts(&pkg);
+    let loot_rolls = wire_loot_rolls(&pkg);
     let sim_log_entries = wire_sim_log_entries(&pkg);
     let boss_phase_updates = pkg.boss_phase_updates.clone();
     let zone_counter_deltas = pkg.zone_counter_deltas.clone();
@@ -98,6 +99,7 @@ fn send_commit(reducers: &RemoteReducers, pkg: CommitPackage, state: Arc<Mutex<C
         encounter_memberships,
         interactable_updates,
         death_state_inserts,
+        loot_rolls,
         sim_log_entries,
         boss_phase_updates
             .into_iter()
@@ -210,6 +212,7 @@ pub fn run(config: CoordinatorConfig) {
     let mut physics = PhysicsWorld::new(tick_dt);
     let abilities = load_abilities();
     let items = load_items();
+    let loot = load_loot_tables(&items);
     let buffs = load_buffs();
     let dungeons = load_dungeons();
     let encounters = load_encounters();
@@ -219,7 +222,7 @@ pub fn run(config: CoordinatorConfig) {
     // `data/layers.ron`. Replaces the previously-hardcoded layer-0
     // placeholder floor in `PhysicsWorld::new` and gives every static
     // layer the same compositional `geometry + Option<terrain_set>`
-    // shape used by `DungeonTemplate`.
+    // shape used by `DungeonTemplate`. See docs/plan/plan.md §4.8b.
     let world_layers = load_world_layers();
     let mut initial_terrain_bindings: Vec<TerrainBinding> = Vec::new();
     for layer_def in &world_layers {
@@ -246,15 +249,18 @@ pub fn run(config: CoordinatorConfig) {
         );
     }
 
+    let mut sim = SimulationRunner::new(
+        TickId(0),
+        Box::new(physics),
+        tick_dt,
+        abilities,
+        buffs,
+        crate::lag_compensation::MAX_REWIND_TICKS,
+    );
+    sim.set_loot_registry(loot);
+
     let state = Arc::new(Mutex::new(CoordinatorState {
-        sim: SimulationRunner::new(
-            TickId(0),
-            Box::new(physics),
-            tick_dt,
-            abilities,
-            buffs,
-            crate::lag_compensation::MAX_REWIND_TICKS,
-        ),
+        sim,
         items,
         dungeons,
         encounters,
@@ -504,6 +510,10 @@ pub fn run(config: CoordinatorConfig) {
             .as_ref()
             .and_then(|c| c.encounter_name.clone())
             .filter(|key| !key.is_empty());
+        let configured_archetype_id = npc_config_row
+            .as_ref()
+            .and_then(|c| c.archetype_id.clone())
+            .filter(|key| !key.is_empty());
 
         // Resolve the authoritative physics body shape.
         // Character kinds read NpcConfig.body_shape (Players have no row →
@@ -524,7 +534,7 @@ pub fn run(config: CoordinatorConfig) {
             _ => None,
         };
 
-        let npc_config: Option<crate::entity_sync::NpcSpawnConfig> = npc_config_row.map(|c| {
+        let npc_config: Option<crate::entity_sync::NpcSpawnConfig> = npc_config_row.as_ref().map(|c| {
             let mut ability_ids: Vec<u32> = Vec::new();
             if let Some(id) = c.ability_id_1 {
                 ability_ids.push(id);
@@ -639,11 +649,15 @@ pub fn run(config: CoordinatorConfig) {
             },
         );
 
+        if let Some(archetype_id) = configured_archetype_id.as_deref() {
+            guard.sim.apply_npc_archetype_to_entity(eid, archetype_id);
+        }
+
         // Register encounter rules for Boss entities so the pipeline can
         // evaluate phase transitions each tick.
         if kind == game_schema::EntityKind::Boss {
             let configured_key = configured_encounter_key.as_deref();
-            if let Some((resolved_key, rules, fell_back)) =
+            if let Some((resolved_key, rules, loot_table_id, fell_back)) =
                 resolve_boss_encounter_rules(&guard.encounters, configured_key)
             {
                 if fell_back {
@@ -659,10 +673,15 @@ pub fn run(config: CoordinatorConfig) {
                 let enc_state =
                     game_core::encounter::EncounterState::new_dormant(eid, rules, tick);
                 guard.sim.register_encounter(eid, enc_state);
+                guard.sim.set_entity_loot_table(eid, loot_table_id.clone());
                 info!(
-                    "Registered encounter rules '{}' for boss entity {}",
+                    "Registered encounter rules '{}' for boss entity {}{}",
                     resolved_key,
                     eid.0,
+                    loot_table_id
+                        .as_deref()
+                        .map(|id| format!(" with loot table '{id}'"))
+                        .unwrap_or_default(),
                 );
             } else if let Some(missing_key) = configured_key {
                 warn!(
@@ -1099,11 +1118,14 @@ pub fn run(config: CoordinatorConfig) {
     // ── Encounter Add Membership projection ─────────────────────────
     // Mirror encounter_add rows into the pipeline's add_to_boss/entity_tags
     // maps so encounter rules like `OnEntityDied { tag }` fire in production.
+    // The row's archetype also lets the worker opt the add into an authored
+    // Behavior Tree policy when the archetype declares one.
+    // See `docs/contracts/spawn_add_membership_contract.md`.
     //
     // Replay ordering note: this fires independently of `entity.on_insert`.
-    // `register_encounter_add_with_tags` only writes the two HashMaps and
-    // does not consult any entity slot table, so out-of-order arrival is
-    // safe.
+    // `register_encounter_add_with_archetype` only writes maps keyed by the
+    // stable add EntityId and does not consult any entity slot table, so
+    // out-of-order arrival is safe.
 
     let state_for_add_insert = Arc::clone(&state);
     conn.db.encounter_add().on_insert(move |_ctx, row| {
@@ -1111,9 +1133,10 @@ pub fn run(config: CoordinatorConfig) {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.sim.register_encounter_add_with_tags(
+        guard.sim.register_encounter_add_with_archetype(
             EntityId(row.add_entity),
             EntityId(row.boss_entity),
+            &row.archetype,
             &row.tags,
         );
     });
@@ -1121,6 +1144,7 @@ pub fn run(config: CoordinatorConfig) {
     // Symmetric on_delete: clear mirrored worker state when the reducer
     // cascade-deletes membership rows (especially via `by_boss()` on boss
     // death, where the add entity may briefly outlive its membership row).
+    // See `docs/contracts/spawn_add_membership_contract.md`.
     let state_for_add_delete = Arc::clone(&state);
     conn.db.encounter_add().on_delete(move |_ctx, row| {
         let mut guard = match state_for_add_delete.lock() {
@@ -1215,6 +1239,141 @@ pub fn run(config: CoordinatorConfig) {
         };
         debug!("npc_goal.on_delete: entity={}", row.entity_id);
         guard.sim.remove_npc_goal(EntityId(row.entity_id));
+    });
+
+    // ── Instance Membership disconnect projection ──────────────────
+    // Mirror `InstanceMembership.disconnect_at.is_some()` into the worker's
+    // `disconnected_players` set so Phase 7.5 can exclude reconnect-grace
+    // players from the active region count. The membership row itself stays
+    // authoritative server-side (the worker never writes it); we only project
+    // the boolean "is currently disconnected" projection. See
+    // `docs/contracts/world_activity_policy_contract.md` "no offscreen
+    // combat" rule and the 2026-06-09 messaging-spine review.
+
+    let state_for_im_insert = Arc::clone(&state);
+    conn.db.instance_membership().on_insert(move |_ctx, row| {
+        let mut guard = match state_for_im_insert.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let disconnected = row.disconnect_at.is_some();
+        debug!(
+            "instance_membership.on_insert: entity={} instance={} disconnected={}",
+            row.entity_id, row.instance_id, disconnected
+        );
+        guard
+            .sim
+            .set_player_disconnected(EntityId(row.entity_id), disconnected);
+    });
+
+    let state_for_im_update = Arc::clone(&state);
+    conn.db
+        .instance_membership()
+        .on_update(move |_ctx, _old, row| {
+            let mut guard = match state_for_im_update.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let disconnected = row.disconnect_at.is_some();
+            debug!(
+                "instance_membership.on_update: entity={} disconnected={}",
+                row.entity_id, disconnected
+            );
+            guard
+                .sim
+                .set_player_disconnected(EntityId(row.entity_id), disconnected);
+        });
+
+    let state_for_im_delete = Arc::clone(&state);
+    conn.db.instance_membership().on_delete(move |_ctx, row| {
+        let mut guard = match state_for_im_delete.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        debug!("instance_membership.on_delete: entity={}", row.entity_id);
+        // Membership delete (leave/expire) clears the disconnect projection.
+        // The Player entity may persist for open-world play, in which case it
+        // should count again toward region presence.
+        guard
+            .sim
+            .set_player_disconnected(EntityId(row.entity_id), false);
+    });
+
+    // ── World Activity Event projection ────────────────────────────
+    // Mirror `world_activity_event` rows into the worker's lookup map
+    // so `DirectorTrigger::WorldActivityEventActive` can gate on both
+    // event state and per-region presence. The scope key matches what
+    // the server reducer writes:
+    //   - open-world events: scope_layer = 0, real (rx, rz)
+    //   - instance events:   scope_layer = instance.layer, (0, 0)
+    // See `docs/contracts/world_activity_policy_contract.md` and step 4
+    // of the 2026-06-09 messaging-spine review.
+
+    fn map_wae_state(s: WorldActivityEventState) -> game_schema::WorldActivityEventState {
+        match s {
+            WorldActivityEventState::Pending => game_schema::WorldActivityEventState::Pending,
+            WorldActivityEventState::Active => game_schema::WorldActivityEventState::Active,
+            WorldActivityEventState::Completed => game_schema::WorldActivityEventState::Completed,
+            WorldActivityEventState::Expired => game_schema::WorldActivityEventState::Expired,
+        }
+    }
+
+    let state_for_wae_insert = Arc::clone(&state);
+    conn.db.world_activity_event().on_insert(move |_ctx, row| {
+        let mut guard = match state_for_wae_insert.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        debug!(
+            "world_activity_event.on_insert: scope=({},{},{}) tag='{}' state={:?}",
+            row.scope_layer, row.scope_region_x, row.scope_region_z, row.tag, row.state
+        );
+        guard.sim.set_world_activity_event(
+            row.scope_layer,
+            row.scope_region_x,
+            row.scope_region_z,
+            row.tag.clone(),
+            map_wae_state(row.state),
+        );
+    });
+
+    let state_for_wae_update = Arc::clone(&state);
+    conn.db
+        .world_activity_event()
+        .on_update(move |_ctx, _old, row| {
+            let mut guard = match state_for_wae_update.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            debug!(
+                "world_activity_event.on_update: scope=({},{},{}) tag='{}' state={:?}",
+                row.scope_layer, row.scope_region_x, row.scope_region_z, row.tag, row.state
+            );
+            guard.sim.set_world_activity_event(
+                row.scope_layer,
+                row.scope_region_x,
+                row.scope_region_z,
+                row.tag.clone(),
+                map_wae_state(row.state),
+            );
+        });
+
+    let state_for_wae_delete = Arc::clone(&state);
+    conn.db.world_activity_event().on_delete(move |_ctx, row| {
+        let mut guard = match state_for_wae_delete.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        debug!(
+            "world_activity_event.on_delete: scope=({},{},{}) tag='{}'",
+            row.scope_layer, row.scope_region_x, row.scope_region_z, row.tag
+        );
+        guard.sim.remove_world_activity_event(
+            row.scope_layer,
+            row.scope_region_x,
+            row.scope_region_z,
+            row.tag.clone(),
+        );
     });
 
     let state_for_equip_insert = Arc::clone(&state);
@@ -1460,8 +1619,10 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
             "SELECT * FROM player_equipment",
             "SELECT * FROM player_inventory",
             "SELECT * FROM instance",
+            "SELECT * FROM instance_membership",
             "SELECT * FROM interactable_config",
             "SELECT * FROM world_phase",
+            "SELECT * FROM world_activity_event",
             "SELECT * FROM npc_goal",
             "SELECT * FROM npc_config",
             "SELECT * FROM entity_team",
@@ -1724,6 +1885,27 @@ fn load_items() -> game_core::stats::ItemRegistry {
         Err(e) => {
             warn!("Could not load {PATH} ({e}) — using hardcoded fallback");
             build_item_registry()
+        }
+    }
+}
+
+fn load_loot_tables(items: &game_core::stats::ItemRegistry) -> game_core::loot::LootRegistry {
+    const PATH: &str = "data/loot_tables.ron";
+    let result = std::fs::read_to_string(PATH)
+        .map_err(|e| format!("read '{PATH}': {e}"))
+        .and_then(|src| {
+            game_core::loot::LootRegistry::from_ron(&src, items)
+                .map_err(|e| format!("parse '{PATH}': {e}"))
+        });
+
+    match result {
+        Ok(registry) => {
+            info!("Loaded {} loot table(s) from {PATH}", registry.len());
+            registry
+        }
+        Err(e) => {
+            warn!("Could not load {PATH} ({e}) — using empty loot registry");
+            game_core::loot::LootRegistry::new()
         }
     }
 }
@@ -2104,7 +2286,7 @@ impl TerrainState {
 ///    The collider rebuild itself happens through the deferred edit
 ///    queue (see `TerrainState::pending_edits`), draining at the start
 ///    of each tick. This keeps mid-tick BVH rebuilds out of the hot
-///    path.
+///    path (see `docs/plan/plan.md` §4.8b, Phase 5).
 /// 4. The layer's `LayerCollisionPolicy`, registered last so policy
 ///    queries during the materialisation itself never observe a
 ///    half-built layer.
@@ -2152,7 +2334,7 @@ fn load_encounters() -> game_core::encounter::EncounterRegistry {
             let count = file.encounters.len();
             let mut reg = EncounterRegistry::new();
             for def in file.encounters {
-                reg.register(def.name, def.rules);
+                reg.register_script(def);
             }
             info!("Loaded {count} encounter definition(s) from {PATH}");
             reg
@@ -2167,19 +2349,39 @@ fn load_encounters() -> game_core::encounter::EncounterRegistry {
 fn resolve_boss_encounter_rules(
     encounters: &game_core::encounter::EncounterRegistry,
     configured_key: Option<&str>,
-) -> Option<(String, Vec<game_core::encounter::Rule>, bool)> {
+) -> Option<(
+    String,
+    Vec<game_core::encounter::Rule>,
+    Option<String>,
+    bool,
+)> {
     if let Some(key) = configured_key.filter(|k| !k.is_empty()) {
         if let Some(rules) = encounters.rules_for(key) {
-            return Some((key.to_string(), rules, false));
+            return Some((
+                key.to_string(),
+                rules,
+                encounters.loot_table_for(key).map(str::to_string),
+                false,
+            ));
         }
-        return encounters
-            .rules_for("default")
-            .map(|rules| ("default".to_string(), rules, true));
+        return encounters.rules_for("default").map(|rules| {
+            (
+                "default".to_string(),
+                rules,
+                encounters.loot_table_for("default").map(str::to_string),
+                true,
+            )
+        });
     }
 
-    encounters
-        .rules_for("default")
-        .map(|rules| ("default".to_string(), rules, false))
+    encounters.rules_for("default").map(|rules| {
+        (
+            "default".to_string(),
+            rules,
+            encounters.loot_table_for("default").map(str::to_string),
+            false,
+        )
+    })
 }
 
 // ── Spawn-rules registry ────────────────────────────────────────
@@ -2344,6 +2546,8 @@ fn convert_interactable_info(
         crate::module_bindings::InteractKind::Gate => SimInteractKind::Gate,
         crate::module_bindings::InteractKind::Grab => SimInteractKind::Grab,
         crate::module_bindings::InteractKind::Chest => SimInteractKind::Chest,
+        crate::module_bindings::InteractKind::BossSpawn => SimInteractKind::BossSpawn,
+        crate::module_bindings::InteractKind::NpcSpawn => SimInteractKind::NpcSpawn,
     };
     let state = match row.state {
         crate::module_bindings::InteractState::Idle => SimInteractState::Idle,
@@ -2416,9 +2620,11 @@ fn wire_combat_event(e: &CommitCombatEvent) -> CombatEventInput {
             CommitCombatEventKind::CastStart {
                 ability_id,
                 cast_duration_ticks,
+                effective_cooldown_ticks,
             } => CombatEventKind::CastStart(CastStartData {
                 ability_id: *ability_id,
                 cast_duration_ticks: *cast_duration_ticks,
+                effective_cooldown_ticks: *effective_cooldown_ticks,
             }),
             CommitCombatEventKind::ChargeStart {
                 ability_id,
@@ -2661,6 +2867,20 @@ fn wire_combat_event(e: &CommitCombatEvent) -> CombatEventInput {
             CommitCombatEventKind::Healed { amount } => {
                 CombatEventKind::Healed(HealedData { amount: *amount })
             }
+            CommitCombatEventKind::AbilityCancelled { ability_id, reason } => {
+                use game_protocol::event::AbilityCancelReason as Reason;
+                CombatEventKind::AbilityCancelled(AbilityCancelledData {
+                    ability_id: *ability_id,
+                    reason: match reason {
+                        Reason::Death => AbilityCancelReasonWire::Death,
+                        Reason::HardCC => AbilityCancelReasonWire::HardCc,
+                        Reason::Manual => AbilityCancelReasonWire::Manual,
+                        Reason::Movement => AbilityCancelReasonWire::Movement,
+                        Reason::Damage => AbilityCancelReasonWire::Damage,
+                        Reason::Replaced => AbilityCancelReasonWire::Replaced,
+                    },
+                })
+            }
         },
     }
 }
@@ -2747,6 +2967,17 @@ fn wire_director_spawns(pkg: &CommitPackage) -> Vec<DirectorSpawnInput> {
             pos_y: s.pos_y,
             pos_z: s.pos_z,
             layer: s.layer,
+            npc_config: s.npc_config.as_ref().map(|cfg| {
+                crate::module_bindings::DirectorNpcConfigInput {
+                    passive: cfg.passive,
+                    no_chase: cfg.no_chase,
+                    ability_ids: cfg.ability_ids.clone(),
+                    leash_radius: cfg.leash_radius,
+                    aggro_radius: cfg.aggro_radius,
+                    body_shape: cfg.body_shape,
+                }
+            }),
+            team_id: s.team_id,
         })
         .collect()
 }
@@ -2786,6 +3017,29 @@ fn wire_death_state_inserts(pkg: &CommitPackage) -> Vec<DeathStateInsertInput> {
             death_pos_x: d.death_pos_x,
             death_pos_y: d.death_pos_y,
             death_pos_z: d.death_pos_z,
+        })
+        .collect()
+}
+
+fn wire_loot_rolls(pkg: &CommitPackage) -> Vec<crate::module_bindings::LootRollInput> {
+    pkg.loot_rolls
+        .iter()
+        .map(|roll| crate::module_bindings::LootRollInput {
+            corpse_entity: roll.corpse_entity,
+            layer: roll.layer,
+            pos_x: roll.pos_x,
+            pos_y: roll.pos_y,
+            pos_z: roll.pos_z,
+            eligible_claimants: roll.eligible_claimants.clone(),
+            claim_window_ticks: roll.claim_window_ticks,
+            items: roll
+                .items
+                .iter()
+                .map(|item| crate::module_bindings::LootRollItemInput {
+                    item_id: item.item_id,
+                    quantity: item.quantity,
+                })
+                .collect(),
         })
         .collect()
 }
@@ -3180,9 +3434,10 @@ mod tests {
             one_rule(game_core::encounter::BossPhase::Phase3),
         );
 
-        let (key, rules, fell_back) =
+        let (key, rules, loot_table_id, fell_back) =
             resolve_boss_encounter_rules(&reg, Some("state_enter_demo")).expect("rules");
         assert_eq!(key, "state_enter_demo");
+        assert_eq!(loot_table_id, None);
         assert!(!fell_back);
         assert_eq!(rules.len(), 1);
     }
@@ -3195,9 +3450,10 @@ mod tests {
             one_rule(game_core::encounter::BossPhase::Phase2),
         );
 
-        let (key, rules, fell_back) =
+        let (key, rules, loot_table_id, fell_back) =
             resolve_boss_encounter_rules(&reg, Some("missing_key")).expect("fallback rules");
         assert_eq!(key, "default");
+        assert_eq!(loot_table_id, None);
         assert!(fell_back);
         assert_eq!(rules.len(), 1);
     }
@@ -3210,9 +3466,10 @@ mod tests {
             one_rule(game_core::encounter::BossPhase::Phase2),
         );
 
-        let (key, rules, fell_back) =
+        let (key, rules, loot_table_id, fell_back) =
             resolve_boss_encounter_rules(&reg, None).expect("default rules");
         assert_eq!(key, "default");
+        assert_eq!(loot_table_id, None);
         assert!(!fell_back);
         assert_eq!(rules.len(), 1);
     }

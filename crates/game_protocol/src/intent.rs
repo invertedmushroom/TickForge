@@ -9,7 +9,7 @@ pub use game_schema::{AbilityTarget, BlockData, IntentAction, MoveDir, UseAbilit
 /// Client input bound to a specific simulation tick.
 ///
 /// Per spec: inputs must be explicitly bound to a tick to prevent drift.
-/// Reducers compute: target_tick = current_tick + 1.
+/// Reducers compute target_tick from the server-owned intent clock policy.
 /// The simulation worker only processes intents where target_tick == current_tick.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlayerIntent {
@@ -19,8 +19,9 @@ pub struct PlayerIntent {
     pub sequence_id: u64,
     /// The tick this intent should be processed on.
     pub target_tick: TickId,
-    /// The tick the client had last rendered when the intent was created.
-    /// Used for lag compensation rewind. 0 means no rewind (legacy/local client).
+    /// The tick the client had last rendered in the same clock domain when the
+    /// intent was created. Used for lag compensation rewind. 0 means no rewind
+    /// (legacy/local client).
     pub client_observed_tick: u64,
     /// What the player wants to do.
     pub action: IntentAction,

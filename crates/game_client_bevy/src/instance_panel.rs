@@ -160,26 +160,26 @@ fn update_instance_panel(
     **text = lines.join("\n");
 }
 
-/// F6 = create test instance, F7 = leave instance.
-fn handle_instance_keys(keyboard: Res<ButtonInput<KeyCode>>, stdb: Option<Res<StdbConnection>>) {
+/// F6 = create + join test instance, F7 = leave instance.
+fn handle_instance_keys(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    stdb: Option<Res<StdbConnection>>,
+    local_player: Res<LocalPlayerEntity>,
+) {
     let Some(stdb) = stdb else { return };
 
     if keyboard.just_pressed(KeyCode::F6) {
-        // Temporary debug UI path: this calls the production `create_instance`
-        // reducer directly. On the server that reducer is trusted/admin-only,
-        // so normal player clients should expect this to fail unless the
-        // caller is running with elevated debug privileges.
-        //
-        // Once the debug reducer is available in generated bindings, switch to:
-        //   stdb.conn.reducers.debug_create_instance(entity_id)
-        // which creates the instance and joins it in one step.
-        match stdb
-            .conn
-            .reducers
-            .create_instance("test_dungeon_01".into(), 4)
-        {
-            Ok(()) => log::info!("create_instance called (test_dungeon_01)"),
-            Err(e) => log::warn!("create_instance failed: {e}"),
+        let Some(entity_id) = local_player.entity_id else {
+            log::warn!("debug_create_instance_for_template skipped: local entity not ready");
+            return;
+        };
+        match stdb.conn.reducers.debug_create_instance_for_template(
+            entity_id,
+            "test_dungeon_01".into(),
+            4,
+        ) {
+            Ok(()) => log::info!("debug_create_instance_for_template called (test_dungeon_01)"),
+            Err(e) => log::warn!("debug_create_instance_for_template failed: {e}"),
         }
     }
 

@@ -15,6 +15,10 @@ pub enum InteractKind {
     Grab,
 
     Chest,
+
+    BossSpawn,
+
+    NpcSpawn,
 }
 
 impl __sdk::InModule for InteractKind {

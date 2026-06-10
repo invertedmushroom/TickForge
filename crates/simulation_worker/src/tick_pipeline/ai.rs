@@ -1,4 +1,8 @@
 use super::*;
+use game_core::ai::decision::{
+    AiBlackboard, AiDecisionPolicy, AiStateChangeReason, DesiredAiAction, FsmAiPolicy,
+};
+use game_core::combat::status::DEFAULT_THREAT_SWITCH_ADVANTAGE;
 
 #[derive(Clone, Debug)]
 enum EncounterTargeting {
@@ -10,19 +14,551 @@ enum EncounterTargeting {
     MultiLockOn(Vec<EntityId>),
 }
 
+const CHASE_DIRECT_ARRIVE_RADIUS: f32 = 1.0;
+const CHASE_SLOT_RADIUS: f32 = 1.35;
+const CHASE_SLOT_ARRIVE_RADIUS: f32 = 0.35;
+const THREAT_TARGETABLE_EPSILON: f32 = 0.001;
+
+fn advance_route_state_if_arrived(
+    state: &mut game_core::ai::routes::RouteFollowState,
+    route: &game_core::ai::routes::RouteDef,
+    current_pos: Vec3f,
+) {
+    while !state.completed {
+        let Some(target) = route.waypoints.get(state.waypoint_index).copied() else {
+            state.completed = true;
+            return;
+        };
+        let dx = target.x - current_pos.x;
+        let dz = target.z - current_pos.z;
+        if dx * dx + dz * dz > route.arrive_radius * route.arrive_radius {
+            return;
+        }
+        let next_index = state.waypoint_index.saturating_add(1);
+        if next_index < route.waypoints.len() {
+            state.waypoint_index = next_index;
+        } else if route.looped {
+            state.waypoint_index = 0;
+        } else {
+            state.completed = true;
+        }
+    }
+}
+
+fn threat_value_is_targetable(threat: f32) -> bool {
+    threat.is_finite() && threat > THREAT_TARGETABLE_EPSILON
+}
+
 impl TickPipeline {
     // ── Phase 7: AI decisions ───────────────────────────────────
 
+    pub(super) fn build_ai_blackboard(&self, idx: EntityIndex) -> Option<AiBlackboard<'_>> {
+        let self_id = self.state.entities.id_of(idx);
+        let state = self.state.ai.npc_ai.get(idx).copied()?;
+        let transform = self.physics.get_transform(self_id)?;
+
+        let mut blackboard = AiBlackboard::new(self_id, state, transform.position);
+        blackboard.layer = self.layer_of_idx(idx);
+        blackboard.home_position = self.state.ai.home_positions.get(idx).copied();
+        let current_target = self
+            .npc_state_prev
+            .get(&self_id)
+            .and_then(|(_, target)| *target);
+        if let Some(table) = self.state.combat.threat_tables.get(idx) {
+            blackboard.top_threat = self.top_perceived_threat(idx, table);
+            blackboard.selected_target = self.select_perceived_target_with_hysteresis(
+                idx,
+                table,
+                current_target,
+                DEFAULT_THREAT_SWITCH_ADVANTAGE,
+            );
+        }
+        blackboard.current_target = current_target;
+        blackboard.goal_kind = self
+            .npc_goals
+            .get(&self_id)
+            .map(|(goal_kind, _)| goal_kind.as_str());
+        blackboard.cc_disabled = self.is_cc_disabled(idx);
+        blackboard.silenced = self.is_silenced(idx);
+        blackboard.rooted = self.is_rooted(idx);
+        blackboard.no_chase = self.state.ai.npc_no_chase.get(idx).copied() == Some(true);
+        blackboard.leash_radius = self
+            .state
+            .ai
+            .npc_leash_radius
+            .get(idx)
+            .copied()
+            .unwrap_or(0.0);
+        blackboard.aggro_radius = self
+            .state
+            .ai
+            .npc_aggro_radius
+            .get(idx)
+            .copied()
+            .unwrap_or(0.0);
+
+        Some(blackboard)
+    }
+
+    fn entity_is_stealthed(&self, target_idx: EntityIndex) -> bool {
+        self.state
+            .status
+            .get_buffs(target_idx)
+            .iter()
+            .any(|buff| buff.modifiers.stealth == Some(true))
+    }
+
+    fn ai_can_perceive(&self, observer_idx: EntityIndex, target_idx: EntityIndex) -> bool {
+        if observer_idx == target_idx {
+            return true;
+        }
+        if !self.state.entities.is_active(target_idx) {
+            return false;
+        }
+        if !self.entity_is_stealthed(target_idx) {
+            return true;
+        }
+        let observer_team = self.team_of_idx(observer_idx);
+        let target_team = self.team_of_idx(target_idx);
+        observer_team != 0 && observer_team == target_team
+    }
+
+    fn top_perceived_threat(
+        &self,
+        observer_idx: EntityIndex,
+        table: &game_core::combat::status::ThreatTable,
+    ) -> Option<EntityId> {
+        table
+            .entries
+            .iter()
+            .filter(|entry| threat_value_is_targetable(entry.threat))
+            .filter(|entry| self.ai_target_is_valid(observer_idx, entry.source))
+            .max_by(|a, b| a.threat.total_cmp(&b.threat))
+            .map(|entry| entry.source)
+    }
+
+    fn select_perceived_target_with_hysteresis(
+        &self,
+        observer_idx: EntityIndex,
+        table: &game_core::combat::status::ThreatTable,
+        current_target: Option<EntityId>,
+        switch_advantage: f32,
+    ) -> Option<EntityId> {
+        let top_target = self.top_perceived_threat(observer_idx, table)?;
+        let top_threat = table.threat_of(top_target)?;
+        let Some(current_target) = current_target else {
+            return Some(top_target);
+        };
+        if current_target == top_target {
+            return Some(current_target);
+        }
+        if !self.ai_target_is_valid(observer_idx, current_target) {
+            return Some(top_target);
+        }
+        let Some(current_threat) = table.threat_of(current_target) else {
+            return Some(top_target);
+        };
+
+        let advantage = switch_advantage.max(0.0);
+        if top_threat > current_threat * (1.0 + advantage) {
+            Some(top_target)
+        } else {
+            Some(current_target)
+        }
+    }
+
+    fn apply_proximity_aggro(&mut self, idx: EntityIndex, players: &[EntityIndex]) {
+        let aggro = self
+            .state
+            .ai
+            .npc_aggro_radius
+            .get(idx)
+            .copied()
+            .unwrap_or(0.0);
+        if aggro <= 0.0 {
+            return;
+        }
+
+        let npc_id = self.state.entities.id_of(idx);
+        let npc_layer = self.layer_of_idx(idx);
+        let Some(npc_t) = self.physics.get_transform(npc_id) else {
+            return;
+        };
+        let npc_pos = npc_t.position;
+        let aggro_sq = aggro * aggro;
+
+        for &player_idx in players {
+            let player_id = self.state.entities.id_of(player_idx);
+            if self.layer_of_idx(player_idx) != npc_layer {
+                continue;
+            }
+            if !self.ai_can_perceive(idx, player_idx) {
+                continue;
+            }
+            let Some(player_t) = self.physics.get_transform(player_id) else {
+                continue;
+            };
+            let dx = player_t.position.x - npc_pos.x;
+            let dz = player_t.position.z - npc_pos.z;
+            if dx * dx + dz * dz > aggro_sq {
+                continue;
+            }
+
+            if !self.state.combat.threat_tables.contains(idx) {
+                self.state
+                    .combat
+                    .threat_tables
+                    .insert(idx, game_core::combat::status::ThreatTable::default());
+            }
+            let table = self.state.combat.threat_tables.get_mut(idx).unwrap();
+            if table.entries.iter().all(|entry| entry.source != player_id) {
+                table.entries.push(game_core::combat::status::ThreatEntry {
+                    source: player_id,
+                    threat: 1.0,
+                });
+            }
+            audit!(
+                self.state,
+                Ai,
+                AiDecisions,
+                7,
+                Some(npc_id),
+                "aggro_proximity"
+            );
+            break;
+        }
+    }
+
+    fn set_ai_state_for_reason(
+        &mut self,
+        idx: EntityIndex,
+        state: game_schema::NpcAiState,
+        reason: AiStateChangeReason,
+    ) {
+        if let Some(ai) = self.state.ai.npc_ai.get_mut(idx) {
+            *ai = state;
+        }
+        let npc_id = self.state.entities.id_of(idx);
+        match reason {
+            AiStateChangeReason::ToCombat => {
+                audit!(self.state, Ai, AiDecisions, 7, None, "to_combat");
+            }
+            AiStateChangeReason::CombatToIdle => {
+                audit!(self.state, Ai, AiDecisions, 7, None, "combat_to_idle");
+            }
+            AiStateChangeReason::LeashEvade => {
+                audit!(self.state, Ai, AiDecisions, 7, Some(npc_id), "leash_evade");
+            }
+            AiStateChangeReason::FleeToIdle => {
+                audit!(self.state, Ai, AiDecisions, 7, None, "flee_to_idle");
+            }
+            AiStateChangeReason::GoalIdle => {
+                audit!(self.state, Ai, AiDecisions, 7, Some(npc_id), "goal_idle");
+            }
+            AiStateChangeReason::EvadeNoHome => {}
+        }
+    }
+
+    fn sanitize_combat_threat_table(&mut self, idx: EntityIndex) {
+        let npc_layer = self.layer_of_idx(idx);
+        if let Some(table) = self.state.combat.threat_tables.get_mut(idx) {
+            let entities = &self.state.entities;
+            let cache = &self.entity_layer_cache;
+            table.entries.retain(|entry| {
+                entities.lookup(entry.source).map_or(false, |source_idx| {
+                    let slot = source_idx.as_usize();
+                    let source_layer = if slot < cache.len() { cache[slot] } else { 0 };
+                    let source_kind = entities.kinds[slot];
+                    source_layer == npc_layer
+                        && source_kind != game_core::entity::lifecycle::EntityKind::Prop
+                })
+            });
+        }
+    }
+
+    fn ai_target_is_valid(&self, idx: EntityIndex, target: EntityId) -> bool {
+        let npc_layer = self.layer_of_idx(idx);
+        self.state
+            .entities
+            .lookup(target)
+            .is_some_and(|target_idx| {
+                if !self.state.entities.is_active(target_idx)
+                    || !self.ai_can_perceive(idx, target_idx)
+                {
+                    return false;
+                }
+                let slot = target_idx.as_usize();
+                let target_layer = if slot < self.entity_layer_cache.len() {
+                    self.entity_layer_cache[slot]
+                } else {
+                    0
+                };
+                let target_kind = self.state.entities.kinds[slot];
+                target_layer == npc_layer
+                    && target_kind != game_core::entity::lifecycle::EntityKind::Prop
+            })
+    }
+
+    fn try_npc_cast_best_ability(
+        &mut self,
+        npc_id: EntityId,
+        idx: EntityIndex,
+        target_id: EntityId,
+    ) {
+        let ability_ids = self
+            .state
+            .ai
+            .npc_ability_ids
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| vec![1]);
+        for ability_id in ability_ids {
+            let Some(targeting) =
+                self.resolve_ai_ability_targeting(npc_id, idx, target_id, ability_id)
+            else {
+                continue;
+            };
+            if !self.reserve_ability_cast(npc_id, ability_id) {
+                continue;
+            }
+            if self.cast_ability(npc_id, ability_id, targeting, 0, 0) {
+                audit!(
+                    self.state,
+                    Execution,
+                    AiDecisions,
+                    7,
+                    Some(npc_id),
+                    "npc_cast"
+                );
+                break;
+            }
+            self.release_ability_reservation(npc_id, ability_id);
+        }
+    }
+
+    fn apply_evade_home(&mut self, npc_id: EntityId, idx: EntityIndex, home: Vec3f) {
+        self.npc_move_toward_pos(npc_id, home, self.dt);
+        audit!(
+            self.state,
+            Transform,
+            AiDecisions,
+            7,
+            Some(npc_id),
+            "evade_walk"
+        );
+
+        if let Some(npc_t) = self.physics.get_transform(npc_id) {
+            let dx = npc_t.position.x - home.x;
+            let dz = npc_t.position.z - home.z;
+            const R: f32 = game_core::physics_constants::EVADE_ARRIVE_RADIUS;
+            if dx * dx + dz * dz <= R * R {
+                if let Some(table) = self.state.combat.threat_tables.get_mut(idx) {
+                    table.entries.clear();
+                }
+                let max_hp = self.state.combat.health.max_hp[idx.as_usize()];
+                let current_hp = self.state.combat.health.hp[idx.as_usize()];
+                if current_hp < max_hp {
+                    self.pending_heals
+                        .push((npc_id, max_hp - current_hp, npc_id));
+                }
+                if let Some(ai) = self.state.ai.npc_ai.get_mut(idx) {
+                    *ai = game_schema::NpcAiState::Idle;
+                }
+                audit!(self.state, Ai, AiDecisions, 7, Some(npc_id), "evade_home");
+            }
+        }
+
+        if let Some(table) = self.state.combat.threat_tables.get_mut(idx) {
+            table.entries.clear();
+        }
+    }
+
+    fn collect_ai_action_plans(
+        &self,
+        ai_actors: &[EntityIndex],
+        skip_decisions: &HashSet<EntityIndex>,
+        actions: &mut Vec<DesiredAiAction>,
+        action_ranges: &mut Vec<(EntityIndex, usize, usize)>,
+        chase_slots: &mut Vec<(EntityId, EntityId)>,
+    ) {
+        actions.clear();
+        action_ranges.clear();
+        chase_slots.clear();
+        for idx in ai_actors {
+            if skip_decisions.contains(idx)
+                || self.state.ai.npc_passive.get(*idx).copied() == Some(true)
+            {
+                continue;
+            }
+            let Some(blackboard) = self.build_ai_blackboard(*idx) else {
+                continue;
+            };
+            let start = actions.len();
+            if let Some(policy) = self.ai_behavior_trees.get(&blackboard.self_id) {
+                policy.decide_into(&blackboard, actions);
+            } else {
+                FsmAiPolicy.decide_into(&blackboard, actions);
+            }
+            let end = actions.len();
+            if let Some(target) = actions[start..end].iter().find_map(|action| match action {
+                DesiredAiAction::MoveTowardEntity(target) => Some(*target),
+                _ => None,
+            }) && self.ai_target_is_valid(*idx, target)
+            {
+                chase_slots.push((target, blackboard.self_id));
+            }
+            action_ranges.push((*idx, start, end));
+        }
+        chase_slots.sort_by_key(|(target, actor)| (target.0, actor.0));
+    }
+
+    fn apply_desired_ai_actions(
+        &mut self,
+        idx: EntityIndex,
+        actions: &[DesiredAiAction],
+        chase_slots: &[(EntityId, EntityId)],
+    ) {
+        let npc_id = self.state.entities.id_of(idx);
+        for action in actions {
+            match action {
+                DesiredAiAction::SetState { state, reason } => {
+                    self.set_ai_state_for_reason(idx, *state, *reason);
+                }
+                DesiredAiAction::StopMovement => {}
+                DesiredAiAction::ClearThreat => {
+                    if let Some(table) = self.state.combat.threat_tables.get_mut(idx) {
+                        table.entries.clear();
+                    }
+                }
+                DesiredAiAction::MoveTowardEntity(target_id) => {
+                    if self.ai_target_is_valid(idx, *target_id) {
+                        self.npc_move_toward(npc_id, idx, *target_id, self.dt, chase_slots);
+                        audit!(self.state, Transform, AiDecisions, 7, Some(npc_id), "chase");
+                    }
+                }
+                DesiredAiAction::MoveAwayFromEntity(target_id) => {
+                    let npc_layer = self.layer_of_idx(idx);
+                    if self.layer_of(*target_id) == npc_layer {
+                        self.npc_move_away(npc_id, idx, *target_id, self.dt);
+                        audit!(self.state, Transform, AiDecisions, 7, Some(npc_id), "flee");
+                    }
+                }
+                DesiredAiAction::MoveToPoint(point) => {
+                    self.npc_move_toward_pos(npc_id, *point, self.dt);
+                    audit!(
+                        self.state,
+                        Transform,
+                        AiDecisions,
+                        7,
+                        Some(npc_id),
+                        "patrol"
+                    );
+                }
+                DesiredAiAction::FollowRoute { route_id } => {
+                    self.follow_ai_route(npc_id, idx, route_id.as_str());
+                }
+                DesiredAiAction::EvadeHome { home_position } => {
+                    self.ai_route_follow.remove(&npc_id);
+                    self.apply_evade_home(npc_id, idx, *home_position);
+                }
+                DesiredAiAction::TryCastBestAbility { target } => {
+                    if self.ai_target_is_valid(idx, *target) {
+                        self.try_npc_cast_best_ability(npc_id, idx, *target);
+                    }
+                }
+            }
+        }
+    }
+
+    fn follow_ai_route(&mut self, npc_id: EntityId, idx: EntityIndex, route_id: &str) {
+        if self.is_cc_disabled(idx) || self.is_rooted(idx) {
+            return;
+        }
+        // Borrow the route from the registry instead of cloning it. The waypoint
+        // vector and id are read-only here, so a shared borrow of `self.routes`
+        // coexists with disjoint mutable access to `self.ai_route_follow`.
+        let Some(route) = self.routes.get(route_id) else {
+            self.ai_route_follow.remove(&npc_id);
+            return;
+        };
+        if let Some(layer_scope) = route.layer_scope
+            && layer_scope != self.layer_of_idx(idx)
+        {
+            self.ai_route_follow.remove(&npc_id);
+            return;
+        }
+        let Some(current_pos) = self.physics.get_transform(npc_id).map(|t| t.position) else {
+            return;
+        };
+
+        // Resolve the next destination while the route borrow is live, then copy
+        // out the `Copy` values so the route borrow ends before the `&mut self`
+        // movement call below.
+        let resolved = {
+            let state = self
+                .ai_route_follow
+                .entry(npc_id)
+                .and_modify(|state| {
+                    if state.route_id != route.route_id {
+                        *state =
+                            game_core::ai::routes::RouteFollowState::new(route.route_id.clone());
+                    }
+                })
+                .or_insert_with(|| {
+                    game_core::ai::routes::RouteFollowState::new(route.route_id.clone())
+                });
+
+            if state.completed {
+                None
+            } else {
+                advance_route_state_if_arrived(state, route, current_pos);
+                if state.completed {
+                    None
+                } else {
+                    Some((route.waypoints[state.waypoint_index], route.arrive_radius))
+                }
+            }
+        };
+        let Some((destination, arrive_radius)) = resolved else {
+            return;
+        };
+
+        self.npc_move_toward_pos_with_radius(npc_id, destination, self.dt, arrive_radius);
+        audit!(
+            self.state,
+            Transform,
+            AiDecisions,
+            7,
+            Some(npc_id),
+            "route_follow"
+        );
+    }
+
     pub(super) fn phase_ai_decisions(&mut self) {
-        use game_core::combat::status::{AiOverride, ThreatTable};
+        use game_core::combat::status::AiOverride;
         use game_core::entity::lifecycle::{EntityKind, NpcAiState};
 
-        let npcs = self.state.active_indices_of_kind(EntityKind::Npc);
-        let bosses = self.state.active_indices_of_kind(EntityKind::Boss);
-        // Pre-compute player indices once for proximity aggro scanning.
-        let players = self.state.active_indices_of_kind(EntityKind::Player);
+        let mut ai_actors = std::mem::take(&mut self.ai_actor_indices_scratch);
+        ai_actors.clear();
+        self.state
+            .extend_active_indices_of_kind(EntityKind::Npc, &mut ai_actors);
+        self.state
+            .extend_active_indices_of_kind(EntityKind::Boss, &mut ai_actors);
 
-        for idx in npcs.iter().chain(bosses.iter()) {
+        // Pre-compute player indices once for proximity aggro scanning.
+        let mut players = std::mem::take(&mut self.ai_player_indices_scratch);
+        players.clear();
+        self.state
+            .extend_active_indices_of_kind(EntityKind::Player, &mut players);
+        let mut actions = std::mem::take(&mut self.ai_action_scratch);
+        let mut skip_decisions = std::mem::take(&mut self.ai_skip_decision_scratch);
+        skip_decisions.clear();
+        let mut chase_slots = std::mem::take(&mut self.ai_chase_slot_scratch);
+        chase_slots.clear();
+        let mut action_ranges = std::mem::take(&mut self.ai_action_ranges_scratch);
+        action_ranges.clear();
+
+        for idx in &ai_actors {
             // Passive NPCs never run AI (training dummies).
             if self.state.ai.npc_passive.get(*idx).copied() == Some(true) {
                 continue;
@@ -55,14 +591,40 @@ impl TickPipeline {
                             *ai = NpcAiState::Flee;
                         }
                         audit!(self.state, Ai, AiDecisions, 7, None, "override_flee");
-                        override_applied = true;
+                        skip_decisions.insert(*idx);
+
+                        if !self.is_cc_disabled(*idx) {
+                            let npc_id = self.state.entities.id_of(*idx);
+                            if let Some(threat_source) = self
+                                .state
+                                .combat
+                                .threat_tables
+                                .get(*idx)
+                                .and_then(|table| table.top_threat())
+                            {
+                                let npc_layer = self.layer_of_idx(*idx);
+                                if self.layer_of(threat_source) == npc_layer {
+                                    self.npc_move_away(npc_id, *idx, threat_source, self.dt);
+                                    audit!(
+                                        self.state,
+                                        Transform,
+                                        AiDecisions,
+                                        7,
+                                        Some(npc_id),
+                                        "flee"
+                                    );
+                                }
+                            }
+                        }
+                        continue;
                     }
                     AiOverride::ForceIdle => {
                         if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) {
                             *ai = NpcAiState::Idle;
                         }
                         audit!(self.state, Ai, AiDecisions, 7, None, "override_idle");
-                        override_applied = true;
+                        skip_decisions.insert(*idx);
+                        continue;
                     }
                     AiOverride::ForceFocus { target } => {
                         // Only force-focus if the target is still alive — the buff
@@ -116,356 +678,70 @@ impl TickPipeline {
                     }
                 }
             }
-            if !override_applied {
-                // Standard state transitions (do not perform movement here).
-                match ai_state {
-                    NpcAiState::Idle | NpcAiState::Patrol => {
-                        // Check if anyone is on the threat table → transition to Combat.
-                        if let Some(table) = self.state.combat.threat_tables.get(*idx)
-                            && table.top_threat().is_some()
-                        {
-                            if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) {
-                                *ai = NpcAiState::Combat;
-                            }
-                            audit!(self.state, Ai, AiDecisions, 7, None, "to_combat");
-                        } else {
-                            // Proximity aggro: scan for players within aggro_radius.
-                            // TODO: O(NPCs × Players) — replace with spatial partitioning
-                            // (e.g. region-cell query) when populations exceed ~50 idle NPCs.
-                            let aggro = self
-                                .state
-                                .ai
-                                .npc_aggro_radius
-                                .get(*idx)
-                                .copied()
-                                .unwrap_or(0.0);
-                            if aggro > 0.0 {
-                                let npc_id = self.state.entities.id_of(*idx);
-                                let npc_layer = self.layer_of_idx(*idx);
-                                if let Some(npc_t) = self.physics.get_transform(npc_id) {
-                                    let npc_pos = npc_t.position;
-                                    let aggro_sq = aggro * aggro;
-                                    for &p_idx in &players {
-                                        let p_id = self.state.entities.id_of(p_idx);
-                                        // Layer isolation: NPCs only aggro players on the same layer.
-                                        if self.layer_of_idx(p_idx) != npc_layer {
-                                            continue;
-                                        }
-                                        if let Some(p_t) = self.physics.get_transform(p_id) {
-                                            let dx = p_t.position.x - npc_pos.x;
-                                            let dz = p_t.position.z - npc_pos.z;
-                                            if dx * dx + dz * dz <= aggro_sq {
-                                                // Add initial threat + enter combat.
-                                                if !self.state.combat.threat_tables.contains(*idx) {
-                                                    self.state
-                                                        .combat
-                                                        .threat_tables
-                                                        .insert(*idx, ThreatTable::default());
-                                                }
-                                                let table = self
-                                                    .state
-                                                    .combat
-                                                    .threat_tables
-                                                    .get_mut(*idx)
-                                                    .unwrap();
-                                                if table.entries.iter().all(|e| e.source != p_id) {
-                                                    table.entries.push(
-                                                        game_core::combat::status::ThreatEntry {
-                                                            source: p_id,
-                                                            threat: 1.0,
-                                                        },
-                                                    );
-                                                }
-                                                if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx)
-                                                {
-                                                    *ai = NpcAiState::Combat;
-                                                }
-                                                audit!(
-                                                    self.state,
-                                                    Ai,
-                                                    AiDecisions,
-                                                    7,
-                                                    Some(npc_id),
-                                                    "aggro_proximity"
-                                                );
-                                                break; // One target is enough to enter combat.
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    NpcAiState::Combat => {
-                        // If threat table is empty, return to Idle.
-                        let top_target = self
-                            .state
-                            .combat
-                            .threat_tables
-                            .get(*idx)
-                            .and_then(|t| t.top_threat());
-                        match top_target {
-                            None => {
-                                if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) {
-                                    *ai = NpcAiState::Idle;
-                                }
-                                audit!(self.state, Ai, AiDecisions, 7, None, "combat_to_idle");
-                            }
-                            Some(_) => {
-                                // Leash check: if NPC exceeds leash radius from home → Evade.
-                                let leash = self
-                                    .state
-                                    .ai
-                                    .npc_leash_radius
-                                    .get(*idx)
-                                    .copied()
-                                    .unwrap_or(0.0);
-                                if leash > 0.0 {
-                                    if let Some(&home) = self.state.ai.home_positions.get(*idx) {
-                                        let npc_id = self.state.entities.id_of(*idx);
-                                        if let Some(npc_t) = self.physics.get_transform(npc_id) {
-                                            let dx = npc_t.position.x - home.x;
-                                            let dz = npc_t.position.z - home.z;
-                                            if dx * dx + dz * dz > leash * leash {
-                                                if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx)
-                                                {
-                                                    *ai = NpcAiState::Evade;
-                                                }
-                                                audit!(
-                                                    self.state,
-                                                    Ai,
-                                                    AiDecisions,
-                                                    7,
-                                                    Some(npc_id),
-                                                    "leash_evade"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    NpcAiState::Flee => {
-                        // Flee behavior: remain fleeing while any top threat exists.
-                        // Only return to Idle when no threats remain.
-                        let top_target = self
-                            .state
-                            .combat
-                            .threat_tables
-                            .get(*idx)
-                            .and_then(|t| t.top_threat());
-                        if top_target.is_none() {
-                            if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) {
-                                *ai = NpcAiState::Idle;
-                            }
-                            audit!(self.state, Ai, AiDecisions, 7, None, "flee_to_idle");
-                        }
-                    }
-                    NpcAiState::Scripted => {
-                        // Scripted NPCs check npc_goals for directives.
-                        // V1: "go_idle" causes transition back to Idle.
-                        let npc_id = self.state.entities.id_of(*idx);
-                        if let Some((goal_kind, _priority)) = self.npc_goals.get(&npc_id) {
-                            match goal_kind.as_str() {
-                                "go_idle" => {
-                                    if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) {
-                                        *ai = NpcAiState::Idle;
-                                    }
-                                    audit!(
-                                        self.state,
-                                        Ai,
-                                        AiDecisions,
-                                        7,
-                                        Some(npc_id),
-                                        "goal_idle"
-                                    );
-                                }
-                                _ => {
-                                    // Unknown goal kind — log and ignore.
-                                    log::trace!(
-                                        "NPC {} has unknown goal '{}'",
-                                        npc_id.0,
-                                        goal_kind
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    NpcAiState::Evade => {
-                        // Evade→Idle: handled in action execution when NPC reaches home.
-                    }
-                }
+            if !override_applied
+                && matches!(ai_state, NpcAiState::Idle | NpcAiState::Patrol)
+                && self
+                    .state
+                    .combat
+                    .threat_tables
+                    .get(*idx)
+                    .and_then(|table| self.top_perceived_threat(*idx, table))
+                    .is_none()
+            {
+                self.apply_proximity_aggro(*idx, &players);
             }
 
-            // 2) Action execution: run movement/behavior for the current state.
-            //
-            // CC-disabled NPCs (stunned, knocked down, launched, sleeping, feared)
-            // must not move or cast. Movement is also blocked by `is_rooted` inside
-            // `npc_step_toward`, but we skip the entire block here to also prevent
-            // casting while CC'd. Silenced NPCs can still move but cannot cast.
-            let cc_disabled = self.is_cc_disabled(*idx);
-            if cc_disabled {
-                continue;
-            }
-            let silenced = self.is_silenced(*idx);
-
-            let current_state = self.state.ai.npc_ai.get(*idx).copied().unwrap();
-            match current_state {
-                NpcAiState::Combat => {
-                    // Sanitize threat table: remove entries for entities on a different layer
-                    // or for non-combat entity kinds (Props should never be valid targets).
-                    let npc_id = self.state.entities.id_of(*idx);
-                    let npc_layer = self.layer_of_idx(*idx);
-                    if let Some(table) = self.state.combat.threat_tables.get_mut(*idx) {
-                        let entities = &self.state.entities;
-                        let cache = &self.entity_layer_cache;
-                        table.entries.retain(|e| {
-                            entities.lookup(e.source).map_or(false, |src_idx| {
-                                let slot = src_idx.as_usize();
-                                let src_layer = if slot < cache.len() { cache[slot] } else { 0 };
-                                let src_kind = entities.kinds[slot];
-                                src_layer == npc_layer
-                                    && src_kind != game_core::entity::lifecycle::EntityKind::Prop
-                            })
-                        });
-                    }
-                    if let Some(target_id) = self
-                        .state
-                        .combat
-                        .threat_tables
-                        .get(*idx)
-                        .and_then(|t| t.top_threat())
-                    {
-                        let no_chase = self.state.ai.npc_no_chase.get(*idx).copied() == Some(true);
-                        if !no_chase {
-                            self.npc_move_toward(npc_id, *idx, target_id, self.dt);
-                            audit!(self.state, Transform, AiDecisions, 7, Some(npc_id), "chase");
-                        }
-
-                        // Cast from this NPC's configured ability list.
-                        // Silenced NPCs can move but cannot cast.
-                        if !silenced {
-                            let ability_ids = self
-                                .state
-                                .ai
-                                .npc_ability_ids
-                                .get(*idx)
-                                .cloned()
-                                .unwrap_or_else(|| vec![1]);
-                            for &aid in &ability_ids {
-                                let Some(targeting) =
-                                    self.resolve_ai_ability_targeting(npc_id, *idx, target_id, aid)
-                                else {
-                                    continue;
-                                };
-                                if !self.reserve_ability_cast(npc_id, aid) {
-                                    continue;
-                                }
-                                if self.cast_ability(npc_id, aid, targeting, 0, 0) {
-                                    audit!(
-                                        self.state,
-                                        Execution,
-                                        AiDecisions,
-                                        7,
-                                        Some(npc_id),
-                                        "npc_cast"
-                                    );
-                                    break; // one cast per tick
-                                } else {
-                                    self.release_ability_reservation(npc_id, aid);
-                                }
-                            }
-                        }
-                    }
-                }
-                NpcAiState::Flee => {
-                    if let Some(threat_source) = self
-                        .state
-                        .combat
-                        .threat_tables
-                        .get(*idx)
-                        .and_then(|t| t.top_threat())
-                    {
-                        let npc_id = self.state.entities.id_of(*idx);
-                        let npc_layer = self.layer_of_idx(*idx);
-                        if self.layer_of(threat_source) != npc_layer {
-                            // Threat source is on a different layer; skip flee movement.
-                        } else {
-                            self.npc_move_away(npc_id, *idx, threat_source, self.dt);
-                            audit!(self.state, Transform, AiDecisions, 7, Some(npc_id), "flee");
-                        }
-                    }
-                }
-                NpcAiState::Patrol => {
-                    if let Some(&home) = self.state.ai.home_positions.get(*idx) {
-                        let npc_id = self.state.entities.id_of(*idx);
-                        self.npc_move_toward_pos(npc_id, home, self.dt);
-                        audit!(
-                            self.state,
-                            Transform,
-                            AiDecisions,
-                            7,
-                            Some(npc_id),
-                            "patrol"
-                        );
-                    }
-                }
-                NpcAiState::Evade => {
-                    // Walk home, clear threat, reset HP on arrival.
-                    let npc_id = self.state.entities.id_of(*idx);
-                    if let Some(&home) = self.state.ai.home_positions.get(*idx) {
-                        self.npc_move_toward_pos(npc_id, home, self.dt);
-                        audit!(
-                            self.state,
-                            Transform,
-                            AiDecisions,
-                            7,
-                            Some(npc_id),
-                            "evade_walk"
-                        );
-
-                        // Check arrival.
-                        if let Some(npc_t) = self.physics.get_transform(npc_id) {
-                            let dx = npc_t.position.x - home.x;
-                            let dz = npc_t.position.z - home.z;
-                            const R: f32 = game_core::physics_constants::EVADE_ARRIVE_RADIUS;
-                            if dx * dx + dz * dz <= R * R {
-                                // Arrived home: clear threat, reset HP, return to Idle.
-                                if let Some(table) = self.state.combat.threat_tables.get_mut(*idx) {
-                                    table.entries.clear();
-                                }
-                                // Queue full heal — applied in Phase 8b so Health
-                                // mutations stay centralised in combat/finalization.
-                                let max_hp = self.state.combat.health.max_hp[idx.as_usize()];
-                                let current_hp = self.state.combat.health.hp[idx.as_usize()];
-                                if current_hp < max_hp {
-                                    self.pending_heals
-                                        .push((npc_id, max_hp - current_hp, npc_id));
-                                }
-                                if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) {
-                                    *ai = NpcAiState::Idle;
-                                }
-                                audit!(self.state, Ai, AiDecisions, 7, Some(npc_id), "evade_home");
-                            }
-                        }
-                    } else {
-                        // No home recorded — snap to Idle.
-                        if let Some(ai) = self.state.ai.npc_ai.get_mut(*idx) {
-                            *ai = NpcAiState::Idle;
-                        }
-                    }
-                    // Clear threat each tick while evading so NPC doesn't re-enter combat.
-                    if let Some(table) = self.state.combat.threat_tables.get_mut(*idx) {
-                        table.entries.clear();
-                    }
-                }
-                _ => {}
-            }
+            self.sanitize_combat_threat_table(*idx);
         }
+
+        self.collect_ai_action_plans(
+            &ai_actors,
+            &skip_decisions,
+            &mut actions,
+            &mut action_ranges,
+            &mut chase_slots,
+        );
+
+        for (idx, start, end) in &action_ranges {
+            self.apply_desired_ai_actions(*idx, &actions[*start..*end], &chase_slots);
+        }
+        actions.clear();
+        action_ranges.clear();
+        ai_actors.clear();
+        players.clear();
+        skip_decisions.clear();
+        chase_slots.clear();
+        self.ai_action_scratch = actions;
+        self.ai_actor_indices_scratch = ai_actors;
+        self.ai_player_indices_scratch = players;
+        self.ai_skip_decision_scratch = skip_decisions;
+        self.ai_chase_slot_scratch = chase_slots;
+        self.ai_action_ranges_scratch = action_ranges;
     }
 
     // ── NPC movement helpers (Phase 7) ─────────────────────────
+
+    fn chase_slot_destination(
+        &self,
+        npc_id: EntityId,
+        target_id: EntityId,
+        chase_slots: &[(EntityId, EntityId)],
+    ) -> Option<Vec3f> {
+        let start = chase_slots.partition_point(|(target, _)| target.0 < target_id.0);
+        let end = chase_slots.partition_point(|(target, _)| target.0 <= target_id.0);
+        let group = &chase_slots[start..end];
+        if group.len() <= 1 {
+            return None;
+        }
+        let slot_index = group.iter().position(|(_, actor)| *actor == npc_id)?;
+        let target_pos = self.physics.get_transform(target_id)?.position;
+        let angle = (slot_index as f32 / group.len() as f32) * std::f32::consts::TAU;
+        Some(Vec3f {
+            x: target_pos.x + angle.cos() * CHASE_SLOT_RADIUS,
+            y: target_pos.y,
+            z: target_pos.z + angle.sin() * CHASE_SLOT_RADIUS,
+        })
+    }
 
     /// Move `npc_id` one step toward `target_id`'s current physics position.
     /// Uses the NPC's authoritative base speed. No-ops if either transform is unavailable.
@@ -475,6 +751,7 @@ impl TickPipeline {
         npc_idx: game_core::entity::entity_index::EntityIndex,
         target_id: EntityId,
         dt: f32,
+        chase_slots: &[(EntityId, EntityId)],
     ) {
         let (npc_pos, target_pos) = match (
             self.physics.get_transform(npc_id),
@@ -483,14 +760,18 @@ impl TickPipeline {
             (Some(a), Some(b)) => (a.position, b.position),
             _ => return,
         };
-        // Stop if already within melee range to prevent overshoot jitter.
-        const CHASE_ARRIVE_RADIUS: f32 = 1.0;
-        let dx = target_pos.x - npc_pos.x;
-        let dz = target_pos.z - npc_pos.z;
-        if dx * dx + dz * dz <= CHASE_ARRIVE_RADIUS * CHASE_ARRIVE_RADIUS {
+        let (destination, arrive_radius) =
+            if let Some(slot) = self.chase_slot_destination(npc_id, target_id, chase_slots) {
+                (slot, CHASE_SLOT_ARRIVE_RADIUS)
+            } else {
+                (target_pos, CHASE_DIRECT_ARRIVE_RADIUS)
+            };
+        let dx = destination.x - npc_pos.x;
+        let dz = destination.z - npc_pos.z;
+        if dx * dx + dz * dz <= arrive_radius * arrive_radius {
             return;
         }
-        self.npc_step_toward(npc_id, npc_idx, npc_pos, target_pos, dt);
+        self.npc_step_toward(npc_id, npc_idx, npc_pos, destination, dt);
     }
 
     /// Move `npc_id` one step away from `threat_source`'s current physics position.
@@ -521,7 +802,16 @@ impl TickPipeline {
     /// Move `npc_id` toward an explicit world position (used for patrol).
     /// No-ops when the NPC is already within `PATROL_ARRIVE_RADIUS` of the target.
     fn npc_move_toward_pos(&mut self, npc_id: EntityId, dest: Vec3f, dt: f32) {
-        const PATROL_ARRIVE_RADIUS: f32 = 0.5;
+        self.npc_move_toward_pos_with_radius(npc_id, dest, dt, 0.5);
+    }
+
+    fn npc_move_toward_pos_with_radius(
+        &mut self,
+        npc_id: EntityId,
+        dest: Vec3f,
+        dt: f32,
+        arrive_radius: f32,
+    ) {
         let npc_pos = match self.physics.get_transform(npc_id) {
             Some(t) => t.position,
             None => return,
@@ -529,7 +819,7 @@ impl TickPipeline {
         // Stop if already close enough — prevents micro-jitter at the home point.
         let dx = dest.x - npc_pos.x;
         let dz = dest.z - npc_pos.z;
-        if dx * dx + dz * dz <= PATROL_ARRIVE_RADIUS * PATROL_ARRIVE_RADIUS {
+        if dx * dx + dz * dz <= arrive_radius * arrive_radius {
             return;
         }
         let idx = if let Some(idx) = self.state.entities.lookup(npc_id) {
@@ -588,8 +878,26 @@ impl TickPipeline {
     /// for the coordinator to persist as DB rows.
     pub(super) fn phase_world_orchestration(&mut self) -> Vec<DirectorSpawn> {
         // Build region player counts from current entity_regions.
+        //
+        // Players currently in reconnect grace
+        // (`InstanceMembership.disconnect_at.is_some()`) are excluded — see
+        // `docs/contracts/world_activity_policy_contract.md` "no offscreen
+        // combat" rule. Their entity rows still exist (so reconnect can
+        // restore them) but they should not count as "present" for
+        // `PlayerCountAtLeast` / `WorldActivityEventActive` triggers or the
+        // Director's per-region scaling.
+        //
+        // Bare `WorldPhase` triggers do not consult this count, so they can
+        // still fire into an empty cell; the shipped `open_world_origin_boss`
+        // rule has been migrated to `WorldActivityEventActive` which combines
+        // a presence floor with a scoped event row. Authored rules that
+        // spawn actors should prefer `WorldActivityEventActive` over bare
+        // `WorldPhase` for the same reason.
         let mut region_player_counts: HashMap<(i32, i32, u32), u32> = HashMap::new();
         for (eid, cell) in &self.entity_regions {
+            if self.disconnected_players.contains(eid) {
+                continue;
+            }
             if let Some(idx) = self.state.entities.lookup(*eid) {
                 let i = idx.as_usize();
                 if self.state.entities.kinds[i] == game_core::entity::lifecycle::EntityKind::Player
@@ -607,8 +915,12 @@ impl TickPipeline {
         // coordinator can send them to SpacetimeDB via commit_tick_results.
         // The DB assigns canonical IDs and broadcasts entity.on_insert, which
         // the coordinator handles to materialize them into the local sim.
-        self.director
-            .evaluate(&region_player_counts, self.current_tick, &self.world_phases)
+        self.director.evaluate(
+            &region_player_counts,
+            self.current_tick,
+            &self.world_phases,
+            &self.world_activity_events,
+        )
     }
 
     /// Deterministic radial offset for scripted add spawns around the boss.
@@ -662,6 +974,31 @@ impl TickPipeline {
             );
             return;
         };
+        // Surface guard: SpawnAdds may only spawn Npc-kind add archetypes whose
+        // `usage` permits the encounter-add path. Anything else (ActorOnly
+        // rows, Boss-kind archetypes) is dropped at the source so we never
+        // commit a director spawn or a membership row that the worker would
+        // later refuse to install in `register_encounter_add_with_archetype`.
+        // content-check rejects these statically; this is the defensive
+        // runtime mirror for live-edited or otherwise-bypassed content.
+        if !profile.usage.allows_encounter_add() {
+            log::warn!(
+                "Encounter: boss {} SpawnAdds archetype '{}' has usage {:?}; encounter-add path requires Both or AddOnly — skipping",
+                boss_entity_id.0,
+                archetype,
+                profile.usage,
+            );
+            return;
+        }
+        if profile.kind != game_schema::EntityKind::Npc {
+            log::warn!(
+                "Encounter: boss {} SpawnAdds archetype '{}' has kind {:?}; only Npc-kind adds are supported — skipping",
+                boss_entity_id.0,
+                archetype,
+                profile.kind,
+            );
+            return;
+        }
         let Some(transform) = self.physics.get_transform(boss_entity_id) else {
             log::warn!(
                 "Encounter: boss {} spawn '{}' skipped (missing transform)",
@@ -728,6 +1065,8 @@ impl TickPipeline {
                     z: transform.position.z + offset.z,
                 },
                 layer,
+                npc_config: profile.director_npc_config(),
+                team_id: profile.team_id,
             });
             pending_memberships.push(game_core::director::PendingAddMembership {
                 spawn_index: local_index,
@@ -1338,7 +1677,7 @@ impl TickPipeline {
     fn resolve_ai_ability_targeting(
         &self,
         npc_id: EntityId,
-        npc_idx: EntityIndex,
+        _npc_idx: EntityIndex,
         target_id: EntityId,
         ability_id: u32,
     ) -> Option<ResolvedTargeting> {
@@ -1354,15 +1693,33 @@ impl TickPipeline {
         {
             return None;
         }
-        self.resolve_encounter_targetings(
-            npc_id,
-            npc_idx,
-            ability_id,
-            &game_core::encounter::Target::TopThreat,
-        )
-        .into_iter()
-        .next()
-        .map(Self::to_resolved_targeting)
+
+        match ability.targeting_mode {
+            TargetingMode::EntityTarget | TargetingMode::AimAssist => {
+                Some(ResolvedTargeting::Entity { target: target_id })
+            }
+            TargetingMode::LockOn { .. } => Some(ResolvedTargeting::MultiLockOn {
+                targets: vec![target_id],
+            }),
+            TargetingMode::GroundTarget => self
+                .physics
+                .get_transform(target_id)
+                .and_then(|target| {
+                    self.resolve_ground_target_point(npc_id, target.position, max_range)
+                })
+                .map(|point| ResolvedTargeting::Position { point }),
+            TargetingMode::CasterOffset => self
+                .physics
+                .get_transform(npc_id)
+                .map(|_| ResolvedTargeting::CasterOffset),
+            TargetingMode::SelfOnly => Some(ResolvedTargeting::SelfCast),
+            TargetingMode::DirectionTarget | TargetingMode::RaycastStrict => {
+                let caster_pos = self.physics.get_transform(npc_id)?.position;
+                let target_pos = self.physics.get_transform(target_id)?.position;
+                Self::direction_to(caster_pos, target_pos)
+                    .map(|dir| ResolvedTargeting::Direction { dir })
+            }
+        }
     }
 
     fn resolve_encounter_positions(
@@ -1564,12 +1921,10 @@ impl TickPipeline {
             .threat_tables
             .get(boss_idx)
             .is_some_and(|table| {
-                table.entries.iter().any(|entry| {
-                    let Some(idx) = self.state.entities.lookup(entry.source) else {
-                        return false;
-                    };
-                    self.layer_of_idx(idx) == boss_layer
-                })
+                table
+                    .entries
+                    .iter()
+                    .any(|entry| self.ai_target_is_valid(boss_idx, entry.source))
             })
         {
             return true;
@@ -1579,6 +1934,9 @@ impl TickPipeline {
             .into_iter()
             .any(|player_idx| {
                 if self.layer_of_idx(player_idx) != boss_layer {
+                    return false;
+                }
+                if !self.ai_can_perceive(boss_idx, player_idx) {
                     return false;
                 }
                 let player_id = self.state.entities.id_of(player_idx);
@@ -1623,6 +1981,9 @@ impl TickPipeline {
         let mut nearest: Option<(EntityId, f32)> = None;
         for player_idx in self.state.active_indices_of_kind(EntityKind::Player) {
             if self.layer_of_idx(player_idx) != boss_layer {
+                continue;
+            }
+            if !self.ai_can_perceive(boss_idx, player_idx) {
                 continue;
             }
             let player_id = self.state.entities.id_of(player_idx);

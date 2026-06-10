@@ -17,10 +17,7 @@ impl Plugin for CombatLogPlugin {
         // 16-param SystemParam impl limit for poll_combat_events).
         app.add_systems(Update, poll_combat_events.in_set(CombatLogSet::Poll));
         app.add_systems(Update, poll_world_events.in_set(CombatLogSet::Poll));
-        app.add_systems(
-            Update,
-            update_combat_log_text.after(CombatLogSet::Poll),
-        );
+        app.add_systems(Update, update_combat_log_text.after(CombatLogSet::Poll));
     }
 }
 
@@ -94,6 +91,7 @@ fn poll_combat_events(
         EventWriter<'_, crate::vfx::HitboxSpawnedEvent>,
         EventWriter<'_, crate::vfx::HitboxDamageFrameEvent>,
         EventWriter<'_, crate::vfx::HitboxRemovedEvent>,
+        ResMut<'_, crate::ability_bar::AbilityCooldowns>,
     ),
     mut buff_applied: EventWriter<crate::vfx::BuffAppliedVfxEvent>,
     mut teleported: EventWriter<crate::vfx::TeleportVfxEvent>,
@@ -116,8 +114,17 @@ fn poll_combat_events(
     while let Ok(ev) = events_res.combat_event_rx.try_recv() {
         new_events.push(ev);
     }
-    // Sort by sequence to ensure proper ordering within a tick batch.
-    new_events.sort_by_key(|ev| ev.event_sequence);
+    // Sort by (tick_id, event_sequence, event_id) — when multiple
+    // ticks queue in a single frame, a later tick with a lower
+    // sequence must not be processed before an older tick with a
+    // higher sequence, or AbilityCancelled could overtake the
+    // CastStart it should follow and leave local cooldown stale.
+    new_events.sort_by(|a, b| {
+        a.tick_id
+            .cmp(&b.tick_id)
+            .then_with(|| a.event_sequence.cmp(&b.event_sequence))
+            .then_with(|| a.event_id.cmp(&b.event_id))
+    });
 
     for ev in &new_events {
         let is_us_source = local_player.entity_id == Some(ev.source_entity);
@@ -241,6 +248,17 @@ fn poll_combat_events(
             // Skip HazardZone abilities (GroundTarget/CasterOffset) — those get
             // their own HazardSpawnEvent with the correct world position.
             CombatEventKind::CastStart(c) => {
+                // Server-authoritative cooldown reconciliation for the
+                // local player — overwrites the press-time prediction
+                // with the CDR-adjusted duration the server applied.
+                // See docs/contracts/ability_cast_lifecycle_contract.md.
+                if is_us_source {
+                    hitbox_events.3.activate_with_effective(
+                        c.ability_id,
+                        ev.tick_id,
+                        c.effective_cooldown_ticks,
+                    );
+                }
                 use crate::ability_bar::{ClientTargetingMode, all_abilities};
                 let is_hazard = all_abilities()
                     .iter()
@@ -257,6 +275,19 @@ fn poll_combat_events(
                         source_entity_id: ev.source_entity,
                         ability_id: c.ability_id,
                     });
+                }
+            }
+            // Server-authoritative cancel: clear local cooldown state.
+            // Only `Death` currently authorizes a hard cooldown clear.
+            // `HardCc` is emitted for server-side interrupts but does not
+            // imply a cooldown refund. Reserved reasons (Manual, Movement,
+            // Damage, Replaced) may have different client semantics later.
+            // See
+            // docs/contracts/ability_cast_lifecycle_contract.md.
+            CombatEventKind::AbilityCancelled(data) => {
+                use game_client::module_bindings::AbilityCancelReasonWire;
+                if is_us_source && matches!(data.reason, AbilityCancelReasonWire::Death) {
+                    hitbox_events.3.clear(data.ability_id);
                 }
             }
             // Proxy SkillHit → HitboxDamageFrame event so shape flashes red on contact.
@@ -646,6 +677,13 @@ fn format_combat_event(
                 Color::srgb(1.0, 0.85, 0.15),
             )
         }
+        CombatEventKind::AbilityCancelled(data) => (
+            format!(
+                "{src} cancelled ability {} ({:?})",
+                data.ability_id, data.reason
+            ),
+            Color::srgb(0.7, 0.7, 0.7),
+        ),
     }
 }
 

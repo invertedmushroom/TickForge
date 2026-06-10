@@ -532,7 +532,7 @@
         (
             ability_id: 25,
             actions: [
-                // Lava Pool: spawned 6 m in front of caster via CasterOffset, lingers 100 ticks (5 s)
+                // Lava Pool: spawned 6 m in front of caster via CasterOffset, lingers 500 ticks
                 (tick_offset: 0, action: SpawnConfiguredHitbox(
                     shape: HazardZone,
                     offset: (x: 0.0, y: 0.0, z: 6.0),
@@ -544,7 +544,7 @@
                 )),
                 (tick_offset: 0, action: CooldownStart(duration_ticks: 100)),
                 (tick_offset: 1, action: ApplyDamageFrame),
-                // Hazard zone stays armed for 100 ticks; periodic re-damage fires every 10 ticks
+                // Hazard zone stays armed for 500 ticks; periodic re-damage fires every 10 ticks
                 (tick_offset: 500, action: RemoveHitbox),
             ],
         ),

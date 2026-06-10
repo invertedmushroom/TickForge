@@ -1,5 +1,10 @@
 use crate::tables::*;
+use game_schema::intent_clock::{
+    DEFAULT_INTENT_INPUT_LEAD_TICKS, DEFAULT_OBSERVED_FUTURE_TOLERANCE_TICKS, IntentClockBinding,
+};
 use spacetimedb::{ReducerContext, Table, TimeDuration, reducer};
+
+const CLAIM_LOOT_MAX_DISTANCE_M: f32 = 4.0;
 
 // ── Lifecycle ───────────────────────────────────────────────────────
 
@@ -156,7 +161,7 @@ const PRUNE_INTERVAL: u64 = 20;
 
 #[reducer]
 pub fn tick_trigger(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String> {
-    if ctx.sender() != ctx.identity() {
+    if ctx.sender() != ctx.database_identity() {
         return Err("tick_trigger may only be invoked by the scheduler".into());
     }
 
@@ -248,11 +253,11 @@ pub fn tick_trigger(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(),
 
 // ── World Clock ─────────────────────────────────────────────────────
 // Tier 2 scheduled reducer (30s interval). Evaluates zone_counter
-// thresholds, transitions world_phase, writes npc_goal directives.
+// thresholds and transitions world_phase.
 
 #[reducer]
 pub fn world_clock(ctx: &ReducerContext, _schedule: WorldClockSchedule) -> Result<(), String> {
-    if ctx.sender() != ctx.identity() {
+    if ctx.sender() != ctx.database_identity() {
         return Err("world_clock may only be invoked by the scheduler".into());
     }
 
@@ -260,13 +265,16 @@ pub fn world_clock(ctx: &ReducerContext, _schedule: WorldClockSchedule) -> Resul
     let expiry_report = expire_instances_inner(ctx, now)?;
     if expiry_report.has_activity() {
         log::info!(
-            "world_clock: instance maintenance expired={} returned_members={} stale_members={} marked_despawn={} cleared_counters={} cleared_phases={}",
+            "world_clock: instance maintenance expired={} returned_members={} stale_members={} removed_entities={} cleared_buffs={} cleared_interactables={} cleared_counters={} cleared_phases={} cleared_world_events={}",
             expiry_report.expired_instances,
             expiry_report.returned_members,
             expiry_report.stale_members,
-            expiry_report.marked_despawn_entities,
+            expiry_report.removed_entities,
+            expiry_report.cleared_buffs,
+            expiry_report.cleared_interactables,
             expiry_report.cleared_counters,
             expiry_report.cleared_phases,
+            expiry_report.cleared_world_events,
         );
     }
 
@@ -291,6 +299,14 @@ pub fn world_clock(ctx: &ReducerContext, _schedule: WorldClockSchedule) -> Resul
         phase_name: &'static str,
         /// Higher priority wins when multiple rules match the same zone.
         priority: u32,
+        /// `required_players` for the matching `world_event` row produced
+        /// alongside the `world_phase` transition. Used by director
+        /// triggers gated on `WorldEventActive { tag, min_players }` to
+        /// prevent offscreen spawns (Finding #4, 2026-06-09 review).
+        /// `0` = no presence gate (terminal events like `completed`).
+        required_players: u32,
+        /// Initial state of the produced `world_event` row.
+        event_state: WorldActivityEventState,
     }
 
     const RULES: &[ThresholdRule] = &[
@@ -299,48 +315,50 @@ pub fn world_clock(ctx: &ReducerContext, _schedule: WorldClockSchedule) -> Resul
             threshold: 1.0,
             phase_name: "completed",
             priority: 10,
+            required_players: 0,
+            event_state: WorldActivityEventState::Completed,
         },
         ThresholdRule {
             counter_name: "kills",
             threshold: 5.0,
             phase_name: "boss_ready",
             priority: 1,
+            required_players: 1,
+            event_state: WorldActivityEventState::Active,
         },
     ];
 
-    // Collect all zone_counter rows into per-zone maps.
-    let mut zone_counters: std::collections::HashMap<(u32, i32, i32), Vec<(&str, f64)>> =
+    // Collect all zone_counter rows into per-zone summed maps.
+    //
+    // Sum same-name counters in the same zone defensively: writers go
+    // through `upsert_zone_counter` so logical-key uniqueness is
+    // maintained today, but if a legacy bug ever produced duplicate rows
+    // for the same `(layer, rx, rz, counter_name)`, this prevents
+    // world_clock from under-evaluating a threshold (Finding #5).
+    // `HashMap<(zone, name), f64>` makes the summation O(1) per row.
+    let mut zone_counters: std::collections::HashMap<(u32, i32, i32, String), f64> =
         std::collections::HashMap::new();
-    // We can't borrow counter_name across the iterator because the row is owned,
-    // so collect tuples first.
-    let counter_rows: Vec<_> = ctx
-        .db
-        .zone_counter()
-        .iter()
-        .map(|c| {
-            (
-                c.layer,
-                c.region_x,
-                c.region_z,
-                c.counter_name.clone(),
-                c.value,
-            )
-        })
-        .collect();
-    for (layer, rx, rz, name, value) in &counter_rows {
-        zone_counters
-            .entry((*layer, *rx, *rz))
+    for c in ctx.db.zone_counter().iter() {
+        *zone_counters
+            .entry((c.layer, c.region_x, c.region_z, c.counter_name.clone()))
+            .or_insert(0.0) += c.value;
+    }
+    let mut zones: std::collections::HashMap<(u32, i32, i32), Vec<(String, f64)>> =
+        std::collections::HashMap::new();
+    for ((layer, rx, rz, name), value) in zone_counters {
+        zones
+            .entry((layer, rx, rz))
             .or_default()
-            .push((name.as_str(), *value));
+            .push((name, value));
     }
 
-    for (&(layer, rx, rz), counters) in &zone_counters {
+    for (&(layer, rx, rz), counters) in &zones {
         // Find the highest-priority matching rule for this zone.
         let mut best: Option<&ThresholdRule> = None;
         for rule in RULES {
             let met = counters
                 .iter()
-                .any(|(name, val)| *name == rule.counter_name && *val >= rule.threshold);
+                .any(|(name, val)| name == rule.counter_name && *val >= rule.threshold);
             if met {
                 if best.map_or(true, |b| rule.priority > b.priority) {
                     best = Some(rule);
@@ -377,10 +395,29 @@ pub fn world_clock(ctx: &ReducerContext, _schedule: WorldClockSchedule) -> Resul
                     rule.threshold
                 );
             }
+            // Mirror the phase transition as a `world_activity_event` row so
+            // director triggers can gate on presence (Finding #4, messaging
+            // spine step 4). One row per logical `(scope, tag)` — the helper
+            // updates state in place if the row already exists, so a
+            // re-evaluation that lands on the same rule doesn't spam
+            // duplicates.
+            upsert_world_activity_event(
+                ctx,
+                layer,
+                rx,
+                rz,
+                rule.phase_name,
+                rule.event_state,
+                rule.required_players,
+                now,
+            );
+            if rule.phase_name == "completed" {
+                mark_instance_completed_for_layer(ctx, layer);
+            }
         }
     }
 
-    log::trace!("world_clock: evaluated {} zones", zone_counters.len());
+    log::trace!("world_clock: evaluated {} zones", zones.len());
     Ok(())
 }
 
@@ -392,6 +429,166 @@ fn synthesise_zone_id(layer: u32, rx: i32, rz: i32) -> u32 {
         .wrapping_mul(1_000_000)
         .wrapping_add(((rx + 500) as u32).wrapping_mul(1000))
         .wrapping_add((rz + 500) as u32)
+}
+
+/// Single upsert path for `zone_counter`.
+///
+/// SpacetimeDB v2 cannot enforce composite uniqueness in storage (see the
+/// `terrain_set` comment in `tables.rs`), so logical uniqueness on
+/// `(layer, region_x, region_z, counter_name)` is enforced by funnelling all
+/// writers through this one helper. `commit_tick_results` and the
+/// `increment_zone_counter` admin/debug reducer both call here. If a third
+/// raw-insert path is ever introduced, this helper is the place to add a
+/// linter check or a hard-fail. See Finding #5 in the 2026-06-09 messaging
+/// review and `world_clock`'s defensive summation for the read-side mirror.
+fn upsert_zone_counter(
+    ctx: &ReducerContext,
+    layer: u32,
+    region_x: i32,
+    region_z: i32,
+    counter_name: String,
+    delta: f64,
+) {
+    let existing = ctx
+        .db
+        .zone_counter()
+        .by_zone()
+        .filter((layer, region_x, region_z..=region_z))
+        .find(|c| c.counter_name == counter_name);
+
+    if let Some(mut row) = existing {
+        row.value += delta;
+        ctx.db.zone_counter().counter_id().update(row);
+    } else {
+        ctx.db.zone_counter().insert(ZoneCounter {
+            counter_id: 0,
+            layer,
+            region_x,
+            region_z,
+            counter_name,
+            value: delta,
+        });
+    }
+}
+
+/// Single upsert path for `world_activity_event`.
+///
+/// Same workspace pattern as `upsert_zone_counter`: SpacetimeDB v2 cannot
+/// express composite uniqueness in storage, so logical uniqueness on
+/// `(scope_layer, scope_region_x, scope_region_z, tag)` is enforced by
+/// routing all writers through here. When a row for the scope+tag
+/// already exists the state / required_players / payload are updated in
+/// place; `started_at` is only set on insert so timer-based events
+/// retain their original activation tick. Future kinds (Timer, Chain,
+/// Escalation) extend through `payload` without a schema migration. See
+/// the table comment in `tables.rs` and Finding #4 of the 2026-06-09
+/// messaging-spine review.
+fn upsert_world_activity_event(
+    ctx: &ReducerContext,
+    scope_layer: u32,
+    scope_region_x: i32,
+    scope_region_z: i32,
+    tag: &str,
+    state: WorldActivityEventState,
+    required_players: u32,
+    now_micros: i64,
+) {
+    let existing = ctx
+        .db
+        .world_activity_event()
+        .by_scope()
+        .filter((scope_layer, scope_region_x, scope_region_z..=scope_region_z))
+        .find(|e| e.tag == tag);
+
+    if let Some(mut row) = existing {
+        // Only write if something observable changed; avoids waking up
+        // every worker subscription on identical re-evaluations.
+        if row.state != state || row.required_players != required_players {
+            row.state = state;
+            row.required_players = required_players;
+            ctx.db.world_activity_event().event_id().update(row);
+        }
+    } else {
+        ctx.db.world_activity_event().insert(WorldActivityEvent {
+            event_id: 0,
+            scope_layer,
+            scope_region_x,
+            scope_region_z,
+            tag: tag.to_string(),
+            state,
+            required_players,
+            started_at: now_micros,
+            payload: String::new(),
+        });
+    }
+}
+
+fn mark_instance_completed_for_layer(ctx: &ReducerContext, layer: u32) {
+    if layer < 100 {
+        return;
+    }
+
+    let Some(instance) = ctx.db.instance().iter().find(|i| {
+        i.layer == layer && (i.state == InstanceState::Active || i.state == InstanceState::Pending)
+    }) else {
+        return;
+    };
+
+    ctx.db.instance().instance_id().update(Instance {
+        instance_id: instance.instance_id,
+        template_id: instance.template_id,
+        layer: instance.layer,
+        layer_group: instance.layer_group,
+        state: InstanceState::Completed,
+        created_at: instance.created_at,
+        expires_at: instance.expires_at,
+        max_players: instance.max_players,
+    });
+    log::info!(
+        "Instance completed: id={} layer={}",
+        instance.instance_id,
+        instance.layer
+    );
+}
+
+fn layer_has_completed_world_phase(ctx: &ReducerContext, layer: u32) -> bool {
+    ctx.db
+        .world_phase()
+        .iter()
+        .any(|wp| wp.phase_name == "completed" && wp.zone_id / 1_000_000 == layer)
+}
+
+#[derive(Clone, Copy)]
+struct IntentClockContext {
+    current_tick: u64,
+    max_rewind_ticks: u64,
+}
+
+fn read_intent_clock_context(ctx: &ReducerContext) -> Result<IntentClockContext, String> {
+    let cfg = ctx
+        .db
+        .module_config()
+        .key()
+        .find(0)
+        .ok_or("module_config missing")?;
+    Ok(IntentClockContext {
+        current_tick: cfg.next_tick_id,
+        max_rewind_ticks: cfg.global_max_rewind_ticks as u64,
+    })
+}
+
+fn bind_player_intent_clock(
+    clock: IntentClockContext,
+    client_observed_tick: u64,
+) -> Result<IntentClockBinding, String> {
+    game_schema::intent_clock::bind_intent_clock(
+        clock.current_tick,
+        DEFAULT_INTENT_INPUT_LEAD_TICKS,
+        client_observed_tick,
+        clock.max_rewind_ticks,
+        DEFAULT_OBSERVED_FUTURE_TOLERANCE_TICKS,
+    )
+    .map_err(|err| format!("Invalid client_observed_tick: {err}"))
 }
 
 // ── Player Input ────────────────────────────────────────────────────
@@ -442,23 +639,16 @@ pub fn submit_intent(
         return Err("Intent queue full: reduce submission rate".into());
     }
 
-    // Intents are always scheduled for the next simulation tick.
-    let current_tick = ctx
-        .db
-        .module_config()
-        .key()
-        .find(0)
-        .map(|c| c.next_tick_id)
-        .unwrap_or(0);
-    let target_tick = current_tick + 1;
+    let clock = read_intent_clock_context(ctx)?;
+    let binding = bind_player_intent_clock(clock, client_observed_tick)?;
 
     ctx.db.player_intent().insert(PlayerIntent {
         intent_id: 0, // auto_inc
         client_identity: caller,
         entity_id,
         sequence_id,
-        target_tick,
-        client_observed_tick,
+        target_tick: binding.target_tick,
+        client_observed_tick: binding.client_observed_tick,
         action,
     });
 
@@ -493,7 +683,7 @@ pub struct BatchedIntent {
 /// any entry that is either already processed (`sequence_id <=
 /// last_processed_sequence`) or already queued (matching `sequence_id` row
 /// already present for `entity_id`). New entries are scheduled for
-/// `current_tick + 1`, identical to the single-shot path.
+/// the server-owned intent clock policy, identical to the single-shot path.
 ///
 /// Rate-limit semantics: rather than rejecting the whole call when the
 /// resulting queue would exceed `MAX_QUEUED_INTENTS`, the server inserts
@@ -549,14 +739,11 @@ pub fn submit_intents_batch(
     let mut sorted = intents;
     sorted.sort_by_key(|i| i.sequence_id);
 
-    let current_tick = ctx
-        .db
-        .module_config()
-        .key()
-        .find(0)
-        .map(|c| c.next_tick_id)
-        .unwrap_or(0);
-    let target_tick = current_tick + 1;
+    let clock = read_intent_clock_context(ctx)?;
+    let target_tick = game_schema::intent_clock::compute_intent_target_tick(
+        clock.current_tick,
+        DEFAULT_INTENT_INPUT_LEAD_TICKS,
+    );
 
     const MAX_QUEUED_INTENTS: usize = 5;
     let mut highest_inserted: u64 = seq.last_processed_sequence;
@@ -564,6 +751,8 @@ pub fn submit_intents_batch(
     let mut stale = 0usize;
     let mut duplicate = 0usize;
     let mut dropped_queue_full = 0usize;
+
+    let mut pending_inserts: Vec<(BatchedIntent, u64)> = Vec::new();
 
     for intent in sorted {
         // Idempotent: already-processed intents are silently skipped.
@@ -587,21 +776,28 @@ pub fn submit_intents_batch(
             continue;
         }
 
+        let sequence_id = intent.sequence_id;
+        let binding = bind_player_intent_clock(clock, intent.client_observed_tick)?;
+
+        pending_inserts.push((intent, binding.client_observed_tick));
+        queued_seqs.insert(sequence_id);
+        queued_depth += 1;
+        inserted += 1;
+        if sequence_id > highest_inserted {
+            highest_inserted = sequence_id;
+        }
+    }
+
+    for (intent, client_observed_tick) in pending_inserts {
         ctx.db.player_intent().insert(PlayerIntent {
             intent_id: 0, // auto_inc
             client_identity: caller,
             entity_id,
             sequence_id: intent.sequence_id,
             target_tick,
-            client_observed_tick: intent.client_observed_tick,
+            client_observed_tick,
             action: intent.action,
         });
-        queued_seqs.insert(intent.sequence_id);
-        queued_depth += 1;
-        inserted += 1;
-        if intent.sequence_id > highest_inserted {
-            highest_inserted = intent.sequence_id;
-        }
     }
 
     // Telemetry: structured log when a batch produced anything other than
@@ -758,6 +954,19 @@ fn spawn_npc_internal(
     max_hp: f32,
     config: Option<NpcConfig>,
 ) -> u64 {
+    spawn_npc_internal_on_layer(ctx, kind, pos_x, pos_y, pos_z, max_hp, 0, config)
+}
+
+fn spawn_npc_internal_on_layer(
+    ctx: &ReducerContext,
+    kind: EntityKind,
+    pos_x: f32,
+    pos_y: f32,
+    pos_z: f32,
+    max_hp: f32,
+    layer: u32,
+    config: Option<NpcConfig>,
+) -> u64 {
     let current_tick = ctx
         .db
         .module_config()
@@ -806,12 +1015,12 @@ fn spawn_npc_internal(
         entity_id: eid,
         region_x: (pos_x / 50.0).floor() as i32,
         region_z: (pos_z / 50.0).floor() as i32,
-        layer: 0,
+        layer,
     });
 
     ctx.db.entity_layer().insert(EntityLayer {
         entity_id: eid,
-        layer: 0,
+        layer,
     });
 
     if let Some(mut cfg) = config {
@@ -850,7 +1059,7 @@ pub fn spawn_npc(
 
 /// Check if the caller is the module admin (the identity that published the module).
 fn is_module_admin(ctx: &ReducerContext) -> bool {
-    if ctx.sender() == ctx.identity() {
+    if ctx.sender() == ctx.database_identity() {
         return true;
     }
     ctx.db
@@ -862,7 +1071,7 @@ fn is_module_admin(ctx: &ReducerContext) -> bool {
 
 /// Check if the caller is the module itself or a registered simulation worker.
 fn is_trusted_caller(ctx: &ReducerContext) -> bool {
-    if ctx.sender() == ctx.identity() {
+    if ctx.sender() == ctx.database_identity() {
         return true;
     }
     ctx.db
@@ -901,6 +1110,7 @@ pub fn commit_tick_results(
     encounter_memberships: Vec<EncounterAddMembershipInput>,
     interactable_updates: Vec<InteractableUpdate>,
     death_state_inserts: Vec<DeathStateInsertInput>,
+    loot_rolls: Vec<LootRollInput>,
     sim_log_entries: Vec<SimLogInput>,
     boss_phase_updates: Vec<BossPhaseUpdateInput>,
     zone_counter_deltas: Vec<ZoneCounterDeltaInput>,
@@ -1050,38 +1260,7 @@ pub fn commit_tick_results(
             // Clean up companion rows for entities reaching terminal Removed state
             // so they disappear from nearby_transforms and other views.
             if u.new_state == EntityState::Removed {
-                ctx.db.entity_transform().entity_id().delete(&u.entity_id);
-                ctx.db.entity_region().entity_id().delete(&u.entity_id);
-                ctx.db.entity_layer().entity_id().delete(&u.entity_id);
-                ctx.db.entity_health().entity_id().delete(&u.entity_id);
-                ctx.db.npc_state().entity_id().delete(&u.entity_id);
-                ctx.db.npc_config().entity_id().delete(&u.entity_id);
-                ctx.db.stealthed_entity().entity_id().delete(&u.entity_id);
-                ctx.db.entity_team().entity_id().delete(&u.entity_id);
-                ctx.db.boss_phase().boss_entity_id().delete(&u.entity_id);
-                ctx.db.npc_goal().entity_id().delete(&u.entity_id);
-                ctx.db
-                    .instance_membership()
-                    .entity_id()
-                    .delete(&u.entity_id);
-                ctx.db
-                    .interactable_config()
-                    .entity_id()
-                    .delete(&u.entity_id);
-                // Encounter add membership: delete by add_entity (this entity
-                // was an add) and cascade by boss_entity (this entity was a
-                // boss whose adds are now orphaned).
-                ctx.db.encounter_add().add_entity().delete(&u.entity_id);
-                let orphan_ids: Vec<u64> = ctx
-                    .db
-                    .encounter_add()
-                    .by_boss()
-                    .filter(&u.entity_id)
-                    .map(|r| r.add_entity)
-                    .collect();
-                for add_id in orphan_ids {
-                    ctx.db.encounter_add().add_entity().delete(&add_id);
-                }
+                delete_removed_entity_companion_rows(ctx, u.entity_id);
                 // Note: death_state is NOT deleted here — players need it for respawn.
                 // Buff rows for Removed entities are already cleaned up by the
                 // buff_cleared section below — the worker explicitly adds Removed
@@ -1132,6 +1311,43 @@ pub fn commit_tick_results(
             death_pos_y: d.death_pos_y,
             death_pos_z: d.death_pos_z,
         });
+    }
+
+    for roll in loot_rolls {
+        if roll.items.is_empty() || roll.eligible_claimants.is_empty() {
+            log::warn!(
+                "commit_tick_results tick={}: dropping loot roll for corpse {} (items={}, claimants={})",
+                tick_id,
+                roll.corpse_entity,
+                roll.items.len(),
+                roll.eligible_claimants.len(),
+            );
+            continue;
+        }
+
+        let pile = ctx.db.loot_pile().insert(LootPile {
+            loot_pile_id: 0,
+            corpse_entity: roll.corpse_entity,
+            layer: roll.layer,
+            pos_x: roll.pos_x,
+            pos_y: roll.pos_y,
+            pos_z: roll.pos_z,
+            eligible_claimants: roll.eligible_claimants,
+            created_at_tick: tick_id,
+            expires_at_tick: tick_id.saturating_add(roll.claim_window_ticks),
+        });
+
+        for item in roll.items {
+            if item.quantity == 0 {
+                continue;
+            }
+            ctx.db.loot_pile_item().insert(LootPileItem {
+                loot_pile_item_id: 0,
+                loot_pile_id: pile.loot_pile_id,
+                item_id: item.item_id,
+                quantity: item.quantity,
+            });
+        }
     }
 
     // Apply region updates.
@@ -1287,12 +1503,45 @@ pub fn commit_tick_results(
             entity_id: eid,
             layer: s.layer,
         });
+
+        if let Some(team_id) = s.team_id {
+            ctx.db.entity_team().insert(EntityTeam {
+                entity_id: eid,
+                team_id,
+            });
+        }
+
+        if let Some(cfg) = s.npc_config {
+            if s.kind == EntityKind::Npc || s.kind == EntityKind::Boss {
+                let mut ability_ids = cfg.ability_ids.into_iter().take(4);
+                ctx.db.npc_config().insert(NpcConfig {
+                    entity_id: eid,
+                    encounter_name: None,
+                    archetype_id: None,
+                    passive: cfg.passive,
+                    no_chase: cfg.no_chase,
+                    ability_id_1: ability_ids.next(),
+                    ability_id_2: ability_ids.next(),
+                    ability_id_3: ability_ids.next(),
+                    ability_id_4: ability_ids.next(),
+                    leash_radius: cfg.leash_radius,
+                    aggro_radius: cfg.aggro_radius,
+                    body_shape: cfg.body_shape,
+                });
+            } else {
+                log::warn!(
+                    "director spawn {} kind {:?} carried npc_config; dropping actor config",
+                    eid,
+                    s.kind
+                );
+            }
+        }
     }
 
     // ── Encounter Add Memberships ─────────────────────────────────────
     // Pair each membership with the matching director spawn by index and
     // insert an `encounter_add` row carrying the boss link + tag list.
-    // The subscription and reducer paths both rely on this pairing invariant.
+    // See `docs/contracts/spawn_add_membership_contract.md`.
     for m in encounter_memberships {
         let idx = m.spawn_index as usize;
         if idx >= director_spawn_ids.len() {
@@ -1430,31 +1679,20 @@ pub fn commit_tick_results(
 
     // Process zone_counter_deltas inline.
     //
-    // Use the `by_zone` btree index (layer, region_x, region_z) to narrow
-    // the scan to the handful of counters in this cell, then linear-scan
-    // those by `counter_name`. This mirrors `increment_zone_counter` and
-    // avoids a full-table scan per delta.
+    // All zone_counter writes go through `upsert_zone_counter` so the
+    // logical key (layer, region_x, region_z, counter_name) stays unique
+    // across this reducer and the trusted `increment_zone_counter`
+    // helper — SpacetimeDB v2 can't express composite uniqueness in
+    // storage, so the invariant is enforced here (see Finding #5).
     for delta in zone_counter_deltas {
-        let existing = ctx
-            .db
-            .zone_counter()
-            .by_zone()
-            .filter((delta.layer, delta.region_x, delta.region_z..=delta.region_z))
-            .find(|c| c.counter_name == delta.counter_name);
-
-        if let Some(mut existing_row) = existing {
-            existing_row.value += delta.delta;
-            ctx.db.zone_counter().counter_id().update(existing_row);
-        } else {
-            ctx.db.zone_counter().insert(ZoneCounter {
-                counter_id: 0,
-                layer: delta.layer,
-                region_x: delta.region_x,
-                region_z: delta.region_z,
-                counter_name: delta.counter_name,
-                value: delta.delta,
-            });
-        }
+        upsert_zone_counter(
+            ctx,
+            delta.layer,
+            delta.region_x,
+            delta.region_z,
+            delta.counter_name,
+            delta.delta,
+        );
     }
 
     // ── Advance last_committed_tick cursor (after all mutations) ────────
@@ -1581,12 +1819,24 @@ pub struct DirectorSpawnInput {
     pub pos_y: f32,
     pub pos_z: f32,
     pub layer: u32,
+    pub npc_config: Option<DirectorNpcConfigInput>,
+    pub team_id: Option<u32>,
+}
+
+#[derive(spacetimedb::SpacetimeType, Clone, Debug)]
+pub struct DirectorNpcConfigInput {
+    pub passive: bool,
+    pub no_chase: bool,
+    pub ability_ids: Vec<u32>,
+    pub leash_radius: f32,
+    pub aggro_radius: f32,
+    pub body_shape: Option<u8>,
 }
 
 /// Encounter-add membership entry emitted by the worker. Pairs with
 /// `director_spawns` by `spawn_index`. The reducer validates the index,
 /// caps tags, and inserts an `encounter_add` row alongside the spawned
-/// entity.
+/// entity. See `docs/contracts/spawn_add_membership_contract.md`.
 #[derive(spacetimedb::SpacetimeType, Clone, Debug)]
 pub struct EncounterAddMembershipInput {
     pub spawn_index: u32,
@@ -1609,6 +1859,24 @@ pub struct DeathStateInsertInput {
     pub death_pos_x: f32,
     pub death_pos_y: f32,
     pub death_pos_z: f32,
+}
+
+#[derive(spacetimedb::SpacetimeType, Clone, Debug)]
+pub struct LootRollItemInput {
+    pub item_id: u32,
+    pub quantity: u32,
+}
+
+#[derive(spacetimedb::SpacetimeType, Clone, Debug)]
+pub struct LootRollInput {
+    pub corpse_entity: u64,
+    pub layer: u32,
+    pub pos_x: f32,
+    pub pos_y: f32,
+    pub pos_z: f32,
+    pub eligible_claimants: Vec<u64>,
+    pub claim_window_ticks: u64,
+    pub items: Vec<LootRollItemInput>,
 }
 
 // ── Worker Registration ─────────────────────────────────────────────
@@ -1931,6 +2199,149 @@ pub fn loot_item(
         target_slot
     );
     Ok(())
+}
+
+#[reducer]
+pub fn claim_loot(
+    ctx: &ReducerContext,
+    loot_pile_id: u64,
+    item_id: u32,
+    target_slot: u32,
+) -> Result<(), String> {
+    let caller = ctx.sender();
+    let seq = ctx
+        .db
+        .client_sequence()
+        .client_identity()
+        .find(&caller)
+        .ok_or("Client not registered")?;
+    let entity_id = seq.entity_id;
+
+    let pile = ctx
+        .db
+        .loot_pile()
+        .loot_pile_id()
+        .find(&loot_pile_id)
+        .ok_or("Loot pile expired or already claimed")?;
+
+    let current_tick = current_committed_tick(ctx);
+    if current_tick >= pile.expires_at_tick {
+        sweep_expired_loot_piles(ctx, pile.layer, current_tick);
+        return Err("Loot pile expired or already claimed".into());
+    }
+
+    if !pile.eligible_claimants.contains(&entity_id) {
+        return Err("Entity is not eligible for this loot".into());
+    }
+
+    let claimant_layer = ctx
+        .db
+        .entity_layer()
+        .entity_id()
+        .find(&entity_id)
+        .ok_or("Claimant layer is unknown")?;
+    if claimant_layer.layer != pile.layer {
+        return Err("Entity is not on the loot pile layer".into());
+    }
+
+    let claimant_transform = ctx
+        .db
+        .entity_transform()
+        .entity_id()
+        .find(&entity_id)
+        .ok_or("Claimant position is unknown")?;
+    if !loot_claim_in_range(&claimant_transform, &pile) {
+        return Err("Loot pile is out of range".into());
+    }
+
+    let slot_occupied = ctx
+        .db
+        .player_inventory()
+        .owner_entity()
+        .filter(&entity_id)
+        .any(|r| r.slot_index == target_slot);
+    if slot_occupied {
+        return Err("Target inventory slot is occupied".into());
+    }
+
+    let item = ctx
+        .db
+        .loot_pile_item()
+        .loot_pile_id()
+        .filter(&loot_pile_id)
+        .find(|row| row.item_id == item_id)
+        .ok_or("Loot item already claimed")?;
+
+    ctx.db.player_inventory().insert(PlayerInventory {
+        row_id: 0,
+        owner_entity: entity_id,
+        slot_index: target_slot,
+        item_id: item.item_id,
+        quantity: item.quantity,
+    });
+    ctx.db
+        .loot_pile_item()
+        .loot_pile_item_id()
+        .delete(&item.loot_pile_item_id);
+
+    if !ctx
+        .db
+        .loot_pile_item()
+        .loot_pile_id()
+        .filter(&loot_pile_id)
+        .any(|_| true)
+    {
+        ctx.db.loot_pile().loot_pile_id().delete(&loot_pile_id);
+    }
+
+    sweep_expired_loot_piles(ctx, pile.layer, current_tick);
+    Ok(())
+}
+
+fn loot_claim_in_range(transform: &EntityTransform, pile: &LootPile) -> bool {
+    let dx = transform.pos_x - pile.pos_x;
+    let dy = transform.pos_y - pile.pos_y;
+    let dz = transform.pos_z - pile.pos_z;
+    let max_distance_sq = CLAIM_LOOT_MAX_DISTANCE_M * CLAIM_LOOT_MAX_DISTANCE_M;
+    dx * dx + dy * dy + dz * dz <= max_distance_sq
+}
+
+fn current_committed_tick(ctx: &ReducerContext) -> u64 {
+    ctx.db
+        .module_config()
+        .key()
+        .find(0)
+        .map(|cfg| cfg.last_committed_tick)
+        .unwrap_or(0)
+}
+
+fn sweep_expired_loot_piles(ctx: &ReducerContext, layer: u32, current_tick: u64) {
+    let expired: Vec<u64> = ctx
+        .db
+        .loot_pile()
+        .layer()
+        .filter(&layer)
+        .filter(|pile| current_tick >= pile.expires_at_tick)
+        .map(|pile| pile.loot_pile_id)
+        .collect();
+
+    for loot_pile_id in expired {
+        delete_loot_pile(ctx, loot_pile_id);
+    }
+}
+
+fn delete_loot_pile(ctx: &ReducerContext, loot_pile_id: u64) {
+    let item_ids: Vec<u64> = ctx
+        .db
+        .loot_pile_item()
+        .loot_pile_id()
+        .filter(&loot_pile_id)
+        .map(|item| item.loot_pile_item_id)
+        .collect();
+    for item_id in item_ids {
+        ctx.db.loot_pile_item().loot_pile_item_id().delete(&item_id);
+    }
+    ctx.db.loot_pile().loot_pile_id().delete(&loot_pile_id);
 }
 
 /// Accept a pending trade. Placeholder reducer; trade acceptance is not implemented yet.
@@ -2724,33 +3135,7 @@ pub fn increment_zone_counter(
         return Err("increment_zone_counter: trusted worker only".into());
     }
 
-    let existing = ctx
-        .db
-        .zone_counter()
-        .by_zone()
-        .filter((layer, region_x, region_z..=region_z))
-        .find(|c| c.counter_name == counter_name);
-
-    if let Some(counter) = existing {
-        let new_value = counter.value + delta;
-        ctx.db.zone_counter().counter_id().update(ZoneCounter {
-            counter_id: counter.counter_id,
-            layer,
-            region_x,
-            region_z,
-            counter_name,
-            value: new_value,
-        });
-    } else {
-        ctx.db.zone_counter().insert(ZoneCounter {
-            counter_id: 0,
-            layer,
-            region_x,
-            region_z,
-            counter_name,
-            value: delta,
-        });
-    }
+    upsert_zone_counter(ctx, layer, region_x, region_z, counter_name, delta);
 
     Ok(())
 }
@@ -2770,9 +3155,12 @@ struct ExpireReport {
     expired_instances: usize,
     returned_members: usize,
     stale_members: usize,
-    marked_despawn_entities: usize,
+    removed_entities: usize,
+    cleared_buffs: usize,
+    cleared_interactables: usize,
     cleared_counters: usize,
     cleared_phases: usize,
+    cleared_world_events: usize,
 }
 
 impl ExpireReport {
@@ -2780,9 +3168,118 @@ impl ExpireReport {
         self.expired_instances > 0
             || self.returned_members > 0
             || self.stale_members > 0
-            || self.marked_despawn_entities > 0
+            || self.removed_entities > 0
+            || self.cleared_buffs > 0
+            || self.cleared_interactables > 0
             || self.cleared_counters > 0
             || self.cleared_phases > 0
+            || self.cleared_world_events > 0
+    }
+}
+
+fn interact_kind_from_def(kind: &game_schema::dungeon::InteractKindDef) -> InteractKind {
+    match kind {
+        game_schema::dungeon::InteractKindDef::Gate => InteractKind::Gate,
+        game_schema::dungeon::InteractKindDef::Switch => InteractKind::Switch,
+        game_schema::dungeon::InteractKindDef::Chest => InteractKind::Chest,
+        game_schema::dungeon::InteractKindDef::BossSpawn { .. } => InteractKind::BossSpawn,
+        game_schema::dungeon::InteractKindDef::NpcSpawn { .. } => InteractKind::NpcSpawn,
+    }
+}
+
+fn default_body_shape_for_interact_kind(kind: InteractKind) -> game_schema::dungeon::BodyShapeDef {
+    match kind {
+        InteractKind::Gate => game_schema::dungeon::BodyShapeDef::GateCuboid,
+        InteractKind::Switch => game_schema::dungeon::BodyShapeDef::SwitchCuboid,
+        InteractKind::Chest => game_schema::dungeon::BodyShapeDef::ChestCuboid,
+        InteractKind::Grab => game_schema::dungeon::BodyShapeDef::CrateCuboid,
+        InteractKind::BossSpawn => game_schema::dungeon::BodyShapeDef::BossCapsule,
+        InteractKind::NpcSpawn => game_schema::dungeon::BodyShapeDef::NpcCapsule,
+    }
+}
+
+fn body_shape_allowed_for_interact_kind(
+    kind: InteractKind,
+    shape: game_schema::dungeon::BodyShapeDef,
+) -> bool {
+    use game_schema::dungeon::BodyShapeDef as Shape;
+
+    match kind {
+        InteractKind::BossSpawn => matches!(shape, Shape::BossCapsule | Shape::LargeBossCapsule),
+        InteractKind::NpcSpawn => matches!(shape, Shape::NpcCapsule),
+        InteractKind::Gate | InteractKind::Switch | InteractKind::Chest | InteractKind::Grab => {
+            matches!(
+                shape,
+                Shape::GateCuboid | Shape::SwitchCuboid | Shape::ChestCuboid | Shape::CrateCuboid
+            )
+        }
+    }
+}
+
+fn expected_body_shape_family(kind: InteractKind) -> &'static str {
+    match kind {
+        InteractKind::BossSpawn => "BossCapsule or LargeBossCapsule",
+        InteractKind::NpcSpawn => "NpcCapsule",
+        InteractKind::Gate | InteractKind::Switch | InteractKind::Chest | InteractKind::Grab => {
+            "a cuboid prop shape"
+        }
+    }
+}
+
+fn resolve_body_shape_for_interact_kind(
+    kind: InteractKind,
+    authored_shape: Option<game_schema::dungeon::BodyShapeDef>,
+) -> Result<u8, String> {
+    let shape = authored_shape.unwrap_or_else(|| default_body_shape_for_interact_kind(kind));
+    if body_shape_allowed_for_interact_kind(kind, shape) {
+        Ok(shape.to_u8())
+    } else {
+        Err(format!(
+            "invalid body_shape {shape:?} for {kind:?}; expected {}",
+            expected_body_shape_family(kind)
+        ))
+    }
+}
+
+fn validate_interactable_body_shapes(
+    template: &game_schema::dungeon::DungeonTemplate,
+) -> Result<(), String> {
+    for def in &template.interactables {
+        let kind = interact_kind_from_def(&def.kind);
+        resolve_body_shape_for_interact_kind(kind, def.body_shape).map_err(|e| {
+            format!(
+                "template '{}' interactable local_id={} {e}",
+                template.template_id, def.local_id
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn delete_removed_entity_companion_rows(ctx: &ReducerContext, entity_id: u64) {
+    ctx.db.entity_transform().entity_id().delete(&entity_id);
+    ctx.db.entity_region().entity_id().delete(&entity_id);
+    ctx.db.entity_layer().entity_id().delete(&entity_id);
+    ctx.db.entity_health().entity_id().delete(&entity_id);
+    ctx.db.player_intent().entity_id().delete(&entity_id);
+    ctx.db.npc_state().entity_id().delete(&entity_id);
+    ctx.db.npc_config().entity_id().delete(&entity_id);
+    ctx.db.stealthed_entity().entity_id().delete(&entity_id);
+    ctx.db.entity_team().entity_id().delete(&entity_id);
+    ctx.db.boss_phase().boss_entity_id().delete(&entity_id);
+    ctx.db.npc_goal().entity_id().delete(&entity_id);
+    ctx.db.instance_membership().entity_id().delete(&entity_id);
+    ctx.db.interactable_config().entity_id().delete(&entity_id);
+    ctx.db.encounter_add().add_entity().delete(&entity_id);
+    let orphan_ids: Vec<u64> = ctx
+        .db
+        .encounter_add()
+        .by_boss()
+        .filter(&entity_id)
+        .map(|r| r.add_entity)
+        .collect();
+    for add_id in orphan_ids {
+        ctx.db.encounter_add().add_entity().delete(&add_id);
     }
 }
 
@@ -2801,16 +3298,123 @@ fn load_dungeon_template(
         .ok_or_else(|| format!("unknown template_id '{template_id}'"))
 }
 
+fn load_npc_archetypes()
+-> Result<std::collections::HashMap<String, game_schema::NpcArchetype>, String> {
+    // Shared validator: same code path the simulation worker runs at startup
+    // (`NpcArchetypeRegistry::with_builtins` → `parse_and_validate`).
+    // Authoring bugs that the worker would warn-and-empty here become a
+    // create_instance failure, which is what we want: a server actor row must
+    // never reference an archetype the worker would silently disagree about.
+    const SRC: &str = include_str!("../../../data/npc_archetypes.ron");
+    let file = game_schema::NpcArchetypeFile::parse_and_validate(SRC)?;
+    Ok(file.archetypes)
+}
+
+struct ResolvedActorSpawnConfig {
+    kind: EntityKind,
+    max_hp: f32,
+    team_id: Option<u32>,
+    archetype_id: Option<String>,
+    ability_ids: [Option<u32>; 4],
+    body_shape: Option<u8>,
+}
+
+fn resolve_actor_spawn_config(
+    kind: &game_schema::dungeon::InteractKindDef,
+    body_shape: Option<game_schema::dungeon::BodyShapeDef>,
+    archetypes: &std::collections::HashMap<String, game_schema::NpcArchetype>,
+) -> Result<Option<ResolvedActorSpawnConfig>, String> {
+    let (expected_kind, interact_kind, fallback_hp, archetype_id, owner) = match kind {
+        game_schema::dungeon::InteractKindDef::BossSpawn {
+            npc_name,
+            archetype_id,
+            ..
+        } => (
+            EntityKind::Boss,
+            InteractKind::BossSpawn,
+            1000.0_f32,
+            archetype_id.as_deref(),
+            format!("BossSpawn '{npc_name}'"),
+        ),
+        game_schema::dungeon::InteractKindDef::NpcSpawn {
+            npc_name,
+            archetype_id,
+        } => (
+            EntityKind::Npc,
+            InteractKind::NpcSpawn,
+            80.0_f32,
+            archetype_id.as_deref(),
+            format!("NpcSpawn '{npc_name}'"),
+        ),
+        _ => return Ok(None),
+    };
+
+    let mut max_hp = fallback_hp;
+    let mut team_id = None;
+    let mut ability_ids = [None; 4];
+    let mut resolved_body_shape = body_shape;
+    let mut resolved_archetype_id = None;
+
+    if let Some(archetype_id) = archetype_id.filter(|id| !id.is_empty()) {
+        let archetype = archetypes
+            .get(archetype_id)
+            .ok_or_else(|| format!("{owner} references unknown archetype_id '{archetype_id}'"))?;
+        if !archetype.usage.allows_actor_spawn() {
+            return Err(format!(
+                "{owner} references archetype_id '{archetype_id}' with usage {:?}; actor spawns require Both or ActorOnly",
+                archetype.usage
+            ));
+        }
+        if archetype.kind != expected_kind {
+            return Err(format!(
+                "{owner} references archetype_id '{archetype_id}' with kind {:?}; expected {:?}",
+                archetype.kind, expected_kind
+            ));
+        }
+        if archetype.max_hp <= 0.0 {
+            return Err(format!(
+                "{owner} references archetype_id '{archetype_id}' with non-positive max_hp {}",
+                archetype.max_hp
+            ));
+        }
+        max_hp = archetype.max_hp;
+        team_id = archetype.team_id;
+        ability_ids = ability_id_slots(&archetype.ability_ids);
+        resolved_body_shape = body_shape.or(archetype.body_shape);
+        resolved_archetype_id = Some(archetype_id.to_string());
+    }
+
+    Ok(Some(ResolvedActorSpawnConfig {
+        kind: expected_kind,
+        max_hp,
+        team_id,
+        archetype_id: resolved_archetype_id,
+        ability_ids,
+        body_shape: Some(resolve_body_shape_for_interact_kind(
+            interact_kind,
+            resolved_body_shape,
+        )?),
+    }))
+}
+
+fn ability_id_slots(ability_ids: &[u32]) -> [Option<u32>; 4] {
+    let mut slots = [None; 4];
+    for (slot, ability_id) in slots.iter_mut().zip(ability_ids.iter().copied()) {
+        *slot = Some(ability_id);
+    }
+    slots
+}
+
 /// Clear all `active_buff` rows for an entity (and the derived
 /// `stealthed_entity` row).
 ///
 /// Used by `leave_instance` and `expire_instances_inner` to prevent
 /// encounter-scoped buffs (notably the `MechanicLocked` Manaya marks
-/// 800/801/803) from following a player out of the instance. The
-/// reducer module has no access to `BuffRegistry`, so we cannot
-/// distinguish encounter-scoped from open-world buffs here; an instance
-/// exit unconditionally resets buff state, matching the typical MMO
-/// convention.
+/// 800/801/803) from following players out of an instance or lingering on
+/// reducer-removed instance NPCs. The reducer module has no access to
+/// `BuffRegistry`, so we cannot distinguish encounter-scoped from open-world
+/// buffs here; an instance exit/removal unconditionally resets buff state,
+/// matching the typical MMO convention.
 fn clear_entity_buffs(ctx: &ReducerContext, entity_id: u64) -> usize {
     let buff_ids: Vec<u64> = ctx
         .db
@@ -2927,6 +3531,8 @@ pub fn create_instance(
     }
 
     let template = load_dungeon_template(&template_id)?;
+    validate_interactable_body_shapes(&template)?;
+    let npc_archetypes = load_npc_archetypes()?;
 
     let mut cfg = ctx
         .db
@@ -2961,18 +3567,17 @@ pub fn create_instance(
         max_players,
     });
 
-    // ── Pass 2: spawn interactable Prop entities ────────────────────
+    // ── Pass 2: spawn interactable entities ─────────────────────────
     // Maps template-scoped local_id → real entity_id for linked_to resolution.
     let mut local_to_entity: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
 
-    // First pass: create all prop/boss entities (so we have real IDs).
+    // First pass: create all prop/NPC/boss entities (so we have real IDs).
     for def in &template.interactables {
-        let (entity_kind, hp, max_hp) = match &def.kind {
-            game_schema::dungeon::InteractKindDef::BossSpawn { .. } => {
-                (EntityKind::Boss, 1000.0_f32, 1000.0_f32)
-            }
-            _ => (EntityKind::Prop, 1.0_f32, 1.0_f32),
-        };
+        let actor_spawn = resolve_actor_spawn_config(&def.kind, def.body_shape, &npc_archetypes)?;
+        let (entity_kind, hp, max_hp) = actor_spawn
+            .as_ref()
+            .map(|cfg| (cfg.kind, cfg.max_hp, cfg.max_hp))
+            .unwrap_or((EntityKind::Prop, 1.0_f32, 1.0_f32));
         let entity = ctx.db.entity().insert(Entity {
             entity_id: 0,
             kind: entity_kind,
@@ -3022,38 +3627,76 @@ pub fn create_instance(
             layer,
         });
 
-        // BossSpawn entities get NpcConfig so the worker treats them as AI-driven.
-        if let game_schema::dungeon::InteractKindDef::BossSpawn {
-            npc_name,
-            encounter_name,
-        } = &def.kind
-        {
-            let encounter_key = encounter_name
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| npc_name.clone());
-            ctx.db.npc_config().insert(NpcConfig {
+        if let Some(team_id) = actor_spawn.as_ref().and_then(|cfg| cfg.team_id) {
+            ctx.db.entity_team().insert(EntityTeam {
                 entity_id: eid,
-                encounter_name: Some(encounter_key.clone()),
-                passive: false,
-                no_chase: false,
-                ability_id_1: None,
-                ability_id_2: None,
-                ability_id_3: None,
-                ability_id_4: None,
-                leash_radius: 30.0,
-                aggro_radius: 15.0,
-                // Resolve per-spawn override or default to BossCapsule.
-                body_shape: Some(
-                    def.body_shape
-                        .map(|s| s.to_u8())
-                        .unwrap_or(/* BodyShape::BossCapsule */ 2),
-                ),
+                team_id,
             });
-            log::info!(
-                "Boss entity {} ({npc_name}) spawned in instance layer={layer} encounter={encounter_key}",
-                eid,
-            );
+        }
+
+        // BossSpawn/NpcSpawn entries are actors, not switch-like props. They
+        // get NpcConfig so the worker configures AI and character collision.
+        match &def.kind {
+            game_schema::dungeon::InteractKindDef::BossSpawn {
+                npc_name,
+                encounter_name,
+                archetype_id,
+            } => {
+                let Some(actor_spawn) = actor_spawn.as_ref() else {
+                    continue;
+                };
+                let encounter_key = encounter_name
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| npc_name.clone());
+                ctx.db.npc_config().insert(NpcConfig {
+                    entity_id: eid,
+                    encounter_name: Some(encounter_key.clone()),
+                    archetype_id: actor_spawn.archetype_id.clone(),
+                    passive: false,
+                    no_chase: false,
+                    ability_id_1: actor_spawn.ability_ids[0],
+                    ability_id_2: actor_spawn.ability_ids[1],
+                    ability_id_3: actor_spawn.ability_ids[2],
+                    ability_id_4: actor_spawn.ability_ids[3],
+                    leash_radius: 30.0,
+                    aggro_radius: 15.0,
+                    body_shape: actor_spawn.body_shape,
+                });
+                log::info!(
+                    "Boss entity {} ({npc_name}) spawned in instance layer={layer} encounter={encounter_key} archetype={:?}",
+                    eid,
+                    archetype_id,
+                );
+            }
+            game_schema::dungeon::InteractKindDef::NpcSpawn {
+                npc_name,
+                archetype_id,
+            } => {
+                let Some(actor_spawn) = actor_spawn.as_ref() else {
+                    continue;
+                };
+                ctx.db.npc_config().insert(NpcConfig {
+                    entity_id: eid,
+                    encounter_name: None,
+                    archetype_id: actor_spawn.archetype_id.clone(),
+                    passive: false,
+                    no_chase: false,
+                    ability_id_1: actor_spawn.ability_ids[0],
+                    ability_id_2: actor_spawn.ability_ids[1],
+                    ability_id_3: actor_spawn.ability_ids[2],
+                    ability_id_4: actor_spawn.ability_ids[3],
+                    leash_radius: 30.0,
+                    aggro_radius: 15.0,
+                    body_shape: actor_spawn.body_shape,
+                });
+                log::info!(
+                    "NPC entity {} ({npc_name}) spawned in instance layer={layer} archetype={:?}",
+                    eid,
+                    archetype_id,
+                );
+            }
+            _ => {}
         }
     }
 
@@ -3063,14 +3706,7 @@ pub fn create_instance(
         let linked_entity = def
             .linked_to
             .and_then(|lid| local_to_entity.get(&lid).copied());
-        let interact_kind = match &def.kind {
-            game_schema::dungeon::InteractKindDef::Gate => InteractKind::Gate,
-            game_schema::dungeon::InteractKindDef::Switch => InteractKind::Switch,
-            game_schema::dungeon::InteractKindDef::Chest => InteractKind::Chest,
-            // Boss/NPC spawns get Switch kind — trigger zone activates them.
-            game_schema::dungeon::InteractKindDef::BossSpawn { .. } => InteractKind::Switch,
-            game_schema::dungeon::InteractKindDef::NpcSpawn { .. } => InteractKind::Switch,
-        };
+        let interact_kind = interact_kind_from_def(&def.kind);
 
         ctx.db.interactable_config().insert(InteractableConfig {
             entity_id: eid,
@@ -3085,17 +3721,7 @@ pub fn create_instance(
             puzzle_required_count: def.puzzle_required_count.unwrap_or(0),
             puzzle_window_ticks: def.puzzle_window_ticks.unwrap_or(0),
             state: InteractState::Idle,
-            // Per-spawn override or default per kind.
-            body_shape: def
-                .body_shape
-                .map(|s| s.to_u8())
-                .unwrap_or_else(|| match interact_kind {
-                    // Discriminants must match `BodyShape::to_u8`.
-                    InteractKind::Gate => 4,    // GateCuboid
-                    InteractKind::Switch => 5,  // SwitchCuboid
-                    InteractKind::Chest => 6,   // ChestCuboid
-                    InteractKind::Grab => 7,    // CrateCuboid
-                }),
+            body_shape: resolve_body_shape_for_interact_kind(interact_kind, def.body_shape)?,
         });
     }
 
@@ -3236,9 +3862,7 @@ pub fn leave_instance(ctx: &ReducerContext) -> Result<(), String> {
     // Manaya Core marks 800/801/803) cannot ride out with the player.
     let cleared = clear_entity_buffs(ctx, entity_id);
     if cleared > 0 {
-        log::debug!(
-            "leave_instance: cleared {cleared} active_buff rows for entity {entity_id}"
-        );
+        log::debug!("leave_instance: cleared {cleared} active_buff rows for entity {entity_id}");
     }
 
     // Resolve exit destination on layer 0:
@@ -3282,13 +3906,16 @@ pub fn expire_instances(ctx: &ReducerContext) -> Result<(), String> {
     let report = expire_instances_inner(ctx, now)?;
     if report.has_activity() {
         log::info!(
-            "expire_instances: expired={} returned_members={} stale_members={} marked_despawn={} cleared_counters={} cleared_phases={}",
+            "expire_instances: expired={} returned_members={} stale_members={} removed_entities={} cleared_buffs={} cleared_interactables={} cleared_counters={} cleared_phases={} cleared_world_events={}",
             report.expired_instances,
             report.returned_members,
             report.stale_members,
-            report.marked_despawn_entities,
+            report.removed_entities,
+            report.cleared_buffs,
+            report.cleared_interactables,
             report.cleared_counters,
             report.cleared_phases,
+            report.cleared_world_events,
         );
     }
     Ok(())
@@ -3297,14 +3924,45 @@ pub fn expire_instances(ctx: &ReducerContext) -> Result<(), String> {
 fn expire_instances_inner(ctx: &ReducerContext, now: i64) -> Result<ExpireReport, String> {
     let mut report = ExpireReport::default();
 
+    let completed_layers: Vec<u32> = ctx
+        .db
+        .instance()
+        .iter()
+        .filter(|i| i.state == InstanceState::Active || i.state == InstanceState::Pending)
+        .filter(|i| layer_has_completed_world_phase(ctx, i.layer))
+        .map(|i| i.layer)
+        .collect();
+    for layer in completed_layers {
+        mark_instance_completed_for_layer(ctx, layer);
+    }
+
     // Collect instances to expire (time-based).
     let expired: Vec<u64> = ctx
         .db
         .instance()
         .iter()
         .filter(|i| {
-            (i.state == InstanceState::Active || i.state == InstanceState::Pending)
+            (i.state == InstanceState::Active
+                || i.state == InstanceState::Pending
+                || i.state == InstanceState::Completed)
                 && i.expires_at < now
+        })
+        .map(|i| i.instance_id)
+        .collect();
+
+    let completed_empty: Vec<u64> = ctx
+        .db
+        .instance()
+        .iter()
+        .filter(|i| i.state == InstanceState::Completed)
+        .filter(|i| !expired.contains(&i.instance_id))
+        .filter(|i| {
+            ctx.db
+                .instance_membership()
+                .instance_id()
+                .filter(&i.instance_id)
+                .next()
+                .is_none()
         })
         .map(|i| i.instance_id)
         .collect();
@@ -3314,8 +3972,13 @@ fn expire_instances_inner(ctx: &ReducerContext, now: i64) -> Result<ExpireReport
         .db
         .instance()
         .iter()
-        .filter(|i| i.state == InstanceState::Active || i.state == InstanceState::Pending)
+        .filter(|i| {
+            i.state == InstanceState::Active
+                || i.state == InstanceState::Pending
+                || i.state == InstanceState::Completed
+        })
         .filter(|i| !expired.contains(&i.instance_id))
+        .filter(|i| !completed_empty.contains(&i.instance_id))
         .filter(|i| {
             let members: Vec<_> = ctx
                 .db
@@ -3332,7 +3995,11 @@ fn expire_instances_inner(ctx: &ReducerContext, now: i64) -> Result<ExpireReport
         .map(|i| i.instance_id)
         .collect();
 
-    let to_expire: Vec<u64> = expired.into_iter().chain(all_disconnected).collect();
+    let to_expire: Vec<u64> = expired
+        .into_iter()
+        .chain(completed_empty)
+        .chain(all_disconnected)
+        .collect();
     report.expired_instances = to_expire.len();
 
     for instance_id in &to_expire {
@@ -3349,6 +4016,7 @@ fn expire_instances_inner(ctx: &ReducerContext, now: i64) -> Result<ExpireReport
             // Clear encounter-scoped buffs (MechanicLocked marks etc.) so they
             // don't survive instance expiry. Mirrors `leave_instance`.
             let cleared = clear_entity_buffs(ctx, *eid);
+            report.cleared_buffs += cleared;
             if cleared > 0 {
                 log::debug!(
                     "expire_instances: cleared {cleared} active_buff rows for entity {eid}"
@@ -3387,9 +4055,9 @@ fn expire_instances_inner(ctx: &ReducerContext, now: i64) -> Result<ExpireReport
             0
         };
 
-        // Clean up interactable configs on the instance layer.
-        // Entity cleanup (gates, switches, props) must go through force_remove_entity
-        // in the tick pipeline. We mark them DespawnPending here; the worker handles removal.
+        // Clean up interactable configs on the instance layer immediately so
+        // clients and the worker do not keep targeting stale gates, switches,
+        // chests, or spawn markers while entity removal drains asynchronously.
         let instance_entities: Vec<u64> = ctx
             .db
             .entity_region()
@@ -3397,22 +4065,40 @@ fn expire_instances_inner(ctx: &ReducerContext, now: i64) -> Result<ExpireReport
             .filter(|er| er.layer == instance_layer)
             .map(|er| er.entity_id)
             .collect();
+        let mut interactable_count = 0usize;
+        for eid in &instance_entities {
+            if ctx.db.interactable_config().entity_id().delete(eid) {
+                interactable_count += 1;
+            }
+        }
+        report.cleared_interactables += interactable_count;
+
+        // Entity cleanup (gates, switches, props, NPCs, bosses) is terminal
+        // for an expired instance. Remove DB companion rows immediately so
+        // entities that never reached worker Phase 8 cannot survive as stale
+        // Spawning rows. The worker mirrors Removed updates by force-removing
+        // any existing runtime entity.
+        let mut removed_count = 0usize;
+        let mut removed_buff_count = 0usize;
         for eid in instance_entities {
-            // Only mark non-player entities for despawn.
             if let Some(entity) = ctx.db.entity().entity_id().find(&eid) {
-                if entity.kind != EntityKind::Player && entity.state == EntityState::Active {
+                if entity.kind != EntityKind::Player && entity.state != EntityState::Removed {
                     ctx.db.entity().entity_id().update(Entity {
                         entity_id: eid,
                         kind: entity.kind,
-                        state: EntityState::DespawnPending,
+                        state: EntityState::Removed,
                         spawned_at_tick: entity.spawned_at_tick,
                         owner_identity: entity.owner_identity,
                         rls_group: 0,
                     });
-                    report.marked_despawn_entities += 1;
+                    removed_buff_count += clear_entity_buffs(ctx, eid);
+                    delete_removed_entity_companion_rows(ctx, eid);
+                    removed_count += 1;
                 }
             }
         }
+        report.removed_entities += removed_count;
+        report.cleared_buffs += removed_buff_count;
 
         // Delete zone_counter rows for this instance layer so world_clock
         // stops evaluating stale counters and the counter won't pollute a
@@ -3445,12 +4131,32 @@ fn expire_instances_inner(ctx: &ReducerContext, now: i64) -> Result<ExpireReport
             ctx.db.world_phase().zone_id().delete(&zone_id);
         }
 
+        // Delete world_activity_event rows for this instance layer so director
+        // triggers stop matching against stale events when the instance
+        // layer is recycled. See `tables.rs` `WorldActivityEvent` comment.
+        let stale_events: Vec<u64> = ctx
+            .db
+            .world_activity_event()
+            .iter()
+            .filter(|ev| ev.scope_layer == instance_layer)
+            .map(|ev| ev.event_id)
+            .collect();
+        let world_event_count = stale_events.len();
+        report.cleared_world_events += world_event_count;
+        for event_id in stale_events {
+            ctx.db.world_activity_event().event_id().delete(&event_id);
+        }
+
         log::info!(
-            "Instance expired: id={} layer={} (cleared {} counters, {} phases)",
+            "Instance expired: id={} layer={} (removed {} entities, cleared {} buffs, {} interactables, {} counters, {} phases, {} world_events)",
             instance_id,
             instance_layer,
+            removed_count,
+            removed_buff_count,
+            interactable_count,
             counter_count,
             phase_count,
+            world_event_count,
         );
     }
 
@@ -3924,15 +4630,6 @@ mod debug_reducers {
             rls_group: 0,
         });
 
-        // Clean companion rows.
-        ctx.db.entity_transform().entity_id().delete(&entity_id);
-        ctx.db.entity_region().entity_id().delete(&entity_id);
-        ctx.db.entity_layer().entity_id().delete(&entity_id);
-        ctx.db.entity_health().entity_id().delete(&entity_id);
-        ctx.db.player_intent().entity_id().delete(&entity_id);
-        ctx.db.npc_state().entity_id().delete(&entity_id);
-        ctx.db.npc_config().entity_id().delete(&entity_id);
-
         if let Some(owner_identity) = entity.owner_identity {
             ctx.db
                 .client_sequence()
@@ -3940,33 +4637,15 @@ mod debug_reducers {
                 .delete(&owner_identity);
         }
 
-        // Stealth + team.
-        ctx.db.stealthed_entity().entity_id().delete(&entity_id);
-        ctx.db.entity_team().entity_id().delete(&entity_id);
-
         // Buffs.
         ctx.db.active_buff().entity_id().delete(&entity_id);
 
-        // Party, boss phase, death state, NPC goals, instances, interactables.
+        // Party, death state, and client ownership are debug-only cleanup.
+        // Shared companion rows use the same path as commit/expiry removal.
         ctx.db.party_member().entity_id().delete(&entity_id);
         ctx.db.party_invite().invitee_entity().delete(&entity_id);
-        ctx.db.boss_phase().boss_entity_id().delete(&entity_id);
         ctx.db.death_state().entity_id().delete(&entity_id);
-        ctx.db.npc_goal().entity_id().delete(&entity_id);
-        ctx.db.instance_membership().entity_id().delete(&entity_id);
-        ctx.db.interactable_config().entity_id().delete(&entity_id);
-        // Encounter add: drop this entity's row and cascade if it was a boss.
-        ctx.db.encounter_add().add_entity().delete(&entity_id);
-        let orphan_ids: Vec<u64> = ctx
-            .db
-            .encounter_add()
-            .by_boss()
-            .filter(&entity_id)
-            .map(|r| r.add_entity)
-            .collect();
-        for add_id in orphan_ids {
-            ctx.db.encounter_add().add_entity().delete(&add_id);
-        }
+        delete_removed_entity_companion_rows(ctx, entity_id);
 
         log::info!("debug_remove_entity: entity={entity_id} force-removed");
         Ok(())
@@ -3993,6 +4672,85 @@ mod debug_reducers {
         Ok(())
     }
 
+    /// Spawn a configured encounter boss near an existing entity and on the
+    /// same visibility layer. This is the fast path for testing a new boss
+    /// script inside whatever dungeon/open-world context the tester is already
+    /// standing in, without editing the dungeon template just to change the
+    /// `BossSpawn` row.
+    #[reducer]
+    pub fn debug_spawn_encounter_boss(
+        ctx: &ReducerContext,
+        anchor_entity_id: u64,
+        encounter_name: String,
+        offset_x: f32,
+        offset_y: f32,
+        offset_z: f32,
+        max_hp: f32,
+    ) -> Result<(), String> {
+        if !is_module_admin(ctx) && !is_debug_caller(ctx) {
+            return Err("debug_spawn_encounter_boss: admin only".into());
+        }
+        if encounter_name.trim().is_empty() {
+            return Err("debug_spawn_encounter_boss: encounter_name is required".into());
+        }
+        if max_hp <= 0.0 {
+            return Err("debug_spawn_encounter_boss: max_hp must be positive".into());
+        }
+
+        let anchor_tf = ctx
+            .db
+            .entity_transform()
+            .entity_id()
+            .find(&anchor_entity_id)
+            .ok_or_else(|| format!("No transform row for anchor entity {anchor_entity_id}"))?;
+        let layer = ctx
+            .db
+            .entity_layer()
+            .entity_id()
+            .find(&anchor_entity_id)
+            .map(|r| r.layer)
+            .or_else(|| {
+                ctx.db
+                    .entity_region()
+                    .entity_id()
+                    .find(&anchor_entity_id)
+                    .map(|r| r.layer)
+            })
+            .ok_or_else(|| format!("No layer row for anchor entity {anchor_entity_id}"))?;
+
+        let pos_x = anchor_tf.pos_x + offset_x;
+        let pos_y = anchor_tf.pos_y + offset_y;
+        let pos_z = anchor_tf.pos_z + offset_z;
+        let eid = spawn_npc_internal_on_layer(
+            ctx,
+            EntityKind::Boss,
+            pos_x,
+            pos_y,
+            pos_z,
+            max_hp,
+            layer,
+            Some(NpcConfig {
+                entity_id: 0,
+                encounter_name: Some(encounter_name.clone()),
+                archetype_id: None,
+                passive: false,
+                no_chase: false,
+                ability_id_1: None,
+                ability_id_2: None,
+                ability_id_3: None,
+                ability_id_4: None,
+                leash_radius: 30.0,
+                aggro_radius: 15.0,
+                body_shape: Some(game_schema::dungeon::BodyShapeDef::BossCapsule.to_u8()),
+            }),
+        );
+
+        log::info!(
+            "debug_spawn_encounter_boss: entity_id={eid} encounter={encounter_name} anchor={anchor_entity_id} layer={layer} pos=({pos_x},{pos_y},{pos_z}) max_hp={max_hp}"
+        );
+        Ok(())
+    }
+
     /// Spawn a predefined test layout. Available scenarios:
     /// - `"combat"`: training dummy + reactive NPC + lock-on NPC (no chase)
     /// - `"stress"`: 1000 NPCs in a grid for performance testing
@@ -4015,6 +4773,7 @@ mod debug_reducers {
                     Some(NpcConfig {
                         entity_id: 0,
                         encounter_name: None,
+                        archetype_id: None,
                         passive: true,
                         no_chase: false,
                         ability_id_1: None,
@@ -4022,7 +4781,8 @@ mod debug_reducers {
                         ability_id_3: None,
                         ability_id_4: None,
                         leash_radius: 0.0,
-                        aggro_radius: 0.0,                        body_shape: None,
+                        aggro_radius: 0.0,
+                        body_shape: None,
                     }),
                 );
                 log::info!("combat scenario: training dummy entity_id={e1}");
@@ -4038,6 +4798,7 @@ mod debug_reducers {
                     Some(NpcConfig {
                         entity_id: 0,
                         encounter_name: None,
+                        archetype_id: None,
                         passive: false,
                         no_chase: true,
                         ability_id_1: Some(1),
@@ -4045,7 +4806,8 @@ mod debug_reducers {
                         ability_id_3: None,
                         ability_id_4: None,
                         leash_radius: 0.0,
-                        aggro_radius: 0.0,                        body_shape: None,
+                        aggro_radius: 0.0,
+                        body_shape: None,
                     }),
                 );
                 log::info!("combat scenario: melee NPC entity_id={e2}");
@@ -4061,6 +4823,7 @@ mod debug_reducers {
                     Some(NpcConfig {
                         entity_id: 0,
                         encounter_name: None,
+                        archetype_id: None,
                         passive: false,
                         no_chase: true,
                         ability_id_1: Some(2),
@@ -4068,7 +4831,8 @@ mod debug_reducers {
                         ability_id_3: None,
                         ability_id_4: None,
                         leash_radius: 0.0,
-                        aggro_radius: 0.0,                        body_shape: None,
+                        aggro_radius: 0.0,
+                        body_shape: None,
                     }),
                 );
                 log::info!("combat scenario: ranged NPC entity_id={e3}");
@@ -4084,6 +4848,7 @@ mod debug_reducers {
                     Some(NpcConfig {
                         entity_id: 0,
                         encounter_name: None,
+                        archetype_id: None,
                         passive: false,
                         no_chase: false,
                         ability_id_1: Some(1),
@@ -4091,7 +4856,8 @@ mod debug_reducers {
                         ability_id_3: None,
                         ability_id_4: None,
                         leash_radius: 0.0,
-                        aggro_radius: 0.0,                        body_shape: None,
+                        aggro_radius: 0.0,
+                        body_shape: None,
                     }),
                 );
                 log::info!("combat scenario: full-combat NPC entity_id={e4}");
@@ -4124,6 +4890,7 @@ mod debug_reducers {
                             Some(NpcConfig {
                                 entity_id: 0,
                                 encounter_name: None,
+                                archetype_id: None,
                                 passive: true,
                                 no_chase: false,
                                 ability_id_1: None,
@@ -4131,7 +4898,8 @@ mod debug_reducers {
                                 ability_id_3: None,
                                 ability_id_4: None,
                                 leash_radius: 0.0,
-                                aggro_radius: 0.0,                                body_shape: None,
+                                aggro_radius: 0.0,
+                                body_shape: None,
                             }),
                         );
                         count += 1;
@@ -4177,6 +4945,7 @@ mod debug_reducers {
                     Some(NpcConfig {
                         entity_id: 0,
                         encounter_name: None,
+                        archetype_id: None,
                         passive: true,
                         no_chase: false,
                         ability_id_1: None,
@@ -4184,7 +4953,8 @@ mod debug_reducers {
                         ability_id_3: None,
                         ability_id_4: None,
                         leash_radius: 0.0,
-                        aggro_radius: 0.0,                        body_shape: None,
+                        aggro_radius: 0.0,
+                        body_shape: None,
                     }),
                 );
                 spawned += 1;
@@ -4242,6 +5012,7 @@ mod debug_reducers {
                     Some(NpcConfig {
                         entity_id: 0,
                         encounter_name: None,
+                        archetype_id: None,
                         passive: false,
                         no_chase,
                         ability_id_1: Some(1), // Slash
@@ -4249,7 +5020,8 @@ mod debug_reducers {
                         ability_id_3: None,
                         ability_id_4: None,
                         leash_radius: 0.0,
-                        aggro_radius: 0.0,                        body_shape: None,
+                        aggro_radius: 0.0,
+                        body_shape: None,
                     }),
                 );
                 let id_b = spawn_npc_internal(
@@ -4262,6 +5034,7 @@ mod debug_reducers {
                     Some(NpcConfig {
                         entity_id: 0,
                         encounter_name: None,
+                        archetype_id: None,
                         passive: false,
                         no_chase,
                         ability_id_1: Some(1), // Slash
@@ -4269,7 +5042,8 @@ mod debug_reducers {
                         ability_id_3: None,
                         ability_id_4: None,
                         leash_radius: 0.0,
-                        aggro_radius: 0.0,                        body_shape: None,
+                        aggro_radius: 0.0,
+                        body_shape: None,
                     }),
                 );
 
@@ -4525,24 +5299,49 @@ mod debug_reducers {
         if !is_module_admin(ctx) && !is_debug_caller(ctx) {
             return Err("debug_create_instance: admin only".into());
         }
-        // Delegate to the real create_instance reducer logic.
-        create_instance(ctx, "test_dungeon_01".into(), 4)?;
+        debug_create_instance_for_template(ctx, entity_id, "test_dungeon_01".into(), 4)
+    }
 
-        // Find the instance we just created (highest ID with our template).
+    /// Create an instance from any dungeon template and immediately join the
+    /// given entity into it. This keeps ad-hoc boss tests from having to reuse
+    /// or edit `test_dungeon_01` just to exercise a different authored arena.
+    #[reducer]
+    pub fn debug_create_instance_for_template(
+        ctx: &ReducerContext,
+        entity_id: u64,
+        template_id: String,
+        max_players: u32,
+    ) -> Result<(), String> {
+        if !is_module_admin(ctx) && !is_debug_caller(ctx) {
+            return Err("debug_create_instance_for_template: admin only".into());
+        }
+        if ctx.db.entity().entity_id().find(&entity_id).is_none() {
+            return Err(format!("Entity {entity_id} not found"));
+        }
+        if template_id.trim().is_empty() {
+            return Err("debug_create_instance_for_template: template_id is required".into());
+        }
+        if max_players == 0 {
+            return Err("debug_create_instance_for_template: max_players must be > 0".into());
+        }
+
+        create_instance(ctx, template_id.clone(), max_players)?;
+
         let inst = ctx
             .db
             .instance()
             .iter()
-            .filter(|i| i.template_id == "test_dungeon_01")
+            .filter(|i| i.template_id == template_id)
             .max_by_key(|i| i.instance_id)
             .ok_or("Instance not found after creation")?;
 
-        // Auto-join the entity.
         debug_join_instance(ctx, entity_id, inst.instance_id)?;
         log::info!(
-            "debug_create_instance: created + joined instance {} (layer {})",
+            "debug_create_instance_for_template: created + joined instance {} template={} layer={} max_players={}",
             inst.instance_id,
-            inst.layer
+            inst.template_id,
+            inst.layer,
+            inst.max_players
         );
         Ok(())
     }

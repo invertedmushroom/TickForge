@@ -386,6 +386,12 @@ fn format_skill_menu_summary(def: &AbilityDef) -> String {
 pub struct AbilityCooldowns {
     /// (ability_id → tick when cast). If current_tick - cast_tick < cooldown_ticks, on CD.
     last_used: [u64; 128], // index by ability_id
+    /// Authoritative cooldown duration (in ticks) overrides per ability,
+    /// supplied by `CastStart.effective_cooldown_ticks`. `None` means
+    /// no authoritative override yet, so fall back to catalog data. `Some(0)`
+    /// is a real server answer: this cast has no cooldown. See
+    /// `docs/contracts/ability_cast_lifecycle_contract.md`.
+    effective: [Option<u32>; 128],
     pub current_tick: u64,
 }
 
@@ -393,17 +399,55 @@ impl Default for AbilityCooldowns {
     fn default() -> Self {
         Self {
             last_used: [0; 128],
+            effective: [None; 128],
             current_tick: 0,
         }
     }
 }
 
 impl AbilityCooldowns {
-    /// Record that an ability was activated on the given tick.
-    pub fn activate(&mut self, ability_id: u32, tick: u64) {
-        if (ability_id as usize) < self.last_used.len() {
-            self.last_used[ability_id as usize] = tick;
+    /// Record a local, speculative activation. Returns `false` if the
+    /// ability is still cooling down, keeping the existing cooldown monotonic.
+    pub fn activate_local(&mut self, ability_id: u32, tick: u64, fallback_ticks: u32) -> bool {
+        self.current_tick = tick;
+        if self.remaining(ability_id, fallback_ticks) > 0 {
+            return false;
         }
+        let idx = ability_id as usize;
+        if idx < self.last_used.len() {
+            self.last_used[idx] = tick;
+            self.effective[idx] = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record a server-authoritative cast: overwrite the start tick
+    /// and remember the effective (CDR-adjusted) cooldown duration.
+    pub fn activate_with_effective(&mut self, ability_id: u32, tick: u64, effective_ticks: u32) {
+        let idx = ability_id as usize;
+        if idx < self.last_used.len() {
+            self.last_used[idx] = tick;
+            self.effective[idx] = Some(effective_ticks);
+        }
+    }
+
+    /// Clear cooldown state for an ability (e.g. on AbilityCancelled).
+    pub fn clear(&mut self, ability_id: u32) {
+        let idx = ability_id as usize;
+        if idx < self.last_used.len() {
+            self.last_used[idx] = 0;
+            self.effective[idx] = None;
+        }
+    }
+
+    fn effective_duration(&self, ability_id: u32, fallback: u32) -> u32 {
+        let idx = ability_id as usize;
+        if idx >= self.effective.len() {
+            return fallback;
+        }
+        self.effective[idx].unwrap_or(fallback)
     }
 
     /// Returns remaining cooldown ticks (0 = ready).
@@ -416,17 +460,59 @@ impl AbilityCooldowns {
         if used_at == 0 {
             return 0;
         }
+        let total = self.effective_duration(ability_id, cooldown_ticks);
         let elapsed = self.current_tick.saturating_sub(used_at) as u32;
-        cooldown_ticks.saturating_sub(elapsed)
+        total.saturating_sub(elapsed)
     }
 
     /// Returns 0.0 (ready) to 1.0 (just cast) fraction.
     pub fn fraction(&self, ability_id: u32, cooldown_ticks: u32) -> f32 {
-        if cooldown_ticks == 0 {
+        let total = self.effective_duration(ability_id, cooldown_ticks);
+        if total == 0 {
             return 0.0;
         }
         let rem = self.remaining(ability_id, cooldown_ticks);
-        rem as f32 / cooldown_ticks as f32
+        rem as f32 / total as f32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AbilityCooldowns;
+
+    #[test]
+    fn authoritative_zero_cooldown_overrides_catalog_fallback() {
+        let mut cooldowns = AbilityCooldowns::default();
+        cooldowns.current_tick = 10;
+        cooldowns.activate_with_effective(3, 10, 0);
+
+        cooldowns.current_tick = 11;
+        assert_eq!(cooldowns.remaining(3, 50), 0);
+        assert_eq!(cooldowns.fraction(3, 50), 0.0);
+    }
+
+    #[test]
+    fn local_activation_does_not_refresh_active_cooldown() {
+        let mut cooldowns = AbilityCooldowns::default();
+        assert!(cooldowns.activate_local(3, 100, 50));
+
+        cooldowns.current_tick = 110;
+        assert!(!cooldowns.activate_local(3, 110, 50));
+
+        cooldowns.current_tick = 120;
+        assert_eq!(cooldowns.remaining(3, 50), 30);
+    }
+
+    #[test]
+    fn local_activation_after_ready_uses_catalog_until_server_reconciles() {
+        let mut cooldowns = AbilityCooldowns::default();
+        cooldowns.activate_with_effective(3, 100, 20);
+
+        cooldowns.current_tick = 121;
+        assert!(cooldowns.activate_local(3, 121, 50));
+
+        cooldowns.current_tick = 122;
+        assert_eq!(cooldowns.remaining(3, 50), 49);
     }
 }
 

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use regex::Regex;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -18,11 +18,14 @@ const SERVER_HOST: &str = "127.0.0.1:3000";
 const MODULE_PATH: &str = "crates/server_module";
 const WORKER_BINDINGS_OUT: &str = "crates/simulation_worker/src/module_bindings";
 const CLIENT_BINDINGS_OUT: &str = "crates/game_client/src/module_bindings";
+const WEB_APP_DIR: &str = "apps/web";
 const WEB_CONTRACT_OUT: &str = "target/web-contract";
 const WEB_CONTRACT_BINDINGS_DIR: &str = "bindings";
 const WEB_CONTRACT_PACKAGE_NAME: &str = "@dive/client-contract";
-const WEB_CONTRACT_STDB_NPM_VERSION: &str = "2.1.0";
+const WEB_CONTRACT_STDB_NPM_VERSION: &str = "2.4.1";
 const WEB_BROWSER_POLICY_FILE: &str = "browser-policy.json";
+const WEB_ABILITIES_FILE: &str = "abilities.json";
+const WEB_PHYSICS_PREDICTION_FILE: &str = "physics-prediction.json";
 const WEB_CONTENT_METADATA_FILE: &str = "content-metadata.json";
 const WEB_CONTENT_LOOKUP_FILE: &str = "content-lookup.json";
 const WEB_MAP_BUNDLES_DIR: &str = "map-bundles";
@@ -33,6 +36,7 @@ const WEB_CONTENT_SOURCES: &[&str] = &[
     "data/dungeons.ron",
     "data/items.ron",
     "data/layers.ron",
+    "data/npc_archetypes.ron",
     "data/spawn_rules.ron",
 ];
 const WEB_ALWAYS_ON_SUBSCRIPTIONS: &[&str] = &[
@@ -45,10 +49,7 @@ const WEB_ALWAYS_ON_SUBSCRIPTIONS: &[&str] = &[
     "SELECT * FROM module_config",
     "SELECT * FROM combat_event",
     "SELECT * FROM world_event",
-    "SELECT * FROM active_buff",
-    "SELECT * FROM npc_state",
     "SELECT * FROM entity_layer",
-    "SELECT * FROM entity_team",
     "SELECT * FROM instance",
     "SELECT * FROM instance_membership",
     "SELECT * FROM death_state",
@@ -64,6 +65,11 @@ const WEB_FEATURE_SUBSCRIPTIONS: &[&str] = &[
     "SELECT * FROM world_phase",
     "SELECT * FROM respawn_point",
     "SELECT * FROM interactable_config",
+    "SELECT * FROM loot_pile",
+    "SELECT * FROM loot_pile_item",
+    "SELECT * FROM active_buff",
+    "SELECT * FROM npc_state",
+    "SELECT * FROM entity_team",
 ];
 const WEB_FORBIDDEN_TABLES: &[&str] = &[
     "entity",
@@ -83,7 +89,7 @@ const WEB_ALLOWED_REDUCERS: &[&str] = &[
     "equipItem",
     "unequipItem",
     "swapItem",
-    "lootItem",
+    "claimLoot",
     "createParty",
     "inviteToParty",
     "acceptPartyInvite",
@@ -106,6 +112,7 @@ const WEB_FORBIDDEN_REDUCERS: &[&str] = &[
     "removeRespawnPoint",
     "expireInstances",
     "incrementZoneCounter",
+    "lootItem",
 ];
 
 #[derive(Parser)]
@@ -139,6 +146,10 @@ enum DevCmd {
     Schema,
     /// Generate the browser-facing contract artifact package.
     WebContract(WebContractArgs),
+    /// Validate checked-in RON content references.
+    ContentCheck,
+    /// Refresh the web contract and start the browser dev server.
+    Web,
     Reset(ResetArgs),
     WorkerRegister(WorkerRegisterArgs),
     Worker(RunWorkerArgs),
@@ -170,6 +181,7 @@ enum BuildCmd {
     Worker(BuildProfileArgs),
     Client(BuildProfileArgs),
     Cli(BuildProfileArgs),
+    Web,
     Wasm,
     All(BuildProfileArgs),
 }
@@ -182,6 +194,8 @@ enum TestCmd {
     Cli(ClientTestArgs),
     /// Run multi-client integration tests (requires running server + worker)
     MultiClient(ClientTestArgs),
+    /// Run the browser client CI test lane.
+    Web,
     Workspace,
     /// Run the deterministic replay test suite (uses fixtures in crates/simulation_worker/tests/fixtures)
     Replay(BuildProfileArgs),
@@ -365,6 +379,8 @@ fn run_dev(cmd: DevCmd) -> Result<()> {
         DevCmd::Server => dev_server(),
         DevCmd::Schema => dev_schema(),
         DevCmd::WebContract(args) => dev_web_contract(args),
+        DevCmd::ContentCheck => dev_content_check(),
+        DevCmd::Web => dev_web(),
         DevCmd::Reset(args) => dev_reset(args),
         DevCmd::WorkerRegister(args) => dev_worker_register(args),
         DevCmd::Worker(args) => dev_worker(args),
@@ -390,6 +406,7 @@ fn run_build(cmd: BuildCmd) -> Result<()> {
             ["-p", "game_client", "--features", "connected"],
             args.release,
         )),
+        BuildCmd::Web => build_web(),
         BuildCmd::Wasm => run_command(cargo_cmd([
             "build",
             "-p",
@@ -408,7 +425,8 @@ fn run_build(cmd: BuildCmd) -> Result<()> {
             }))?;
             run_build(BuildCmd::Cli(BuildProfileArgs {
                 release: args.release,
-            }))
+            }))?;
+            run_build(BuildCmd::Web)
         }
     }
 }
@@ -433,6 +451,7 @@ fn run_test(cmd: TestCmd) -> Result<()> {
             command.args(args.args);
             run_command(command)
         }
+        TestCmd::Web => test_web(),
         TestCmd::Workspace => run_command(cargo_cmd([
             "test",
             "--workspace",
@@ -444,6 +463,40 @@ fn run_test(cmd: TestCmd) -> Result<()> {
             args.release,
         )),
     }
+}
+
+fn dev_web() -> Result<()> {
+    refresh_web_contract()?;
+    run_npm_in_web(["run", "dev"])
+}
+
+fn build_web() -> Result<()> {
+    refresh_web_contract()?;
+    run_npm_in_web(["run", "build"])
+}
+
+fn test_web() -> Result<()> {
+    refresh_web_contract()?;
+    run_npm_in_web(["run", "test:ci"])
+}
+
+fn refresh_web_contract() -> Result<()> {
+    dev_web_contract(WebContractArgs {
+        out: PathBuf::from(WEB_CONTRACT_OUT),
+        skip_schema: true,
+        check: false,
+    })
+}
+
+fn run_npm_in_web<const N: usize>(args: [&str; N]) -> Result<()> {
+    let mut command = Command::new(npm_program());
+    command.args(args);
+    command.current_dir(WEB_APP_DIR);
+    run_command(command)
+}
+
+fn npm_program() -> &'static str {
+    if cfg!(windows) { "npm.cmd" } else { "npm" }
 }
 
 fn dev_server() -> Result<()> {
@@ -502,8 +555,11 @@ struct WebContractManifest {
     schema_hash: String,
     content_hash: String,
     metadata_hash: String,
+    physics_hash: String,
     bindings_dir: String,
     browser_policy_file: String,
+    abilities_file: String,
+    physics_prediction_file: String,
     content_metadata_file: String,
     content_lookup_file: String,
     map_bundles_dir: String,
@@ -549,6 +605,106 @@ struct BrowserPolicy {
     forbidden_tables: Vec<String>,
     allowed_reducers: Vec<String>,
     forbidden_reducers: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct WebPhysicsPrediction {
+    #[serde(flatten)]
+    payload: WebPhysicsPredictionPayload,
+    hash: String,
+}
+
+#[derive(Serialize)]
+struct WebPhysicsPredictionPayload {
+    schema_version: u32,
+    tick_rate_hz: u32,
+    fixed_dt_seconds: f32,
+    player_capsule: WebCapsulePhysics,
+    kcc: WebKccPhysics,
+    collision_groups: WebKccCollisionGroups,
+}
+
+#[derive(Serialize)]
+struct WebCapsulePhysics {
+    half_height: f32,
+    radius: f32,
+}
+
+#[derive(Serialize)]
+struct WebKccPhysics {
+    offset_relative: f32,
+    normal_nudge_factor: f32,
+    max_slope_climb_radians: f32,
+    snap_to_ground_relative: f32,
+    autostep_max_height_relative: f32,
+    autostep_min_width_relative: f32,
+    autostep_include_dynamic_bodies: bool,
+    ground_pull_meters_per_second: f32,
+    gravity_meters_per_second_squared: f32,
+    move_shape_dt_seconds: f32,
+}
+
+#[derive(Serialize)]
+struct WebKccCollisionGroups {
+    movement_membership_bits: u32,
+    movement_filter_bits: u32,
+}
+
+#[derive(Serialize)]
+struct WebAbilityCatalog {
+    schema_version: u32,
+    tick_rate: u32,
+    abilities: Vec<WebAbilityMetadata>,
+}
+
+#[derive(Serialize)]
+struct WebAbilityMetadata {
+    ability_id: u32,
+    name: String,
+    base_damage: f32,
+    damage_type: String,
+    targeting_mode: WebTargetingModeMetadata,
+    cast_facing_policy: String,
+    max_range: Option<f32>,
+    projectile_speed: Option<f32>,
+    cooldown_ticks: u32,
+    linger_ticks: u32,
+    damage_interval_ticks: u32,
+    timeline_duration_ticks: u32,
+    hitbox_spawn_tick: Option<u32>,
+    damage_frame_tick: Option<u32>,
+    hitbox_remove_tick: Option<u32>,
+    lock_on_timeout_ticks: Option<u32>,
+    charge_tiers: Vec<WebChargeTierMetadata>,
+    preview_shape: WebPreviewShapeMetadata,
+    offset: [f32; 3],
+}
+
+#[derive(Serialize)]
+struct WebChargeTierMetadata {
+    min_ticks: u32,
+    damage_mult: f32,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WebTargetingModeMetadata {
+    DirectionTarget,
+    EntityTarget,
+    GroundTarget,
+    RaycastStrict,
+    AimAssist,
+    LockOn { max_targets: u32 },
+    SelfOnly,
+    CasterOffset,
+}
+
+#[derive(Serialize, Clone, Copy)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WebPreviewShapeMetadata {
+    None,
+    Sphere { radius: f32 },
+    Capsule { radius: f32, half_height: f32 },
 }
 
 #[derive(Serialize, Clone)]
@@ -638,9 +794,11 @@ enum InteractableKindMetadata {
     BossSpawn {
         npc_name: String,
         encounter_name: Option<String>,
+        archetype_id: Option<String>,
     },
     NpcSpawn {
         npc_name: String,
+        archetype_id: Option<String>,
     },
 }
 
@@ -686,7 +844,13 @@ struct MapBundleModuleEntry {
 struct MapBundleManifest {
     schema_version: u32,
     bundle_version: String,
+    /// Physics determinism hash. Equal to `colliders.content_hash`.
+    /// Changing this invalidates client prediction; must match the worker's bundle.
     content_hash: String,
+    /// Hash over the visual asset payload (`render_meshes` + their referenced bytes).
+    /// `None` when no visual bundle exists; clients must gate visual loading on this
+    /// hash, not on `content_hash`, so visual revisions never invalidate prediction.
+    visual_content_hash: Option<String>,
     bundle_id: String,
     source: MapBundleSource,
     render_meshes: Vec<AssetRef>,
@@ -823,13 +987,267 @@ fn build_browser_policy() -> BrowserPolicy {
     }
 }
 
+fn build_physics_prediction() -> Result<WebPhysicsPrediction> {
+    use game_core::collision_layers::CollisionMasks;
+    use game_core::physics_constants::{
+        CAPSULE_HALF_HEIGHT, CAPSULE_RADIUS, FALL_GRAVITY, GROUND_PULL,
+        KCC_AUTOSTEP_INCLUDE_DYNAMIC_BODIES, KCC_AUTOSTEP_MAX_HEIGHT_RELATIVE,
+        KCC_AUTOSTEP_MIN_WIDTH_RELATIVE, KCC_MAX_SLOPE_CLIMB_RADIANS, KCC_MOVE_SHAPE_DT_SECONDS,
+        KCC_NORMAL_NUDGE_FACTOR, KCC_OFFSET_RELATIVE, KCC_SNAP_TO_GROUND_RELATIVE,
+    };
+
+    let tick_config = game_protocol::tick::TickConfig::default_20hz();
+    let payload = WebPhysicsPredictionPayload {
+        schema_version: 1,
+        tick_rate_hz: tick_config.rate_hz,
+        fixed_dt_seconds: tick_config.dt,
+        player_capsule: WebCapsulePhysics {
+            half_height: CAPSULE_HALF_HEIGHT,
+            radius: CAPSULE_RADIUS,
+        },
+        kcc: WebKccPhysics {
+            offset_relative: KCC_OFFSET_RELATIVE,
+            normal_nudge_factor: KCC_NORMAL_NUDGE_FACTOR,
+            max_slope_climb_radians: KCC_MAX_SLOPE_CLIMB_RADIANS,
+            snap_to_ground_relative: KCC_SNAP_TO_GROUND_RELATIVE,
+            autostep_max_height_relative: KCC_AUTOSTEP_MAX_HEIGHT_RELATIVE,
+            autostep_min_width_relative: KCC_AUTOSTEP_MIN_WIDTH_RELATIVE,
+            autostep_include_dynamic_bodies: KCC_AUTOSTEP_INCLUDE_DYNAMIC_BODIES,
+            ground_pull_meters_per_second: GROUND_PULL,
+            gravity_meters_per_second_squared: FALL_GRAVITY,
+            move_shape_dt_seconds: KCC_MOVE_SHAPE_DT_SECONDS,
+        },
+        collision_groups: WebKccCollisionGroups {
+            movement_membership_bits: CollisionMasks::KCC_MOVEMENT_MEMBERSHIP,
+            movement_filter_bits: CollisionMasks::KCC_MOVEMENT_FILTER,
+        },
+    };
+    let payload_json =
+        serde_json::to_string_pretty(&payload).context("serialize physics prediction payload")?;
+    let hash = hash_bytes(payload_json.as_bytes());
+    Ok(WebPhysicsPrediction { payload, hash })
+}
+
+fn build_ability_catalog(file: &game_core::combat::skill::AbilityFile) -> WebAbilityCatalog {
+    use game_core::combat::skill::AbilityAction;
+
+    let abilities = file
+        .abilities
+        .iter()
+        .map(|data| {
+            let timeline = file
+                .timelines
+                .iter()
+                .find(|timeline| timeline.ability_id == data.ability_id);
+
+            let cooldown_ticks = timeline
+                .and_then(|timeline| {
+                    timeline
+                        .actions
+                        .iter()
+                        .find_map(|scheduled| match &scheduled.action {
+                            AbilityAction::CooldownStart { duration_ticks } => {
+                                Some(*duration_ticks)
+                            }
+                            _ => None,
+                        })
+                })
+                .unwrap_or(0);
+
+            let timeline_duration_ticks = timeline
+                .and_then(|timeline| {
+                    timeline
+                        .actions
+                        .iter()
+                        .map(|scheduled| scheduled.tick_offset.saturating_add(1))
+                        .max()
+                })
+                .unwrap_or(0);
+
+            let hitbox_spawn_tick = timeline.and_then(|timeline| {
+                timeline
+                    .actions
+                    .iter()
+                    .find_map(|scheduled| match &scheduled.action {
+                        AbilityAction::SpawnHitbox { .. }
+                        | AbilityAction::SpawnConfiguredHitbox { .. } => {
+                            Some(scheduled.tick_offset)
+                        }
+                        _ => None,
+                    })
+            });
+
+            let damage_frame_tick = timeline.and_then(|timeline| {
+                timeline
+                    .actions
+                    .iter()
+                    .find_map(|scheduled| match &scheduled.action {
+                        AbilityAction::ApplyDamageFrame => Some(scheduled.tick_offset),
+                        _ => None,
+                    })
+            });
+
+            let hitbox_remove_tick = timeline.and_then(|timeline| {
+                timeline
+                    .actions
+                    .iter()
+                    .find_map(|scheduled| match &scheduled.action {
+                        AbilityAction::RemoveHitbox => Some(scheduled.tick_offset),
+                        _ => None,
+                    })
+            });
+
+            let first_spawn = timeline.and_then(|timeline| {
+                timeline
+                    .actions
+                    .iter()
+                    .find_map(|scheduled| match &scheduled.action {
+                        AbilityAction::SpawnHitbox { shape, offset } => {
+                            Some((*shape, [offset.x, offset.y, offset.z], None))
+                        }
+                        AbilityAction::SpawnConfiguredHitbox {
+                            shape,
+                            offset,
+                            rules,
+                            ..
+                        } => Some((*shape, [offset.x, offset.y, offset.z], *rules)),
+                        _ => None,
+                    })
+            });
+
+            let linger_ticks = timeline
+                .map(|timeline| {
+                    let spawn_tick = timeline
+                        .actions
+                        .iter()
+                        .find_map(|scheduled| match &scheduled.action {
+                            AbilityAction::SpawnHitbox { .. }
+                            | AbilityAction::SpawnConfiguredHitbox { .. } => {
+                                Some(scheduled.tick_offset)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    let remove_tick = timeline
+                        .actions
+                        .iter()
+                        .find_map(|scheduled| match &scheduled.action {
+                            AbilityAction::RemoveHitbox => Some(scheduled.tick_offset),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    remove_tick.saturating_sub(spawn_tick)
+                })
+                .unwrap_or(0);
+
+            let (preview_shape, offset, hitbox_rules) = first_spawn
+                .map(|(shape, offset, rules)| (preview_shape_for(shape), offset, rules))
+                .unwrap_or_else(|| (preview_shape_for(data.shape), [0.0, 0.0, 0.0], None));
+
+            WebAbilityMetadata {
+                ability_id: data.ability_id,
+                name: data.name.clone(),
+                base_damage: data.base_damage,
+                damage_type: damage_type_label(data.damage_type).to_string(),
+                targeting_mode: targeting_mode_metadata(data.targeting_mode),
+                cast_facing_policy: cast_facing_policy_label(data.cast_facing_policy).to_string(),
+                max_range: data.max_range,
+                projectile_speed: data.projectile_speed,
+                cooldown_ticks,
+                linger_ticks,
+                damage_interval_ticks: hitbox_rules
+                    .map(|rules| rules.damage_interval_ticks)
+                    .unwrap_or(data.damage_interval_ticks),
+                timeline_duration_ticks,
+                hitbox_spawn_tick,
+                damage_frame_tick,
+                hitbox_remove_tick,
+                lock_on_timeout_ticks: data.lock_on_timeout_ticks,
+                charge_tiers: data
+                    .charge_tiers
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|tier| WebChargeTierMetadata {
+                        min_ticks: tier.min_ticks,
+                        damage_mult: tier.damage_mult,
+                    })
+                    .collect(),
+                preview_shape,
+                offset,
+            }
+        })
+        .collect();
+
+    WebAbilityCatalog {
+        schema_version: 1,
+        tick_rate: 20,
+        abilities,
+    }
+}
+
+fn preview_shape_for(shape: game_core::combat::skill::SkillShape) -> WebPreviewShapeMetadata {
+    use game_core::combat::skill::SkillShape;
+    match shape {
+        SkillShape::CapsuleSweep => WebPreviewShapeMetadata::Capsule {
+            radius: 0.75,
+            half_height: 1.0,
+        },
+        SkillShape::LineSweep => WebPreviewShapeMetadata::Capsule {
+            radius: 0.5,
+            half_height: 3.0,
+        },
+        SkillShape::Cone => WebPreviewShapeMetadata::Capsule {
+            radius: 0.75,
+            half_height: 1.0,
+        },
+        SkillShape::Sphere => WebPreviewShapeMetadata::Sphere { radius: 2.0 },
+        SkillShape::HazardZone => WebPreviewShapeMetadata::Sphere { radius: 5.0 },
+        SkillShape::Projectile => WebPreviewShapeMetadata::None,
+    }
+}
+
+fn targeting_mode_metadata(
+    mode: game_core::combat::skill::TargetingMode,
+) -> WebTargetingModeMetadata {
+    use game_core::combat::skill::TargetingMode;
+    match mode {
+        TargetingMode::DirectionTarget => WebTargetingModeMetadata::DirectionTarget,
+        TargetingMode::EntityTarget => WebTargetingModeMetadata::EntityTarget,
+        TargetingMode::GroundTarget => WebTargetingModeMetadata::GroundTarget,
+        TargetingMode::RaycastStrict => WebTargetingModeMetadata::RaycastStrict,
+        TargetingMode::AimAssist => WebTargetingModeMetadata::AimAssist,
+        TargetingMode::LockOn { max_targets } => WebTargetingModeMetadata::LockOn { max_targets },
+        TargetingMode::SelfOnly => WebTargetingModeMetadata::SelfOnly,
+        TargetingMode::CasterOffset => WebTargetingModeMetadata::CasterOffset,
+    }
+}
+
+fn damage_type_label(damage_type: game_schema::DamageType) -> &'static str {
+    match damage_type {
+        game_schema::DamageType::Physical => "physical",
+        game_schema::DamageType::Magical => "magical",
+        game_schema::DamageType::True => "true",
+    }
+}
+
+fn cast_facing_policy_label(policy: game_core::combat::skill::CastFacingPolicy) -> &'static str {
+    use game_core::combat::skill::CastFacingPolicy;
+    match policy {
+        CastFacingPolicy::PreserveBody => "preserve_body",
+        CastFacingPolicy::FaceAimDirection => "face_aim_direction",
+        CastFacingPolicy::FaceResolvedTarget => "face_resolved_target",
+    }
+}
+
 fn build_map_bundle_outputs(
     metadata: &WebContentMetadata,
     content_hash: &str,
-) -> Result<(MapBundleIndex, MapBundleModule, Vec<(String, String)>)> {
+    repo_root: &Path,
+) -> Result<(MapBundleIndex, MapBundleModule, Vec<MapBundleFile>)> {
     let mut index_entries = Vec::new();
     let mut module_entries = Vec::new();
-    let mut files = Vec::new();
+    let mut files: Vec<MapBundleFile> = Vec::new();
 
     for layer in &metadata.layers {
         let slug = sanitize_bundle_part(&format!("layer-{}-{}", layer.layer_id, layer.name));
@@ -847,8 +1265,13 @@ fn build_map_bundle_outputs(
             &layer.geometry,
             &format!("layer-{}", layer.layer_id),
         );
+        let visual_stem = layer
+            .client_visual
+            .clone()
+            .or_else(|| layer.terrain_set.clone());
+        let visual = collect_visual_assets(repo_root, visual_stem.as_deref(), &bundle_id)?;
         let (manifest, collider_json) =
-            build_single_map_bundle(&bundle_id, content_hash, source, &colliders)?;
+            build_single_map_bundle(&bundle_id, content_hash, source, &colliders, &visual)?;
         let manifest_path = format!("{bundle_id}/manifest.json");
         let collider_path = format!("{bundle_id}/colliders/static-colliders.json");
         index_entries.push(MapBundleIndexEntry {
@@ -867,11 +1290,14 @@ fn build_map_bundle_outputs(
             manifest,
             colliders,
         });
-        files.push((
+        files.push(MapBundleFile::text(
             manifest_path,
             serde_json::to_string_pretty(&module_entries.last().unwrap().manifest)?,
         ));
-        files.push((collider_path, collider_json));
+        files.push(MapBundleFile::text(collider_path, collider_json));
+        if let Some(visual) = visual {
+            files.extend(visual.files);
+        }
     }
 
     for template in &metadata.dungeon_templates {
@@ -890,8 +1316,12 @@ fn build_map_bundle_outputs(
             &template.geometry,
             &format!("dungeon-{}", template.template_id),
         );
+        // Dungeon templates only carry `terrain_set` today (no separate
+        // `client_visual` override); reuse the same stem for both physics and
+        // visual lookup.
+        let visual = collect_visual_assets(repo_root, template.terrain_set.as_deref(), &bundle_id)?;
         let (manifest, collider_json) =
-            build_single_map_bundle(&bundle_id, content_hash, source, &colliders)?;
+            build_single_map_bundle(&bundle_id, content_hash, source, &colliders, &visual)?;
         let manifest_path = format!("{bundle_id}/manifest.json");
         let collider_path = format!("{bundle_id}/colliders/static-colliders.json");
         index_entries.push(MapBundleIndexEntry {
@@ -910,11 +1340,14 @@ fn build_map_bundle_outputs(
             manifest,
             colliders,
         });
-        files.push((
+        files.push(MapBundleFile::text(
             manifest_path,
             serde_json::to_string_pretty(&module_entries.last().unwrap().manifest)?,
         ));
-        files.push((collider_path, collider_json));
+        files.push(MapBundleFile::text(collider_path, collider_json));
+        if let Some(visual) = visual {
+            files.extend(visual.files);
+        }
     }
 
     Ok((
@@ -935,6 +1368,7 @@ fn build_single_map_bundle(
     content_hash: &str,
     source: MapBundleSource,
     colliders: &ColliderBundle,
+    visual: &Option<VisualBundle>,
 ) -> Result<(MapBundleManifest, String)> {
     let collider_json =
         serde_json::to_string_pretty(&colliders).context("serialize collider bundle")?;
@@ -954,14 +1388,23 @@ fn build_single_map_bundle(
         .into_iter()
         .collect();
 
+    let (render_meshes, visual_content_hash) = match visual {
+        Some(visual) => (
+            visual.render_meshes.clone(),
+            Some(visual.content_hash.clone()),
+        ),
+        None => (Vec::new(), None),
+    };
+
     Ok((
         MapBundleManifest {
             schema_version: 1,
             bundle_version: "local-v1".to_string(),
             content_hash: content_hash.to_string(),
+            visual_content_hash,
             bundle_id: bundle_id.to_string(),
             source,
-            render_meshes: Vec::new(),
+            render_meshes,
             collider_json: vec![collider_asset],
             debug_markers,
         },
@@ -1020,6 +1463,144 @@ fn sanitize_bundle_part(value: &str) -> String {
         }
     }
     out.trim_matches('-').to_string()
+}
+
+/// File payload emitted by the map-bundle builder. Text payloads (JSON) and
+/// binary payloads (glTF, .bin, textures) both flow through one channel so the
+/// caller can write them in a single loop.
+enum MapBundleFile {
+    Text {
+        relative_path: String,
+        content: String,
+    },
+    Binary {
+        relative_path: String,
+        content: Vec<u8>,
+    },
+}
+
+impl MapBundleFile {
+    fn text(relative_path: String, content: String) -> Self {
+        Self::Text {
+            relative_path,
+            content,
+        }
+    }
+
+    fn binary(relative_path: String, content: Vec<u8>) -> Self {
+        Self::Binary {
+            relative_path,
+            content,
+        }
+    }
+}
+
+/// One bundle's worth of resolved visual assets.
+///
+/// `render_meshes` lists every file that ships under `<bundle_id>/visual/...`
+/// with a per-file SHA-256. `content_hash` is a stable hash over the URL list
+/// + each file's SHA-256, so visual revisions surface as a single field on the
+/// manifest without bloating it.
+struct VisualBundle {
+    render_meshes: Vec<AssetRef>,
+    content_hash: String,
+    files: Vec<MapBundleFile>,
+}
+
+const VISUAL_ASSET_ROOT: &str = "crates/game_client_bevy/assets/terrain";
+
+/// Probe `crates/game_client_bevy/assets/terrain/{stem}/` for a glTF/glb +
+/// siblings and return a `VisualBundle` ready to embed into a map bundle.
+///
+/// Returns `Ok(None)` when no `stem` is configured or the on-disk directory
+/// does not contain an entry point (`{stem}.gltf` or `{stem}.glb`). This is
+/// the common case today — most layers/dungeons have no imported visual mesh.
+fn collect_visual_assets(
+    repo_root: &Path,
+    stem: Option<&str>,
+    bundle_id: &str,
+) -> Result<Option<VisualBundle>> {
+    let Some(stem) = stem else {
+        return Ok(None);
+    };
+    let stem_dir = repo_root.join(VISUAL_ASSET_ROOT).join(stem);
+    if !stem_dir.is_dir() {
+        return Ok(None);
+    }
+
+    let gltf_path = stem_dir.join(format!("{stem}.gltf"));
+    let glb_path = stem_dir.join(format!("{stem}.glb"));
+    let entry_point = if gltf_path.is_file() {
+        gltf_path
+    } else if glb_path.is_file() {
+        glb_path
+    } else {
+        return Ok(None);
+    };
+    let entry_relative = entry_point
+        .strip_prefix(&stem_dir)
+        .with_context(|| format!("entry point not under {}", stem_dir.display()))?
+        .to_path_buf();
+
+    let mut render_meshes = Vec::new();
+    let mut files = Vec::new();
+    let mut hash_inputs: Vec<(String, String)> = Vec::new();
+
+    for relative in collect_files_relative(&stem_dir)? {
+        let absolute = stem_dir.join(&relative);
+        let bytes = fs::read(&absolute)
+            .with_context(|| format!("reading visual asset {}", absolute.display()))?;
+        let sha256 = hash_bytes(&bytes);
+        let url = format!("visual/{}", relative.to_string_lossy().replace('\\', "/"));
+        let bundle_relative = format!("{bundle_id}/{url}");
+        render_meshes.push(AssetRef {
+            url: url.clone(),
+            sha256: sha256.clone(),
+            bytes: bytes.len(),
+        });
+        hash_inputs.push((url, sha256));
+        files.push(MapBundleFile::binary(bundle_relative, bytes));
+    }
+
+    // Stable order: entry point first (`.gltf` / `.glb`), then siblings sorted
+    // by URL so the manifest is deterministic across filesystems.
+    let entry_url = format!(
+        "visual/{}",
+        entry_relative.to_string_lossy().replace('\\', "/")
+    );
+    render_meshes.sort_by(|a, b| {
+        let a_is_entry = a.url == entry_url;
+        let b_is_entry = b.url == entry_url;
+        match (a_is_entry, b_is_entry) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.url.cmp(&b.url),
+        }
+    });
+    hash_inputs.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"dive-visual-v1");
+    hasher.update([0u8]);
+    hasher.update(
+        entry_relative
+            .to_string_lossy()
+            .replace('\\', "/")
+            .as_bytes(),
+    );
+    hasher.update([0u8]);
+    for (url, sha) in &hash_inputs {
+        hasher.update(url.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(sha.as_bytes());
+        hasher.update([0u8]);
+    }
+    let content_hash = hex_digest(&hasher.finalize());
+
+    Ok(Some(VisualBundle {
+        render_meshes,
+        content_hash,
+        files,
+    }))
 }
 
 fn export_layer_metadata(layer: &game_schema::dungeon::WorldLayerDef) -> LayerMetadata {
@@ -1143,15 +1724,19 @@ fn export_interactable_kind_metadata(
         game_schema::dungeon::InteractKindDef::BossSpawn {
             npc_name,
             encounter_name,
+            archetype_id,
         } => InteractableKindMetadata::BossSpawn {
             npc_name: npc_name.clone(),
             encounter_name: encounter_name.clone(),
+            archetype_id: archetype_id.clone(),
         },
-        game_schema::dungeon::InteractKindDef::NpcSpawn { npc_name } => {
-            InteractableKindMetadata::NpcSpawn {
-                npc_name: npc_name.clone(),
-            }
-        }
+        game_schema::dungeon::InteractKindDef::NpcSpawn {
+            npc_name,
+            archetype_id,
+        } => InteractableKindMetadata::NpcSpawn {
+            npc_name: npc_name.clone(),
+            archetype_id: archetype_id.clone(),
+        },
     }
 }
 
@@ -1203,17 +1788,25 @@ fn dev_web_contract(args: WebContractArgs) -> Result<()> {
         load_ron_file(Path::new("data/layers.ron"))?;
     let dungeons: game_schema::dungeon::DungeonFile =
         load_ron_file(Path::new("data/dungeons.ron"))?;
+    let ability_file: game_core::combat::skill::AbilityFile =
+        load_ron_file(Path::new("data/abilities.ron"))?;
+    let ability_catalog = build_ability_catalog(&ability_file);
     let content_metadata = build_content_metadata(&world_layers, &dungeons);
     let content_lookup = build_content_lookup(&content_metadata);
     let browser_policy = build_browser_policy();
+    let physics_prediction = build_physics_prediction()?;
     let (map_bundle_index, map_bundle_module, map_bundle_files) =
-        build_map_bundle_outputs(&content_metadata, &content_hash)?;
+        build_map_bundle_outputs(&content_metadata, &content_hash, Path::new("."))?;
+    let abilities_json =
+        serde_json::to_string_pretty(&ability_catalog).context("serialize ability catalog")?;
     let content_metadata_json =
         serde_json::to_string_pretty(&content_metadata).context("serialize content metadata")?;
     let content_lookup_json =
         serde_json::to_string_pretty(&content_lookup).context("serialize content lookup")?;
     let browser_policy_json =
         serde_json::to_string_pretty(&browser_policy).context("serialize browser policy")?;
+    let physics_prediction_json = serde_json::to_string_pretty(&physics_prediction)
+        .context("serialize physics prediction")?;
     let map_bundle_index_json =
         serde_json::to_string_pretty(&map_bundle_index).context("serialize map bundle index")?;
     let map_bundle_module_json =
@@ -1221,7 +1814,7 @@ fn dev_web_contract(args: WebContractArgs) -> Result<()> {
     let map_bundle_module_ts = format!(
         "export const mapBundles = {map_bundle_module_json} as const;\nexport default mapBundles;\n"
     );
-    let metadata_hash = hash_bytes(content_metadata_json.as_bytes());
+    let metadata_hash = hash_bytes(format!("{abilities_json}\n{content_metadata_json}").as_bytes());
 
     let source_files = WEB_CONTENT_SOURCES
         .iter()
@@ -1234,8 +1827,11 @@ fn dev_web_contract(args: WebContractArgs) -> Result<()> {
         schema_hash,
         content_hash: content_hash.clone(),
         metadata_hash,
+        physics_hash: physics_prediction.hash.clone(),
         bindings_dir: WEB_CONTRACT_BINDINGS_DIR.to_string(),
         browser_policy_file: WEB_BROWSER_POLICY_FILE.to_string(),
+        abilities_file: WEB_ABILITIES_FILE.to_string(),
+        physics_prediction_file: WEB_PHYSICS_PREDICTION_FILE.to_string(),
         content_metadata_file: WEB_CONTENT_METADATA_FILE.to_string(),
         content_lookup_file: WEB_CONTENT_LOOKUP_FILE.to_string(),
         map_bundles_dir: WEB_MAP_BUNDLES_DIR.to_string(),
@@ -1257,6 +1853,14 @@ fn dev_web_contract(args: WebContractArgs) -> Result<()> {
     exports.insert(
         "./browser-policy.json".to_string(),
         "./browser-policy.json".to_string(),
+    );
+    exports.insert(
+        "./abilities.json".to_string(),
+        "./abilities.json".to_string(),
+    );
+    exports.insert(
+        "./physics-prediction.json".to_string(),
+        "./physics-prediction.json".to_string(),
     );
     exports.insert("./contract.json".to_string(), "./contract.json".to_string());
     exports.insert(
@@ -1294,6 +1898,8 @@ fn dev_web_contract(args: WebContractArgs) -> Result<()> {
             WEB_CONTRACT_BINDINGS_DIR.to_string(),
             WEB_MAP_BUNDLES_DIR.to_string(),
             WEB_BROWSER_POLICY_FILE.to_string(),
+            WEB_ABILITIES_FILE.to_string(),
+            WEB_PHYSICS_PREDICTION_FILE.to_string(),
             "contract.json".to_string(),
             WEB_CONTENT_METADATA_FILE.to_string(),
             WEB_CONTENT_LOOKUP_FILE.to_string(),
@@ -1303,6 +1909,7 @@ fn dev_web_contract(args: WebContractArgs) -> Result<()> {
         dependencies,
     };
 
+    write_text_file(&staging_dir.join(WEB_ABILITIES_FILE), &abilities_json)?;
     write_text_file(
         &staging_dir.join(WEB_CONTENT_METADATA_FILE),
         &content_metadata_json,
@@ -1315,11 +1922,28 @@ fn dev_web_contract(args: WebContractArgs) -> Result<()> {
         &staging_dir.join(WEB_BROWSER_POLICY_FILE),
         &browser_policy_json,
     )?;
+    write_text_file(
+        &staging_dir.join(WEB_PHYSICS_PREDICTION_FILE),
+        &physics_prediction_json,
+    )?;
     let map_bundles_dir = staging_dir.join(WEB_MAP_BUNDLES_DIR);
     write_text_file(&map_bundles_dir.join("index.json"), &map_bundle_index_json)?;
     write_text_file(&map_bundles_dir.join("index.ts"), &map_bundle_module_ts)?;
-    for (relative_path, content) in map_bundle_files {
-        write_text_file(&map_bundles_dir.join(relative_path), &content)?;
+    for file in map_bundle_files {
+        match file {
+            MapBundleFile::Text {
+                relative_path,
+                content,
+            } => {
+                write_text_file(&map_bundles_dir.join(relative_path), &content)?;
+            }
+            MapBundleFile::Binary {
+                relative_path,
+                content,
+            } => {
+                write_binary_file(&map_bundles_dir.join(relative_path), &content)?;
+            }
+        }
     }
 
     write_text_file(
@@ -1332,7 +1956,7 @@ fn dev_web_contract(args: WebContractArgs) -> Result<()> {
     )?;
     write_text_file(
         &staging_dir.join("README.md"),
-        "Generated by `cargo xtask dev web-contract`.\nContains TypeScript bindings, browser policy, deterministic contract metadata, exported layer/dungeon content artifacts, and local map-bundle fixtures.\n",
+        "Generated by `cargo xtask dev web-contract`.\nContains TypeScript bindings, browser policy, deterministic contract metadata, exported ability/layer/dungeon content artifacts, Rapier prediction metadata, and local map-bundle fixtures.\n",
     )?;
 
     if args.check {
@@ -2210,12 +2834,753 @@ fn write_text_file(path: &Path, content: &str) -> Result<()> {
     fs::write(path, content).with_context(|| format!("writing {}", path.display()))
 }
 
+fn write_binary_file(path: &Path, content: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed creating parent {}", parent.display()))?;
+    }
+    fs::write(path, content).with_context(|| format!("writing {}", path.display()))
+}
+
 fn hex_digest(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+#[derive(Deserialize)]
+struct ItemFile {
+    items: Vec<game_core::stats::ItemData>,
+}
+
+#[derive(Default)]
+struct ContentCheck {
+    errors: Vec<String>,
+    warnings: Vec<String>,
+    ability_ids: BTreeSet<u32>,
+    buff_ids: BTreeSet<u32>,
+    item_ids: BTreeSet<u32>,
+    loot_table_ids: BTreeSet<String>,
+    behavior_tree_ids: BTreeSet<String>,
+    route_ids: BTreeSet<String>,
+    archetype_kinds: BTreeMap<String, game_schema::EntityKind>,
+    archetype_usage: BTreeMap<String, game_schema::ArchetypeUsage>,
+    encounter_ids: BTreeSet<String>,
+    dungeon_template_ids: BTreeSet<String>,
+}
+
+impl ContentCheck {
+    fn error(&mut self, message: impl Into<String>) {
+        self.errors.push(message.into());
+    }
+
+    fn warn(&mut self, message: impl Into<String>) {
+        self.warnings.push(message.into());
+    }
+
+    fn require_u32(&mut self, known: &BTreeSet<u32>, id: u32, kind: &str, owner: &str) {
+        if !known.contains(&id) {
+            self.error(format!("{owner} references unknown {kind} {id}"));
+        }
+    }
+
+    fn require_str(&mut self, known: &BTreeSet<String>, id: &str, kind: &str, owner: &str) {
+        if !known.contains(id) {
+            self.error(format!("{owner} references unknown {kind} '{id}'"));
+        }
+    }
+}
+
+fn dev_content_check() -> Result<()> {
+    let ability_file: game_core::combat::skill::AbilityFile =
+        load_ron_file(Path::new("data/abilities.ron"))?;
+    let buff_file: game_core::combat::status::BuffFile =
+        load_ron_file(Path::new("data/buffs.ron"))?;
+    let item_file: ItemFile = load_ron_file(Path::new("data/items.ron"))?;
+    let loot_file: game_core::loot::LootTablesFile =
+        load_ron_file(Path::new("data/loot_tables.ron"))?;
+    let behavior_tree_file: game_core::ai::behavior_tree::BehaviorTreeFile =
+        load_ron_file(Path::new("data/behavior_trees.ron"))?;
+    let route_file: game_core::ai::routes::RouteFile =
+        load_ron_file(Path::new("data/npc_routes.ron"))?;
+    let archetype_file: game_schema::NpcArchetypeFile =
+        load_ron_file(Path::new("data/npc_archetypes.ron"))?;
+    let encounter_file: game_core::encounter::EncounterFile =
+        load_ron_file(Path::new("data/encounters.ron"))?;
+    let dungeon_file: game_schema::dungeon::DungeonFile =
+        load_ron_file(Path::new("data/dungeons.ron"))?;
+    let spawn_file: game_schema::spawn::SpawnFile =
+        load_ron_file(Path::new("data/spawn_rules.ron"))?;
+
+    let mut check = ContentCheck::default();
+    collect_content_ids(
+        &mut check,
+        &ability_file,
+        &buff_file,
+        &item_file,
+        &loot_file,
+        &behavior_tree_file,
+        &route_file,
+        &archetype_file,
+        &encounter_file,
+        &dungeon_file,
+    );
+
+    validate_abilities(&mut check, &ability_file);
+    validate_loot_tables(&mut check, &loot_file);
+    validate_behavior_trees(&mut check, &behavior_tree_file);
+    validate_archetypes(&mut check, &archetype_file);
+    validate_encounters(&mut check, &encounter_file);
+    validate_dungeons(&mut check, &dungeon_file);
+    validate_spawn_rules(&mut check, &spawn_file);
+
+    if !check.warnings.is_empty() {
+        eprintln!("content-check warnings:");
+        for warning in &check.warnings {
+            eprintln!("  - {warning}");
+        }
+    }
+
+    if !check.errors.is_empty() {
+        let mut message = format!("content-check failed with {} error(s):", check.errors.len());
+        for error in &check.errors {
+            message.push_str("\n  - ");
+            message.push_str(error);
+        }
+        bail!("{message}");
+    }
+
+    println!(
+        "content-check ok: {} abilities, {} buffs, {} items, {} loot tables, {} behavior trees, {} routes, {} archetypes, {} encounters, {} dungeons",
+        check.ability_ids.len(),
+        check.buff_ids.len(),
+        check.item_ids.len(),
+        check.loot_table_ids.len(),
+        check.behavior_tree_ids.len(),
+        check.route_ids.len(),
+        check.archetype_kinds.len(),
+        check.encounter_ids.len(),
+        check.dungeon_template_ids.len(),
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_content_ids(
+    check: &mut ContentCheck,
+    ability_file: &game_core::combat::skill::AbilityFile,
+    buff_file: &game_core::combat::status::BuffFile,
+    item_file: &ItemFile,
+    loot_file: &game_core::loot::LootTablesFile,
+    behavior_tree_file: &game_core::ai::behavior_tree::BehaviorTreeFile,
+    route_file: &game_core::ai::routes::RouteFile,
+    archetype_file: &game_schema::NpcArchetypeFile,
+    encounter_file: &game_core::encounter::EncounterFile,
+    dungeon_file: &game_schema::dungeon::DungeonFile,
+) {
+    for ability in &ability_file.abilities {
+        if !check.ability_ids.insert(ability.ability_id) {
+            check.error(format!("duplicate ability_id {}", ability.ability_id));
+        }
+    }
+    for buff in &buff_file.buffs {
+        if !check.buff_ids.insert(buff.buff_id) {
+            check.error(format!("duplicate buff_id {}", buff.buff_id));
+        }
+    }
+    for item in &item_file.items {
+        if !check.item_ids.insert(item.item_id) {
+            check.error(format!("duplicate item_id {}", item.item_id));
+        }
+    }
+    for table_id in loot_file.tables.keys() {
+        if !check.loot_table_ids.insert(table_id.clone()) {
+            check.error(format!("duplicate loot table id '{table_id}'"));
+        }
+    }
+    for tree in &behavior_tree_file.trees {
+        if tree.id.trim().is_empty() {
+            check.error("behavior tree id must not be empty");
+        } else if !check.behavior_tree_ids.insert(tree.id.clone()) {
+            check.error(format!("duplicate behavior tree id '{}'", tree.id));
+        }
+    }
+    for route in &route_file.routes {
+        if route.route_id.trim().is_empty() {
+            check.error("route_id must not be empty");
+        } else if !check.route_ids.insert(route.route_id.clone()) {
+            check.error(format!("duplicate route_id '{}'", route.route_id));
+        }
+    }
+    for (archetype_id, archetype) in &archetype_file.archetypes {
+        if archetype_id.trim().is_empty() {
+            check.error("npc archetype id must not be empty");
+        } else if check
+            .archetype_kinds
+            .insert(archetype_id.clone(), archetype.kind)
+            .is_some()
+        {
+            check.error(format!("duplicate npc archetype id '{archetype_id}'"));
+        }
+        check
+            .archetype_usage
+            .insert(archetype_id.clone(), archetype.usage);
+    }
+    for encounter in &encounter_file.encounters {
+        if encounter.name.trim().is_empty() {
+            check.error("encounter name must not be empty");
+        } else if !check.encounter_ids.insert(encounter.name.clone()) {
+            check.error(format!("duplicate encounter name '{}'", encounter.name));
+        }
+    }
+    for template in &dungeon_file.templates {
+        if template.template_id.trim().is_empty() {
+            check.error("dungeon template_id must not be empty");
+        } else if !check
+            .dungeon_template_ids
+            .insert(template.template_id.clone())
+        {
+            check.error(format!(
+                "duplicate dungeon template_id '{}'",
+                template.template_id
+            ));
+        }
+    }
+}
+
+fn validate_abilities(
+    check: &mut ContentCheck,
+    ability_file: &game_core::combat::skill::AbilityFile,
+) {
+    let mut timeline_ids = BTreeSet::new();
+    for ability in &ability_file.abilities {
+        let owner = format!("ability {}", ability.ability_id);
+        for buff_id in &ability.on_hit_buffs {
+            check.require_u32(&check.buff_ids.clone(), *buff_id, "buff_id", &owner);
+        }
+    }
+
+    for timeline in &ability_file.timelines {
+        let owner = format!("ability timeline {}", timeline.ability_id);
+        if !timeline_ids.insert(timeline.ability_id) {
+            check.error(format!(
+                "duplicate ability timeline {}",
+                timeline.ability_id
+            ));
+        }
+        check.require_u32(
+            &check.ability_ids.clone(),
+            timeline.ability_id,
+            "ability_id",
+            &owner,
+        );
+        for action in &timeline.actions {
+            validate_ability_action(
+                check,
+                &format!("{owner} @ tick {}", action.tick_offset),
+                &action.action,
+            );
+        }
+    }
+}
+
+fn validate_ability_action(
+    check: &mut ContentCheck,
+    owner: &str,
+    action: &game_core::combat::skill::AbilityAction,
+) {
+    use game_core::combat::skill::AbilityAction;
+    match action {
+        AbilityAction::SpawnHitbox { .. }
+        | AbilityAction::ApplyDamageFrame
+        | AbilityAction::RemoveHitbox
+        | AbilityAction::CooldownStart { .. }
+        | AbilityAction::StanceBegin { .. }
+        | AbilityAction::StanceEnd
+        | AbilityAction::RootForTicks { .. }
+        | AbilityAction::SetMovement { .. }
+        | AbilityAction::ArcMovement { .. }
+        | AbilityAction::Telegraph { .. }
+        | AbilityAction::Cleanse { .. }
+        | AbilityAction::ClearCC { .. }
+        | AbilityAction::Stunbreak
+        | AbilityAction::TeleportBehindTarget { .. }
+        | AbilityAction::TeleportForward { .. } => {}
+        AbilityAction::SpawnConfiguredHitbox { effect, .. } => {
+            if let Some(effect) = effect.as_deref() {
+                validate_hit_effect(check, &format!("{owner} configured hitbox"), effect);
+            }
+        }
+        AbilityAction::OpenFollowUpWindow {
+            next_ability_id, ..
+        } => {
+            check.require_u32(
+                &check.ability_ids.clone(),
+                *next_ability_id,
+                "ability_id",
+                owner,
+            );
+        }
+        AbilityAction::ApplyBuff { buff_id } => {
+            check.require_u32(&check.buff_ids.clone(), *buff_id, "buff_id", owner);
+        }
+    }
+}
+
+fn validate_hit_effect(
+    check: &mut ContentCheck,
+    owner: &str,
+    effect: &game_core::combat::skill::HitEffectSpec,
+) {
+    for buff_id in &effect.on_hit_buffs {
+        check.require_u32(&check.buff_ids.clone(), *buff_id, "buff_id", owner);
+    }
+    for (index, contact) in effect.on_contact.iter().enumerate() {
+        match contact {
+            game_core::combat::skill::HitEffectAction::SpawnHitbox { effect, .. } => {
+                if let Some(effect) = effect.as_deref() {
+                    validate_hit_effect(check, &format!("{owner} contact effect {index}"), effect);
+                }
+            }
+        }
+    }
+}
+
+fn validate_loot_tables(check: &mut ContentCheck, loot_file: &game_core::loot::LootTablesFile) {
+    for (table_id, table) in &loot_file.tables {
+        if table.rolls == 0 {
+            check.error(format!("loot table '{table_id}' has rolls=0"));
+        }
+        if table.entries.is_empty() {
+            check.error(format!("loot table '{table_id}' has no entries"));
+        }
+        for entry in &table.entries {
+            let owner = format!("loot table '{table_id}'");
+            check.require_u32(&check.item_ids.clone(), entry.item_id, "item_id", &owner);
+            if entry.weight == 0 {
+                check.error(format!(
+                    "loot table '{table_id}' entry item_id={} has weight=0",
+                    entry.item_id
+                ));
+            }
+            if entry.min == 0 || entry.max == 0 || entry.min > entry.max {
+                check.error(format!(
+                    "loot table '{table_id}' entry item_id={} has invalid quantity range {}..{}",
+                    entry.item_id, entry.min, entry.max
+                ));
+            }
+        }
+    }
+}
+
+fn validate_behavior_trees(
+    check: &mut ContentCheck,
+    behavior_tree_file: &game_core::ai::behavior_tree::BehaviorTreeFile,
+) {
+    for tree in &behavior_tree_file.trees {
+        validate_behavior_node(check, &format!("behavior tree '{}'", tree.id), &tree.root);
+    }
+}
+
+fn validate_behavior_node(
+    check: &mut ContentCheck,
+    owner: &str,
+    node: &game_core::ai::behavior_tree::BehaviorNode,
+) {
+    use game_core::ai::behavior_tree::{ActionNode, BehaviorNode};
+    match node {
+        BehaviorNode::Selector(children) | BehaviorNode::Sequence(children) => {
+            if children.is_empty() {
+                check.warn(format!("{owner} contains an empty composite node"));
+            }
+            for (index, child) in children.iter().enumerate() {
+                validate_behavior_node(check, &format!("{owner} child {index}"), child);
+            }
+        }
+        BehaviorNode::Condition(_) => {}
+        BehaviorNode::Action(action) => match action {
+            ActionNode::FollowRoute(route_id) => {
+                check.require_str(
+                    &check.route_ids.clone(),
+                    route_id.as_str(),
+                    "route_id",
+                    owner,
+                );
+            }
+            ActionNode::Emit(action) => {
+                check.warn(format!(
+                    "{owner} uses ActionNode::Emit; prefer named high-level BT leaves for shipped content"
+                ));
+                validate_desired_ai_action(check, owner, action);
+            }
+            _ => {}
+        },
+        BehaviorNode::Invert(child) => {
+            validate_behavior_node(check, &format!("{owner} inverted child"), child);
+        }
+    }
+}
+
+fn validate_desired_ai_action(
+    check: &mut ContentCheck,
+    owner: &str,
+    action: &game_core::ai::decision::DesiredAiAction,
+) {
+    use game_core::ai::decision::DesiredAiAction;
+    match action {
+        DesiredAiAction::FollowRoute { route_id } => {
+            check.require_str(
+                &check.route_ids.clone(),
+                route_id.as_str(),
+                "route_id",
+                owner,
+            );
+        }
+        DesiredAiAction::MoveToPoint(point)
+        | DesiredAiAction::EvadeHome {
+            home_position: point,
+        } => {
+            if !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite() {
+                check.error(format!("{owner} emits a non-finite AI point"));
+            }
+        }
+        DesiredAiAction::SetState { .. }
+        | DesiredAiAction::StopMovement
+        | DesiredAiAction::ClearThreat
+        | DesiredAiAction::MoveTowardEntity(_)
+        | DesiredAiAction::MoveAwayFromEntity(_)
+        | DesiredAiAction::TryCastBestAbility { .. } => {}
+    }
+}
+
+fn validate_archetypes(check: &mut ContentCheck, archetype_file: &game_schema::NpcArchetypeFile) {
+    for (archetype_id, archetype) in &archetype_file.archetypes {
+        let owner = format!("npc archetype '{archetype_id}'");
+        // Shared structural validator: same code path the server reducer
+        // (`load_npc_archetypes`) and the simulation worker
+        // (`NpcArchetypeRegistry::from_ron`) run. Aggregates per-row instead
+        // of bailing on the first error so the content-check report still
+        // surfaces all archetype problems in one run.
+        if let Err(err) = game_schema::npc_archetype::validate_archetype(archetype_id, archetype) {
+            check.error(err);
+        }
+        for ability_id in &archetype.ability_ids {
+            check.require_u32(
+                &check.ability_ids.clone(),
+                *ability_id,
+                "ability_id",
+                &owner,
+            );
+        }
+        if let Some(tree_id) = archetype.behavior_tree_id.as_deref()
+            && !tree_id.is_empty()
+        {
+            check.require_str(
+                &check.behavior_tree_ids.clone(),
+                tree_id,
+                "behavior_tree_id",
+                &owner,
+            );
+        }
+        if let Some(route_id) = archetype.route_id.as_deref()
+            && !route_id.is_empty()
+        {
+            check.require_str(&check.route_ids.clone(), route_id, "route_id", &owner);
+        }
+        if let Some(table_id) = archetype.loot_table_id.as_deref()
+            && !table_id.is_empty()
+        {
+            check.require_str(
+                &check.loot_table_ids.clone(),
+                table_id,
+                "loot_table_id",
+                &owner,
+            );
+        }
+    }
+}
+
+fn validate_encounters(
+    check: &mut ContentCheck,
+    encounter_file: &game_core::encounter::EncounterFile,
+) {
+    for encounter in &encounter_file.encounters {
+        let owner = format!("encounter '{}'", encounter.name);
+        if let Some(table_id) = encounter.loot_table_id.as_deref() {
+            check.require_str(
+                &check.loot_table_ids.clone(),
+                table_id,
+                "loot_table_id",
+                &owner,
+            );
+        }
+        let mut rule_ids = BTreeSet::new();
+        for rule in &encounter.rules {
+            if rule.id.trim().is_empty() {
+                check.error(format!("{owner} has a rule with an empty id"));
+            } else if !rule_ids.insert(rule.id.clone()) {
+                check.error(format!("{owner} has duplicate rule id '{}'", rule.id));
+            }
+            let rule_owner = format!("{owner} rule '{}'", rule.id);
+            validate_encounter_cond(check, &rule_owner, &rule.cond);
+            for (index, effect) in rule.effects.iter().enumerate() {
+                validate_encounter_effect(check, &format!("{rule_owner} effect {index}"), effect);
+            }
+        }
+    }
+}
+
+fn validate_encounter_cond(
+    check: &mut ContentCheck,
+    owner: &str,
+    cond: &game_core::encounter::Cond,
+) {
+    use game_core::encounter::Cond;
+    match cond {
+        Cond::All { conds } | Cond::Any { conds } => {
+            for (index, cond) in conds.iter().enumerate() {
+                validate_encounter_cond(check, &format!("{owner} cond {index}"), cond);
+            }
+        }
+        Cond::Not { cond } => validate_encounter_cond(check, &format!("{owner} not cond"), cond),
+        Cond::AllVolumeOccupantsHaveBuff { buff_id, .. } => {
+            check.require_u32(&check.buff_ids.clone(), *buff_id, "buff_id", owner);
+        }
+        Cond::Always
+        | Cond::PhaseIs { .. }
+        | Cond::HpPctCmp { .. }
+        | Cond::CounterCmp { .. }
+        | Cond::OccupancyCmp { .. }
+        | Cond::VolumeOccupantsExactlyOneOf { .. } => {}
+    }
+}
+
+fn validate_encounter_effect(
+    check: &mut ContentCheck,
+    owner: &str,
+    effect: &game_core::encounter::Effect,
+) {
+    use game_core::encounter::Effect;
+    match effect {
+        Effect::CastSkill { skill_id, .. } | Effect::Telegraph { skill_id, .. } => {
+            check.require_u32(&check.ability_ids.clone(), *skill_id, "ability_id", owner);
+        }
+        Effect::ReplaceAbilityList { ability_ids } => {
+            for ability_id in ability_ids {
+                check.require_u32(&check.ability_ids.clone(), *ability_id, "ability_id", owner);
+            }
+        }
+        Effect::SpawnAdds { archetype, .. } => {
+            if !check.archetype_kinds.contains_key(archetype) {
+                check.error(format!(
+                    "{owner} references unknown archetype '{archetype}'"
+                ));
+            } else {
+                if check.archetype_kinds.get(archetype) != Some(&game_schema::EntityKind::Npc) {
+                    check.error(format!(
+                        "{owner} spawns archetype '{archetype}' with kind {:?}; SpawnAdds requires kind Npc",
+                        check.archetype_kinds.get(archetype)
+                    ));
+                }
+                if let Some(usage) = check.archetype_usage.get(archetype).copied()
+                    && !usage.allows_encounter_add()
+                {
+                    check.error(format!(
+                        "{owner} spawns archetype '{archetype}' with usage {:?}; SpawnAdds requires usage Both or AddOnly",
+                        usage
+                    ));
+                }
+            }
+        }
+        Effect::ApplyBuff { buff_id, .. } => {
+            check.require_u32(&check.buff_ids.clone(), *buff_id, "buff_id", owner);
+        }
+        Effect::RemoveBuffs { buff_ids, .. } => {
+            for buff_id in buff_ids {
+                check.require_u32(&check.buff_ids.clone(), *buff_id, "buff_id", owner);
+            }
+        }
+        Effect::Sequence { steps } | Effect::Parallel { steps } => {
+            for (index, step) in steps.iter().enumerate() {
+                validate_encounter_effect(check, &format!("{owner} step {index}"), step);
+            }
+        }
+        Effect::ChangePhase { .. }
+        | Effect::StartMechanic { .. }
+        | Effect::StopMechanic { .. }
+        | Effect::EncounterCue { .. }
+        | Effect::SetInteractableState { .. }
+        | Effect::ToggleInteractable { .. }
+        | Effect::IncrementCounter { .. }
+        | Effect::IncrementZoneCounter { .. }
+        | Effect::EmitEncounterEvent { .. }
+        | Effect::SpawnVolume { .. }
+        | Effect::DespawnVolume { .. }
+        | Effect::Wait { .. } => {}
+    }
+}
+
+fn validate_dungeons(check: &mut ContentCheck, dungeon_file: &game_schema::dungeon::DungeonFile) {
+    for template in &dungeon_file.templates {
+        let owner = format!("dungeon '{}'", template.template_id);
+        let mut local_ids = BTreeSet::new();
+        for interactable in &template.interactables {
+            let interactable_owner =
+                format!("{owner} interactable local_id={}", interactable.local_id);
+            if !local_ids.insert(interactable.local_id) {
+                check.error(format!(
+                    "{owner} has duplicate interactable local_id {}",
+                    interactable.local_id
+                ));
+            }
+            if let Some(buff_id) = interactable.required_buff {
+                check.require_u32(
+                    &check.buff_ids.clone(),
+                    buff_id,
+                    "buff_id",
+                    &interactable_owner,
+                );
+            }
+            if let Some(item_id) = interactable.required_item {
+                check.require_u32(
+                    &check.item_ids.clone(),
+                    item_id,
+                    "item_id",
+                    &interactable_owner,
+                );
+            }
+            if let game_schema::dungeon::InteractKindDef::BossSpawn {
+                npc_name,
+                encounter_name,
+                archetype_id,
+            } = &interactable.kind
+            {
+                match encounter_name.as_deref() {
+                    Some(encounter_name) => check.require_str(
+                        &check.encounter_ids.clone(),
+                        encounter_name,
+                        "encounter",
+                        &interactable_owner,
+                    ),
+                    None => check.warn(format!(
+                        "{interactable_owner} BossSpawn has no encounter_name; runtime falls back to npc_name '{npc_name}'"
+                    )),
+                }
+                validate_dungeon_actor_archetype(
+                    check,
+                    &interactable_owner,
+                    archetype_id.as_deref(),
+                    game_schema::EntityKind::Boss,
+                );
+            }
+            if let game_schema::dungeon::InteractKindDef::NpcSpawn { archetype_id, .. } =
+                &interactable.kind
+            {
+                validate_dungeon_actor_archetype(
+                    check,
+                    &interactable_owner,
+                    archetype_id.as_deref(),
+                    game_schema::EntityKind::Npc,
+                );
+            }
+        }
+        for interactable in &template.interactables {
+            if let Some(linked_to) = interactable.linked_to
+                && !local_ids.contains(&linked_to)
+            {
+                check.error(format!(
+                    "{owner} interactable local_id={} links to missing local_id {}",
+                    interactable.local_id, linked_to
+                ));
+            }
+        }
+    }
+}
+
+fn validate_dungeon_actor_archetype(
+    check: &mut ContentCheck,
+    owner: &str,
+    archetype_id: Option<&str>,
+    expected_kind: game_schema::EntityKind,
+) {
+    let Some(archetype_id) = archetype_id.filter(|id| !id.is_empty()) else {
+        return;
+    };
+    match check.archetype_kinds.get(archetype_id).copied() {
+        Some(kind) if kind == expected_kind => {}
+        Some(kind) => check.error(format!(
+            "{owner} references archetype_id '{archetype_id}' with kind {:?}; expected {:?}",
+            kind, expected_kind
+        )),
+        None => {
+            check.error(format!(
+                "{owner} references unknown archetype_id '{archetype_id}'"
+            ));
+            return;
+        }
+    }
+    if let Some(usage) = check.archetype_usage.get(archetype_id).copied()
+        && !usage.allows_actor_spawn()
+    {
+        check.error(format!(
+            "{owner} references archetype_id '{archetype_id}' with usage {:?}; dungeon actor spawns require usage Both or ActorOnly",
+            usage
+        ));
+    }
+}
+
+fn validate_spawn_rules(check: &mut ContentCheck, spawn_file: &game_schema::spawn::SpawnFile) {
+    let mut rule_ids = BTreeSet::new();
+    for rule in &spawn_file.rules {
+        let owner = format!("spawn rule '{}'", rule.rule_id);
+        if rule.rule_id.trim().is_empty() {
+            check.error("spawn rule_id must not be empty");
+        } else if !rule_ids.insert(rule.rule_id.clone()) {
+            check.error(format!("duplicate spawn rule_id '{}'", rule.rule_id));
+        }
+        if let game_schema::spawn::SpawnScope::Dungeon { template_id } = &rule.scope {
+            check.require_str(
+                &check.dungeon_template_ids.clone(),
+                template_id,
+                "dungeon template_id",
+                &owner,
+            );
+        }
+        match &rule.trigger {
+            game_schema::spawn::SpawnTrigger::WorldActivityEventActive { tag, .. } => {
+                if tag.trim().is_empty() {
+                    check.error(format!(
+                        "{owner} trigger WorldActivityEventActive tag must not be empty"
+                    ));
+                }
+            }
+            game_schema::spawn::SpawnTrigger::WorldPhase { phase_name } => {
+                if phase_name.trim().is_empty() {
+                    check.error(format!(
+                        "{owner} trigger WorldPhase phase_name must not be empty"
+                    ));
+                }
+            }
+            game_schema::spawn::SpawnTrigger::OnEvent { event_name } => {
+                if event_name.trim().is_empty() {
+                    check.error(format!(
+                        "{owner} trigger OnEvent event_name must not be empty"
+                    ));
+                }
+            }
+            game_schema::spawn::SpawnTrigger::PlayerCountAtLeast { .. } => {}
+        }
+        for (index, spawn) in rule.spawns.iter().enumerate() {
+            if spawn.max_hp <= 0.0 && spawn.kind != game_schema::EntityKind::Prop {
+                check.error(format!("{owner} spawn {index} max_hp must be positive"));
+            }
+            if spawn.offset.iter().any(|value| !value.is_finite()) {
+                check.error(format!("{owner} spawn {index} has a non-finite offset"));
+            }
+        }
+    }
 }
 
 fn dev_capture_fixture(args: CaptureFixtureArgs) -> Result<()> {

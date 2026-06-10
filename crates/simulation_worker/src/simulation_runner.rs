@@ -136,6 +136,25 @@ impl SimulationRunner {
         self.pending_stat_recalcs.insert(entity_id);
     }
 
+    pub fn set_loot_registry(&mut self, registry: game_core::loot::LootRegistry) {
+        self.pipeline.set_loot_registry(registry);
+    }
+
+    pub fn set_behavior_tree_registry(
+        &mut self,
+        registry: game_core::ai::behavior_tree::BehaviorTreeRegistry,
+    ) {
+        self.pipeline.set_behavior_tree_registry(registry);
+    }
+
+    pub fn set_route_registry(&mut self, registry: game_core::ai::routes::RouteRegistry) {
+        self.pipeline.set_route_registry(registry);
+    }
+
+    pub fn set_entity_loot_table(&mut self, entity: EntityId, loot_table_id: Option<String>) {
+        self.pipeline.set_entity_loot_table(entity, loot_table_id);
+    }
+
     /// Ingest an entity from a DB snapshot row into the simulation.
     pub fn spawn_entity_from_snapshot(
         &mut self,
@@ -469,6 +488,60 @@ impl SimulationRunner {
         self.pipeline.npc_goals.remove(&entity_id);
     }
 
+    /// Mark a player entity as disconnected (in instance-reconnect grace).
+    /// Mirrors `InstanceMembership.disconnect_at.is_some()` from the DB.
+    /// Phase 7.5 excludes disconnected players from the active region
+    /// count so encounters and the director don't progress around them.
+    pub fn set_player_disconnected(&mut self, entity_id: EntityId, disconnected: bool) {
+        if disconnected {
+            self.pipeline.disconnected_players.insert(entity_id);
+        } else {
+            self.pipeline.disconnected_players.remove(&entity_id);
+        }
+    }
+
+    /// Project a `world_activity_event` row into the worker's lookup
+    /// map. The director's `WorldActivityEventActive` trigger reads
+    /// this map to gate spawns on both event state AND per-region
+    /// presence. Called by the coordinator on
+    /// `world_activity_event.on_insert` / `on_update`.
+    pub fn set_world_activity_event(
+        &mut self,
+        scope_layer: u32,
+        scope_region_x: i32,
+        scope_region_z: i32,
+        tag: String,
+        state: game_schema::WorldActivityEventState,
+    ) {
+        let key = game_schema::WorldActivityEventKey {
+            scope_layer,
+            scope_region_x,
+            scope_region_z,
+            tag,
+        };
+        self.pipeline.world_activity_events.insert(key, state);
+    }
+
+    /// Drop a `world_activity_event` projection. Called by the
+    /// coordinator on `world_activity_event.on_delete` (e.g. when an
+    /// instance expires and its rows are cleaned up by
+    /// `expire_instances_inner`).
+    pub fn remove_world_activity_event(
+        &mut self,
+        scope_layer: u32,
+        scope_region_x: i32,
+        scope_region_z: i32,
+        tag: String,
+    ) {
+        let key = game_schema::WorldActivityEventKey {
+            scope_layer,
+            scope_region_x,
+            scope_region_z,
+            tag,
+        };
+        self.pipeline.world_activity_events.remove(&key);
+    }
+
     // ── Encounter management ────────────────────────────────────────
 
     /// Register an encounter for a boss entity.
@@ -492,6 +565,26 @@ impl SimulationRunner {
     ) {
         self.pipeline
             .register_encounter_add_with_tags(add_entity, boss_entity, tags);
+    }
+
+    pub fn register_encounter_add_with_archetype(
+        &mut self,
+        add_entity: EntityId,
+        boss_entity: EntityId,
+        archetype: &str,
+        tags: &[String],
+    ) {
+        self.pipeline.register_encounter_add_with_archetype(
+            add_entity,
+            boss_entity,
+            archetype,
+            tags,
+        );
+    }
+
+    pub fn apply_npc_archetype_to_entity(&mut self, entity: EntityId, archetype: &str) {
+        self.pipeline
+            .apply_npc_archetype_to_entity(entity, archetype);
     }
 
     // ── Director management ────────────────────────────────────────

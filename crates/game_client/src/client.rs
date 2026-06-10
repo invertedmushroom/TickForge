@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::module_bindings::*;
-use spacetimedb_sdk::{DbContext, Table};
+use spacetimedb_sdk::{DbContext, Table, TableWithPrimaryKey};
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -16,14 +16,14 @@ pub struct ClientConfig {
 
 const TOKEN_FILE: &str = ".client_token";
 
-fn load_token() -> Option<String> {
+pub(crate) fn load_token() -> Option<String> {
     std::fs::read_to_string(TOKEN_FILE)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
-fn save_token(token: &str) {
+pub(crate) fn save_token(token: &str) {
     if let Err(e) = std::fs::write(TOKEN_FILE, token) {
         warn!("Failed to save client token to {TOKEN_FILE}: {e}");
     } else {
@@ -119,8 +119,21 @@ fn subscribe(ctx: &DbConnection) {
 fn register_callbacks(conn: &DbConnection) {
     conn.db.my_region().on_insert(|_ctx, row| {
         info!(
-            "Region update: entity_id={} cell=({},{}) layer={}",
+            "Region entered: entity_id={} cell=({},{}) layer={}",
             row.entity_id, row.region_x, row.region_z, row.layer
+        );
+    });
+
+    conn.db.my_region().on_update(|_ctx, old, row| {
+        info!(
+            "Region update: entity_id={} cell=({},{}) layer={} -> cell=({},{}) layer={}",
+            row.entity_id,
+            old.region_x,
+            old.region_z,
+            old.layer,
+            row.region_x,
+            row.region_z,
+            row.layer
         );
     });
 
@@ -128,6 +141,20 @@ fn register_callbacks(conn: &DbConnection) {
         info!(
             "Entity entered AOI: entity_id={} pos=({:.1},{:.1},{:.1})",
             row.entity_id, row.pos_x, row.pos_y, row.pos_z
+        );
+    });
+
+    conn.db.nearby_transforms().on_update(|_ctx, old, row| {
+        info!(
+            "Entity moved in AOI: entity_id={} pos=({:.1},{:.1},{:.1}) -> ({:.1},{:.1},{:.1}) tick={}",
+            row.entity_id,
+            old.pos_x,
+            old.pos_y,
+            old.pos_z,
+            row.pos_x,
+            row.pos_y,
+            row.pos_z,
+            row.last_tick
         );
     });
 

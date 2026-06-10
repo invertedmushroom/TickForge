@@ -13,7 +13,7 @@ debug = []
 
 [dependencies]
 game_schema = { workspace = true, features = ["spacetimedb"] }
-spacetimedb = { version = "2.1", features = ["unstable"] }
+spacetimedb = { workspace = true, features = ["unstable"] }
 log = { workspace = true }
 ron = { workspace = true }
 serde = { workspace = true }

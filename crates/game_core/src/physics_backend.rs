@@ -146,9 +146,7 @@ impl BodyShape {
             EntityKind::Player => BodyShape::PlayerCapsule,
             EntityKind::Npc => BodyShape::NpcCapsule,
             EntityKind::Boss => BodyShape::BossCapsule,
-            EntityKind::Prop | EntityKind::Projectile | EntityKind::Hazard => {
-                BodyShape::NpcCapsule
-            }
+            EntityKind::Prop | EntityKind::Projectile | EntityKind::Hazard => BodyShape::NpcCapsule,
         }
     }
 

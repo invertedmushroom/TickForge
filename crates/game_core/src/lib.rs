@@ -1,9 +1,11 @@
+pub mod ai;
 pub mod collision_layers;
 pub mod combat;
 pub mod director;
 pub mod dungeon;
 pub mod encounter;
 pub mod entity;
+pub mod loot;
 pub mod physics_backend;
 pub mod physics_constants;
 pub mod region;

@@ -10,6 +10,7 @@ use game_protocol::entity_id::EntityId;
 use game_protocol::tick::TickId;
 use game_schema::EntityKind;
 use game_schema::spawn::SpawnScaling;
+use game_schema::world_activity::{WorldActivityEventKey, WorldActivityEventState};
 use serde::{Deserialize, Serialize};
 
 /// Width of a spatial grid cell in world units — must match `tick_pipeline::CELL_SIZE`.
@@ -54,17 +55,36 @@ pub enum DirectorTrigger {
     AfterTick { tick: u64 },
     /// Fires when a zone's world_phase matches `phase_name`.
     WorldPhase { zone_id: u32, phase_name: String },
+    /// Fires when a `world_activity_event` row tagged `tag` is in state
+    /// `Active` in the rule's region scope, AND the active player count
+    /// in that region is at least `min_players`. The scope key is
+    /// derived from the owning rule's `region` (so the same trigger
+    /// reused across cells gates each independently).
+    ///
+    /// This is the preferred replacement for bare `WorldPhase` for
+    /// actor-spawning rules: a `world_activity_event` row carries the
+    /// authored `required_players` value, and the worker's effective
+    /// region count already excludes reconnect-grace players (step 2 of
+    /// the messaging-spine review). See
+    /// `docs/contracts/world_activity_policy_contract.md`.
+    WorldActivityEventActive { tag: String, min_players: u32 },
     /// Both conditions must be true.
     And(Box<DirectorTrigger>, Box<DirectorTrigger>),
 }
 
 impl DirectorTrigger {
     /// Evaluate the trigger against current region state.
+    ///
+    /// `region_scope` is the `(rx, rz, layer)` of the owning event, used
+    /// by `WorldActivityEventActive` to look up the right scope row in
+    /// `world_events`.
     pub fn evaluate(
         &self,
         player_count: u32,
         current_tick: TickId,
         world_phases: &HashMap<u32, String>,
+        world_events: &HashMap<WorldActivityEventKey, WorldActivityEventState>,
+        region_scope: (i32, i32, u32),
     ) -> bool {
         match self {
             Self::PlayerCountAtLeast { threshold } => player_count >= *threshold,
@@ -73,9 +93,36 @@ impl DirectorTrigger {
                 zone_id,
                 phase_name,
             } => world_phases.get(zone_id).map_or(false, |p| p == phase_name),
+            Self::WorldActivityEventActive { tag, min_players } => {
+                if player_count < *min_players {
+                    return false;
+                }
+                let (rx, rz, layer) = region_scope;
+                let key = WorldActivityEventKey {
+                    scope_layer: layer,
+                    scope_region_x: rx,
+                    scope_region_z: rz,
+                    tag: tag.clone(),
+                };
+                world_events
+                    .get(&key)
+                    .map(|state| *state == WorldActivityEventState::Active)
+                    .unwrap_or(false)
+            }
             Self::And(a, b) => {
-                a.evaluate(player_count, current_tick, world_phases)
-                    && b.evaluate(player_count, current_tick, world_phases)
+                a.evaluate(
+                    player_count,
+                    current_tick,
+                    world_phases,
+                    world_events,
+                    region_scope,
+                ) && b.evaluate(
+                    player_count,
+                    current_tick,
+                    world_phases,
+                    world_events,
+                    region_scope,
+                )
             }
         }
     }
@@ -129,12 +176,27 @@ pub struct DirectorSpawn {
     pub position: game_protocol::types::Vec3f,
     /// Target visibility layer (0 = open world, 100+ = dynamic instance).
     pub layer: u32,
+    /// Optional actor runtime configuration to persist alongside NPC/Boss
+    /// rows. `None` keeps the reducer's historical defaults.
+    pub npc_config: Option<DirectorNpcConfig>,
+    /// Optional team assignment to persist into `entity_team`.
+    pub team_id: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DirectorNpcConfig {
+    pub passive: bool,
+    pub no_chase: bool,
+    pub ability_ids: Vec<u32>,
+    pub leash_radius: f32,
+    pub aggro_radius: f32,
+    pub body_shape: Option<u8>,
 }
 
 /// Encounter membership entry paired with a `DirectorSpawn` produced by an
 /// encounter rule's `SpawnAdds` effect. The commit reducer reads this to
 /// insert an `encounter_add` row tying the new entity to its owning boss
-/// and tags.
+/// and tags. See `docs/contracts/spawn_add_membership_contract.md`.
 #[derive(Clone, Debug)]
 pub struct PendingAddMembership {
     /// Index into the same tick's `director_spawns` vector. The reducer
@@ -200,6 +262,7 @@ impl DirectorState {
         region_player_counts: &HashMap<(i32, i32, u32), u32>,
         current_tick: TickId,
         world_phases: &HashMap<u32, String>,
+        world_events: &HashMap<WorldActivityEventKey, WorldActivityEventState>,
     ) -> Vec<DirectorSpawn> {
         let mut spawns = Vec::new();
 
@@ -220,11 +283,13 @@ impl DirectorState {
                 .copied()
                 .unwrap_or(0);
 
-            if rt
-                .def
-                .trigger
-                .evaluate(player_count, current_tick, world_phases)
-            {
+            if rt.def.trigger.evaluate(
+                player_count,
+                current_tick,
+                world_phases,
+                world_events,
+                rt.def.region,
+            ) {
                 let (rx, rz, layer) = rt.def.region;
                 let center_x = (rx as f32 + 0.5) * REGION_CELL_SIZE;
                 let center_z = (rz as f32 + 0.5) * REGION_CELL_SIZE;
@@ -269,6 +334,8 @@ impl DirectorState {
                                 z: center_z + directive.offset[2],
                             },
                             layer,
+                            npc_config: None,
+                            team_id: None,
                         });
                     }
                 }
@@ -343,18 +410,20 @@ mod tests {
     fn trigger_player_count() {
         let t = DirectorTrigger::PlayerCountAtLeast { threshold: 3 };
         let wp = HashMap::new();
-        assert!(!t.evaluate(2, TickId(100), &wp));
-        assert!(t.evaluate(3, TickId(100), &wp));
-        assert!(t.evaluate(5, TickId(100), &wp));
+        let we = HashMap::new();
+        assert!(!t.evaluate(2, TickId(100), &wp, &we, (0, 0, 0)));
+        assert!(t.evaluate(3, TickId(100), &wp, &we, (0, 0, 0)));
+        assert!(t.evaluate(5, TickId(100), &wp, &we, (0, 0, 0)));
     }
 
     #[test]
     fn trigger_after_tick() {
         let t = DirectorTrigger::AfterTick { tick: 50 };
         let wp = HashMap::new();
-        assert!(!t.evaluate(0, TickId(49), &wp));
-        assert!(t.evaluate(0, TickId(50), &wp));
-        assert!(t.evaluate(0, TickId(100), &wp));
+        let we = HashMap::new();
+        assert!(!t.evaluate(0, TickId(49), &wp, &we, (0, 0, 0)));
+        assert!(t.evaluate(0, TickId(50), &wp, &we, (0, 0, 0)));
+        assert!(t.evaluate(0, TickId(100), &wp, &we, (0, 0, 0)));
     }
 
     #[test]
@@ -364,9 +433,68 @@ mod tests {
             Box::new(DirectorTrigger::AfterTick { tick: 100 }),
         );
         let wp = HashMap::new();
-        assert!(!t.evaluate(2, TickId(99), &wp));
-        assert!(!t.evaluate(1, TickId(100), &wp));
-        assert!(t.evaluate(2, TickId(100), &wp));
+        let we = HashMap::new();
+        assert!(!t.evaluate(2, TickId(99), &wp, &we, (0, 0, 0)));
+        assert!(!t.evaluate(1, TickId(100), &wp, &we, (0, 0, 0)));
+        assert!(t.evaluate(2, TickId(100), &wp, &we, (0, 0, 0)));
+    }
+
+    /// `WorldActivityEventActive` must require BOTH the event row being
+    /// in `Active` state AND the per-region player count meeting the
+    /// authored `min_players` floor. This is the runtime mirror of the
+    /// `world_clock`-side `required_players` gate and the worker-side
+    /// disconnected-player exclusion — together they close the
+    /// "WorldPhase spawns offscreen" gap (Finding #4, 2026-06-09 review).
+    #[test]
+    fn trigger_world_activity_event_active_requires_state_and_presence() {
+        let t = DirectorTrigger::WorldActivityEventActive {
+            tag: "boss_ready".to_string(),
+            min_players: 1,
+        };
+        let wp = HashMap::new();
+        let scope = (0, 0, 0);
+        let key = WorldActivityEventKey {
+            scope_layer: 0,
+            scope_region_x: 0,
+            scope_region_z: 0,
+            tag: "boss_ready".to_string(),
+        };
+
+        // Event row missing entirely: must not fire.
+        let we = HashMap::new();
+        assert!(!t.evaluate(1, TickId(1), &wp, &we, scope));
+
+        // Event Pending: state not Active, must not fire.
+        let mut we = HashMap::new();
+        we.insert(key.clone(), WorldActivityEventState::Pending);
+        assert!(!t.evaluate(1, TickId(1), &wp, &we, scope));
+
+        // Event Active but zero players in region: must not fire.
+        let mut we = HashMap::new();
+        we.insert(key.clone(), WorldActivityEventState::Active);
+        assert!(!t.evaluate(0, TickId(1), &wp, &we, scope));
+
+        // Event Active and presence requirement met: fires.
+        assert!(t.evaluate(1, TickId(1), &wp, &we, scope));
+
+        // Event Completed/Expired: must not fire even with players present.
+        we.insert(key.clone(), WorldActivityEventState::Completed);
+        assert!(!t.evaluate(5, TickId(1), &wp, &we, scope));
+        we.insert(key, WorldActivityEventState::Expired);
+        assert!(!t.evaluate(5, TickId(1), &wp, &we, scope));
+
+        // Different scope (rx=1) with the same tag: lookup misses, no fire.
+        let mut we = HashMap::new();
+        we.insert(
+            WorldActivityEventKey {
+                scope_layer: 0,
+                scope_region_x: 1,
+                scope_region_z: 0,
+                tag: "boss_ready".to_string(),
+            },
+            WorldActivityEventState::Active,
+        );
+        assert!(!t.evaluate(1, TickId(1), &wp, &we, scope));
     }
 
     #[test]
@@ -390,15 +518,16 @@ mod tests {
 
         // First evaluation fires.
         let wp = HashMap::new();
-        let spawns = director.evaluate(&counts, TickId(1), &wp);
+        let we = HashMap::new();
+        let spawns = director.evaluate(&counts, TickId(1), &wp, &we);
         assert!(!spawns.is_empty());
 
         // Still on cooldown.
-        let spawns = director.evaluate(&counts, TickId(5), &wp);
+        let spawns = director.evaluate(&counts, TickId(5), &wp, &we);
         assert!(spawns.is_empty());
 
         // Cooldown expired.
-        let spawns = director.evaluate(&counts, TickId(11), &wp);
+        let spawns = director.evaluate(&counts, TickId(11), &wp, &we);
         assert!(!spawns.is_empty());
 
         assert_eq!(eid, EventId(1));
@@ -424,10 +553,11 @@ mod tests {
         counts.insert((1, 2, 0), 3u32);
 
         let wp = HashMap::new();
-        assert!(!director.evaluate(&counts, TickId(1), &wp).is_empty());
-        assert!(!director.evaluate(&counts, TickId(2), &wp).is_empty());
+        let we = HashMap::new();
+        assert!(!director.evaluate(&counts, TickId(1), &wp, &we).is_empty());
+        assert!(!director.evaluate(&counts, TickId(2), &wp, &we).is_empty());
         // Max activations hit.
-        assert!(director.evaluate(&counts, TickId(3), &wp).is_empty());
+        assert!(director.evaluate(&counts, TickId(3), &wp, &we).is_empty());
     }
 
     #[test]
@@ -523,7 +653,8 @@ mod tests {
         let mut counts = HashMap::new();
         counts.insert((0, 0, 0), 3u32); // 3 players → 2 extras
         let wp = HashMap::new();
-        let spawns = director.evaluate(&counts, TickId(1), &wp);
+        let we = HashMap::new();
+        let spawns = director.evaluate(&counts, TickId(1), &wp, &we);
 
         // count = 1 + 1.0 * 2 = 3
         assert_eq!(spawns.len(), 3);

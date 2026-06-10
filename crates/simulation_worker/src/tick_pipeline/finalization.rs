@@ -1,6 +1,40 @@
 use super::*;
 
 impl TickPipeline {
+    fn death_position(&mut self, id: EntityId, context: &str) -> Vec3f {
+        self.physics
+            .get_transform(id)
+            .map(|t| t.position)
+            .unwrap_or_else(|| {
+                let fallback = self.last_committed_transforms.get(&id).map(|t| t.position);
+                match fallback {
+                    Some(p) => {
+                        sim_warn!(
+                            self,
+                            "{context}: physics transform missing for entity {} at death; using last-committed position ({:.2}, {:.2}, {:.2})",
+                            id.0,
+                            p.x,
+                            p.y,
+                            p.z,
+                        );
+                        p
+                    }
+                    None => {
+                        sim_warn!(
+                            self,
+                            "{context}: no physics transform and no last-committed transform for entity {} at death; anchoring at origin",
+                            id.0,
+                        );
+                        Vec3f {
+                            x: 0.0,
+                            y: 0.0,
+                            z: 0.0,
+                        }
+                    }
+                }
+            })
+    }
+
     /// Push zone_counter deltas for a dying entity based on its `EntityKind`.
     /// Looks up the entity's last-known region via `entity_regions`; if the
     /// entity was never region-assigned (synthetic/test entities), emits no
@@ -73,47 +107,7 @@ impl TickPipeline {
         if self.state.entities.kinds[idx.as_usize()] != EntityKind::Player {
             return;
         }
-        let pos = self
-            .physics
-            .get_transform(id)
-            .map(|t| t.position)
-            .unwrap_or_else(|| {
-                // Physics body missing: fall back to last-committed transform if any.
-                // This is a strict-best-effort path; with a healthy pipeline the
-                // physics body always exists when the entity transitions to
-                // DespawnPending in this same tick. Emit a warning when the
-                // fallback fires so the desync is visible rather than silently
-                // anchoring a respawn at the previous commit's position — or
-                // worse, at world origin.
-                let fallback = self.last_committed_transforms.get(&id).map(|t| t.position);
-                match fallback {
-                    Some(p) => {
-                        sim_warn!(
-                            self,
-                            "death_state: physics transform missing for player {} \
-                             at death; using last-committed position ({:.2}, {:.2}, {:.2})",
-                            id.0,
-                            p.x,
-                            p.y,
-                            p.z,
-                        );
-                        p
-                    }
-                    None => {
-                        sim_warn!(
-                            self,
-                            "death_state: no physics transform and no last-committed \
-                             transform for player {} at death; anchoring respawn at origin",
-                            id.0,
-                        );
-                        Vec3f {
-                            x: 0.0,
-                            y: 0.0,
-                            z: 0.0,
-                        }
-                    }
-                }
-            });
+        let pos = self.death_position(id, "death_state");
         let layer = self.layer_of_idx(idx);
         self.pending_death_state_inserts
             .push(super::DeathStateInsertEntry {
@@ -123,6 +117,85 @@ impl TickPipeline {
                 death_pos_x: pos.x,
                 death_pos_y: pos.y,
                 death_pos_z: pos.z,
+            });
+    }
+
+    fn push_death_loot_roll(&mut self, id: EntityId, idx: EntityIndex, killer: Option<EntityId>) {
+        let Some(table_id) = self.entity_loot_tables.get(&id).cloned() else {
+            return;
+        };
+        let Some(table) = self.loot_registry.get(&table_id).cloned() else {
+            sim_warn!(
+                self,
+                "loot: entity {} references unknown loot table '{}'; dropping roll",
+                id.0,
+                table_id,
+            );
+            return;
+        };
+
+        let layer = self.layer_of_idx(idx);
+        let contributors = self
+            .state
+            .combat
+            .threat_tables
+            .get(idx)
+            .into_iter()
+            .flat_map(|table| table.entries.iter())
+            .filter_map(|entry| {
+                let source_idx = self.state.entities.lookup(entry.source)?;
+                if self.state.entities.kinds[source_idx.as_usize()]
+                    != game_core::entity::lifecycle::EntityKind::Player
+                {
+                    return None;
+                }
+                if self.layer_of_idx(source_idx) != layer {
+                    return None;
+                }
+                Some((entry.source, entry.threat))
+            });
+        let killer = killer.filter(|killer| {
+            self.state
+                .entities
+                .lookup(*killer)
+                .is_some_and(|killer_idx| {
+                    self.state.entities.kinds[killer_idx.as_usize()]
+                        == game_core::entity::lifecycle::EntityKind::Player
+                        && self.layer_of_idx(killer_idx) == layer
+                })
+        });
+        let eligible_claimants = game_core::loot::freeze_eligible_claimants(contributors, killer);
+        if eligible_claimants.is_empty() {
+            sim_warn!(
+                self,
+                "loot: entity {} table '{}' produced no eligible claimants; dropping roll",
+                id.0,
+                table_id,
+            );
+            return;
+        }
+
+        let rolled_items =
+            game_core::loot::roll_loot_table(&table_id, &table, self.current_tick, id);
+        if rolled_items.is_empty() {
+            sim_warn!(
+                self,
+                "loot: entity {} table '{}' produced no items; dropping roll",
+                id.0,
+                table_id,
+            );
+            return;
+        }
+
+        let position = self.death_position(id, "loot");
+        self.pending_loot_rolls
+            .push(game_core::loot::LootRollOutput {
+                corpse_entity: id,
+                layer,
+                position,
+                rolled_items,
+                eligible_claimants,
+                claim_window_ticks: table.claim_window_ticks,
             });
     }
 
@@ -217,6 +290,19 @@ impl TickPipeline {
         }
     }
 
+    /// Emit `AbilityCancelled { reason: Death }` for every active cast
+    /// and every active charge owned by `entity`.
+    ///
+    /// Called in Phase 8b for an entity transitioning to
+    /// `DespawnPending`. Must run BEFORE the `EntityDied` event so
+    /// clients still hold live cast/charge state when the cancel
+    /// arrives. See
+    /// `docs/contracts/ability_cast_lifecycle_contract.md` and
+    /// `docs/contracts/event_ordering_contract.md`.
+    fn emit_death_cancels(&mut self, entity: EntityId) {
+        self.cancel_entity_abilities(entity, AbilityCancelReason::Death);
+    }
+
     // ── Phase 8b: State finalization ────────────────────────────
 
     /// Returns (state_updates, dot_health_updates). The latter captures health for
@@ -294,10 +380,17 @@ impl TickPipeline {
                         .get(idx)
                         .and_then(|t| t.top_threat())
                 });
+            // Cancel-before-died: emit AbilityCancelled events for any
+            // in-flight casts and charges before EntityDied so clients
+            // can clean up cast/charge UI in the same event_sequence
+            // window. Codified in
+            // `docs/contracts/event_ordering_contract.md`.
+            self.emit_death_cancels(id);
             self.emit_event(id, EventPayload::EntityDied { killer });
             self.forward_death_to_encounter(id);
             self.push_death_zone_counter(id, idx);
             self.push_player_death_state(id, idx, killer);
+            self.push_death_loot_roll(id, idx, killer);
         }
 
         // Clean up DespawnPending entities.
@@ -492,6 +585,7 @@ impl TickPipeline {
                         .get(idx)
                         .and_then(|t| t.top_threat())
                 });
+            self.emit_death_cancels(id);
             self.emit_event(id, EventPayload::EntityDied { killer });
             self.forward_death_to_encounter(id);
             self.push_death_zone_counter(id, idx);

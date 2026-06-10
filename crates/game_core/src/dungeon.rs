@@ -200,15 +200,23 @@ mod tests {
             InteractKindDef::BossSpawn {
                 npc_name,
                 encounter_name,
+                archetype_id,
             } => {
                 assert_eq!(npc_name, "Golem");
                 assert_eq!(encounter_name.as_deref(), Some("state_enter_demo"));
+                assert_eq!(archetype_id.as_deref(), None);
             }
             other => panic!("expected BossSpawn, got {other:?}"),
         }
 
         match &ints[3].kind {
-            InteractKindDef::NpcSpawn { npc_name } => assert_eq!(npc_name, "Guard"),
+            InteractKindDef::NpcSpawn {
+                npc_name,
+                archetype_id,
+            } => {
+                assert_eq!(npc_name, "Guard");
+                assert!(archetype_id.is_none());
+            }
             other => panic!("expected NpcSpawn, got {other:?}"),
         }
 
@@ -275,9 +283,11 @@ mod tests {
             InteractKindDef::BossSpawn {
                 npc_name,
                 encounter_name,
+                archetype_id,
             } => {
                 assert_eq!(npc_name, "LegacyBoss");
                 assert!(encounter_name.is_none());
+                assert!(archetype_id.is_none());
             }
             other => panic!("expected BossSpawn, got {other:?}"),
         }

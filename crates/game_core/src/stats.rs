@@ -206,6 +206,24 @@ impl StatBlock {
     }
 }
 
+/// Apply `cooldown_reduce_pct` to a base cooldown duration in ticks.
+///
+/// Single source of truth for the cast-lifecycle contract: the same
+/// effective duration must be emitted in the Phase 2 `CastStart` event
+/// payload (`effective_cooldown_ticks`) and inserted into the Phase 3
+/// cooldown map by the `AbilityAction::CooldownStart` handler.
+///
+/// Returns `0` for a `0` base (ability has no cooldown). Otherwise the
+/// result is clamped to `>= 1` so reductions can never produce an
+/// instant-ready ability.
+pub fn apply_cooldown_reduction(base_ticks: u32, cd_reduce_pct: f32) -> u32 {
+    if base_ticks == 0 {
+        return 0;
+    }
+    let effective = ((base_ticks as f32) * (1.0 - cd_reduce_pct)).ceil() as u32;
+    effective.max(1)
+}
+
 // ── StatsStore ──────────────────────────────────────────────────
 
 /// Dense array of cached `StatBlock` values, indexed by `EntityIndex`.

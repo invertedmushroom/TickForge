@@ -4,6 +4,7 @@
 #![allow(unused, clippy::all)]
 use spacetimedb_sdk::__codegen::{self as __sdk, __lib, __sats, __ws};
 
+use super::director_npc_config_input_type::DirectorNpcConfigInput;
 use super::entity_kind_type::EntityKind;
 
 #[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
@@ -15,6 +16,8 @@ pub struct DirectorSpawnInput {
     pub pos_y: f32,
     pub pos_z: f32,
     pub layer: u32,
+    pub npc_config: Option<DirectorNpcConfigInput>,
+    pub team_id: Option<u32>,
 }
 
 impl __sdk::InModule for DirectorSpawnInput {
