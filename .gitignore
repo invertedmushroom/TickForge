@@ -5,3 +5,8 @@
 /.client_token_left
 /.client_token_right
 *.log
+/target/
+/**/target/
+/**/module_bindings/
+data/terrain/*
+crates/game_client_bevy/assets/*
