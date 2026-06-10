@@ -1,0 +1,28 @@
+{
+  "name": "dive-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc --noEmit && vite build && node scripts/check-build-budget.mjs",
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "npm run test:static && npm run build && npm run test:e2e -- --grep smoke",
+    "test:static": "node scripts/check-subscriptions.mjs",
+    "test:e2e": "playwright test",
+    "test:ci": "npm run test:static && npm run build && npm run test:e2e"
+  },
+  "dependencies": {
+    "@dimforge/rapier3d-compat": "^0.19.3",
+    "@dive/client-contract": "file:../../target/web-contract",
+    "spacetimedb": "2.4.1",
+    "three": "^0.184.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "@types/three": "^0.184.0",
+    "@playwright/test": "^1.60.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.13"
+  }
+}
