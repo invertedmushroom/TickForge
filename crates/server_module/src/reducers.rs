@@ -302,7 +302,7 @@ pub fn world_clock(ctx: &ReducerContext, _schedule: WorldClockSchedule) -> Resul
         /// `required_players` for the matching `world_event` row produced
         /// alongside the `world_phase` transition. Used by director
         /// triggers gated on `WorldEventActive { tag, min_players }` to
-        /// prevent offscreen spawns (Finding #4, 2026-06-09 review).
+        /// prevent offscreen spawns.
         /// `0` = no presence gate (terminal events like `completed`).
         required_players: u32,
         /// Initial state of the produced `world_event` row.
@@ -334,7 +334,7 @@ pub fn world_clock(ctx: &ReducerContext, _schedule: WorldClockSchedule) -> Resul
     // through `upsert_zone_counter` so logical-key uniqueness is
     // maintained today, but if a legacy bug ever produced duplicate rows
     // for the same `(layer, rx, rz, counter_name)`, this prevents
-    // world_clock from under-evaluating a threshold (Finding #5).
+    // world_clock from under-evaluating a threshold.
     // `HashMap<(zone, name), f64>` makes the summation O(1) per row.
     let mut zone_counters: std::collections::HashMap<(u32, i32, i32, String), f64> =
         std::collections::HashMap::new();
@@ -396,12 +396,25 @@ pub fn world_clock(ctx: &ReducerContext, _schedule: WorldClockSchedule) -> Resul
                 );
             }
             // Mirror the phase transition as a `world_activity_event` row so
-            // director triggers can gate on presence (Finding #4, messaging
-            // spine step 4). One row per logical `(scope, tag)` — the helper
-            // updates state in place if the row already exists, so a
-            // re-evaluation that lands on the same rule doesn't spam
+            // director triggers and diagnostics can observe one logical
+            // `(scope, tag)` record. The helper updates state in place if the
+            // row already exists, so re-evaluating the same rule does not spam
             // duplicates.
             upsert_world_activity_event(
+                ctx,
+                layer,
+                rx,
+                rz,
+                rule.phase_name,
+                rule.event_state,
+                rule.required_players,
+                now,
+            );
+            // Mirror the same scope+tag into `activity_scope` so the worker
+            // gate reads it and enforces the `required_players` floor. This is
+            // parallel to the event row above; `world_activity_event` remains
+            // the event-reason / diagnostic record.
+            upsert_activity_scope(
                 ctx,
                 layer,
                 rx,
@@ -415,6 +428,36 @@ pub fn world_clock(ctx: &ReducerContext, _schedule: WorldClockSchedule) -> Resul
                 mark_instance_completed_for_layer(ctx, layer);
             }
         }
+    }
+
+    // ── Advance the durable sleep descent (Tier 2 only) ──────────────
+    // The worker requests drains (`request_scope_drain`: Awake → Draining)
+    // but never sleeps a scope itself — Rule 1: Tier 2 clocks own durable
+    // timers. Here the clock flips every `Draining` scope whose settle
+    // window (`drain_until`) has elapsed to `Sleeping`, arming the
+    // `min_dormant_until` hysteresis floor. Collected first so the
+    // iterator is released before the in-place updates.
+    let to_sleep: Vec<ActivityScope> = ctx
+        .db
+        .activity_scope()
+        .iter()
+        .filter(|s| {
+            s.mode == ActivityScopeMode::Draining && s.drain_until != 0 && now >= s.drain_until
+        })
+        .collect();
+    for mut row in to_sleep {
+        row.mode = ActivityScopeMode::Sleeping;
+        row.last_sleep_at = now;
+        row.min_dormant_until = now + SCOPE_MIN_DORMANT_MICROS;
+        row.drain_until = 0;
+        log::info!(
+            "world_clock: scope ({},{},{}) tag '{}' Draining → Sleeping",
+            row.scope_layer,
+            row.scope_region_x,
+            row.scope_region_z,
+            row.tag
+        );
+        ctx.db.activity_scope().scope_id().update(row);
     }
 
     log::trace!("world_clock: evaluated {} zones", zones.len());
@@ -439,8 +482,8 @@ fn synthesise_zone_id(layer: u32, rx: i32, rz: i32) -> u32 {
 /// writers through this one helper. `commit_tick_results` and the
 /// `increment_zone_counter` admin/debug reducer both call here. If a third
 /// raw-insert path is ever introduced, this helper is the place to add a
-/// linter check or a hard-fail. See Finding #5 in the 2026-06-09 messaging
-/// review and `world_clock`'s defensive summation for the read-side mirror.
+/// linter check or a hard-fail. `world_clock` mirrors this defensively by
+/// summing same-key rows on read.
 fn upsert_zone_counter(
     ctx: &ReducerContext,
     layer: u32,
@@ -481,8 +524,7 @@ fn upsert_zone_counter(
 /// place; `started_at` is only set on insert so timer-based events
 /// retain their original activation tick. Future kinds (Timer, Chain,
 /// Escalation) extend through `payload` without a schema migration. See
-/// the table comment in `tables.rs` and Finding #4 of the 2026-06-09
-/// messaging-spine review.
+/// the table comment in `tables.rs`.
 fn upsert_world_activity_event(
     ctx: &ReducerContext,
     scope_layer: u32,
@@ -521,6 +563,174 @@ fn upsert_world_activity_event(
             payload: String::new(),
         });
     }
+}
+
+/// Single upsert path for `activity_scope`.
+///
+/// Parallel to `upsert_world_activity_event` and called alongside it:
+/// it mirrors the same scope+tag, state, and `required_players` into the
+/// `activity_scope` table. Same logical-uniqueness pattern: all writers
+/// funnel through here so the `(scope_layer, scope_region_x, scope_region_z,
+/// tag)` key stays unique despite SpacetimeDB v2 lacking composite storage
+/// uniqueness. `started_at` is only set on insert; sleep/wake reducers own the
+/// independent `mode` axis.
+fn upsert_activity_scope(
+    ctx: &ReducerContext,
+    scope_layer: u32,
+    scope_region_x: i32,
+    scope_region_z: i32,
+    tag: &str,
+    state: WorldActivityEventState,
+    required_players: u32,
+    now_micros: i64,
+) {
+    let existing = ctx
+        .db
+        .activity_scope()
+        .by_scope()
+        .filter((scope_layer, scope_region_x, scope_region_z..=scope_region_z))
+        .find(|s| s.tag == tag);
+
+    if let Some(mut row) = existing {
+        // Only write on observable change to avoid waking every worker
+        // subscription on identical re-evaluations. `mode` is fixed at
+        // Sleep/wake reducers own `mode`, so this mirror only updates
+        // state / required_players.
+        if row.state != state || row.required_players != required_players {
+            row.state = state;
+            row.required_players = required_players;
+            ctx.db.activity_scope().scope_id().update(row);
+        }
+    } else {
+        ctx.db.activity_scope().insert(ActivityScope {
+            scope_id: 0,
+            scope_layer,
+            scope_region_x,
+            scope_region_z,
+            tag: tag.to_string(),
+            state,
+            mode: ActivityScopeMode::Awake,
+            required_players,
+            started_at: now_micros,
+            // Sleep/wake hysteresis: a brand-new scope starts Awake with a
+            // fresh epoch and no timers armed (all-zero = legacy default).
+            scope_epoch: 0,
+            drain_until: 0,
+            min_awake_until: 0,
+            min_dormant_until: 0,
+            last_wake_at: 0,
+            last_sleep_at: 0,
+        });
+    }
+}
+
+// ── Scope sleep/wake hysteresis tuning (micros) ────────────────────
+// Tunables for the `Active → Draining → Dormant → wake` machine. Kept
+// as module constants (not per-row columns) so the table stays lean;
+// the computed deadlines they produce are persisted per scope. See
+// `docs/contracts/world_activity_policy_contract.md`.
+/// Minimum time a freshly-woken scope stays `Awake` before it may begin
+/// draining. Prevents a player flickering across a cell edge from
+/// thrashing the scope awake/asleep.
+const SCOPE_KEEP_AWAKE_MICROS: i64 = 30_000_000; // 30s
+/// Settle window: how long a scope sits in `Draining` (volatile state
+/// quiescing, spawns suppressed) before `world_clock` flips it to
+/// `Sleeping`.
+const SCOPE_DRAIN_MICROS: i64 = 15_000_000; // 15s
+/// Minimum time a `Sleeping` scope stays dormant before it may *naturally*
+/// re-wake. A strong presence wake (a player actually entering) overrides
+/// this floor.
+const SCOPE_MIN_DORMANT_MICROS: i64 = 10_000_000; // 10s
+
+/// Strong-wake a region cell: flip every `Sleeping`/`Draining` scope in
+/// `(scope_layer, scope_region_x, scope_region_z)` back to `Awake`,
+/// bumping its `scope_epoch` so the worker invalidates pre-sleep caches.
+///
+/// Trusted-worker only. The worker is the presence authority (ADR-0002
+/// Tier 1) and calls this the same tick a player enters a dormant cell,
+/// so wake latency is one tick. Overrides the `min_dormant_until` floor
+/// because real presence always wins over hysteresis. Idempotent: cells
+/// already fully `Awake` are a no-op.
+#[reducer]
+pub fn request_scope_wake(
+    ctx: &ReducerContext,
+    scope_layer: u32,
+    scope_region_x: i32,
+    scope_region_z: i32,
+) -> Result<(), String> {
+    if !is_trusted_caller(ctx) {
+        return Err("request_scope_wake may only be invoked by a trusted worker".into());
+    }
+    let now = ctx.timestamp.to_micros_since_unix_epoch();
+    let rows: Vec<ActivityScope> = ctx
+        .db
+        .activity_scope()
+        .by_scope()
+        .filter((scope_layer, scope_region_x, scope_region_z..=scope_region_z))
+        .collect();
+    for mut row in rows {
+        if row.mode == ActivityScopeMode::Sleeping || row.mode == ActivityScopeMode::Draining {
+            row.mode = ActivityScopeMode::Awake;
+            row.scope_epoch = row.scope_epoch.wrapping_add(1);
+            row.last_wake_at = now;
+            row.min_awake_until = now + SCOPE_KEEP_AWAKE_MICROS;
+            row.drain_until = 0;
+            log::info!(
+                "request_scope_wake: scope ({},{},{}) tag '{}' → Awake (epoch {})",
+                row.scope_layer,
+                row.scope_region_x,
+                row.scope_region_z,
+                row.tag,
+                row.scope_epoch
+            );
+            ctx.db.activity_scope().scope_id().update(row);
+        }
+    }
+    Ok(())
+}
+
+/// Begin draining a region cell: flip every `Awake` scope in
+/// `(scope_layer, scope_region_x, scope_region_z)` that has outlived its
+/// keep-awake floor to `Draining`, arming `drain_until`.
+///
+/// Trusted-worker only. The worker requests the drain when a scope
+/// empties of players, but it never sleeps the scope itself — Rule 1:
+/// Tier 2 (`world_clock`) owns the durable `Draining → Sleeping` descent.
+/// Scopes still inside `min_awake_until` are left `Awake` (hysteresis).
+/// Idempotent: cells with nothing to drain are a no-op.
+#[reducer]
+pub fn request_scope_drain(
+    ctx: &ReducerContext,
+    scope_layer: u32,
+    scope_region_x: i32,
+    scope_region_z: i32,
+) -> Result<(), String> {
+    if !is_trusted_caller(ctx) {
+        return Err("request_scope_drain may only be invoked by a trusted worker".into());
+    }
+    let now = ctx.timestamp.to_micros_since_unix_epoch();
+    let rows: Vec<ActivityScope> = ctx
+        .db
+        .activity_scope()
+        .by_scope()
+        .filter((scope_layer, scope_region_x, scope_region_z..=scope_region_z))
+        .collect();
+    for mut row in rows {
+        if row.mode == ActivityScopeMode::Awake && now >= row.min_awake_until {
+            row.mode = ActivityScopeMode::Draining;
+            row.drain_until = now + SCOPE_DRAIN_MICROS;
+            log::info!(
+                "request_scope_drain: scope ({},{},{}) tag '{}' → Draining (until {})",
+                row.scope_layer,
+                row.scope_region_x,
+                row.scope_region_z,
+                row.tag,
+                row.drain_until
+            );
+            ctx.db.activity_scope().scope_id().update(row);
+        }
+    }
+    Ok(())
 }
 
 fn mark_instance_completed_for_layer(ctx: &ReducerContext, layer: u32) {
@@ -1683,7 +1893,7 @@ pub fn commit_tick_results(
     // logical key (layer, region_x, region_z, counter_name) stays unique
     // across this reducer and the trusted `increment_zone_counter`
     // helper — SpacetimeDB v2 can't express composite uniqueness in
-    // storage, so the invariant is enforced here (see Finding #5).
+    // storage, so the invariant is enforced here.
     for delta in zone_counter_deltas {
         upsert_zone_counter(
             ctx,
@@ -2714,7 +2924,7 @@ pub fn respawn_player(ctx: &ReducerContext) -> Result<(), String> {
 
 // ── Party System ────────────────────────────────────────────────────
 // CRUD reducers for party management. Worker subscribes for team
-// awareness. Required for dungeon entry (Phase B).
+// awareness. Required for dungeon entry.
 
 #[reducer]
 pub fn create_party(ctx: &ReducerContext) -> Result<(), String> {
@@ -4147,6 +4357,21 @@ fn expire_instances_inner(ctx: &ReducerContext, now: i64) -> Result<ExpireReport
             ctx.db.world_activity_event().event_id().delete(&event_id);
         }
 
+        // Delete activity_scope rows for this instance layer too, for the
+        // same reason: a recycled layer must not leave a stale `Active` scope
+        // resident in the worker mirror. Written 1:1 with the
+        // world_activity_event rows above, so counted together.
+        let stale_scopes: Vec<u64> = ctx
+            .db
+            .activity_scope()
+            .iter()
+            .filter(|s| s.scope_layer == instance_layer)
+            .map(|s| s.scope_id)
+            .collect();
+        for scope_id in stale_scopes {
+            ctx.db.activity_scope().scope_id().delete(&scope_id);
+        }
+
         log::info!(
             "Instance expired: id={} layer={} (removed {} entities, cleared {} buffs, {} interactables, {} counters, {} phases, {} world_events)",
             instance_id,
@@ -4209,9 +4434,10 @@ pub struct InteractableUpdate {
     pub state: InteractState,
 }
 
-// ── Voxel Terrain Editor Reducers (§4.8b Phase 1) ───────────────────
+// ── Voxel Terrain Editor Reducers ───────────────────────────────────
 // Admin/debug-gated upserts for the offline editor pipeline. The worker
-// (Phase 5) only READS these tables; nobody mutates terrain at runtime.
+// terrain callbacks read these tables into deferred collider edits; nobody
+// mutates terrain from inside the simulation tick.
 //
 // Logical uniqueness on `(terrain_set_id, chunk_morton[, voxel_idx])` is
 // enforced here (read-then-update or insert) since SpacetimeDB v2 has no
@@ -4254,8 +4480,8 @@ pub fn terrain_set_upsert(
     Ok(())
 }
 
-/// Insert or replace one baked terrain chunk. Worker (Phase 5) will
-/// react to `on_update` to swap the matching Rapier collider.
+/// Insert or replace one baked terrain chunk. Worker terrain callbacks react to
+/// row changes by swapping the matching Rapier collider at a tick boundary.
 #[reducer]
 pub fn terrain_chunk_upsert(
     ctx: &ReducerContext,

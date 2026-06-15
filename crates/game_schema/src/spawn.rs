@@ -72,9 +72,8 @@ pub enum SpawnTrigger {
     /// over bare `WorldPhase` for actor-spawning rules, because the
     /// `world_activity_event` row carries the authored
     /// `required_players` value and the worker's effective region count
-    /// already excludes reconnect-grace players. Closes the "WorldPhase
-    /// spawns offscreen" gap (Finding #4 of the 2026-06-09 messaging
-    /// review).
+    /// already excludes reconnect-grace players. This avoids
+    /// `WorldPhase`-driven actor spawns in offscreen cells.
     WorldActivityEventActive { tag: String, min_players: u32 },
     /// Fires when a named event is raised (reserved for future use; e.g. on
     /// instance creation or an encounter-script callback).

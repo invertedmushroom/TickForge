@@ -387,7 +387,7 @@ impl SimulationRunner {
             z: 0.0,
         };
 
-        // Cave-aware origin selection (§4.8b Phase 6).
+        // Cave-aware origin selection.
         //
         // The naive "lift to sky, cast down" snaps to the first surface
         // below the sky — which is the *cave ceiling* when `advisory` is
@@ -500,18 +500,18 @@ impl SimulationRunner {
         }
     }
 
-    /// Project a `world_activity_event` row into the worker's lookup
-    /// map. The director's `WorldActivityEventActive` trigger reads
-    /// this map to gate spawns on both event state AND per-region
-    /// presence. Called by the coordinator on
-    /// `world_activity_event.on_insert` / `on_update`.
-    pub fn set_world_activity_event(
+    /// Project an `activity_scope` row into the worker's lookup map. The
+    /// director's `WorldActivityEventActive` trigger reads this map to gate
+    /// spawns on scope state AND the two AND-ed presence floors (the scope's
+    /// `required_players` and the rule's `min_players`). Called by the coordinator on
+    /// `activity_scope.on_insert` / `on_update`.
+    pub fn set_activity_scope(
         &mut self,
         scope_layer: u32,
         scope_region_x: i32,
         scope_region_z: i32,
         tag: String,
-        state: game_schema::WorldActivityEventState,
+        projection: game_schema::ActivityScopeProjection,
     ) {
         let key = game_schema::WorldActivityEventKey {
             scope_layer,
@@ -519,14 +519,13 @@ impl SimulationRunner {
             scope_region_z,
             tag,
         };
-        self.pipeline.world_activity_events.insert(key, state);
+        self.pipeline.activity_scopes.insert(key, projection);
     }
 
-    /// Drop a `world_activity_event` projection. Called by the
-    /// coordinator on `world_activity_event.on_delete` (e.g. when an
-    /// instance expires and its rows are cleaned up by
-    /// `expire_instances_inner`).
-    pub fn remove_world_activity_event(
+    /// Drop an `activity_scope` projection. Called by the coordinator on
+    /// `activity_scope.on_delete` (e.g. when an instance expires and its
+    /// rows are cleaned up by `expire_instances_inner`).
+    pub fn remove_activity_scope(
         &mut self,
         scope_layer: u32,
         scope_region_x: i32,
@@ -539,7 +538,7 @@ impl SimulationRunner {
             scope_region_z,
             tag,
         };
-        self.pipeline.world_activity_events.remove(&key);
+        self.pipeline.activity_scopes.remove(&key);
     }
 
     // ── Encounter management ────────────────────────────────────────
@@ -1049,8 +1048,8 @@ mod tests {
         assert_eq!(resolved.z, advisory.z);
     }
 
-    /// §4.8b Phase 6: a spawn point inside a cave (advisory below a
-    /// ceiling) must snap to the cave floor, not the ceiling above it.
+    /// A spawn point inside a cave (advisory below a ceiling) must snap to the
+    /// cave floor, not the ceiling above it.
     /// The naive sky-down cast hit the ceiling first; the cave-aware
     /// path probes upward, detects the ceiling, and casts down from
     /// `advisory` itself instead.
@@ -1108,9 +1107,9 @@ mod tests {
         );
     }
 
-    /// §4.8b Phase 6: open-terrain spawns still benefit from sky-cast
-    /// robustness — an advisory placed 100 m above the surface still
-    /// snaps correctly because no ceiling is detected above it.
+    /// Open-terrain spawns still benefit from sky-cast robustness — an advisory
+    /// placed 100 m above the surface still snaps correctly because no ceiling
+    /// is detected above it.
     #[test]
     fn resolve_spawn_position_snaps_open_terrain_from_far_above() {
         use crate::physics::rapier_world::PhysicsWorld;

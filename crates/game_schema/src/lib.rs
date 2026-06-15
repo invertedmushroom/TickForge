@@ -31,4 +31,6 @@ pub use spawn::{
     LevelSource, SpawnEntityDef, SpawnFile, SpawnRule, SpawnScaling, SpawnScope, SpawnTrigger,
 };
 pub use types::Vec3f;
-pub use world_activity::{WorldActivityEventKey, WorldActivityEventState};
+pub use world_activity::{
+    ActivityScopeMode, ActivityScopeProjection, WorldActivityEventKey, WorldActivityEventState,
+};

@@ -114,8 +114,8 @@ pub enum Trigger {
     OnCounter { name: String, op: CmpOp, value: i64 },
     /// Fires when a mechanic with the matching `name` finished this tick.
     OnMechanicEnded { name: String },
-    /// An entity entered a volume matching `tag`. Volume events are wired
-    /// in Step 2.5 ahead of the rest of the bus, but they only fire when
+    /// An entity entered a volume matching `tag`. Volume events are published
+    /// by the volume sync before encounter rule evaluation, and only fire when
     /// a corresponding volume currently exists.
     OnVolumeEnter { tag: String },
     /// An entity exited a volume matching `tag`.
@@ -565,6 +565,18 @@ impl Rule {
             self.hp_threshold_armed = true;
             self.counter_was_true = false;
         }
+    }
+
+    /// Unconditionally clear all per-rule firing state. Used by the encounter
+    /// leash reset so a re-entered fight re-runs `Once`/`OnEnter` setup and
+    /// already-fired `OnHpBelow`/`OnCounter` progression rules from a clean
+    /// slate. Unlike [`re_arm_on_phase_entry`](Self::re_arm_on_phase_entry),
+    /// this ignores `RepeatPolicy`.
+    pub fn reset(&mut self) {
+        self.fire_count = 0;
+        self.last_fire_tick = None;
+        self.hp_threshold_armed = true;
+        self.counter_was_true = false;
     }
 
     fn can_fire(&self) -> bool {
@@ -1141,6 +1153,33 @@ impl EncounterState {
         self.pending_continuations.clear();
         for rule in &mut self.rules {
             rule.hp_threshold_armed = true;
+        }
+    }
+
+    /// Leash reset: return an active encounter to its dormant baseline so a
+    /// later arena entry re-runs [`activate`](Self::activate) from a clean
+    /// slate. Used when the boss's arena goes vacant (every valid target left
+    /// the layer). The worker is responsible for stopping any active mechanics
+    /// through the normal stop cascade *before* calling this — `active_mechanics`
+    /// is cleared here only as a safety net — and for restoring boss HP, threat,
+    /// and position. Phase, counters, the event bus, and parked continuations
+    /// are reset so progress does not carry across a reset.
+    pub fn deactivate(&mut self) {
+        self.active = false;
+        self.activated_at_tick = None;
+        self.phase = BossPhase::Phase1;
+        self.phase_start_tick = TickId(0);
+        self.active_mechanics.clear();
+        self.counters.clear();
+        self.bus = EncounterBus::new();
+        self.pending_continuations.clear();
+        self.next_sequence_id = 0;
+        self.last_hp_pct = 1.0;
+        // Full firing-state reset (not just re-arming HP thresholds): a leashed
+        // boss must re-run `Once`/`OnEnter` setup rules and already-fired
+        // progression rules when a player re-enters and re-activates it.
+        for rule in &mut self.rules {
+            rule.reset();
         }
     }
 

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
+use game_schema::dungeon::{TerrainAssetDef, TerrainAssetFile};
 use regex::Regex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -22,12 +23,14 @@ const WEB_APP_DIR: &str = "apps/web";
 const WEB_CONTRACT_OUT: &str = "target/web-contract";
 const WEB_CONTRACT_BINDINGS_DIR: &str = "bindings";
 const WEB_CONTRACT_PACKAGE_NAME: &str = "@dive/client-contract";
-const WEB_CONTRACT_STDB_NPM_VERSION: &str = "2.4.1";
+const WEB_CONTRACT_STDB_NPM_VERSION: &str = "2.5.0";
 const WEB_BROWSER_POLICY_FILE: &str = "browser-policy.json";
 const WEB_ABILITIES_FILE: &str = "abilities.json";
 const WEB_PHYSICS_PREDICTION_FILE: &str = "physics-prediction.json";
 const WEB_CONTENT_METADATA_FILE: &str = "content-metadata.json";
 const WEB_CONTENT_LOOKUP_FILE: &str = "content-lookup.json";
+const TERRAIN_ASSETS_FILE: &str = "data/terrain_assets.ron";
+const TERRAIN_ASSET_ROOT: &str = "assets/terrain";
 const WEB_MAP_BUNDLES_DIR: &str = "map-bundles";
 const WEB_MAP_BUNDLE_COLLIDER_FORMAT_VERSION: u32 = 1;
 const WEB_CONTENT_SOURCES: &[&str] = &[
@@ -38,6 +41,7 @@ const WEB_CONTENT_SOURCES: &[&str] = &[
     "data/layers.ron",
     "data/npc_archetypes.ron",
     "data/spawn_rules.ron",
+    TERRAIN_ASSETS_FILE,
 ];
 const WEB_ALWAYS_ON_SUBSCRIPTIONS: &[&str] = &[
     "SELECT * FROM my_region",
@@ -224,6 +228,9 @@ struct WorkerRegisterArgs {
 
     #[arg(long)]
     release: bool,
+
+    #[arg(long, default_value = ".worker_token")]
+    token_file: String,
 }
 
 #[derive(Args)]
@@ -232,6 +239,8 @@ struct RunWorkerArgs {
     release: bool,
     #[arg(long, default_value = "info")]
     log: String,
+    #[arg(long, default_value = ".worker_token")]
+    token_file: String,
 }
 
 #[derive(Args)]
@@ -305,9 +314,16 @@ struct SeedTerrainArgs {
 #[derive(Args)]
 struct ImportTerrainArgs {
     /// Path to a glTF 2.0 file (`.gltf` or `.glb`). All meshes in all
-    /// scenes are flattened with their node transforms applied.
+    /// scenes are flattened with their node transforms applied. Defaults to
+    /// the `server_mesh` for `--set-name` in `data/terrain_assets.ron`.
     #[arg(long)]
-    gltf: PathBuf,
+    gltf: Option<PathBuf>,
+
+    /// Allow `--gltf` to differ from the manifest `server_mesh`.
+    /// Use only for one-off local experiments; production imports should keep
+    /// the DB collision mesh and web prediction mesh manifest-driven.
+    #[arg(long, default_value_t = false)]
+    allow_mesh_override: bool,
 
     /// Name of the `terrain_set` row to upsert.
     #[arg(long)]
@@ -321,29 +337,32 @@ struct ImportTerrainArgs {
 
     /// XZ chunk size in meters (Y is single-chunk on the cy=0 plane).
     /// Triangles are bucketed by the chunk that owns their centroid.
-    #[arg(long, default_value_t = 32.0)]
-    chunk_size: f32,
+    /// Overrides the value in `data/terrain_assets.ron` when provided.
+    #[arg(long)]
+    chunk_size: Option<f32>,
 
     /// LOD value to write on each chunk row (0 = collision LOD).
     #[arg(long, default_value_t = 0u8)]
     lod: u8,
 
     /// World-space translation applied to all imported vertices before
-    /// chunking (meters). Useful when the source mesh is centered.
-    #[arg(long, default_value_t = 0.0)]
-    offset_x: f32,
-    #[arg(long, default_value_t = 0.0)]
-    offset_y: f32,
-    #[arg(long, default_value_t = 0.0)]
-    offset_z: f32,
+    /// chunking (meters). Overrides the manifest `import.offset` when provided.
+    #[arg(long)]
+    offset_x: Option<f32>,
+    #[arg(long)]
+    offset_y: Option<f32>,
+    #[arg(long)]
+    offset_z: Option<f32>,
 
     /// Uniform scale applied to imported vertices (e.g. cm → m = 0.01).
-    #[arg(long, default_value_t = 1.0)]
-    scale: f32,
+    /// Overrides the manifest `import.scale` when provided.
+    #[arg(long)]
+    scale: Option<f32>,
 
     /// Flip triangle winding (use if your floors come out facing down).
-    #[arg(long, default_value_t = false)]
-    flip_winding: bool,
+    /// Overrides the manifest `import.flip_winding` when provided.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    flip_winding: Option<bool>,
 
     /// Skip the `terrain_set_upsert` call (set already exists).
     #[arg(long, default_value_t = false)]
@@ -724,6 +743,7 @@ struct DungeonTemplateMetadata {
     name: String,
     max_players: u32,
     terrain_set: Option<String>,
+    client_visual: Option<String>,
     collision_policy: LayerCollisionPolicyMetadata,
     spawn_points: Vec<[f32; 3]>,
     exit_points: Vec<[f32; 3]>,
@@ -822,6 +842,7 @@ struct MapBundleIndexEntry {
     layer_id: Option<u32>,
     dungeon_template_id: Option<String>,
     terrain_set: Option<String>,
+    client_visual: Option<String>,
     manifest_path: String,
     collider_count: usize,
     content_hash: String,
@@ -855,6 +876,13 @@ struct MapBundleManifest {
     source: MapBundleSource,
     render_meshes: Vec<AssetRef>,
     collider_json: Vec<AssetRef>,
+    /// Low-resolution terrain collision mesh the client loads directly to weld
+    /// its prediction trimesh. `None` for synthetic/RON-only bundles. Clients
+    /// can use `collision_mesh.content_hash` for per-mesh diagnostics; the
+    /// bundle `content_hash` already folds these asset bytes into prediction
+    /// determinism.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collision_mesh: Option<CollisionMeshRef>,
     debug_markers: Vec<DebugMarker>,
 }
 
@@ -865,6 +893,7 @@ struct MapBundleSource {
     layer_id: Option<u32>,
     dungeon_template_id: Option<String>,
     terrain_set: Option<String>,
+    client_visual: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -872,6 +901,29 @@ struct AssetRef {
     url: String,
     sha256: String,
     bytes: usize,
+}
+
+/// Manifest reference to a terrain collision mesh shipped under
+/// `<bundle_id>/collision/...`. The client loads `entry_url`, applies
+/// `transform`, and welds a Rapier trimesh — matching the worker DB import.
+#[derive(Serialize, Clone)]
+struct CollisionMeshRef {
+    terrain_set: String,
+    /// glTF/glb entry point (other entries are buffers/textures it references).
+    entry_url: String,
+    /// Every file shipped for this mesh, entry first then siblings.
+    assets: Vec<AssetRef>,
+    /// Import transform the client must apply before welding the trimesh.
+    transform: CollisionMeshTransform,
+    /// Hash over the shipped mesh bytes; clients gate loading on this.
+    content_hash: String,
+}
+
+#[derive(Serialize, Clone, Copy)]
+struct CollisionMeshTransform {
+    scale: f32,
+    offset: [f32; 3],
+    flip_winding: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -1244,6 +1296,7 @@ fn build_map_bundle_outputs(
     metadata: &WebContentMetadata,
     content_hash: &str,
     repo_root: &Path,
+    terrain_assets: &TerrainAssetCatalog,
 ) -> Result<(MapBundleIndex, MapBundleModule, Vec<MapBundleFile>)> {
     let mut index_entries = Vec::new();
     let mut module_entries = Vec::new();
@@ -1258,6 +1311,7 @@ fn build_map_bundle_outputs(
             layer_id: Some(layer.layer_id),
             dungeon_template_id: None,
             terrain_set: layer.terrain_set.clone(),
+            client_visual: layer.client_visual.clone(),
         };
         let colliders = collider_bundle_for_geometries(
             content_hash,
@@ -1265,13 +1319,30 @@ fn build_map_bundle_outputs(
             &layer.geometry,
             &format!("layer-{}", layer.layer_id),
         );
+        let collision = collect_collision_mesh(
+            repo_root,
+            terrain_assets,
+            layer.terrain_set.as_deref(),
+            &bundle_id,
+        )?;
         let visual_stem = layer
             .client_visual
             .clone()
             .or_else(|| layer.terrain_set.clone());
-        let visual = collect_visual_assets(repo_root, visual_stem.as_deref(), &bundle_id)?;
-        let (manifest, collider_json) =
-            build_single_map_bundle(&bundle_id, content_hash, source, &colliders, &visual)?;
+        let visual = collect_visual_assets(
+            repo_root,
+            visual_stem.as_deref(),
+            terrain_assets,
+            &bundle_id,
+        )?;
+        let (manifest, collider_json) = build_single_map_bundle(
+            &bundle_id,
+            content_hash,
+            source,
+            &colliders,
+            &visual,
+            &collision,
+        )?;
         let manifest_path = format!("{bundle_id}/manifest.json");
         let collider_path = format!("{bundle_id}/colliders/static-colliders.json");
         index_entries.push(MapBundleIndexEntry {
@@ -1281,6 +1352,7 @@ fn build_map_bundle_outputs(
             layer_id: Some(layer.layer_id),
             dungeon_template_id: None,
             terrain_set: layer.terrain_set.clone(),
+            client_visual: layer.client_visual.clone(),
             manifest_path: manifest_path.clone(),
             collider_count: colliders.colliders.len(),
             content_hash: content_hash.to_string(),
@@ -1298,6 +1370,9 @@ fn build_map_bundle_outputs(
         if let Some(visual) = visual {
             files.extend(visual.files);
         }
+        if let Some(collision) = collision {
+            files.extend(collision.files);
+        }
     }
 
     for template in &metadata.dungeon_templates {
@@ -1309,6 +1384,7 @@ fn build_map_bundle_outputs(
             layer_id: None,
             dungeon_template_id: Some(template.template_id.clone()),
             terrain_set: template.terrain_set.clone(),
+            client_visual: template.client_visual.clone(),
         };
         let colliders = collider_bundle_for_geometries(
             content_hash,
@@ -1316,12 +1392,30 @@ fn build_map_bundle_outputs(
             &template.geometry,
             &format!("dungeon-{}", template.template_id),
         );
-        // Dungeon templates only carry `terrain_set` today (no separate
-        // `client_visual` override); reuse the same stem for both physics and
-        // visual lookup.
-        let visual = collect_visual_assets(repo_root, template.terrain_set.as_deref(), &bundle_id)?;
-        let (manifest, collider_json) =
-            build_single_map_bundle(&bundle_id, content_hash, source, &colliders, &visual)?;
+        let collision = collect_collision_mesh(
+            repo_root,
+            terrain_assets,
+            template.terrain_set.as_deref(),
+            &bundle_id,
+        )?;
+        let visual_stem = template
+            .client_visual
+            .clone()
+            .or_else(|| template.terrain_set.clone());
+        let visual = collect_visual_assets(
+            repo_root,
+            visual_stem.as_deref(),
+            terrain_assets,
+            &bundle_id,
+        )?;
+        let (manifest, collider_json) = build_single_map_bundle(
+            &bundle_id,
+            content_hash,
+            source,
+            &colliders,
+            &visual,
+            &collision,
+        )?;
         let manifest_path = format!("{bundle_id}/manifest.json");
         let collider_path = format!("{bundle_id}/colliders/static-colliders.json");
         index_entries.push(MapBundleIndexEntry {
@@ -1331,6 +1425,7 @@ fn build_map_bundle_outputs(
             layer_id: None,
             dungeon_template_id: Some(template.template_id.clone()),
             terrain_set: template.terrain_set.clone(),
+            client_visual: template.client_visual.clone(),
             manifest_path: manifest_path.clone(),
             collider_count: colliders.colliders.len(),
             content_hash: content_hash.to_string(),
@@ -1347,6 +1442,9 @@ fn build_map_bundle_outputs(
         files.push(MapBundleFile::text(collider_path, collider_json));
         if let Some(visual) = visual {
             files.extend(visual.files);
+        }
+        if let Some(collision) = collision {
+            files.extend(collision.files);
         }
     }
 
@@ -1369,6 +1467,7 @@ fn build_single_map_bundle(
     source: MapBundleSource,
     colliders: &ColliderBundle,
     visual: &Option<VisualBundle>,
+    collision: &Option<CollisionBundle>,
 ) -> Result<(MapBundleManifest, String)> {
     let collider_json =
         serde_json::to_string_pretty(&colliders).context("serialize collider bundle")?;
@@ -1406,6 +1505,7 @@ fn build_single_map_bundle(
             source,
             render_meshes,
             collider_json: vec![collider_asset],
+            collision_mesh: collision.as_ref().map(|c| c.reference.clone()),
             debug_markers,
         },
         collider_json,
@@ -1427,7 +1527,7 @@ fn collider_bundle_for_geometries(
             rotation: [0.0, 0.0, 0.0, 1.0],
             shape: geometry.shape.clone(),
         })
-        .collect();
+        .collect::<Vec<_>>();
 
     ColliderBundle {
         format_version: WEB_MAP_BUNDLE_COLLIDER_FORMAT_VERSION,
@@ -1436,6 +1536,123 @@ fn collider_bundle_for_geometries(
         source,
         colliders,
     }
+}
+
+/// Collect the low-resolution terrain collision mesh for a layer/dungeon's
+/// terrain set and copy it into `<bundle_id>/collision/...` as a referenced
+/// binary asset. The client loads this glTF directly, applies `transform`, and
+/// welds a trimesh collider — the same `client_prediction_mesh` (fallback
+/// `server_mesh`) and import transform the worker uses for DB collision, so web
+/// prediction collides against identical geometry.
+///
+/// Returns `Ok(None)` for synthetic sets or sets without a mesh, so RON-only
+/// fixtures are unaffected.
+fn collect_collision_mesh(
+    repo_root: &Path,
+    terrain_assets: &TerrainAssetCatalog,
+    terrain_set: Option<&str>,
+    bundle_id: &str,
+) -> Result<Option<CollisionBundle>> {
+    let Some(set) = terrain_set else {
+        return Ok(None);
+    };
+    let Some(asset) = terrain_assets.asset_for_set(set) else {
+        return Ok(None);
+    };
+    if asset.synthetic {
+        return Ok(None);
+    }
+    let Some(mesh_rel) = asset
+        .client_prediction_mesh
+        .as_deref()
+        .or(asset.server_mesh.as_deref())
+    else {
+        return Ok(None);
+    };
+
+    let entry_point = repo_root.join(mesh_rel);
+    if !entry_point.is_file() {
+        bail!(
+            "terrain_set '{set}' collision mesh missing: {}",
+            entry_point.display()
+        );
+    }
+    let mesh_dir = entry_point.parent().ok_or_else(|| {
+        anyhow!(
+            "terrain_set '{set}' collision mesh '{}' has no parent directory",
+            entry_point.display()
+        )
+    })?;
+    let entry_relative = entry_point
+        .strip_prefix(mesh_dir)
+        .with_context(|| format!("collision mesh not under {}", mesh_dir.display()))?
+        .to_path_buf();
+
+    let mut assets = Vec::new();
+    let mut files = Vec::new();
+    let mut hash_inputs: Vec<(String, String)> = Vec::new();
+
+    for relative in collect_files_relative(mesh_dir)? {
+        let absolute = mesh_dir.join(&relative);
+        let bytes = fs::read(&absolute)
+            .with_context(|| format!("reading collision asset {}", absolute.display()))?;
+        let sha256 = hash_bytes(&bytes);
+        let url = format!(
+            "collision/{}",
+            relative.to_string_lossy().replace('\\', "/")
+        );
+        let bundle_relative = format!("{bundle_id}/{url}");
+        assets.push(AssetRef {
+            url: url.clone(),
+            sha256: sha256.clone(),
+            bytes: bytes.len(),
+        });
+        hash_inputs.push((url, sha256));
+        files.push(MapBundleFile::binary(bundle_relative, bytes));
+    }
+
+    let entry_url = format!(
+        "collision/{}",
+        entry_relative.to_string_lossy().replace('\\', "/")
+    );
+    assets.sort_by(|a, b| {
+        let a_is_entry = a.url == entry_url;
+        let b_is_entry = b.url == entry_url;
+        match (a_is_entry, b_is_entry) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.url.cmp(&b.url),
+        }
+    });
+    hash_inputs.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"dive-collision-v1");
+    hasher.update([0u8]);
+    hasher.update(entry_url.as_bytes());
+    hasher.update([0u8]);
+    for (url, sha) in &hash_inputs {
+        hasher.update(url.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(sha.as_bytes());
+        hasher.update([0u8]);
+    }
+    let content_hash = hex_digest(&hasher.finalize());
+
+    let transform = ResolvedTerrainTransform::from_manifest(asset.import);
+    Ok(Some(CollisionBundle {
+        reference: CollisionMeshRef {
+            terrain_set: set.to_string(),
+            entry_url,
+            assets,
+            transform: CollisionMeshTransform {
+                scale: transform.scale,
+                offset: transform.offset,
+                flip_winding: transform.flip_winding,
+            },
+            content_hash,
+        },
+        files,
+    }))
 }
 
 fn sanitize_bundle_part(value: &str) -> String {
@@ -1507,36 +1724,61 @@ struct VisualBundle {
     files: Vec<MapBundleFile>,
 }
 
-const VISUAL_ASSET_ROOT: &str = "crates/game_client_bevy/assets/terrain";
+/// Result of copying a terrain collision mesh into a bundle: the manifest
+/// reference plus the binary files to write under `<bundle_id>/collision/...`.
+struct CollisionBundle {
+    reference: CollisionMeshRef,
+    files: Vec<MapBundleFile>,
+}
 
-/// Probe `crates/game_client_bevy/assets/terrain/{stem}/` for a glTF/glb +
-/// siblings and return a `VisualBundle` ready to embed into a map bundle.
+/// Probe `data/terrain_assets.ron` first, then `assets/terrain/{stem}/`, for a
+/// glTF/glb entry point + siblings and return a `VisualBundle` ready to embed
+/// into a map bundle.
 ///
 /// Returns `Ok(None)` when no `stem` is configured or the on-disk directory
 /// does not contain an entry point (`{stem}.gltf` or `{stem}.glb`). This is
-/// the common case today — most layers/dungeons have no imported visual mesh.
+/// expected for synthetic/dev-only terrain sets.
 fn collect_visual_assets(
     repo_root: &Path,
     stem: Option<&str>,
+    terrain_assets: &TerrainAssetCatalog,
     bundle_id: &str,
 ) -> Result<Option<VisualBundle>> {
     let Some(stem) = stem else {
         return Ok(None);
     };
-    let stem_dir = repo_root.join(VISUAL_ASSET_ROOT).join(stem);
-    if !stem_dir.is_dir() {
-        return Ok(None);
-    }
 
-    let gltf_path = stem_dir.join(format!("{stem}.gltf"));
-    let glb_path = stem_dir.join(format!("{stem}.glb"));
-    let entry_point = if gltf_path.is_file() {
-        gltf_path
-    } else if glb_path.is_file() {
-        glb_path
+    let entry_point = if let Some(path) = terrain_assets.visual_mesh_path(stem) {
+        let path = repo_root.join(path);
+        if !path.is_file() {
+            bail!(
+                "terrain visual '{stem}' points at missing asset {}",
+                path.display()
+            );
+        }
+        path
     } else {
-        return Ok(None);
+        let stem_dir = repo_root.join(TERRAIN_ASSET_ROOT).join(stem);
+        if !stem_dir.is_dir() {
+            return Ok(None);
+        }
+
+        let gltf_path = stem_dir.join(format!("{stem}.gltf"));
+        let glb_path = stem_dir.join(format!("{stem}.glb"));
+        if gltf_path.is_file() {
+            gltf_path
+        } else if glb_path.is_file() {
+            glb_path
+        } else {
+            return Ok(None);
+        }
     };
+    let stem_dir = entry_point.parent().ok_or_else(|| {
+        anyhow!(
+            "terrain visual '{}' has no parent directory",
+            entry_point.display()
+        )
+    })?;
     let entry_relative = entry_point
         .strip_prefix(&stem_dir)
         .with_context(|| format!("entry point not under {}", stem_dir.display()))?
@@ -1629,6 +1871,7 @@ fn export_dungeon_template_metadata(
         name: template.name.clone(),
         max_players: template.max_players,
         terrain_set: template.terrain_set.clone(),
+        client_visual: template.client_visual.clone(),
         collision_policy: LayerCollisionPolicyMetadata {
             player_collides_player: template.collision_policy.player_collides_player,
         },
@@ -1782,12 +2025,26 @@ fn dev_web_contract(args: WebContractArgs) -> Result<()> {
     run_spacetime_generate_typescript(&bindings_dir)?;
 
     let schema_hash = hash_directory(&bindings_dir)?;
-    let content_hash = hash_content_files(WEB_CONTENT_SOURCES)?;
 
     let world_layers: game_schema::dungeon::WorldLayersFile =
         load_ron_file(Path::new("data/layers.ron"))?;
     let dungeons: game_schema::dungeon::DungeonFile =
         load_ron_file(Path::new("data/dungeons.ron"))?;
+    let terrain_assets: TerrainAssetFile = load_ron_file(Path::new(TERRAIN_ASSETS_FILE))?;
+    let terrain_asset_catalog = TerrainAssetCatalog::from_file(&terrain_assets)?;
+
+    // The prediction-collision determinism hash must move when the underlying
+    // terrain collision meshes change, not just when the RON manifest path
+    // changes. Fold the referenced collision mesh bytes into `content_hash` so
+    // re-exporting a mesh invalidates stale browser prediction bundles via the
+    // generated-package check.
+    let mut content_sources = WEB_CONTENT_SOURCES
+        .iter()
+        .map(|path| path.to_string())
+        .collect::<Vec<_>>();
+    content_sources.extend(terrain_collision_mesh_files(&terrain_assets)?);
+    let content_hash = hash_content_files_owned(&content_sources)?;
+
     let ability_file: game_core::combat::skill::AbilityFile =
         load_ron_file(Path::new("data/abilities.ron"))?;
     let ability_catalog = build_ability_catalog(&ability_file);
@@ -1795,8 +2052,12 @@ fn dev_web_contract(args: WebContractArgs) -> Result<()> {
     let content_lookup = build_content_lookup(&content_metadata);
     let browser_policy = build_browser_policy();
     let physics_prediction = build_physics_prediction()?;
-    let (map_bundle_index, map_bundle_module, map_bundle_files) =
-        build_map_bundle_outputs(&content_metadata, &content_hash, Path::new("."))?;
+    let (map_bundle_index, map_bundle_module, map_bundle_files) = build_map_bundle_outputs(
+        &content_metadata,
+        &content_hash,
+        Path::new("."),
+        &terrain_asset_catalog,
+    )?;
     let abilities_json =
         serde_json::to_string_pretty(&ability_catalog).context("serialize ability catalog")?;
     let content_metadata_json =
@@ -1816,10 +2077,7 @@ fn dev_web_contract(args: WebContractArgs) -> Result<()> {
     );
     let metadata_hash = hash_bytes(format!("{abilities_json}\n{content_metadata_json}").as_bytes());
 
-    let source_files = WEB_CONTENT_SOURCES
-        .iter()
-        .map(|path| path.to_string())
-        .collect::<Vec<_>>();
+    let source_files = content_sources.clone();
 
     let manifest = WebContractManifest {
         package_name: WEB_CONTRACT_PACKAGE_NAME.to_string(),
@@ -2030,20 +2288,37 @@ fn dev_worker_register(args: WorkerRegisterArgs) -> Result<()> {
         bail!("SpacetimeDB is not running. Start it with `cargo xtask dev server`.");
     }
 
+    let token_path = Path::new(&args.token_file);
+    let had_token = token_path.exists();
+    if had_token {
+        println!("Using worker auth token file: {}", args.token_file);
+    } else {
+        println!(
+            "No worker auth token at {}; worker-register will create a new worker identity",
+            args.token_file
+        );
+    }
+
     run_build(BuildCmd::Worker(BuildProfileArgs {
         release: args.release,
     }))?;
-    let identity = capture_worker_identity(args.release)?;
+    let identity = capture_worker_identity(args.release, &args.token_file)?;
     println!("Captured worker identity: {identity}");
+    if !had_token && token_path.exists() {
+        println!(
+            "Created worker auth token at {}; keep this file to preserve the worker identity",
+            args.token_file
+        );
+    }
 
-    let id_json = format!(r#"{{"__identity__":"0x{identity}"}}"#);
+    let identity_arg = format!("0x{identity}");
     let status = command(
         "spacetime",
         [
             "call",
             MODULE_NAME,
             "register_worker",
-            id_json.as_str(),
+            identity_arg.as_str(),
             "-s",
             SERVER_ALIAS,
         ],
@@ -2085,6 +2360,7 @@ fn dev_worker(args: RunWorkerArgs) -> Result<()> {
     }
 
     command.env("RUST_LOG", args.log);
+    command.env("STDB_TOKEN_FILE", args.token_file);
     run_command(command)
 }
 
@@ -2304,25 +2580,77 @@ fn dev_import_terrain(args: ImportTerrainArgs) -> Result<()> {
         bail!("SpacetimeDB is not running. Start it with `cargo xtask dev server`.");
     }
 
-    let path = &args.gltf;
-    if !path.exists() {
-        bail!("glTF file not found: {}", path.display());
+    // Resolve the import transform from the manifest (authoritative), letting
+    // explicit CLI flags override individual fields. This keeps worker DB
+    // collision and web prediction colliders derived from the same transform.
+    let manifest: TerrainAssetFile = load_ron_file(Path::new(TERRAIN_ASSETS_FILE))?;
+    let asset = manifest
+        .assets
+        .iter()
+        .find(|asset| asset.terrain_set == args.set_name)
+        .ok_or_else(|| {
+            anyhow!(
+                "terrain_set '{}' is not declared in {TERRAIN_ASSETS_FILE}; add it before importing",
+                args.set_name
+            )
+        })?;
+    if asset.synthetic {
+        bail!(
+            "terrain_set '{}' is synthetic in {TERRAIN_ASSETS_FILE}; use seed-terrain instead",
+            args.set_name
+        );
     }
-    if args.chunk_size <= 0.0 {
-        bail!("--chunk-size must be > 0");
+    let manifest_mesh = asset.server_mesh.as_deref().ok_or_else(|| {
+        anyhow!(
+            "terrain_set '{}' must declare server_mesh in {TERRAIN_ASSETS_FILE}",
+            args.set_name
+        )
+    })?;
+    let manifest_path = PathBuf::from(manifest_mesh);
+    if !manifest_path.is_file() {
+        bail!(
+            "terrain_set '{}' server_mesh missing: {}",
+            args.set_name,
+            manifest_path.display()
+        );
+    }
+    let path = match args.gltf.as_deref() {
+        Some(cli_path) => {
+            if !cli_path.is_file() {
+                bail!("glTF file not found: {}", cli_path.display());
+            }
+            if !args.allow_mesh_override && !paths_refer_to_same_file(cli_path, &manifest_path)? {
+                bail!(
+                    "--gltf {} differs from {TERRAIN_ASSETS_FILE} server_mesh {}; \
+                     update the manifest or pass --allow-mesh-override for a one-off import",
+                    cli_path.display(),
+                    manifest_path.display()
+                );
+            }
+            cli_path
+        }
+        None => manifest_path.as_path(),
+    };
+
+    let base = asset.import;
+    let base = ResolvedTerrainTransform::from_manifest(base);
+    let transform = ResolvedTerrainTransform {
+        scale: args.scale.unwrap_or(base.scale),
+        offset: [
+            args.offset_x.unwrap_or(base.offset[0]),
+            args.offset_y.unwrap_or(base.offset[1]),
+            args.offset_z.unwrap_or(base.offset[2]),
+        ],
+        flip_winding: args.flip_winding.unwrap_or(base.flip_winding),
+        chunk_size: args.chunk_size.unwrap_or(base.chunk_size),
+    };
+
+    if transform.chunk_size <= 0.0 {
+        bail!("chunk_size must be > 0 (manifest or --chunk-size)");
     }
 
     println!("Loading glTF: {}", path.display());
-    let (doc, buffers, _images) =
-        gltf::import(path).with_context(|| format!("loading {}", path.display()))?;
-
-    // Collect all triangles into a flat (v0,v1,v2) world-space pool.
-    let mut tris: Vec<[[f32; 3]; 3]> = Vec::new();
-    for scene in doc.scenes() {
-        for node in scene.nodes() {
-            collect_node_triangles(&node, &buffers, identity4(), &mut tris);
-        }
-    }
+    let mut tris = load_gltf_triangles(path)?;
 
     if tris.is_empty() {
         bail!(
@@ -2331,25 +2659,14 @@ fn dev_import_terrain(args: ImportTerrainArgs) -> Result<()> {
         );
     }
 
-    // Apply user offset/scale and optional flip.
-    let s = args.scale;
-    let (ox, oy, oz) = (args.offset_x, args.offset_y, args.offset_z);
-    for t in tris.iter_mut() {
-        for v in t.iter_mut() {
-            v[0] = v[0] * s + ox;
-            v[1] = v[1] * s + oy;
-            v[2] = v[2] * s + oz;
-        }
-        if args.flip_winding {
-            t.swap(1, 2);
-        }
-    }
+    // Apply manifest/override offset, scale, and optional flip.
+    apply_terrain_transform(&mut tris, &transform);
 
     println!("Imported {} triangles. Bucketing...", tris.len());
 
     // Bucket triangles by (cx, cz) chunk via centroid; cy=0 (single y-row).
     use std::collections::HashMap;
-    let cs = args.chunk_size;
+    let cs = transform.chunk_size;
     let mut buckets: HashMap<(i32, i32), Vec<[[f32; 3]; 3]>> = HashMap::new();
     for t in tris.iter() {
         let cx = ((t[0][0] + t[1][0] + t[2][0]) / 3.0 / cs).floor() as i32;
@@ -2357,11 +2674,7 @@ fn dev_import_terrain(args: ImportTerrainArgs) -> Result<()> {
         buckets.entry((cx, cz)).or_default().push(*t);
     }
 
-    println!(
-        "{} non-empty chunks at {} m grid.",
-        buckets.len(),
-        args.chunk_size
-    );
+    println!("{} non-empty chunks at {} m grid.", buckets.len(), cs);
 
     // Obtain auth token once (needed for HTTP reducer calls).
     let token = get_spacetime_token()?;
@@ -2500,6 +2813,62 @@ fn transform_point(m: [[f32; 4]; 4], p: [f32; 3]) -> [f32; 3] {
     let y = m[0][1] * p[0] + m[1][1] * p[1] + m[2][1] * p[2] + m[3][1];
     let z = m[0][2] * p[0] + m[1][2] * p[1] + m[2][2] * p[2] + m[3][2];
     [x, y, z]
+}
+
+/// Resolved terrain import transform after merging manifest defaults with any
+/// CLI overrides. Both the worker DB import path and the web prediction-collider
+/// builder consume this same struct so their geometry stays aligned.
+#[derive(Clone, Copy, Debug)]
+struct ResolvedTerrainTransform {
+    scale: f32,
+    offset: [f32; 3],
+    flip_winding: bool,
+    chunk_size: f32,
+}
+
+impl ResolvedTerrainTransform {
+    fn from_manifest(import: game_schema::dungeon::TerrainImportTransform) -> Self {
+        Self {
+            scale: import.scale,
+            offset: import.offset,
+            flip_winding: import.flip_winding,
+            chunk_size: import.chunk_size,
+        }
+    }
+}
+
+/// Load a glTF file and flatten every mesh in every scene into a flat
+/// world-space triangle pool with node transforms applied. Shared by the
+/// worker terrain import and the web prediction-collider builder so both
+/// derive identical source geometry.
+fn load_gltf_triangles(path: &Path) -> Result<Vec<[[f32; 3]; 3]>> {
+    let (doc, buffers, _images) =
+        gltf::import(path).with_context(|| format!("loading {}", path.display()))?;
+    let mut tris: Vec<[[f32; 3]; 3]> = Vec::new();
+    for scene in doc.scenes() {
+        for node in scene.nodes() {
+            collect_node_triangles(&node, &buffers, identity4(), &mut tris);
+        }
+    }
+    Ok(tris)
+}
+
+/// Apply the resolved offset, scale, and optional winding flip to a triangle
+/// pool in place. Mirrors the transform used by the worker DB import so web
+/// prediction colliders match server collision geometry exactly.
+fn apply_terrain_transform(tris: &mut [[[f32; 3]; 3]], transform: &ResolvedTerrainTransform) {
+    let s = transform.scale;
+    let [ox, oy, oz] = transform.offset;
+    for t in tris.iter_mut() {
+        for v in t.iter_mut() {
+            v[0] = v[0] * s + ox;
+            v[1] = v[1] * s + oy;
+            v[2] = v[2] * s + oz;
+        }
+        if transform.flip_winding {
+            t.swap(1, 2);
+        }
+    }
 }
 
 fn collect_node_triangles(
@@ -2759,6 +3128,63 @@ fn hash_content_files(paths: &[&str]) -> Result<String> {
     Ok(hex_digest(&hasher.finalize()))
 }
 
+/// Owned-path variant of [`hash_content_files`] used when the source set is
+/// computed at runtime (e.g. terrain collision meshes resolved from the
+/// manifest). Hashing is order-sensitive, so callers must pass a stable order.
+fn hash_content_files_owned(paths: &[String]) -> Result<String> {
+    let refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
+    hash_content_files(&refs)
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> Result<bool> {
+    let left =
+        fs::canonicalize(left).with_context(|| format!("canonicalizing {}", left.display()))?;
+    let right =
+        fs::canonicalize(right).with_context(|| format!("canonicalizing {}", right.display()))?;
+    Ok(left == right)
+}
+
+/// Collect the on-disk terrain collision meshes referenced by the manifest in a
+/// stable, de-duplicated order. These are the full sibling asset sets copied by
+/// `collect_collision_mesh` for each `client_prediction_mesh` (falling back to
+/// `server_mesh`), so changing a `.bin` buffer or other loader dependency moves
+/// the prediction determinism hash.
+fn terrain_collision_mesh_files(manifest: &TerrainAssetFile) -> Result<Vec<String>> {
+    let mut seen = BTreeSet::new();
+    for asset in &manifest.assets {
+        if asset.synthetic {
+            continue;
+        }
+        let Some(mesh) = asset
+            .client_prediction_mesh
+            .as_deref()
+            .or(asset.server_mesh.as_deref())
+        else {
+            continue;
+        };
+        let entry_point = Path::new(mesh);
+        if !entry_point.is_file() {
+            bail!(
+                "terrain_set '{}' collision mesh missing: {}",
+                asset.terrain_set,
+                entry_point.display()
+            );
+        }
+        let mesh_dir = entry_point.parent().ok_or_else(|| {
+            anyhow!(
+                "terrain_set '{}' collision mesh '{}' has no parent directory",
+                asset.terrain_set,
+                entry_point.display()
+            )
+        })?;
+        for relative in collect_files_relative(mesh_dir)? {
+            let path = mesh_dir.join(relative);
+            seen.insert(path.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    Ok(seen.into_iter().collect())
+}
+
 fn hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -2856,6 +3282,66 @@ struct ItemFile {
 }
 
 #[derive(Default)]
+struct TerrainAssetCatalog {
+    by_set: BTreeMap<String, TerrainAssetDef>,
+    by_visual: BTreeMap<String, TerrainAssetDef>,
+}
+
+impl TerrainAssetCatalog {
+    fn from_file(file: &TerrainAssetFile) -> Result<Self> {
+        let mut catalog = TerrainAssetCatalog::default();
+        for asset in &file.assets {
+            if catalog
+                .by_set
+                .insert(asset.terrain_set.clone(), asset.clone())
+                .is_some()
+            {
+                bail!(
+                    "{} has duplicate terrain_set '{}'",
+                    TERRAIN_ASSETS_FILE,
+                    asset.terrain_set
+                );
+            }
+            if let Some(visual) = &asset.client_visual
+                && catalog
+                    .by_visual
+                    .insert(visual.clone(), asset.clone())
+                    .is_some()
+            {
+                bail!("{TERRAIN_ASSETS_FILE} has duplicate client_visual '{visual}'");
+            }
+        }
+        Ok(catalog)
+    }
+
+    fn asset_for_set(&self, terrain_set: &str) -> Option<&TerrainAssetDef> {
+        self.by_set.get(terrain_set)
+    }
+
+    fn has_visual(&self, visual: &str) -> bool {
+        self.by_visual.contains_key(visual)
+            || self
+                .by_set
+                .get(visual)
+                .is_some_and(|asset| asset.visual_mesh.is_some() || asset.server_mesh.is_some())
+    }
+
+    fn visual_mesh_path(&self, visual: &str) -> Option<&str> {
+        self.by_visual
+            .get(visual)
+            .and_then(|asset| asset.visual_mesh.as_deref())
+            .or_else(|| {
+                self.by_set.get(visual).and_then(|asset| {
+                    asset
+                        .visual_mesh
+                        .as_deref()
+                        .or(asset.server_mesh.as_deref())
+                })
+            })
+    }
+}
+
+#[derive(Default)]
 struct ContentCheck {
     errors: Vec<String>,
     warnings: Vec<String>,
@@ -2911,6 +3397,9 @@ fn dev_content_check() -> Result<()> {
         load_ron_file(Path::new("data/encounters.ron"))?;
     let dungeon_file: game_schema::dungeon::DungeonFile =
         load_ron_file(Path::new("data/dungeons.ron"))?;
+    let world_layers: game_schema::dungeon::WorldLayersFile =
+        load_ron_file(Path::new("data/layers.ron"))?;
+    let terrain_assets: TerrainAssetFile = load_ron_file(Path::new(TERRAIN_ASSETS_FILE))?;
     let spawn_file: game_schema::spawn::SpawnFile =
         load_ron_file(Path::new("data/spawn_rules.ron"))?;
 
@@ -2934,6 +3423,8 @@ fn dev_content_check() -> Result<()> {
     validate_archetypes(&mut check, &archetype_file);
     validate_encounters(&mut check, &encounter_file);
     validate_dungeons(&mut check, &dungeon_file);
+    validate_terrain_assets(&mut check, &terrain_assets);
+    validate_terrain_references(&mut check, &world_layers, &dungeon_file, &terrain_assets);
     validate_spawn_rules(&mut check, &spawn_file);
 
     if !check.warnings.is_empty() {
@@ -2953,7 +3444,7 @@ fn dev_content_check() -> Result<()> {
     }
 
     println!(
-        "content-check ok: {} abilities, {} buffs, {} items, {} loot tables, {} behavior trees, {} routes, {} archetypes, {} encounters, {} dungeons",
+        "content-check ok: {} abilities, {} buffs, {} items, {} loot tables, {} behavior trees, {} routes, {} archetypes, {} encounters, {} dungeons, {} world layers, {} terrain assets",
         check.ability_ids.len(),
         check.buff_ids.len(),
         check.item_ids.len(),
@@ -2963,6 +3454,8 @@ fn dev_content_check() -> Result<()> {
         check.archetype_kinds.len(),
         check.encounter_ids.len(),
         check.dungeon_template_ids.len(),
+        world_layers.layers.len(),
+        terrain_assets.assets.len(),
     );
     Ok(())
 }
@@ -3251,6 +3744,8 @@ fn validate_desired_ai_action(
         | DesiredAiAction::ClearThreat
         | DesiredAiAction::MoveTowardEntity(_)
         | DesiredAiAction::MoveAwayFromEntity(_)
+        | DesiredAiAction::MoveToGraphTarget { .. }
+        | DesiredAiAction::CancelPath
         | DesiredAiAction::TryCastBestAbility { .. } => {}
     }
 }
@@ -3499,6 +3994,142 @@ fn validate_dungeons(check: &mut ContentCheck, dungeon_file: &game_schema::dunge
     }
 }
 
+fn validate_terrain_assets(check: &mut ContentCheck, terrain_file: &TerrainAssetFile) {
+    let mut terrain_sets = BTreeSet::new();
+    let mut visuals = BTreeSet::new();
+
+    for asset in &terrain_file.assets {
+        let owner = format!("terrain asset '{}'", asset.terrain_set);
+        if asset.terrain_set.trim().is_empty() {
+            check.error("terrain asset has empty terrain_set");
+            continue;
+        }
+        if !terrain_sets.insert(asset.terrain_set.clone()) {
+            check.error(format!(
+                "duplicate terrain asset terrain_set '{}'",
+                asset.terrain_set
+            ));
+        }
+        if let Some(visual) = &asset.client_visual {
+            if visual.trim().is_empty() {
+                check.error(format!("{owner} has empty client_visual"));
+            } else if !visuals.insert(visual.clone()) {
+                check.error(format!("duplicate terrain asset client_visual '{visual}'"));
+            }
+            if asset.visual_mesh.is_none() {
+                check.error(format!(
+                    "{owner} declares client_visual '{visual}' without visual_mesh"
+                ));
+            }
+        }
+
+        if asset.synthetic {
+            if asset.note.is_none() {
+                check.warn(format!("{owner} is synthetic without a note"));
+            }
+            continue;
+        }
+
+        let Some(server_mesh) = asset.server_mesh.as_deref() else {
+            check.error(format!(
+                "{owner} must declare server_mesh or synthetic=true"
+            ));
+            continue;
+        };
+        require_existing_gltf(check, &owner, "server_mesh", server_mesh);
+
+        let prediction_mesh = asset
+            .client_prediction_mesh
+            .as_deref()
+            .unwrap_or(server_mesh);
+        require_existing_gltf(check, &owner, "client_prediction_mesh", prediction_mesh);
+
+        if let Some(visual_mesh) = asset.visual_mesh.as_deref() {
+            require_existing_gltf(check, &owner, "visual_mesh", visual_mesh);
+        }
+    }
+}
+
+fn validate_terrain_references(
+    check: &mut ContentCheck,
+    world_layers: &game_schema::dungeon::WorldLayersFile,
+    dungeon_file: &game_schema::dungeon::DungeonFile,
+    terrain_file: &TerrainAssetFile,
+) {
+    let catalog = match TerrainAssetCatalog::from_file(terrain_file) {
+        Ok(catalog) => catalog,
+        Err(err) => {
+            check.error(err.to_string());
+            return;
+        }
+    };
+
+    for layer in &world_layers.layers {
+        let owner = format!("world layer {} '{}'", layer.layer_id, layer.name);
+        validate_terrain_reference(
+            check,
+            &catalog,
+            &owner,
+            layer.terrain_set.as_deref(),
+            layer.client_visual.as_deref(),
+        );
+    }
+
+    for template in &dungeon_file.templates {
+        let owner = format!("dungeon '{}'", template.template_id);
+        validate_terrain_reference(
+            check,
+            &catalog,
+            &owner,
+            template.terrain_set.as_deref(),
+            template.client_visual.as_deref(),
+        );
+    }
+}
+
+fn validate_terrain_reference(
+    check: &mut ContentCheck,
+    catalog: &TerrainAssetCatalog,
+    owner: &str,
+    terrain_set: Option<&str>,
+    client_visual: Option<&str>,
+) {
+    if let Some(set) = terrain_set
+        && catalog.asset_for_set(set).is_none()
+    {
+        check.error(format!("{owner} references unknown terrain_set '{set}'"));
+    }
+
+    if let Some(visual) = client_visual {
+        if !catalog.has_visual(visual) {
+            check.error(format!(
+                "{owner} references unknown client_visual '{visual}'"
+            ));
+        }
+        if terrain_set.is_none() {
+            check.warn(format!(
+                "{owner} declares client_visual '{visual}' without terrain_set"
+            ));
+        }
+    }
+}
+
+fn require_existing_gltf(check: &mut ContentCheck, owner: &str, field: &str, path: &str) {
+    let path_ref = Path::new(path);
+    let extension = path_ref
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase);
+    if !matches!(extension.as_deref(), Some("gltf" | "glb")) {
+        check.error(format!(
+            "{owner} {field} must point to a .gltf or .glb file: {path}"
+        ));
+    }
+    if !path_ref.is_file() {
+        check.error(format!("{owner} {field} file does not exist: {path}"));
+    }
+}
+
 fn validate_dungeon_actor_archetype(
     check: &mut ContentCheck,
     owner: &str,
@@ -3600,12 +4231,13 @@ fn dev_capture_fixture(args: CaptureFixtureArgs) -> Result<()> {
     run_command(command)
 }
 
-fn capture_worker_identity(release: bool) -> Result<String> {
+fn capture_worker_identity(release: bool, token_file: &str) -> Result<String> {
     let mut child = cargo_run_command(
         ["-p", "simulation_worker", "--features", "connected"],
         release,
     )
     .env("RUST_LOG", "simulation_worker=info")
+    .env("STDB_TOKEN_FILE", token_file)
     .stderr(Stdio::piped())
     .stdout(Stdio::null())
     .spawn()

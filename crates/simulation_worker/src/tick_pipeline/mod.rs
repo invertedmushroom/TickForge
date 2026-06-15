@@ -27,11 +27,14 @@ mod combat;
 mod controller;
 mod encounter_runtime;
 mod finalization;
+mod path;
 mod skill_dispatch;
-
+#[cfg(test)]
+mod tests;
 mod volumes;
 
 pub(super) use archetype::{NpcArchetypeDirectorConfigExt, NpcArchetypeRegistry};
+use path::{PathingState, PATH_REPLAN_COOLDOWN_TICKS, PATH_SEARCHES_PER_TICK_CAP};
 
 fn load_builtin_behavior_trees() -> game_core::ai::behavior_tree::BehaviorTreeRegistry {
     game_core::ai::behavior_tree::BehaviorTreeRegistry::from_ron(include_str!(
@@ -201,6 +204,33 @@ pub struct DeathStateInsertEntry {
     pub death_pos_z: f32,
 }
 
+/// Presence-driven request to transition a region cell's activity scopes
+/// between simulation modes.
+///
+/// The worker is the presence authority (ADR-0002 Tier 1): it observes which
+/// cells hold players each tick and emits these requests, which the coordinator
+/// turns into `request_scope_wake` / `request_scope_drain` reducer calls. The
+/// worker never sleeps a scope itself — Tier 2 (`world_clock`) owns the durable
+/// `Draining → Sleeping` descent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScopeTransitionRequest {
+    pub layer: u32,
+    pub region_x: i32,
+    pub region_z: i32,
+    pub kind: ScopeTransitionKind,
+}
+
+/// Direction of a [`ScopeTransitionRequest`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScopeTransitionKind {
+    /// A player is present in a cell that holds a `Sleeping`/`Draining` scope —
+    /// strong-wake it immediately (overrides the dormant hysteresis floor).
+    Wake,
+    /// A cell holding an `Awake` scope has emptied of players — begin draining
+    /// (subject to the keep-awake hysteresis floor, enforced reducer-side).
+    Drain,
+}
+
 /// Output of a single simulation tick — committed atomically to SpacetimeDB.
 pub struct TickResult {
     pub tick_id: TickId,
@@ -248,6 +278,10 @@ pub struct TickResult {
     /// Diagnostic warnings from the pipeline this tick. Each message is shipped
     /// to the DB as a `SimLog` event row (level=Warn) by the coordinator.
     pub sim_warnings: Vec<String>,
+    /// Presence-driven scope mode transitions produced this tick.
+    /// The coordinator turns each into a `request_scope_wake` /
+    /// `request_scope_drain` reducer call (separate from `commit_tick_results`).
+    pub scope_transition_requests: Vec<ScopeTransitionRequest>,
 }
 
 /// The canonical 10-phase simulation tick pipeline per spec.
@@ -356,14 +390,34 @@ pub struct TickPipeline {
     /// World phase projections from the DB — keyed by zone_id → phase_name.
     /// Updated by coordinator callbacks when world_phase rows change.
     pub(super) world_phases: HashMap<u32, String>,
-    /// World activity event projections from the DB — keyed by
-    /// `(scope_layer, scope_region_x, scope_region_z, tag)` → state.
-    /// Updated by coordinator callbacks when `world_activity_event` rows
-    /// change. Consumed by `DirectorTrigger::WorldActivityEventActive`
-    /// to gate spawns on both event state and per-region presence
-    /// (Finding #4 of the 2026-06-09 messaging-spine review).
-    pub(super) world_activity_events:
-        HashMap<game_schema::WorldActivityEventKey, game_schema::WorldActivityEventState>,
+    /// Activity-scope projections from the DB — keyed by
+    /// `(scope_layer, scope_region_x, scope_region_z, tag)` →
+    /// `ActivityScopeProjection { state, mode, required_players }`.
+    /// Updated by coordinator callbacks when `activity_scope` rows change.
+    /// Consumed by `DirectorTrigger::WorldActivityEventActive` to gate
+    /// spawns on scope state AND the two AND-ed presence floors (the
+    /// scope's `required_players` and the rule's `min_players`).
+    /// Replaces the former `world_activity_event` projection as the gate
+    /// source.
+    pub(super) activity_scopes:
+        HashMap<game_schema::WorldActivityEventKey, game_schema::ActivityScopeProjection>,
+    /// Region cells whose every `activity_scope` is `Sleeping` — Tier 1
+    /// work (physics, AI, combat, casts, mechanics) is skipped for
+    /// entities in these cells. Recomputed
+    /// once at the top of each `run_tick` from `activity_scopes` by
+    /// `recompute_dormant_scopes`. A cell with no scope row defaults to
+    /// awake (open-world background), and `Draining` / `Cleanup` scopes
+    /// still count as awake, so this set is empty whenever nothing is
+    /// asleep and the gate is a pure no-op.
+    pub(super) dormant_cells: HashSet<RegionCell>,
+    /// `dormant_cells` as of the *previous* `run_tick`, used to detect
+    /// scope sleep/wake edges. Diffed against `dormant_cells` each tick:
+    /// cells newly added are settled (in-flight volatile state cancelled
+    /// so nothing resolves off-screen); cells newly removed have woken and
+    /// are the worker-local signal to drop any epoch-keyed caches. Seeded
+    /// empty so the first tick treats every already-dormant cell as a
+    /// fresh sleep edge (settling stale volatile state on startup).
+    pub(super) prev_dormant_cells: HashSet<RegionCell>,
     /// NPC goal directives from the DB (Tier 2 world_clock output).
     /// Keyed by entity_id → (goal_kind, priority). Phase 7 AI reads before decisions.
     pub(super) npc_goals: HashMap<EntityId, (String, u32)>,
@@ -397,9 +451,32 @@ pub struct TickPipeline {
     pub(crate) behavior_trees: game_core::ai::behavior_tree::BehaviorTreeRegistry,
     /// Authored NPC route registry loaded from checked-in authoring data.
     pub(crate) routes: game_core::ai::routes::RouteRegistry,
+    /// Authored per-layer navigation graphs for Phase 3 graph pathing. Empty
+    /// until content is authored; injected in tests via [`Self::set_nav_graph_registry`].
+    pub(crate) nav_graphs: game_core::ai::graph::NavGraphRegistry,
     /// Per-entity route-follow runtime state. Keyed by stable EntityId so slot
     /// reuse cannot inherit route progress.
     pub(super) ai_route_follow: HashMap<EntityId, game_core::ai::routes::RouteFollowState>,
+    /// Per-entity graph-path follow runtime state. Keyed by stable EntityId;
+    /// carries the layer + graph_version it was planned against so a stale or
+    /// cross-layer plan is rejected on the next follow.
+    pub(super) ai_graph_path_follow: HashMap<EntityId, ai::GraphFollowState>,
+    /// Per-layer runtime invalidation epoch. Bumped whenever a gate on that
+    /// layer toggles (or another runtime traversability change occurs). The
+    /// authored `NavGraph::graph_version` is immutable for the process lifetime
+    /// (baked from RON), so it can't carry runtime change; the *effective* cache
+    /// version a search keys against is `authored.wrapping_add(epoch)`. Within a
+    /// layer the authored version is constant, so adding the monotonic epoch is
+    /// collision-free, and the path cache key already discriminates by `layer`.
+    pub(super) nav_layer_epoch: HashMap<u32, u64>,
+    /// Per-boss consecutive-tick counter for the encounter arena leash. An
+    /// *active* encounter whose arena has no valid same-layer target (every
+    /// player left the layer) accrues ticks here; once it reaches
+    /// [`encounter_runtime::ENCOUNTER_LEASH_VACANCY_TICKS`] the encounter is
+    /// reset to dormant so it stops ticking mechanics/telegraphs offscreen.
+    /// Reset to zero the moment a valid target reappears, and removed with the
+    /// boss runtime slot in `force_remove_entities`.
+    pub(super) encounter_vacancy_ticks: HashMap<EntityId, u32>,
     /// Reusable scratch buffer for Phase 7 AI decision output. Cleared and
     /// refilled per entity so policies never allocate a fresh `Vec` per tick.
     pub(super) ai_action_scratch: Vec<game_core::ai::decision::DesiredAiAction>,
@@ -511,6 +588,11 @@ pub struct TickPipeline {
     /// `cleanup_encounter_for_boss_removal`. `spawn_index` values are
     /// local to `pending_cleanup_spawns` and must be shifted at drain time.
     pub(super) pending_cleanup_memberships: Vec<game_core::director::PendingAddMembership>,
+    /// Phase 2 pathing scheduler: per-tick search budget, result cache, and
+    /// per-NPC replan cooldown. The budget is reset at the top of each
+    /// `run_tick`; the authored graph search (Phase 3) routes every request
+    /// through `request_path` so the hot path can never search uncapped.
+    pub(super) pathing: PathingState,
 }
 
 impl TickPipeline {
@@ -579,6 +661,8 @@ impl TickPipeline {
         for puzzle in self.lever_puzzles.values_mut() {
             puzzle.activated.retain(|eid| !removed_set.contains(eid));
         }
+        // Keep the pathing scheduler's per-NPC replan cooldowns in step.
+        self.pathing.forget_entities(&removed_set);
 
         // 4) Single-pass follow-up windows + charging cleanup.
         self.state
@@ -649,12 +733,14 @@ impl TickPipeline {
             self.npc_state_prev.remove(id);
             self.ai_behavior_trees.remove(id);
             self.ai_route_follow.remove(id);
+            self.ai_graph_path_follow.remove(id);
             self.npc_goals.remove(id);
             self.disconnected_players.remove(id);
             self.equipment_modifiers.remove(id);
             self.weapon_swap_cooldowns.remove(id);
             self.entity_tags.remove(id);
             self.add_to_boss.remove(id);
+            self.encounter_vacancy_ticks.remove(id);
             self.entity_loot_tables.remove(id);
             self.entity_body_shapes.remove(id);
         }
@@ -754,7 +840,9 @@ impl TickPipeline {
             transform_history: TransformHistory::new(),
             director: DirectorState::new(),
             world_phases: HashMap::new(),
-            world_activity_events: HashMap::new(),
+            activity_scopes: HashMap::new(),
+            dormant_cells: HashSet::new(),
+            prev_dormant_cells: HashSet::new(),
             npc_goals: HashMap::new(),
             disconnected_players: HashSet::new(),
             ai_behavior_trees: HashMap::new(),
@@ -763,7 +851,11 @@ impl TickPipeline {
             npc_archetypes: NpcArchetypeRegistry::with_builtins(),
             behavior_trees: load_builtin_behavior_trees(),
             routes: load_builtin_routes(),
+            nav_graphs: game_core::ai::graph::NavGraphRegistry::new(),
             ai_route_follow: HashMap::new(),
+            ai_graph_path_follow: HashMap::new(),
+            nav_layer_epoch: HashMap::new(),
+            encounter_vacancy_ticks: HashMap::new(),
             ai_action_scratch: Vec::new(),
             ai_actor_indices_scratch: Vec::new(),
             ai_player_indices_scratch: Vec::new(),
@@ -794,6 +886,10 @@ impl TickPipeline {
             pending_cleanup_commit_outputs: Vec::new(),
             pending_cleanup_spawns: Vec::new(),
             pending_cleanup_memberships: Vec::new(),
+            pathing: PathingState::new(
+                PATH_SEARCHES_PER_TICK_CAP,
+                PATH_REPLAN_COOLDOWN_TICKS,
+            ),
         }
     }
 
@@ -837,6 +933,34 @@ impl TickPipeline {
     pub fn set_route_registry(&mut self, registry: game_core::ai::routes::RouteRegistry) {
         self.routes = registry;
         self.ai_route_follow.clear();
+    }
+
+    pub fn set_nav_graph_registry(&mut self, registry: game_core::ai::graph::NavGraphRegistry) {
+        self.nav_graphs = registry;
+        self.ai_graph_path_follow.clear();
+        self.nav_layer_epoch.clear();
+    }
+
+    /// Invalidate cached graph paths for `layer` after a runtime traversability
+    /// change (gate toggle). Bumps the per-layer epoch — which
+    /// raises the effective cache version every subsequent search keys against,
+    /// so both the follower's in-flight reuse check and the path-cache lookup
+    /// miss and a budgeted replan is forced — then proactively drops the
+    /// now-unreachable cache entries via the path-cache invalidate hook. A no-op
+    /// when no graph is authored for the layer.
+    pub(super) fn bump_nav_layer_epoch(&mut self, layer: u32) {
+        let epoch = self
+            .nav_layer_epoch
+            .entry(layer)
+            .and_modify(|e| *e = e.wrapping_add(1))
+            .or_insert(1);
+        let effective = self
+            .nav_graphs
+            .graph_for_layer(layer)
+            .map(|g| g.graph_version().wrapping_add(*epoch));
+        if let Some(effective) = effective {
+            self.pathing.invalidate_layer(layer, effective);
+        }
     }
 
     pub fn physics_mut(&mut self) -> &mut dyn PhysicsBackend {
@@ -1088,15 +1212,158 @@ impl TickPipeline {
         &mut self.world_phases
     }
 
-    /// Direct access to the `world_activity_event` projection map for
-    /// test setup (normally written by the coordinator on
-    /// `world_activity_event` DB inserts).
+    /// Direct access to the `activity_scope` projection map for test
+    /// setup (normally written by the coordinator on `activity_scope` DB
+    /// inserts). Gate source for `DirectorTrigger::WorldActivityEventActive`.
     #[doc(hidden)]
-    pub fn world_activity_events_mut(
+    pub fn activity_scopes_mut(
         &mut self,
-    ) -> &mut HashMap<game_schema::WorldActivityEventKey, game_schema::WorldActivityEventState>
+    ) -> &mut HashMap<game_schema::WorldActivityEventKey, game_schema::ActivityScopeProjection>
     {
-        &mut self.world_activity_events
+        &mut self.activity_scopes
+    }
+
+    /// Recompute `dormant_cells` from the `activity_scopes` mirror.
+    ///
+    /// A region cell is dormant only when it has at least one
+    /// `activity_scope` and *every* scope in it is `Sleeping`. Cells with
+    /// no scope row default to awake (open-world background; the contract
+    /// keeps inactive cells row-less rather than asleep). `Draining` and
+    /// `Cleanup` count as awake — draining still settles volatile work and
+    /// cleanup wakes briefly to tear down — so only fully-`Sleeping` cells
+    /// gate Tier 1 off. Called once at the top of `run_tick`; with every
+    /// scope `Awake` this leaves `dormant_cells` empty and the gate is a
+    /// no-op.
+    pub(super) fn recompute_dormant_scopes(&mut self) {
+        self.dormant_cells.clear();
+        if self.activity_scopes.is_empty() {
+            return;
+        }
+        // Per cell: does any scope keep it awake? A cell is dormant iff it
+        // has scopes and none keep it awake.
+        let mut any_awake: HashMap<RegionCell, bool> = HashMap::new();
+        for (key, proj) in &self.activity_scopes {
+            let cell = RegionCell {
+                region_x: key.scope_region_x,
+                region_z: key.scope_region_z,
+                layer: key.scope_layer,
+            };
+            let keeps_awake = proj.mode != game_schema::ActivityScopeMode::Sleeping;
+            let entry = any_awake.entry(cell).or_insert(false);
+            *entry = *entry || keeps_awake;
+        }
+        for (cell, awake) in any_awake {
+            if !awake {
+                self.dormant_cells.insert(cell);
+            }
+        }
+    }
+
+    /// Whether Tier 1 simulation should advance for entities in the given
+    /// region cell. True unless every `activity_scope` in the cell is
+    /// `Sleeping` (see `recompute_dormant_scopes`). Cells with no scope are
+    /// always awake.
+    pub(super) fn scope_is_awake(&self, cell: &RegionCell) -> bool {
+        !self.dormant_cells.contains(cell)
+    }
+
+    /// Whether the entity's current region cell is awake. Entities with no
+    /// tracked region (not yet placed) default to awake so spawn-time work
+    /// is never accidentally gated. O(1): one `entity_regions` lookup plus
+    /// one `dormant_cells` membership test.
+    pub(super) fn entity_in_awake_scope(&self, entity: EntityId) -> bool {
+        match self.entity_regions.get(&entity) {
+            Some(cell) => self.scope_is_awake(cell),
+            None => true,
+        }
+    }
+
+    /// Detect scope sleep/wake *edges* by diffing the freshly recomputed
+    /// `dormant_cells` against `prev_dormant_cells`, then run the settle on
+    /// any cell that just fell asleep.
+    ///
+    /// A cell present in `dormant_cells` but not in `prev_dormant_cells`
+    /// crossed the Awake→Sleeping edge this tick: `settle_dormant_cell`
+    /// clears its entities' residual selection state. Most volatile work
+    /// (casts, projectiles, buffs) already quiesced during the `Draining`
+    /// window — a draining cell counts as awake and keeps ticking for the
+    /// full drain timer, so in-flight casts resolve normally *before* the
+    /// cell sleeps. The Sleeping-edge settle only sweeps long-lived
+    /// targeting sessions that the drain window would not have expired.
+    ///
+    /// A cell present in `prev_dormant_cells` but *not* in `dormant_cells`
+    /// crossed the Sleeping→Awake edge: `settle_woken_cell` drops any
+    /// graph-path follow plans for its entities. A plan built
+    /// before a long sleep may point at a now-stale waypoint, so waking an
+    /// NPC forces a fresh nearest-node replan against the live graph rather
+    /// than reusing dead state. This wake invalidation is keyed purely on the
+    /// worker-local wake edge (plus the per-layer `graph_version` checked in
+    /// the follower), never on a durable scope epoch. Called once per
+    /// `run_tick`, immediately after `recompute_dormant_scopes`.
+    pub(super) fn settle_scope_transitions(&mut self) {
+        // Fast path: no scopes and never had any → nothing to diff.
+        if self.dormant_cells.is_empty() && self.prev_dormant_cells.is_empty() {
+            return;
+        }
+        let newly_dormant: Vec<RegionCell> = self
+            .dormant_cells
+            .difference(&self.prev_dormant_cells)
+            .copied()
+            .collect();
+        for cell in newly_dormant {
+            self.settle_dormant_cell(cell);
+        }
+        let newly_woken: Vec<RegionCell> = self
+            .prev_dormant_cells
+            .difference(&self.dormant_cells)
+            .copied()
+            .collect();
+        for cell in newly_woken {
+            self.settle_woken_cell(cell);
+        }
+        // Snapshot for next tick's edge diff.
+        self.prev_dormant_cells.clone_from(&self.dormant_cells);
+    }
+
+    /// Clear residual selection state for every entity in a cell that just
+    /// went `Sleeping`. Pure data-structure
+    /// cleanup — no physics-body changes (deferred) and no cast
+    /// cancellation (the `Draining` window already let casts resolve):
+    /// drops active lock-on sessions, whose multi-second `timeout_at`
+    /// could otherwise outlive the drain and linger on a frozen cell.
+    /// Idempotent and safe to call on a cell with no entities (no-op).
+    pub(super) fn settle_dormant_cell(&mut self, cell: RegionCell) {
+        let entities: Vec<EntityId> = self
+            .entity_regions
+            .iter()
+            .filter(|(_, c)| **c == cell)
+            .map(|(e, _)| *e)
+            .collect();
+        for entity in entities {
+            self.active_lock_on_sessions.remove(&entity);
+        }
+    }
+
+    /// Drop graph-path follow plans for every entity in a cell that just woke.
+    /// A plan resolved before the cell slept could now reference a stale
+    /// waypoint; clearing it forces the follower to replan from the NPC's
+    /// current position against the live graph. Route-follow state is
+    /// intentionally left intact — authored route waypoints are static, so a
+    /// sleeping NPC simply resumes its patrol.
+    /// Idempotent and safe on a cell with no entities (no-op).
+    pub(super) fn settle_woken_cell(&mut self, cell: RegionCell) {
+        if self.ai_graph_path_follow.is_empty() {
+            return;
+        }
+        let entities: Vec<EntityId> = self
+            .entity_regions
+            .iter()
+            .filter(|(_, c)| **c == cell)
+            .map(|(e, _)| *e)
+            .collect();
+        for entity in entities {
+            self.ai_graph_path_follow.remove(&entity);
+        }
     }
 
     pub fn set_current_tick(&mut self, tick: TickId) {
@@ -1969,6 +2236,17 @@ impl TickPipeline {
                     entity,
                     state != game_core::sim_state::SimInteractState::Active,
                 );
+                // A real gate state change alters runtime traversability, so
+                // invalidate cached graph paths on the gate's layer (forcing a
+                // budgeted replan). `info.state` is the pre-mutation state
+                // (captured before
+                // `set_interactable_own_state_runtime`), so this fires only on a
+                // genuine edge — redundant same-state re-applies don't thrash
+                // replans.
+                if info.state != state {
+                    let layer = self.layer_of(entity);
+                    self.bump_nav_layer_epoch(layer);
+                }
             }
             SimInteractKind::Switch => {
                 if let Some(linked_entity) = info.linked_entity {
@@ -2205,6 +2483,11 @@ impl TickPipeline {
         self.pending_death_state_inserts.clear();
         self.summary = TickSummary::default();
 
+        // Refill the per-tick path-search budget before any phase can request a
+        // route. The cache and per-NPC replan cooldowns persist across ticks;
+        // only the per-tick search count resets here.
+        self.pathing.begin_tick();
+
         // Phase 1: Input ingestion — filter intents for this tick
         let tick_intents: Vec<_> = intents
             .iter()
@@ -2214,6 +2497,17 @@ impl TickPipeline {
 
         // Phase 1.5: Stat recalculation — recompute cached StatBlocks for dirty entities
         self.phase_stat_recalc();
+
+        // Phase 1.6: Awake-scope gate — recompute the dormant-cell set from
+        // the `activity_scope` mirror before any Tier 1 phase consults
+        // `entity_in_awake_scope`. With every scope `Awake`, this
+        // leaves `dormant_cells` empty and downstream gating is a no-op.
+        self.recompute_dormant_scopes();
+
+        // Phase 1.6b: Sleep/wake edge settle — diff against the previous
+        // tick's dormant set and finalize any cell that just fell asleep
+        // (clears residual lock-on sessions). No-op while nothing sleeps.
+        self.settle_scope_transitions();
 
         // Phase 2: Controller update
         self.phase_controller_update(&tick_intents);
@@ -2238,6 +2532,12 @@ impl TickPipeline {
 
         // Phase 7.5: World orchestration — director evaluates triggers and spawns
         let mut director_spawns = self.phase_world_orchestration();
+
+        // Presence-driven scope mode transition requests. The worker is the
+        // presence authority; these become request_scope_wake/drain reducer
+        // calls in the coordinator. Empty whenever no activity scopes exist, so
+        // the open world pays a single is_empty branch.
+        let scope_transition_requests = self.compute_scope_transitions();
 
         // Phase 7.5a: Volume occupant sync — refresh per-volume occupant lists
         // from the physics backend, emit VolumeEnter/VolumeExit events, and
@@ -2452,6 +2752,7 @@ impl TickPipeline {
             death_state_inserts: std::mem::take(&mut self.pending_death_state_inserts),
             loot_rolls: std::mem::take(&mut self.pending_loot_rolls),
             sim_warnings,
+            scope_transition_requests,
         };
 
         self.current_tick = self.current_tick.next();

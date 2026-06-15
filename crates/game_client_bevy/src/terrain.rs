@@ -1,16 +1,16 @@
 //! Client-side terrain visual rendering.
 //!
 //! Watches the local player's `entity_layer` row and spawns the
-//! corresponding glTF scene from `assets/terrain/{set_name}/{set_name}.gltf`
-//! (where `set_name` is resolved from `data/layers.ron`).  Despawns
-//! and re-spawns when the layer changes.
+//! corresponding glTF scene from root `assets/terrain/...`. The visual stem is
+//! resolved from `data/layers.ron`, then the concrete file path is resolved via
+//! `data/terrain_assets.ron`. Despawns and re-spawns when the layer changes.
 //!
 //! Collision is handled server-side (trimesh on the worker). This
 //! module only manages the visual mesh.
 
 use bevy::prelude::*;
 use game_client::module_bindings::EntityLayerTableAccess;
-use game_schema::dungeon::WorldLayersFile;
+use game_schema::dungeon::{TerrainAssetFile, WorldLayersFile};
 use spacetimedb_sdk::Table;
 
 use crate::dungeon_geometry::{ActiveDungeon, DefaultGround};
@@ -40,6 +40,7 @@ struct TerrainScene;
 
 /// Embedded `layers.ron` — same source the worker uses.
 static LAYERS: std::sync::OnceLock<WorldLayersFile> = std::sync::OnceLock::new();
+static TERRAIN_ASSETS: std::sync::OnceLock<TerrainAssetFile> = std::sync::OnceLock::new();
 
 fn all_layers() -> &'static WorldLayersFile {
     LAYERS.get_or_init(|| {
@@ -49,19 +50,55 @@ fn all_layers() -> &'static WorldLayersFile {
     })
 }
 
-/// Return the client-side visual asset stem for a static layer, if any.
+fn all_terrain_assets() -> &'static TerrainAssetFile {
+    TERRAIN_ASSETS.get_or_init(|| {
+        let src = include_str!("../../../data/terrain_assets.ron");
+        ron::from_str::<TerrainAssetFile>(src)
+            .expect("data/terrain_assets.ron embedded at compile time must be valid RON")
+    })
+}
+
+/// Return the client-side visual asset path for a static layer, if any.
 /// Prefers the explicit `client_visual` override; falls back to the
 /// `terrain_set` name so layers that don't decouple visual from collision
 /// still work without extra config.
-fn visual_asset_for_layer(layer_id: u32) -> Option<&'static str> {
+fn visual_asset_for_layer(layer_id: u32) -> Option<String> {
     let layer = all_layers()
         .layers
         .iter()
         .find(|l| l.layer_id == layer_id)?;
-    layer
+    let stem = layer
         .client_visual
         .as_deref()
-        .or(layer.terrain_set.as_deref())
+        .or(layer.terrain_set.as_deref())?;
+    resolve_visual_asset_path(stem).or_else(|| Some(format!("terrain/{stem}/{stem}.gltf#Scene0")))
+}
+
+fn resolve_visual_asset_path(stem: &str) -> Option<String> {
+    let assets = all_terrain_assets();
+    for asset in &assets.assets {
+        if asset.client_visual.as_deref() == Some(stem) {
+            return asset.visual_mesh.as_deref().and_then(to_bevy_asset_path);
+        }
+    }
+    for asset in &assets.assets {
+        if asset.terrain_set == stem {
+            return asset
+                .visual_mesh
+                .as_deref()
+                .or(asset.server_mesh.as_deref())
+                .and_then(to_bevy_asset_path);
+        }
+    }
+    None
+}
+
+fn to_bevy_asset_path(path: &str) -> Option<String> {
+    let relative = path.strip_prefix("assets/").unwrap_or(path);
+    if !(relative.ends_with(".gltf") || relative.ends_with(".glb")) {
+        return None;
+    }
+    Some(format!("{}#Scene0", relative.replace('\\', "/")))
 }
 
 /// Watch for local-player layer changes and swap the terrain glTF scene.
@@ -115,16 +152,14 @@ fn sync_terrain_visual(
     despawn_terrain(&mut active, &mut commands);
 
     // Find the asset stem for this layer (client_visual override, else terrain_set).
-    let Some(set_name) = visual_asset_for_layer(layer_id) else {
+    let Some(asset_path) = visual_asset_for_layer(layer_id) else {
         // No visual on this layer (e.g. open_world with placeholder cuboid).
         active.layer = Some(layer_id);
         show_default_ground(&ground_query, &mut commands);
         return;
     };
 
-    // Load the glTF scene from assets/terrain/{set_name}/{set_name}.gltf#Scene0
-    let asset_path = format!("terrain/{set_name}/{set_name}.gltf#Scene0");
-    log::info!("Layer {layer_id} → visual='{set_name}': loading '{asset_path}'");
+    log::info!("Layer {layer_id}: loading terrain visual '{asset_path}'");
 
     hide_default_ground(&ground_query, &mut commands);
 

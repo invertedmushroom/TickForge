@@ -54,9 +54,8 @@ impl NpcArchetypeRegistry {
     /// On parse/validation failure the registry is left **empty**, not
     /// populated with a hardcoded fallback. Server-side
     /// `load_npc_archetypes` errors out on the same input, so the two
-    /// processes never silently disagree about which archetypes exist
-    /// (Finding #2 in the 2026-06-09 review). The worker still tolerates
-    /// the empty case — `register_encounter_add_with_archetype` and
+    /// processes never silently disagree about which archetypes exist. The
+    /// worker still tolerates the empty case — `register_encounter_add_with_archetype` and
     /// `apply_npc_archetype_to_entity` warn and skip when an archetype
     /// is missing — so a content bug degrades to "no add profile
     /// installed" rather than worker crash.

@@ -8,9 +8,9 @@
 //! systems (encounters, future puzzle/water systems) consume those events
 //! and the per-tick occupant list.
 //!
-//! Step 2.5 keeps the surface minimal: spawn / despawn / list occupants /
-//! enter-exit edges. Dwell-time triggers, satisfaction rules, and
-//! data-driven authoring (volumes in dungeons.ron) are deliberately deferred.
+//! The current surface is intentionally minimal: spawn / despawn / list
+//! occupants / enter-exit edges. Dwell-time triggers, satisfaction rules, and
+//! data-driven authoring (volumes in dungeons.ron) can build on that surface.
 
 use std::collections::HashMap;
 

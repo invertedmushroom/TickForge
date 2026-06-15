@@ -1,3 +1,4 @@
+use super::graph::NavNodeId;
 use game_protocol::entity_id::EntityId;
 use game_protocol::types::Vec3f;
 use game_schema::NpcAiState;
@@ -135,6 +136,16 @@ pub enum DesiredAiAction {
     FollowRoute {
         route_id: AiStringId,
     },
+    /// Navigate to a node in the layer's authored nav graph (Phase 3). The
+    /// worker resolves the nearest start node, runs bounded A* through the
+    /// per-tick path budget, and follows the resulting waypoints. Issuing this
+    /// again while a path to the same goal is in flight is a no-op (the worker's
+    /// replan cooldown debounces it).
+    MoveToGraphTarget {
+        goal: NavNodeId,
+    },
+    /// Abandon any in-progress graph navigation and clear the follower state.
+    CancelPath,
     EvadeHome {
         home_position: Vec3f,
     },

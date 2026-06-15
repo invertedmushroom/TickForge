@@ -651,9 +651,9 @@ mod tests {
 
     #[test]
     fn respawn_on_instance_layer_preserves_layer() {
-        // Validates Finding 2: when a player dies in a dungeon instance
-        // (layer 100) and respawns, the coordinator must pass the death
-        // layer to sync_insert — not hard-code 0.
+        // When a player dies in a dungeon instance (layer 100) and respawns,
+        // the coordinator must pass the death layer to sync_insert, not
+        // hard-code 0.
         let mut sim = test_runner();
         let id = EntityId(1000);
         let instance_layer = 100u32;

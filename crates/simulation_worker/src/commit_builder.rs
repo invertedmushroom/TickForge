@@ -360,6 +360,20 @@ pub struct CommitEncounterAddMembership {
     pub tags: Vec<String>,
 }
 
+/// Presence-driven scope mode transition. Mirrors
+/// `tick_pipeline::ScopeTransitionRequest` in SDK-free form. The coordinator
+/// turns each into a `request_scope_wake` (`wake = true`) or
+/// `request_scope_drain` (`wake = false`) reducer call — separate from
+/// `commit_tick_results`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitScopeTransition {
+    pub layer: u32,
+    pub region_x: i32,
+    pub region_z: i32,
+    /// `true` = wake the cell's scopes, `false` = drain them.
+    pub wake: bool,
+}
+
 /// Complete marshalled payload for one tick commit.
 ///
 /// Contains all vectors the `commit_tick_results` reducer expects,
@@ -406,6 +420,10 @@ pub struct CommitPackage {
     /// Forwarded to the `sim_log` event table via `commit_tick_results`.
     /// Populated from `TickResult::sim_warnings`; level is always Warn (2).
     pub sim_logs: Vec<String>,
+    /// Presence-driven scope mode transitions. Sent as separate
+    /// `request_scope_wake` / `request_scope_drain` reducer calls by the
+    /// coordinator, not as part of `commit_tick_results`.
+    pub scope_transition_requests: Vec<CommitScopeTransition>,
 }
 
 /// Build a `CommitPackage` from a `TickResult` and consumed intent IDs.
@@ -596,6 +614,17 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
         })
         .collect();
 
+    let scope_transition_requests = result
+        .scope_transition_requests
+        .iter()
+        .map(|t| CommitScopeTransition {
+            layer: t.layer,
+            region_x: t.region_x,
+            region_z: t.region_z,
+            wake: matches!(t.kind, crate::tick_pipeline::ScopeTransitionKind::Wake),
+        })
+        .collect();
+
     CommitPackage {
         tick_id,
         transforms,
@@ -616,6 +645,7 @@ pub fn build(result: TickResult, consumed_intent_ids: Vec<u64>) -> CommitPackage
         death_state_inserts,
         loot_rolls,
         sim_logs: result.sim_warnings,
+        scope_transition_requests,
     }
 }
 
@@ -1268,6 +1298,7 @@ mod tests {
             death_state_inserts: Vec::new(),
             loot_rolls: Vec::new(),
             sim_warnings: Vec::new(),
+            scope_transition_requests: Vec::new(),
         }
     }
 
@@ -1634,6 +1665,7 @@ mod tests {
             death_state_inserts: Vec::new(),
             loot_rolls: Vec::new(),
             sim_warnings: Vec::new(),
+            scope_transition_requests: Vec::new(),
         };
         let pkg = build(result, Vec::new());
 
@@ -1736,6 +1768,7 @@ mod tests {
             death_state_inserts: Vec::new(),
             loot_rolls: Vec::new(),
             sim_warnings: Vec::new(),
+            scope_transition_requests: Vec::new(),
         };
         let pkg = build(result, Vec::new());
 

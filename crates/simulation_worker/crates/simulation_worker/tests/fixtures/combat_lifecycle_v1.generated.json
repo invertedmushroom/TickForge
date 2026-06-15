@@ -1,0 +1,202 @@
+{
+  "name": "combat_lifecycle_v1",
+  "dt": 0.05,
+  "ability_seed": "slash_v1",
+  "initial_entities": [
+    {
+      "entity_id": 1,
+      "kind": "Player",
+      "spawned_at_tick": 0,
+      "max_hp": 100.0,
+      "position": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      }
+    },
+    {
+      "entity_id": 2,
+      "kind": "Npc",
+      "spawned_at_tick": 0,
+      "max_hp": 50.0,
+      "position": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+      }
+    }
+  ],
+  "intents_by_tick": [
+    [],
+    [
+      {
+        "entity_id": 1,
+        "sequence_id": 1,
+        "target_tick": 1,
+        "client_observed_tick": 0,
+        "action": {
+          "UseAbility": {
+            "ability_id": 1,
+            "target": "None",
+            "target_hint": null
+          }
+        }
+      }
+    ],
+    [],
+    [],
+    [],
+    []
+  ],
+  "expected_ticks": [
+    {
+      "tick_id": 0,
+      "events": [],
+      "entity_state_updates": [
+        {
+          "entity_id": 1,
+          "new_state": "Active"
+        },
+        {
+          "entity_id": 2,
+          "new_state": "Active"
+        }
+      ]
+    },
+    {
+      "tick_id": 1,
+      "events": [
+        {
+          "tick_id": 1,
+          "event_sequence": 0,
+          "entity_id": 1,
+          "payload": {
+            "CastStart": {
+              "ability_id": 1,
+              "cast_duration_ticks": 3
+            }
+          }
+        },
+        {
+          "tick_id": 1,
+          "event_sequence": 1,
+          "entity_id": 1,
+          "payload": {
+            "HitboxSpawned": {
+              "ability_id": 1
+            }
+          }
+        }
+      ],
+      "entity_state_updates": []
+    },
+    {
+      "tick_id": 2,
+      "events": [
+        {
+          "tick_id": 2,
+          "event_sequence": 0,
+          "entity_id": 1,
+          "payload": {
+            "DamageFrame": {
+              "ability_id": 1
+            }
+          }
+        },
+        {
+          "tick_id": 2,
+          "event_sequence": 1,
+          "entity_id": 2,
+          "payload": {
+            "Damage": {
+              "source": 1,
+              "amount": 50.0,
+              "damage_type": "Physical"
+            }
+          }
+        },
+        {
+          "tick_id": 2,
+          "event_sequence": 2,
+          "entity_id": 2,
+          "payload": {
+            "SkillHit": {
+              "skill_id": 1,
+              "source": 1
+            }
+          }
+        },
+        {
+          "tick_id": 2,
+          "event_sequence": 3,
+          "entity_id": 2,
+          "payload": {
+            "CastStart": {
+              "ability_id": 1,
+              "cast_duration_ticks": 3
+            }
+          }
+        },
+        {
+          "tick_id": 2,
+          "event_sequence": 4,
+          "entity_id": 2,
+          "payload": {
+            "EntityDied": {
+              "killer": 1
+            }
+          }
+        },
+        {
+          "tick_id": 2,
+          "event_sequence": 5,
+          "entity_id": 2,
+          "payload": "EntityDespawned"
+        }
+      ],
+      "entity_state_updates": [
+        {
+          "entity_id": 2,
+          "new_state": "Removed"
+        }
+      ]
+    },
+    {
+      "tick_id": 3,
+      "events": [
+        {
+          "tick_id": 3,
+          "event_sequence": 0,
+          "entity_id": 1,
+          "payload": {
+            "HitboxRemoved": {
+              "ability_id": 1
+            }
+          }
+        }
+      ],
+      "entity_state_updates": []
+    },
+    {
+      "tick_id": 4,
+      "events": [
+        {
+          "tick_id": 4,
+          "event_sequence": 0,
+          "entity_id": 1,
+          "payload": {
+            "CooldownReady": {
+              "ability_id": 1
+            }
+          }
+        }
+      ],
+      "entity_state_updates": []
+    },
+    {
+      "tick_id": 5,
+      "events": [],
+      "entity_state_updates": []
+    }
+  ]
+}

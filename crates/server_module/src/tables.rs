@@ -610,7 +610,7 @@ pub struct EntityRegion {
 // identities so the auth guard can accept them.
 //
 // Workers are registered via the register_worker reducer, which itself
-// is restricted to the module identity (called during init or via CLI).
+// is restricted to the module admin identity.
 
 #[table(accessor = trusted_worker, public)]
 pub struct TrustedWorker {
@@ -793,7 +793,7 @@ pub struct WorldPhase {
     pub metadata: String,
 }
 
-// ── World Activity Event (messaging spine — step 4 of the 2026-06-09 review) ─
+// ── World Activity Event ─────────────────────────────────────────
 // Scope-keyed Tier 2 event row used to gate director spawns on both a
 // scope state transition AND an explicit player-presence requirement.
 //
@@ -803,7 +803,7 @@ pub struct WorldPhase {
 // Tier 2 progression continue (durable counters, timers, world_phase)
 // while preventing director spawns from firing offscreen — see
 // `docs/contracts/world_activity_policy_contract.md` "no offscreen
-// combat" rule and Finding #4 from the 2026-06-09 messaging review.
+// combat" rule.
 //
 // V1 tags (no payload yet):
 //   - `boss_ready` : produced by world_clock alongside the
@@ -855,6 +855,91 @@ pub struct WorldActivityEvent {
     /// Versioned JSON payload for kind-specific data. Empty for v1
     /// `boss_ready` / `completed` events.
     pub payload: String,
+}
+
+// ── Activity Scope ───────────────────────────────────────────────
+// Canonical scope-state record for worker activity gating. It carries
+// durable activity state above `zone_counter` (the raw progression signal)
+// and exposes the simulation mode that decides whether worker Tier 1 work
+// should advance for a scope.
+//
+// `world_clock` mirrors progression outcomes here alongside
+// `world_activity_event`, while trusted worker reducers update the
+// sleep/wake mode and hysteresis fields. Unlike `world_activity_event`, the
+// `required_players` column is mirrored to the worker and enforced by
+// `DirectorTrigger::WorldActivityEventActive` alongside the spawn rule's
+// `min_players` escalation tier.
+//
+// Two-axis shape (contract: keep distinct columns, do not collapse):
+//   - `state` (durable activity axis): what the scope has achieved.
+//   - `mode`  (simulation axis): whether the worker ticks it. New
+//             progression rows start `Awake`; trusted worker reducers request
+//             wake/drain transitions, `world_clock` advances drained scopes to
+//             `Sleeping`, and instance expiry deletes stale scope rows directly.
+//
+// Keyed by `(scope_layer, scope_region_x, scope_region_z, tag)` to match
+// `world_activity_event` gate behavior. Logical uniqueness on the
+// scope+tag key is enforced by `reducers::upsert_activity_scope` (same
+// workspace pattern as `zone_counter` / `world_activity_event`).
+
+pub use game_schema::ActivityScopeMode;
+
+#[table(
+    accessor = activity_scope,
+    public,
+    index(accessor = by_scope, btree(columns = [scope_layer, scope_region_x, scope_region_z]))
+)]
+pub struct ActivityScope {
+    #[primary_key]
+    #[auto_inc]
+    pub scope_id: u64,
+    /// Scope key, matching `world_activity_event` / `zone_counter`:
+    /// open-world uses `scope_layer = 0` with the real `(rx, rz)`;
+    /// instances use `scope_layer = instance.layer` with `(rx, rz) = (0, 0)`.
+    pub scope_layer: u32,
+    pub scope_region_x: i32,
+    pub scope_region_z: i32,
+    /// Tag identifying the achieved phase within the scope (`boss_ready`,
+    /// `completed`). Logically unique together with the scope key.
+    pub tag: String,
+    /// Durable activity axis (`Active`, `Completed`, and related states).
+    pub state: WorldActivityEventState,
+    /// Simulation-mode axis. Progression rows start `Awake`; sleep/wake
+    /// reducers move this independently from the durable state.
+    pub mode: ActivityScopeMode,
+    /// Scope-liveness floor: minimum active (non-disconnected) players
+    /// required in the scope before director triggers gated on it fire.
+    /// AND-ed with the rule's `min_players`. `0` = no floor.
+    pub required_players: u32,
+    pub started_at: i64,
+    // ── Durable sleep/wake hysteresis ───────────────────────────────
+    // These columns persist the `Active → Draining → Dormant → wake`
+    // machine across worker restarts so a freshly-attached worker
+    // reconstructs sleep state from the DB instead of re-waking the
+    // whole world. All-zero is the legacy/`Awake` default, so existing
+    // rows upgrade in place. See
+    // `docs/contracts/world_activity_policy_contract.md`.
+    /// Wake-invalidation token. Bumped every time the scope flips to
+    /// `Awake`; the worker keys volatile caches on it so stale pre-sleep
+    /// state is dropped on wake. Monotonic, never reset.
+    pub scope_epoch: u64,
+    /// Micros deadline at which `world_clock` flips a `Draining` scope to
+    /// `Sleeping`. `0` when the scope is not draining. Set by
+    /// `request_scope_drain`; the timed descent is Tier 2 (Rule 1: the
+    /// clock advances it, the worker never sleeps it directly).
+    pub drain_until: i64,
+    /// Wake hysteresis floor: a freshly-woken scope may not begin draining
+    /// before this micros timestamp, so a player flickering across a cell
+    /// edge cannot thrash the scope awake/asleep. `0` = no floor.
+    pub min_awake_until: i64,
+    /// Sleep hysteresis floor: a `Sleeping` scope will not *naturally*
+    /// re-wake before this micros timestamp. A strong presence wake
+    /// (a player actually entering) overrides it. `0` = no floor.
+    pub min_dormant_until: i64,
+    /// Micros timestamp of the most recent flip to `Awake`. `0` if never woken.
+    pub last_wake_at: i64,
+    /// Micros timestamp of the most recent flip to `Sleeping`. `0` if never slept.
+    pub last_sleep_at: i64,
 }
 
 // ── NPC Goal (ADR-0002 Tier 2) ──────────────────────────────────────
@@ -1031,7 +1116,7 @@ pub struct SimLog {
     pub message: String,
 }
 
-// ── Voxel Terrain (§4.8b Phase 1) ───────────────────────────────────
+// ── Voxel Terrain ───────────────────────────────────────────────────
 // Bulk baked terrain rows are rekeyed by `terrain_set_id` (NOT layer) so
 // multiple layers can share one bake (PvE/PvP forks of the same map, etc.).
 // `WorldLayerDef.terrain_set` and `DungeonTemplate.terrain_set` carry the

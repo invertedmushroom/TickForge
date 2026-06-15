@@ -10,7 +10,9 @@ use game_protocol::entity_id::EntityId;
 use game_protocol::tick::TickId;
 use game_schema::EntityKind;
 use game_schema::spawn::SpawnScaling;
-use game_schema::world_activity::{WorldActivityEventKey, WorldActivityEventState};
+use game_schema::world_activity::{
+    ActivityScopeMode, ActivityScopeProjection, WorldActivityEventKey, WorldActivityEventState,
+};
 use serde::{Deserialize, Serialize};
 
 /// Width of a spatial grid cell in world units — must match `tick_pipeline::CELL_SIZE`.
@@ -55,18 +57,20 @@ pub enum DirectorTrigger {
     AfterTick { tick: u64 },
     /// Fires when a zone's world_phase matches `phase_name`.
     WorldPhase { zone_id: u32, phase_name: String },
-    /// Fires when a `world_activity_event` row tagged `tag` is in state
-    /// `Active` in the rule's region scope, AND the active player count
-    /// in that region is at least `min_players`. The scope key is
+    /// Fires when the `activity_scope` row tagged `tag` in the rule's
+    /// region scope is `Awake` + `Active`, AND the active player count in
+    /// that region clears **both** presence floors: the scope's authored
+    /// `required_players` (event liveness) and this rule's `min_players`
+    /// (escalation tier). The two floors are AND-ed, never collapsed —
+    /// multiple rules may gate on the same scope with different
+    /// `min_players` to express "more players → bigger event", while the
+    /// scope floor independently gates event liveness. The scope key is
     /// derived from the owning rule's `region` (so the same trigger
     /// reused across cells gates each independently).
     ///
-    /// This is the preferred replacement for bare `WorldPhase` for
-    /// actor-spawning rules: a `world_activity_event` row carries the
-    /// authored `required_players` value, and the worker's effective
-    /// region count already excludes reconnect-grace players (step 2 of
-    /// the messaging-spine review). See
-    /// `docs/contracts/world_activity_policy_contract.md`.
+    /// The worker sources this from the `activity_scope` projection. The
+    /// worker's effective region count already excludes reconnect-grace
+    /// players. See `docs/contracts/world_activity_policy_contract.md`.
     WorldActivityEventActive { tag: String, min_players: u32 },
     /// Both conditions must be true.
     And(Box<DirectorTrigger>, Box<DirectorTrigger>),
@@ -77,13 +81,13 @@ impl DirectorTrigger {
     ///
     /// `region_scope` is the `(rx, rz, layer)` of the owning event, used
     /// by `WorldActivityEventActive` to look up the right scope row in
-    /// `world_events`.
+    /// `activity_scopes`.
     pub fn evaluate(
         &self,
         player_count: u32,
         current_tick: TickId,
         world_phases: &HashMap<u32, String>,
-        world_events: &HashMap<WorldActivityEventKey, WorldActivityEventState>,
+        activity_scopes: &HashMap<WorldActivityEventKey, ActivityScopeProjection>,
         region_scope: (i32, i32, u32),
     ) -> bool {
         match self {
@@ -94,6 +98,7 @@ impl DirectorTrigger {
                 phase_name,
             } => world_phases.get(zone_id).map_or(false, |p| p == phase_name),
             Self::WorldActivityEventActive { tag, min_players } => {
+                // Rule escalation tier floor (authored per spawn rule).
                 if player_count < *min_players {
                     return false;
                 }
@@ -104,23 +109,29 @@ impl DirectorTrigger {
                     scope_region_z: rz,
                     tag: tag.clone(),
                 };
-                world_events
-                    .get(&key)
-                    .map(|state| *state == WorldActivityEventState::Active)
-                    .unwrap_or(false)
+                match activity_scopes.get(&key) {
+                    Some(scope) => {
+                        // Awake + Active, AND the scope-liveness floor
+                        // (independent of the rule floor above).
+                        scope.mode == ActivityScopeMode::Awake
+                            && scope.state == WorldActivityEventState::Active
+                            && player_count >= scope.required_players
+                    }
+                    None => false,
+                }
             }
             Self::And(a, b) => {
                 a.evaluate(
                     player_count,
                     current_tick,
                     world_phases,
-                    world_events,
+                    activity_scopes,
                     region_scope,
                 ) && b.evaluate(
                     player_count,
                     current_tick,
                     world_phases,
-                    world_events,
+                    activity_scopes,
                     region_scope,
                 )
             }
@@ -262,7 +273,7 @@ impl DirectorState {
         region_player_counts: &HashMap<(i32, i32, u32), u32>,
         current_tick: TickId,
         world_phases: &HashMap<u32, String>,
-        world_events: &HashMap<WorldActivityEventKey, WorldActivityEventState>,
+        activity_scopes: &HashMap<WorldActivityEventKey, ActivityScopeProjection>,
     ) -> Vec<DirectorSpawn> {
         let mut spawns = Vec::new();
 
@@ -287,7 +298,7 @@ impl DirectorState {
                 player_count,
                 current_tick,
                 world_phases,
-                world_events,
+                activity_scopes,
                 rt.def.region,
             ) {
                 let (rx, rz, layer) = rt.def.region;
@@ -443,8 +454,8 @@ mod tests {
     /// in `Active` state AND the per-region player count meeting the
     /// authored `min_players` floor. This is the runtime mirror of the
     /// `world_clock`-side `required_players` gate and the worker-side
-    /// disconnected-player exclusion — together they close the
-    /// "WorldPhase spawns offscreen" gap (Finding #4, 2026-06-09 review).
+    /// disconnected-player exclusion; together they keep actor spawns out of
+    /// offscreen cells.
     #[test]
     fn trigger_world_activity_event_active_requires_state_and_presence() {
         let t = DirectorTrigger::WorldActivityEventActive {
@@ -460,27 +471,36 @@ mod tests {
             tag: "boss_ready".to_string(),
         };
 
+        // Helper: an Awake scope projection with no scope floor, so the
+        // gate reduces to the rule's `min_players` (preserves the
+        // historical single-floor behavior this test asserts).
+        let proj = |state: WorldActivityEventState| ActivityScopeProjection {
+            state,
+            mode: ActivityScopeMode::Awake,
+            required_players: 0,
+        };
+
         // Event row missing entirely: must not fire.
         let we = HashMap::new();
         assert!(!t.evaluate(1, TickId(1), &wp, &we, scope));
 
         // Event Pending: state not Active, must not fire.
         let mut we = HashMap::new();
-        we.insert(key.clone(), WorldActivityEventState::Pending);
+        we.insert(key.clone(), proj(WorldActivityEventState::Pending));
         assert!(!t.evaluate(1, TickId(1), &wp, &we, scope));
 
         // Event Active but zero players in region: must not fire.
         let mut we = HashMap::new();
-        we.insert(key.clone(), WorldActivityEventState::Active);
+        we.insert(key.clone(), proj(WorldActivityEventState::Active));
         assert!(!t.evaluate(0, TickId(1), &wp, &we, scope));
 
         // Event Active and presence requirement met: fires.
         assert!(t.evaluate(1, TickId(1), &wp, &we, scope));
 
         // Event Completed/Expired: must not fire even with players present.
-        we.insert(key.clone(), WorldActivityEventState::Completed);
+        we.insert(key.clone(), proj(WorldActivityEventState::Completed));
         assert!(!t.evaluate(5, TickId(1), &wp, &we, scope));
-        we.insert(key, WorldActivityEventState::Expired);
+        we.insert(key, proj(WorldActivityEventState::Expired));
         assert!(!t.evaluate(5, TickId(1), &wp, &we, scope));
 
         // Different scope (rx=1) with the same tag: lookup misses, no fire.
@@ -492,9 +512,70 @@ mod tests {
                 scope_region_z: 0,
                 tag: "boss_ready".to_string(),
             },
-            WorldActivityEventState::Active,
+            proj(WorldActivityEventState::Active),
         );
         assert!(!t.evaluate(1, TickId(1), &wp, &we, scope));
+    }
+
+    /// The scope's `required_players` floor is AND-ed with the rule's
+    /// `min_players` escalation tier, never replacing it.
+    /// A rule whose `min_players` is *below* the scope floor is gated by
+    /// the scope floor; a non-`Awake` mode never fires.
+    #[test]
+    fn trigger_world_activity_event_active_ands_scope_floor() {
+        // Rule floor = 1 (would fire with a single player), but the scope
+        // requires 3. The effective gate is max(1, 3) = 3.
+        let t = DirectorTrigger::WorldActivityEventActive {
+            tag: "boss_ready".to_string(),
+            min_players: 1,
+        };
+        let wp = HashMap::new();
+        let scope = (0, 0, 0);
+        let key = WorldActivityEventKey {
+            scope_layer: 0,
+            scope_region_x: 0,
+            scope_region_z: 0,
+            tag: "boss_ready".to_string(),
+        };
+
+        let awake_floor3 = ActivityScopeProjection {
+            state: WorldActivityEventState::Active,
+            mode: ActivityScopeMode::Awake,
+            required_players: 3,
+        };
+
+        // 2 players clears the rule floor (1) but not the scope floor (3).
+        let mut we = HashMap::new();
+        we.insert(key.clone(), awake_floor3);
+        assert!(
+            !t.evaluate(2, TickId(1), &wp, &we, scope),
+            "scope floor (3) must gate even though the rule floor (1) is met"
+        );
+
+        // 3 players clears both floors: fires.
+        assert!(t.evaluate(3, TickId(1), &wp, &we, scope));
+
+        // Same scope but Sleeping/Draining/Cleanup never fires, even with
+        // ample players.
+        for mode in [
+            ActivityScopeMode::Sleeping,
+            ActivityScopeMode::Draining,
+            ActivityScopeMode::Cleanup,
+        ] {
+            let mut we = HashMap::new();
+            we.insert(
+                key.clone(),
+                ActivityScopeProjection {
+                    state: WorldActivityEventState::Active,
+                    mode,
+                    required_players: 0,
+                },
+            );
+            assert!(
+                !t.evaluate(10, TickId(1), &wp, &we, scope),
+                "non-Awake mode {mode:?} must not fire"
+            );
+        }
     }
 
     #[test]

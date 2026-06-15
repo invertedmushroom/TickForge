@@ -264,7 +264,7 @@ impl TickPipeline {
         //   - no defensive routing (dodge / block / cover)
         //   - no sleep-break (only damage breaks sleep)
         //   - no CC application (heals never CC)
-        //   - no threat (healer aggro is deferred — see plan §3.4)
+        //   - no threat (healer aggro is not modeled yet)
         //   - no `on_contact` follow-ups (designed for damage chains)
         //   - no `last_damage_source` update (`apply_healing` is source-less)
         // On-hit buffs (e.g. HoT regen) DO still apply, mirroring the damage path.

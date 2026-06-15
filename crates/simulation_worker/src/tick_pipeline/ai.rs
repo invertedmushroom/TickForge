@@ -49,6 +49,116 @@ fn threat_value_is_targetable(threat: f32) -> bool {
     threat.is_finite() && threat > THREAT_TARGETABLE_EPSILON
 }
 
+/// Arrival radius (XZ) used when following a graph path waypoint. Matches the
+/// route follower's default so graph and route locomotion feel identical.
+const GRAPH_FOLLOW_ARRIVE_RADIUS: f32 = 0.5;
+
+/// Consecutive ticks a follower may fail to get closer to its current waypoint
+/// before the plan is treated as blocked and a replan is forced. The pathing
+/// budget + per-NPC replan cooldown debounce the actual search, so a
+/// persistently stuck NPC replans at most once per cooldown window rather than
+/// every tick.
+pub(super) const GRAPH_FOLLOW_BLOCKED_TICKS: u32 = 30;
+
+/// Minimum XZ distance-squared improvement that counts as progress toward the
+/// current waypoint. Guards against float jitter being mistaken for movement.
+const GRAPH_FOLLOW_PROGRESS_EPS: f32 = 1e-4;
+
+/// Per-entity runtime state for following an authored-graph path.
+///
+/// Stores the resolved waypoint list plus the `(layer, graph_version, goal)` it
+/// was planned against. A follow whose layer or graph_version no longer matches
+/// the live graph — or whose goal changed — is discarded and replanned, which is
+/// how cross-layer paths are rejected and how a graph edit invalidates a plan.
+pub(crate) struct GraphFollowState {
+    goal: game_core::ai::graph::NavNodeId,
+    layer: u32,
+    graph_version: u64,
+    waypoints: Vec<Vec3f>,
+    index: usize,
+    /// Blocked-path detection: closest XZ distance-squared to the *current*
+    /// waypoint seen since it became current. Reset on every waypoint advance
+    /// so progress is measured per-leg.
+    closest_dist_sq: f32,
+    /// Consecutive ticks without progress toward the current waypoint.
+    blocked_ticks: u32,
+}
+
+impl GraphFollowState {
+    pub(super) fn new(
+        goal: game_core::ai::graph::NavNodeId,
+        layer: u32,
+        graph_version: u64,
+        waypoints: Vec<Vec3f>,
+    ) -> Self {
+        Self {
+            goal,
+            layer,
+            graph_version,
+            waypoints,
+            index: 0,
+            closest_dist_sq: f32::INFINITY,
+            blocked_ticks: 0,
+        }
+    }
+
+    fn current_waypoint(&self) -> Option<Vec3f> {
+        self.waypoints.get(self.index).copied()
+    }
+
+    /// Record this tick's distance to the current waypoint and return whether the
+    /// plan now counts as blocked (no progress for [`GRAPH_FOLLOW_BLOCKED_TICKS`]
+    /// consecutive ticks). Progress resets the stall counter.
+    pub(super) fn note_progress(&mut self, current_pos: Vec3f) -> bool {
+        let Some(target) = self.current_waypoint() else {
+            return false;
+        };
+        let dx = target.x - current_pos.x;
+        let dz = target.z - current_pos.z;
+        let dist_sq = dx * dx + dz * dz;
+        if dist_sq + GRAPH_FOLLOW_PROGRESS_EPS < self.closest_dist_sq {
+            self.closest_dist_sq = dist_sq;
+            self.blocked_ticks = 0;
+            false
+        } else {
+            self.blocked_ticks = self.blocked_ticks.saturating_add(1);
+            self.blocked_ticks >= GRAPH_FOLLOW_BLOCKED_TICKS
+        }
+    }
+}
+
+/// Advance `state.index` past every waypoint already reached (XZ arrival), the
+/// graph-path analog of [`advance_route_state_if_arrived`]. Unlike a route it
+/// never loops: once the last waypoint is consumed the follow is arrived.
+fn advance_graph_follow_if_arrived(state: &mut GraphFollowState, current_pos: Vec3f) {
+    while let Some(target) = state.current_waypoint() {
+        let dx = target.x - current_pos.x;
+        let dz = target.z - current_pos.z;
+        if dx * dx + dz * dz > GRAPH_FOLLOW_ARRIVE_RADIUS * GRAPH_FOLLOW_ARRIVE_RADIUS {
+            return;
+        }
+        // Reaching a waypoint is progress: start the next leg's stall tracking
+        // from scratch.
+        state.index = state.index.saturating_add(1);
+        state.closest_dist_sq = f32::INFINITY;
+        state.blocked_ticks = 0;
+    }
+}
+
+/// Informational, deterministic path id so a cache hit and a fresh search for
+/// the same route agree. Not a key — collisions are harmless.
+fn graph_path_id(
+    layer: u32,
+    graph_version: u64,
+    start: game_core::ai::graph::NavNodeId,
+    goal: game_core::ai::graph::NavNodeId,
+) -> u64 {
+    ((layer as u64) << 48)
+        ^ (graph_version << 24)
+        ^ ((start.0 as u64) << 12)
+        ^ goal.0 as u64
+}
+
 impl TickPipeline {
     // ── Phase 7: AI decisions ───────────────────────────────────
 
@@ -457,8 +567,15 @@ impl TickPipeline {
                 DesiredAiAction::FollowRoute { route_id } => {
                     self.follow_ai_route(npc_id, idx, route_id.as_str());
                 }
+                DesiredAiAction::MoveToGraphTarget { goal } => {
+                    self.follow_ai_graph_target(npc_id, idx, *goal);
+                }
+                DesiredAiAction::CancelPath => {
+                    self.ai_graph_path_follow.remove(&npc_id);
+                }
                 DesiredAiAction::EvadeHome { home_position } => {
                     self.ai_route_follow.remove(&npc_id);
+                    self.ai_graph_path_follow.remove(&npc_id);
                     self.apply_evade_home(npc_id, idx, *home_position);
                 }
                 DesiredAiAction::TryCastBestAbility { target } => {
@@ -534,6 +651,159 @@ impl TickPipeline {
         );
     }
 
+    /// Phase 3 graph-path follower: navigate `npc_id` toward authored graph node
+    /// `goal` on its current layer.
+    ///
+    /// Reuses an in-flight plan when its `(goal, layer, graph_version)` still
+    /// matches — advancing one waypoint per tick through the KCC without a new
+    /// search. Otherwise it asks [`PathingState::request_path`] for a fresh
+    /// bounded A* (capped by the per-tick budget and the NPC's replan cooldown);
+    /// on any deferral it falls back to straight-line steering toward the goal
+    /// node. Hard CC and root pause the follow without dropping the plan; a
+    /// missing/mismatched graph or unknown goal node clears it.
+    fn follow_ai_graph_target(
+        &mut self,
+        npc_id: EntityId,
+        idx: EntityIndex,
+        goal: game_core::ai::graph::NavNodeId,
+    ) {
+        use super::path::{PathCacheKey, PathCapability, PathNodeId, PathOutcome, PathResult};
+        use game_core::ai::graph::{DEFAULT_MAX_NODES_EXPANDED, DEFAULT_MAX_WAYPOINTS};
+
+        if self.is_cc_disabled(idx) || self.is_rooted(idx) {
+            return;
+        }
+        let layer = self.layer_of_idx(idx);
+        let Some(current_pos) = self.physics.get_transform(npc_id).map(|t| t.position) else {
+            return;
+        };
+        let now = self.current_tick;
+        // Fold the per-layer runtime epoch into the cache version so a gate
+        // toggle (which bumps the epoch) makes both the in-flight reuse check
+        // and the path-cache key miss, forcing a budgeted replan.
+        let layer_epoch = self.nav_layer_epoch.get(&layer).copied().unwrap_or(0);
+
+        // Read-only graph work that resolves a movement destination. Borrows of
+        // the disjoint `nav_graphs`, `pathing`, and `ai_graph_path_follow` fields
+        // all end with this block so the `&mut self` movement call below is free
+        // of conflicts.
+        let destination: Option<Vec3f> = {
+            let Some(graph) = self.nav_graphs.graph_for_layer(layer) else {
+                self.ai_graph_path_follow.remove(&npc_id);
+                return;
+            };
+            if !graph.contains(goal) {
+                self.ai_graph_path_follow.remove(&npc_id);
+                return;
+            }
+            // Effective version = immutable authored version + runtime epoch.
+            let graph_version = graph.graph_version().wrapping_add(layer_epoch);
+
+            // Reuse a still-valid plan (same goal, layer, and graph version):
+            // advance it without spending search budget — unless it has stalled,
+            // in which case we drop it and fall through to a budgeted replan.
+            let reuse = matches!(
+                self.ai_graph_path_follow.get(&npc_id),
+                Some(state)
+                    if state.goal == goal
+                        && state.layer == layer
+                        && state.graph_version == graph_version
+            );
+
+            let reusable = if reuse {
+                let state = self
+                    .ai_graph_path_follow
+                    .get_mut(&npc_id)
+                    .expect("reuse implies present");
+                advance_graph_follow_if_arrived(state, current_pos);
+                // If the follower can't get closer to its waypoint for too long,
+                // it's wedged (e.g. a gate closed across the leg); force one
+                // budgeted replan instead of pushing into geometry forever.
+                if state.note_progress(current_pos) {
+                    self.ai_graph_path_follow.remove(&npc_id);
+                    false
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
+
+            if reusable {
+                self.ai_graph_path_follow
+                    .get(&npc_id)
+                    .expect("reusable implies present")
+                    .current_waypoint()
+            } else {
+                // Plan a fresh path from the nearest node, gated by budget/cooldown.
+                let Some(start) = graph.nearest_node(current_pos) else {
+                    self.ai_graph_path_follow.remove(&npc_id);
+                    return;
+                };
+                let key = PathCacheKey {
+                    layer,
+                    graph_version,
+                    start: PathNodeId(start.0),
+                    goal: PathNodeId(goal.0),
+                    capability: PathCapability::Ground,
+                };
+                let path_id = graph_path_id(layer, graph_version, start, goal);
+                let outcome = self.pathing.request_path(npc_id, key, now, || {
+                    graph
+                        .find_path(
+                            start,
+                            goal,
+                            DEFAULT_MAX_NODES_EXPANDED,
+                            DEFAULT_MAX_WAYPOINTS,
+                        )
+                        .map(|nav_path| PathResult {
+                            path_id,
+                            layer: nav_path.layer,
+                            // Store the *effective* version so a later epoch bump
+                            // invalidates this cache entry and reuse state.
+                            graph_version,
+                            waypoints: nav_path.waypoints,
+                        })
+                });
+                match outcome {
+                    PathOutcome::Cached(result) | PathOutcome::Searched(result) => {
+                        let mut state = GraphFollowState::new(
+                            goal,
+                            result.layer,
+                            result.graph_version,
+                            result.waypoints,
+                        );
+                        advance_graph_follow_if_arrived(&mut state, current_pos);
+                        let dest = state.current_waypoint();
+                        self.ai_graph_path_follow.insert(npc_id, state);
+                        dest
+                    }
+                    // No route this tick (budget/cooldown/unreachable): degrade to
+                    // straight-line steering toward the goal node's position.
+                    PathOutcome::Deferred(_) => graph.position_of(goal),
+                }
+            }
+        };
+
+        let Some(destination) = destination else {
+            return;
+        };
+        self.npc_move_toward_pos_with_radius(
+            npc_id,
+            destination,
+            self.dt,
+            GRAPH_FOLLOW_ARRIVE_RADIUS,
+        );
+        audit!(
+            self.state,
+            Transform,
+            AiDecisions,
+            7,
+            Some(npc_id),
+            "graph_path_follow"
+        );
+    }
+
     pub(super) fn phase_ai_decisions(&mut self) {
         use game_core::combat::status::AiOverride;
         use game_core::entity::lifecycle::{EntityKind, NpcAiState};
@@ -544,6 +814,19 @@ impl TickPipeline {
             .extend_active_indices_of_kind(EntityKind::Npc, &mut ai_actors);
         self.state
             .extend_active_indices_of_kind(EntityKind::Boss, &mut ai_actors);
+
+        // Awake-scope gate: drop NPC/Boss actors whose region cell is dormant
+        // (every `activity_scope` in it is `Sleeping`). Frozen actors run no AI
+        // this tick, so they emit no movement or cast intent and their cell
+        // quiesces — Tier 1 work stops for empty scopes without replaying
+        // skipped ticks on wake. The `is_empty` fast path makes this a true
+        // no-op whenever nothing is asleep, avoiding any per-actor cost.
+        if !self.dormant_cells.is_empty() {
+            ai_actors.retain(|idx| {
+                let eid = self.state.entities.id_of(*idx);
+                self.entity_in_awake_scope(eid)
+            });
+        }
 
         // Pre-compute player indices once for proximity aggro scanning.
         let mut players = std::mem::take(&mut self.ai_player_indices_scratch);
@@ -877,22 +1160,38 @@ impl TickPipeline {
     /// Returns the list of spawns so Phase 10 can include them in the TickResult
     /// for the coordinator to persist as DB rows.
     pub(super) fn phase_world_orchestration(&mut self) -> Vec<DirectorSpawn> {
-        // Build region player counts from current entity_regions.
-        //
-        // Players currently in reconnect grace
-        // (`InstanceMembership.disconnect_at.is_some()`) are excluded — see
-        // `docs/contracts/world_activity_policy_contract.md` "no offscreen
-        // combat" rule. Their entity rows still exist (so reconnect can
-        // restore them) but they should not count as "present" for
-        // `PlayerCountAtLeast` / `WorldActivityEventActive` triggers or the
-        // Director's per-region scaling.
-        //
-        // Bare `WorldPhase` triggers do not consult this count, so they can
-        // still fire into an empty cell; the shipped `open_world_origin_boss`
-        // rule has been migrated to `WorldActivityEventActive` which combines
-        // a presence floor with a scoped event row. Authored rules that
-        // spawn actors should prefer `WorldActivityEventActive` over bare
-        // `WorldPhase` for the same reason.
+        let region_player_counts = self.active_player_counts_by_cell();
+
+        // Director spawns are deferred: we return the spawn requests so the
+        // coordinator can send them to SpacetimeDB via commit_tick_results.
+        // The DB assigns canonical IDs and broadcasts entity.on_insert, which
+        // the coordinator handles to materialize them into the local sim.
+        self.director.evaluate(
+            &region_player_counts,
+            self.current_tick,
+            &self.world_phases,
+            &self.activity_scopes,
+        )
+    }
+
+    /// Count active (non-disconnected) players per region cell, keyed
+    /// `(region_x, region_z, layer)`.
+    ///
+    /// Players currently in reconnect grace
+    /// (`InstanceMembership.disconnect_at.is_some()`) are excluded — see
+    /// `docs/contracts/world_activity_policy_contract.md` "no offscreen
+    /// combat" rule. Their entity rows still exist (so reconnect can restore
+    /// them) but they should not count as "present" for
+    /// `PlayerCountAtLeast` / `WorldActivityEventActive` triggers, the
+    /// Director's per-region scaling, or scope presence.
+    ///
+    /// Bare `WorldPhase` triggers do not consult this count, so they can still
+    /// fire into an empty cell; the shipped `open_world_origin_boss` rule has
+    /// been migrated to `WorldActivityEventActive` which combines a presence
+    /// floor with a scoped event row. Authored rules that spawn actors should
+    /// prefer `WorldActivityEventActive` over bare `WorldPhase` for the same
+    /// reason.
+    pub(super) fn active_player_counts_by_cell(&self) -> HashMap<(i32, i32, u32), u32> {
         let mut region_player_counts: HashMap<(i32, i32, u32), u32> = HashMap::new();
         for (eid, cell) in &self.entity_regions {
             if self.disconnected_players.contains(eid) {
@@ -910,17 +1209,70 @@ impl TickPipeline {
                 }
             }
         }
+        region_player_counts
+    }
 
-        // Director spawns are deferred: we return the spawn requests so the
-        // coordinator can send them to SpacetimeDB via commit_tick_results.
-        // The DB assigns canonical IDs and broadcasts entity.on_insert, which
-        // the coordinator handles to materialize them into the local sim.
-        self.director.evaluate(
-            &region_player_counts,
-            self.current_tick,
-            &self.world_phases,
-            &self.world_activity_events,
-        )
+    /// Derive presence-driven scope mode transition requests.
+    ///
+    /// The worker is the presence authority. For every region cell that holds
+    /// at least one `activity_scope` row, compare live player presence against
+    /// the scopes' current modes and emit a wake/drain request:
+    ///   - **Wake** when a player is present and the cell holds a
+    ///     `Sleeping`/`Draining` scope (strong wake — one-tick latency).
+    ///   - **Drain** when the cell is empty and holds an `Awake` scope.
+    ///
+    /// Emission is self-terminating: once the requested transition lands (the
+    /// coordinator's subscription updates `activity_scopes`), the condition no
+    /// longer holds. The reducer-side hysteresis floors (`min_awake_until` /
+    /// `min_dormant_until`) absorb edge flicker, so the worker can emit every
+    /// tick without thrashing the durable state. The scanned set is tiny — only
+    /// cells that actually have activity scopes (triggered bosses/events).
+    pub(super) fn compute_scope_transitions(&self) -> Vec<ScopeTransitionRequest> {
+        if self.activity_scopes.is_empty() {
+            return Vec::new();
+        }
+        let counts = self.active_player_counts_by_cell();
+        // Per cell: (any scope Awake, any scope Sleeping/Draining).
+        let mut by_cell: HashMap<RegionCell, (bool, bool)> = HashMap::new();
+        for (key, proj) in &self.activity_scopes {
+            let cell = RegionCell {
+                layer: key.scope_layer,
+                region_x: key.scope_region_x,
+                region_z: key.scope_region_z,
+            };
+            let entry = by_cell.entry(cell).or_insert((false, false));
+            match proj.mode {
+                game_schema::ActivityScopeMode::Awake => entry.0 = true,
+                game_schema::ActivityScopeMode::Sleeping
+                | game_schema::ActivityScopeMode::Draining => entry.1 = true,
+                // Cleanup is terminal/reserved teardown state; leave it alone.
+                game_schema::ActivityScopeMode::Cleanup => {}
+            }
+        }
+        let mut out = Vec::new();
+        for (cell, (any_awake, any_dormantish)) in by_cell {
+            let present = counts
+                .get(&(cell.region_x, cell.region_z, cell.layer))
+                .copied()
+                .unwrap_or(0)
+                > 0;
+            if present && any_dormantish {
+                out.push(ScopeTransitionRequest {
+                    layer: cell.layer,
+                    region_x: cell.region_x,
+                    region_z: cell.region_z,
+                    kind: ScopeTransitionKind::Wake,
+                });
+            } else if !present && any_awake {
+                out.push(ScopeTransitionRequest {
+                    layer: cell.layer,
+                    region_x: cell.region_x,
+                    region_z: cell.region_z,
+                    kind: ScopeTransitionKind::Drain,
+                });
+            }
+        }
+        out
     }
 
     /// Deterministic radial offset for scripted add spawns around the boss.
@@ -1937,6 +2289,84 @@ impl TickPipeline {
                     return false;
                 }
                 if !self.ai_can_perceive(boss_idx, player_idx) {
+                    return false;
+                }
+                let player_id = self.state.entities.id_of(player_idx);
+                self.physics.get_transform(player_id).is_some_and(|t| {
+                    let dx = t.position.x - boss_pos.x;
+                    let dz = t.position.z - boss_pos.z;
+                    dx * dx + dz * dz <= radius_sq
+                })
+            })
+    }
+
+    /// Physical-presence test used by the arena leash to decide whether an
+    /// *already active* encounter should stay active.
+    ///
+    /// This is deliberately **not** `encounter_arena_activated`: activation
+    /// requires a *perceivable* enemy (you cannot pull a boss while
+    /// stealthed), but retention must survive stealth. A player who turns
+    /// invisible while standing in the arena is still physically there and
+    /// must keep the boss engaged — otherwise popping invisibility would reset
+    /// the encounter. Perceivability is therefore ignored here; only physical
+    /// presence on the boss's layer matters.
+    ///
+    /// Returns `true` if any same-layer threat source is still present, or any
+    /// same-layer player is physically within the leash radius.
+    pub(super) fn encounter_arena_occupied(
+        &self,
+        boss_id: EntityId,
+        boss_idx: EntityIndex,
+    ) -> bool {
+        let boss_layer = self.layer_of_idx(boss_idx);
+        let radius = self
+            .state
+            .ai
+            .npc_aggro_radius
+            .get(boss_idx)
+            .copied()
+            .filter(|r| *r > 0.0)
+            .unwrap_or(20.0);
+        let Some(boss_pos) = self.physics.get_transform(boss_id).map(|t| t.position) else {
+            return false;
+        };
+        let radius_sq = radius * radius;
+
+        // Threat-table presence: a same-layer threat source that is still in
+        // the world keeps the arena occupied regardless of perceivability —
+        // a kiting ranged DPS or a player who stealthed mid-fight. No radius
+        // gate here, mirroring activation's threat branch, so long-range
+        // threat still counts.
+        if self
+            .state
+            .combat
+            .threat_tables
+            .get(boss_idx)
+            .is_some_and(|table| {
+                table.entries.iter().any(|entry| {
+                    self.state
+                        .entities
+                        .lookup(entry.source)
+                        .is_some_and(|src_idx| {
+                            self.state.entities.is_active(src_idx)
+                                && self.layer_of_idx(src_idx) == boss_layer
+                                && self.state.entities.kinds[src_idx.as_usize()]
+                                    != game_core::entity::lifecycle::EntityKind::Prop
+                        })
+                })
+            })
+        {
+            return true;
+        }
+
+        // Cold presence scan: any same-layer player physically within the
+        // leash radius. Perceivability is intentionally ignored so stealth
+        // cannot drop the boss back to dormant.
+        self.state
+            .active_indices_of_kind(EntityKind::Player)
+            .into_iter()
+            .any(|player_idx| {
+                if self.layer_of_idx(player_idx) != boss_layer {
                     return false;
                 }
                 let player_id = self.state.entities.id_of(player_idx);

@@ -40,6 +40,81 @@ pub struct WorldLayersFile {
     pub layers: Vec<WorldLayerDef>,
 }
 
+/// On-disk serialization format for `data/terrain_assets.ron`.
+///
+/// This is authoring/deployment metadata, not a SpacetimeDB table. It binds the
+/// `terrain_set` names used by layers/dungeons to their low-resolution
+/// collision/prediction meshes and optional high-resolution visual meshes.
+#[derive(Clone, Debug, Deserialize)]
+pub struct TerrainAssetFile {
+    pub assets: Vec<TerrainAssetDef>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct TerrainAssetDef {
+    pub terrain_set: String,
+    #[serde(default)]
+    pub synthetic: bool,
+    #[serde(default)]
+    pub server_mesh: Option<String>,
+    #[serde(default)]
+    pub client_prediction_mesh: Option<String>,
+    #[serde(default)]
+    pub client_visual: Option<String>,
+    #[serde(default)]
+    pub visual_mesh: Option<String>,
+    /// Authoritative import transform applied to `server_mesh` /
+    /// `client_prediction_mesh` triangles before bucketing into DB chunks
+    /// (worker collision) and before welding into web prediction colliders.
+    /// This is the single source of truth for the transform so server DB
+    /// collision and web prediction geometry stay byte-for-byte aligned.
+    #[serde(default)]
+    pub import: TerrainImportTransform,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// Deterministic transform applied to a terrain mesh during import. Lives in
+/// the manifest (not as CLI flags) so `cargo xtask dev import-terrain` and the
+/// web map-bundle prediction-collider builder derive identical geometry from
+/// the same source mesh.
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct TerrainImportTransform {
+    /// Uniform scale applied to imported vertices (e.g. cm → m = 0.01).
+    #[serde(default = "default_terrain_scale")]
+    pub scale: f32,
+    /// World-space translation applied to all imported vertices (meters).
+    #[serde(default)]
+    pub offset: [f32; 3],
+    /// Flip triangle winding (use if surfaces come out facing down).
+    #[serde(default)]
+    pub flip_winding: bool,
+    /// XZ chunk size in meters used when bucketing server collision chunks.
+    /// The web prediction bundle ignores this (single static trimesh) but it
+    /// is hashed so worker re-imports and bundle hashes move together.
+    #[serde(default = "default_terrain_chunk_size")]
+    pub chunk_size: f32,
+}
+
+fn default_terrain_scale() -> f32 {
+    1.0
+}
+
+fn default_terrain_chunk_size() -> f32 {
+    32.0
+}
+
+impl Default for TerrainImportTransform {
+    fn default() -> Self {
+        Self {
+            scale: default_terrain_scale(),
+            offset: [0.0, 0.0, 0.0],
+            flip_winding: false,
+            chunk_size: default_terrain_chunk_size(),
+        }
+    }
+}
+
 /// A pre-allocated static layer (e.g. open world, hub) authored in
 /// `data/layers.ron`. Materialised at worker startup using the same
 /// `GeometryDef + Option<terrain_set>` shape as `DungeonTemplate`,
@@ -64,17 +139,16 @@ pub struct WorldLayerDef {
     /// Optional reference to a baked voxel terrain set. When Some,
     /// the worker also loads the matching `terrain_chunk` rows and
     /// adds them as TriMesh colliders on this layer. Authoring of
-    /// terrain rows is offline / editor-side — see
-    /// `docs/plan/plan.md` §4.8b.
+    /// terrain rows is offline / editor-side.
     #[serde(default)]
     pub terrain_set: Option<String>,
     /// Optional client-side visual mesh override. The Bevy client loads
-    /// `assets/terrain/{client_visual}/{client_visual}.gltf` when set,
-    /// otherwise falls back to the `terrain_set` name. Use this to point
-    /// at a higher-poly artist-authored mesh while the server keeps a
-    /// coarser baked collision set, or to share one visual across
-    /// multiple collision sets. Server-only field — the worker never
-    /// reads it.
+    /// Root asset manifest visual stem. When set, clients load that
+    /// high-detail visual entry; otherwise they fall back to the
+    /// `terrain_set` entry. Use this to point at a higher-poly artist-authored
+    /// mesh while the server keeps a coarser baked collision set, or to share
+    /// one visual across multiple collision sets. Server-only field — the
+    /// worker never reads it.
     #[serde(default)]
     pub client_visual: Option<String>,
     /// Per-layer collision rules. Defaults to
@@ -126,9 +200,14 @@ pub struct DungeonTemplate {
     /// the worker materialises the matching `terrain_chunk` rows on the
     /// instance's layer in addition to `geometry` above. Many instances
     /// can share one terrain set; rows live once and are referenced by
-    /// id. See `docs/plan/plan.md` §4.8b.
+    /// id.
     #[serde(default)]
     pub terrain_set: Option<String>,
+    /// Optional client-side visual mesh override. Mirrors `WorldLayerDef` so
+    /// dungeon instances can use the same low-res collision / high-res visual
+    /// pairing as static world layers.
+    #[serde(default)]
+    pub client_visual: Option<String>,
 }
 
 /// A piece of static environment geometry (wall, floor, pillar).
@@ -175,8 +254,7 @@ pub enum ShapeDef {
     /// Used for editor-baked open-world / cave geometry. Hand-authored
     /// dungeon RON files normally use `Cuboid`, `Cylinder`, or
     /// `Heightfield`; `TriMesh` is here so the same `ShapeDef` enum
-    /// can describe terrain colliders sourced from the voxel pipeline
-    /// (see `docs/plan/plan.md` §4.8b).
+    /// can describe terrain colliders sourced from the voxel pipeline.
     TriMesh {
         vertices: Vec<f32>,
         indices: Vec<u32>,

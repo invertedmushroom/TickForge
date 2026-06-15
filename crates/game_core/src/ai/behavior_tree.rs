@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use super::decision::{
     AiBlackboard, AiDecisionPolicy, AiStateChangeReason, AiStringId, DesiredAiAction,
 };
+use super::graph::NavNodeId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BehaviorStatus {
@@ -100,6 +101,10 @@ pub enum ActionNode {
     MoveAwayFromSelectedTarget,
     MoveToHome,
     FollowRoute(AiStringId),
+    /// Navigate to a node in the layer's authored nav graph (Phase 3).
+    MoveToGraphTarget(NavNodeId),
+    /// Abandon any in-progress graph navigation.
+    CancelPath,
     EvadeHome,
     TryCastBestAbilityAtSelectedTarget,
     Idle,
@@ -156,6 +161,14 @@ impl ActionNode {
                     route_id: route_id.clone(),
                 });
                 BehaviorStatus::Running
+            }
+            Self::MoveToGraphTarget(goal) => {
+                actions.push(DesiredAiAction::MoveToGraphTarget { goal: *goal });
+                BehaviorStatus::Running
+            }
+            Self::CancelPath => {
+                actions.push(DesiredAiAction::CancelPath);
+                BehaviorStatus::Success
             }
             Self::EvadeHome => {
                 let Some(home) = blackboard.home_position else {

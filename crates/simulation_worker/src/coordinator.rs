@@ -43,13 +43,37 @@ struct CoordinatorState {
     items: game_core::stats::ItemRegistry,
     dungeons: game_core::dungeon::DungeonRegistry,
     encounters: game_core::encounter::EncounterRegistry,
-    /// Parsed `data/spawn_rules.ron` (Phase 7.5).  Consumed at on_applied to
+    /// Parsed `data/spawn_rules.ron`. Consumed at on_applied to
     /// populate open-world director events, and by the `instance` subscription
     /// callbacks to register dungeon-scoped rules on instance creation.
     spawn_rules: game_core::spawn_rules::SpawnRulesRegistry,
     /// Voxel-terrain bindings, cached row→collider mapping, and the deferred
-    /// edit queue. See `TerrainState` (§4.8b Phase 5).
+    /// edit queue.
     terrain: TerrainState,
+}
+
+/// Fire presence-driven scope mode transitions for one tick.
+///
+/// Each request becomes a separate `request_scope_wake` / `request_scope_drain`
+/// reducer call — independent of `commit_tick_results`. Both reducers are
+/// idempotent and best-effort, so this is fire-and-forget: a failure is logged
+/// but never retried (the next tick re-emits the request while the condition
+/// still holds). Called once per produced tick, not on commit retries, so a
+/// commit retry never re-fires transitions.
+fn fire_scope_transitions(reducers: &RemoteReducers, pkg: &CommitPackage) {
+    for t in &pkg.scope_transition_requests {
+        let result = if t.wake {
+            reducers.request_scope_wake(t.layer, t.region_x, t.region_z)
+        } else {
+            reducers.request_scope_drain(t.layer, t.region_x, t.region_z)
+        };
+        if let Err(e) = result {
+            warn!(
+                "scope transition send failed: cell=({},{},{}) wake={}: {e}",
+                t.layer, t.region_x, t.region_z, t.wake
+            );
+        }
+    }
 }
 
 /// Send (or re-send) a commit payload to SpacetimeDB.
@@ -187,22 +211,42 @@ fn send_commit(reducers: &RemoteReducers, pkg: CommitPackage, state: Arc<Mutex<C
     }
 }
 
-const TOKEN_FILE: &str = ".worker_token";
+const DEFAULT_TOKEN_FILE: &str = ".worker_token";
+
+fn token_file_path() -> String {
+    std::env::var("STDB_TOKEN_FILE").unwrap_or_else(|_| DEFAULT_TOKEN_FILE.to_string())
+}
 
 /// Load a previously-saved auth token from disk.
-fn load_token() -> Option<String> {
-    std::fs::read_to_string(TOKEN_FILE)
+fn load_token(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
 /// Save the auth token so the worker keeps the same identity across restarts.
-fn save_token(token: &str) {
-    if let Err(e) = std::fs::write(TOKEN_FILE, token) {
-        warn!("Failed to save auth token to {TOKEN_FILE}: {e}");
+fn save_token(path: &str, token: &str) {
+    if load_token(path).as_deref() == Some(token) {
+        info!("Auth token unchanged at {path}");
+        return;
+    }
+
+    if let Some(parent) = Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        warn!(
+            "Failed to create auth token directory {}: {e}",
+            parent.display()
+        );
+        return;
+    }
+
+    if let Err(e) = std::fs::write(path, token) {
+        warn!("Failed to save auth token to {path}: {e}");
     } else {
-        info!("Auth token saved to {TOKEN_FILE}");
+        info!("Auth token saved or refreshed at {path}");
     }
 }
 
@@ -222,7 +266,7 @@ pub fn run(config: CoordinatorConfig) {
     // `data/layers.ron`. Replaces the previously-hardcoded layer-0
     // placeholder floor in `PhysicsWorld::new` and gives every static
     // layer the same compositional `geometry + Option<terrain_set>`
-    // shape used by `DungeonTemplate`. See docs/plan/plan.md §4.8b.
+    // shape used by `DungeonTemplate`.
     let world_layers = load_world_layers();
     let mut initial_terrain_bindings: Vec<TerrainBinding> = Vec::new();
     for layer_def in &world_layers {
@@ -273,9 +317,10 @@ pub fn run(config: CoordinatorConfig) {
     let state_for_entity = Arc::clone(&state);
 
     // Use persisted token if no explicit token provided.
-    let auth_token = config.auth_token.or_else(load_token);
-    if auth_token.is_some() && Path::new(TOKEN_FILE).exists() {
-        info!("Using persisted auth token from {TOKEN_FILE}");
+    let token_file = token_file_path();
+    let auth_token = config.auth_token.or_else(|| load_token(&token_file));
+    if auth_token.is_some() && Path::new(&token_file).exists() {
+        info!("Using persisted auth token from {token_file}");
     }
 
     let conn = DbConnection::builder()
@@ -283,13 +328,13 @@ pub fn run(config: CoordinatorConfig) {
         .with_database_name(&config.module_name)
         .with_token(auth_token.as_deref())
         .on_connect(move |ctx: &DbConnection, identity: Identity, token: &str| {
-            save_token(token);
+            save_token(&token_file, token);
 
             info!("========================================");
             info!("  Worker identity: {identity}");
             info!("========================================");
             info!("Register once with:");
-            info!(r#"  spacetime call tickforge register_worker '{{"__identity__":"0x{identity}"}}' -s local"#);
+            info!("  spacetime call tickforge register_worker 0x{identity} -s local");
 
             subscribe_to_tables(ctx, Arc::clone(&state_for_connect));
         })
@@ -363,7 +408,7 @@ pub fn run(config: CoordinatorConfig) {
 
             // Drain any pending terrain edits BEFORE the tick step so a
             // chunk swap never lands mid-step. Idle workers pay a single
-            // empty-vec branch (§4.8b Phase 5).
+            // empty-vec branch.
             {
                 let CoordinatorState { sim, terrain, .. } = &mut *guard;
                 terrain.drain_into(sim.physics_mut());
@@ -389,6 +434,7 @@ pub fn run(config: CoordinatorConfig) {
         // Send the commit via the retry-aware path.  On transient failure
         // the ack callback re-sends immediately; on exhaustion the process
         // exits for a clean supervisor reseed.
+        fire_scope_transitions(&ctx.reducers, &pkg);
         send_commit(&ctx.reducers, pkg, Arc::clone(&state_for_tick));
 
         // ── Catch-up loop ───────────────────────────────────────────────
@@ -415,6 +461,7 @@ pub fn run(config: CoordinatorConfig) {
                 };
                 commit_builder::build(result, vec![])
             };
+            fire_scope_transitions(&ctx.reducers, &pkg);
             send_commit(&ctx.reducers, pkg, Arc::clone(&state_for_tick));
         }
     });
@@ -1017,7 +1064,7 @@ pub fn run(config: CoordinatorConfig) {
         guard.sim.remove_interactable(EntityId(row.entity_id));
     });
 
-    // ── Voxel terrain (§4.8b Phase 5) ───────────────────────────────
+    // ── Voxel terrain subscriptions ─────────────────────────────────
     //
     // Three callbacks per table. The actual physics mutation is
     // **deferred** — every callback only enqueues a `TerrainEdit`, which
@@ -1248,7 +1295,7 @@ pub fn run(config: CoordinatorConfig) {
     // authoritative server-side (the worker never writes it); we only project
     // the boolean "is currently disconnected" projection. See
     // `docs/contracts/world_activity_policy_contract.md` "no offscreen
-    // combat" rule and the 2026-06-09 messaging-spine review.
+    // combat" rule.
 
     let state_for_im_insert = Arc::clone(&state);
     conn.db.instance_membership().on_insert(move |_ctx, row| {
@@ -1299,15 +1346,18 @@ pub fn run(config: CoordinatorConfig) {
             .set_player_disconnected(EntityId(row.entity_id), false);
     });
 
-    // ── World Activity Event projection ────────────────────────────
-    // Mirror `world_activity_event` rows into the worker's lookup map
-    // so `DirectorTrigger::WorldActivityEventActive` can gate on both
-    // event state and per-region presence. The scope key matches what
-    // the server reducer writes:
+    // ── Activity Scope projection ─────────────────────────────────
+    // Mirror `activity_scope` rows into the worker's lookup map so
+    // `DirectorTrigger::WorldActivityEventActive` can gate on scope
+    // state AND the two AND-ed presence floors (the scope's
+    // `required_players` and the rule's `min_players`). This replaces
+    // the former `world_activity_event` projection as the gate source;
+    // `world_activity_event` is still written server-side but is no
+    // longer mirrored to the worker. The scope key matches what the server
+    // reducer writes:
     //   - open-world events: scope_layer = 0, real (rx, rz)
     //   - instance events:   scope_layer = instance.layer, (0, 0)
-    // See `docs/contracts/world_activity_policy_contract.md` and step 4
-    // of the 2026-06-09 messaging-spine review.
+    // See `docs/contracts/world_activity_policy_contract.md`.
 
     fn map_wae_state(s: WorldActivityEventState) -> game_schema::WorldActivityEventState {
         match s {
@@ -1318,57 +1368,90 @@ pub fn run(config: CoordinatorConfig) {
         }
     }
 
-    let state_for_wae_insert = Arc::clone(&state);
-    conn.db.world_activity_event().on_insert(move |_ctx, row| {
-        let mut guard = match state_for_wae_insert.lock() {
+    fn map_scope_mode(m: ActivityScopeMode) -> game_schema::ActivityScopeMode {
+        match m {
+            ActivityScopeMode::Awake => game_schema::ActivityScopeMode::Awake,
+            ActivityScopeMode::Draining => game_schema::ActivityScopeMode::Draining,
+            ActivityScopeMode::Sleeping => game_schema::ActivityScopeMode::Sleeping,
+            ActivityScopeMode::Cleanup => game_schema::ActivityScopeMode::Cleanup,
+        }
+    }
+
+    fn project_scope(
+        state: WorldActivityEventState,
+        mode: ActivityScopeMode,
+        required_players: u32,
+    ) -> game_schema::ActivityScopeProjection {
+        game_schema::ActivityScopeProjection {
+            state: map_wae_state(state),
+            mode: map_scope_mode(mode),
+            required_players,
+        }
+    }
+
+    let state_for_scope_insert = Arc::clone(&state);
+    conn.db.activity_scope().on_insert(move |_ctx, row| {
+        let mut guard = match state_for_scope_insert.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
         debug!(
-            "world_activity_event.on_insert: scope=({},{},{}) tag='{}' state={:?}",
-            row.scope_layer, row.scope_region_x, row.scope_region_z, row.tag, row.state
+            "activity_scope.on_insert: scope=({},{},{}) tag='{}' state={:?} mode={:?} req={}",
+            row.scope_layer,
+            row.scope_region_x,
+            row.scope_region_z,
+            row.tag,
+            row.state,
+            row.mode,
+            row.required_players
         );
-        guard.sim.set_world_activity_event(
+        guard.sim.set_activity_scope(
             row.scope_layer,
             row.scope_region_x,
             row.scope_region_z,
             row.tag.clone(),
-            map_wae_state(row.state),
+            project_scope(row.state, row.mode, row.required_players),
         );
     });
 
-    let state_for_wae_update = Arc::clone(&state);
+    let state_for_scope_update = Arc::clone(&state);
     conn.db
-        .world_activity_event()
+        .activity_scope()
         .on_update(move |_ctx, _old, row| {
-            let mut guard = match state_for_wae_update.lock() {
+            let mut guard = match state_for_scope_update.lock() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
             debug!(
-                "world_activity_event.on_update: scope=({},{},{}) tag='{}' state={:?}",
-                row.scope_layer, row.scope_region_x, row.scope_region_z, row.tag, row.state
+                "activity_scope.on_update: scope=({},{},{}) tag='{}' state={:?} mode={:?} req={}",
+                row.scope_layer,
+                row.scope_region_x,
+                row.scope_region_z,
+                row.tag,
+                row.state,
+                row.mode,
+                row.required_players
             );
-            guard.sim.set_world_activity_event(
+            guard.sim.set_activity_scope(
                 row.scope_layer,
                 row.scope_region_x,
                 row.scope_region_z,
                 row.tag.clone(),
-                map_wae_state(row.state),
+                project_scope(row.state, row.mode, row.required_players),
             );
         });
 
-    let state_for_wae_delete = Arc::clone(&state);
-    conn.db.world_activity_event().on_delete(move |_ctx, row| {
-        let mut guard = match state_for_wae_delete.lock() {
+    let state_for_scope_delete = Arc::clone(&state);
+    conn.db.activity_scope().on_delete(move |_ctx, row| {
+        let mut guard = match state_for_scope_delete.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
         debug!(
-            "world_activity_event.on_delete: scope=({},{},{}) tag='{}'",
+            "activity_scope.on_delete: scope=({},{},{}) tag='{}'",
             row.scope_layer, row.scope_region_x, row.scope_region_z, row.tag
         );
-        guard.sim.remove_world_activity_event(
+        guard.sim.remove_activity_scope(
             row.scope_layer,
             row.scope_region_x,
             row.scope_region_z,
@@ -1622,7 +1705,7 @@ fn subscribe_to_tables(ctx: &DbConnection, state: Arc<Mutex<CoordinatorState>>) 
             "SELECT * FROM instance_membership",
             "SELECT * FROM interactable_config",
             "SELECT * FROM world_phase",
-            "SELECT * FROM world_activity_event",
+            "SELECT * FROM activity_scope",
             "SELECT * FROM npc_goal",
             "SELECT * FROM npc_config",
             "SELECT * FROM entity_team",
@@ -1672,7 +1755,7 @@ fn materialize_active_instance(
 
     // Register terrain binding for this instance layer + enqueue every
     // currently cached chunk for the matching set. Drain happens at the
-    // next tick boundary (§4.8b Phase 5).
+    // next tick boundary.
     //
     // `register_binding` picks up an existing set_id if any sibling layer
     // already resolved this name; the explicit resolve below handles the
@@ -2042,7 +2125,7 @@ fn load_world_layers() -> Vec<game_schema::dungeon::WorldLayerDef> {
     }
 }
 
-// ── Voxel terrain state (§4.8b Phase 5) ─────────────────────────────
+// ── Voxel terrain state ─────────────────────────────────────────────
 //
 // The worker treats baked `terrain_chunk` rows as immutable-during-tick
 // environment colliders. Live edits from the offline editor (rare) are
@@ -2276,20 +2359,9 @@ impl TerrainState {
 ///    the authored `WorldLayerDef::geometry` when one exists.
 /// 2. Hand-authored `geometry` — every `GeometryDef` becomes one
 ///    parentless environment collider stamped with `layer`.
-/// 3. **Baked terrain binding** — when `terrain_set` is `Some`, the layer
-///    is registered with `terrain` so that:
-///      - any chunks already cached locally are hydrated immediately
-///        (live path: instance creation after subscription is up), and
-///      - any chunks arriving later are routed to this layer via the
-///        `terrain_chunk.on_*` callbacks (covers initial subscription
-///        and live editor edits both).
-///    The collider rebuild itself happens through the deferred edit
-///    queue (see `TerrainState::pending_edits`), draining at the start
-///    of each tick. This keeps mid-tick BVH rebuilds out of the hot
-///    path (see `docs/plan/plan.md` §4.8b, Phase 5).
-/// 4. The layer's `LayerCollisionPolicy`, registered last so policy
-///    queries during the materialisation itself never observe a
-///    half-built layer.
+/// 3. Baked terrain hydration is owned by callers via `TerrainState`: they
+///    register any `terrain_set`, enqueue cached chunks, and let the deferred
+///    edit queue apply collider rebuilds at the next tick boundary.
 /// 4. The layer's `LayerCollisionPolicy`, registered last so policy
 ///    queries during the materialisation itself never observe a
 ///    half-built layer.
@@ -2312,10 +2384,9 @@ fn materialize_layer(
     }
     // Terrain hydration is owned by the caller via `TerrainState`: the
     // (layer, terrain_set name) binding is recorded there and chunks are
-    // applied through the deferred edit queue (see §4.8b Phase 5). We
-    // keep the parameter so this signature is uniform across both call
-    // sites (`run()` startup loop and `Instance::on_insert`) and so the
-    // intent is visible at the call site.
+    // applied through the deferred edit queue. Keep the parameter so this
+    // signature is uniform across both call sites (`run()` startup loop and
+    // `Instance::on_insert`) and the intent is visible at the call site.
     let _ = terrain_set;
     physics.set_layer_policy(layer, policy);
 }
@@ -3356,8 +3427,8 @@ mod tests {
         use game_schema::dungeon::{GeometryDef, LayerCollisionPolicy, ShapeDef};
 
         // Hand-authored geometry alongside a terrain_set reference.
-        // The terrain_set hookup is a no-op until §4.8b Phase 1+5 lands,
-        // but the authored geometry must still materialise on the layer.
+        // Terrain hydration is handled by callers via `TerrainState`, but the
+        // authored geometry must still materialise on the layer.
         let mut world = PhysicsWorld::new(1.0 / 60.0);
         let geometry = vec![GeometryDef {
             shape: ShapeDef::Cuboid {
