@@ -56,10 +56,15 @@ export function summarizeGameEvents(
   ownEntityId: bigint | undefined,
   limit = 8,
 ): GameEventLogEntry[] {
-  return events
-    .map((event) => summarizeGameEvent(event, ownEntityId))
-    .filter((entry): entry is GameEventLogEntry => entry !== undefined)
-    .slice(-limit);
+  const entries: GameEventLogEntry[] = [];
+  for (let index = events.length - 1; index >= 0 && entries.length < limit; index -= 1) {
+    const entry = summarizeGameEvent(events[index]!, ownEntityId);
+    if (entry) {
+      entries.push(entry);
+    }
+  }
+  entries.reverse();
+  return entries;
 }
 
 export function summarizeGameEvent(

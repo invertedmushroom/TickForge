@@ -65,6 +65,7 @@ declare global {
       extrapolationSecsMax?: number;
       snapshotGapEwma?: number;
       snapshotGapMax?: number;
+      remoteIngestMs?: number;
       selectedTarget?: bigint;
       hoverTarget?: bigint;
       tabCandidates?: number;

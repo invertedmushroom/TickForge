@@ -31,9 +31,20 @@ export async function buildStaticPhysicsWorld(bundle: LoadedMapBundle): Promise<
     }
   }
 
+  let colliderCount = bundle.colliders.colliders.length;
+  const terrain = bundle.terrainCollision;
+  if (terrain && isValidTriMesh(terrain.vertices, terrain.indices)) {
+    try {
+      world.createCollider(RAPIER.ColliderDesc.trimesh(terrain.vertices, terrain.indices));
+      colliderCount += 1;
+    } catch (error) {
+      console.warn('terrain collision mesh failed to build; prediction uses RON colliders only', error);
+    }
+  }
+
   return {
     world,
-    colliderCount: bundle.colliders.colliders.length,
+    colliderCount,
     step: () => world.step(),
     destroy: () => world.free(),
   };
@@ -75,7 +86,7 @@ function fallbackColliderDesc(): RAPIER.ColliderDesc {
   return RAPIER.ColliderDesc.cuboid(0.5, 0.05, 0.5);
 }
 
-function isValidTriMesh(vertices: readonly number[], indices: readonly number[]): boolean {
+function isValidTriMesh(vertices: ArrayLike<number>, indices: ArrayLike<number>): boolean {
   if (vertices.length % 3 !== 0 || indices.length % 3 !== 0) {
     return false;
   }
@@ -83,5 +94,11 @@ function isValidTriMesh(vertices: readonly number[], indices: readonly number[])
   if (vertexCount < 3 || indices.length < 3) {
     return false;
   }
-  return indices.every((index) => index >= 0 && index < vertexCount);
+  for (let i = 0; i < indices.length; i += 1) {
+    const index = indices[i];
+    if (index < 0 || index >= vertexCount) {
+      return false;
+    }
+  }
+  return true;
 }

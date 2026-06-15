@@ -2,10 +2,23 @@ import { mapBundles, type BundleCollider, type MapBundleEntry } from '@dive/clie
 
 export const MAP_COLLIDER_FORMAT_VERSION = 1;
 
+/**
+ * Terrain collision geometry welded on the client from the bundle's
+ * `collision_mesh` glTF, in world space with the import transform applied. This
+ * is the low-resolution mesh the worker imported into the DB, so KCC prediction
+ * collides against identical geometry. Absent when the bundle ships no collision
+ * mesh (synthetic/RON-only) or the glTF failed to load.
+ */
+export type TerrainCollisionGeometry = {
+  vertices: Float32Array;
+  indices: Uint32Array;
+};
+
 export type LoadedMapBundle = {
   bundleId: string;
   manifest: MapBundleEntry['manifest'];
   colliders: MapBundleEntry['colliders'];
+  terrainCollision?: TerrainCollisionGeometry;
 };
 
 export type RuntimeMapState = {

@@ -22,7 +22,7 @@ import type { Identity } from 'spacetimedb';
 
 import { ALWAYS_ON_SUBSCRIPTIONS, DEFAULT_STDB_URI, FEATURE_SUBSCRIPTIONS, MODULE_NAME, shortHash } from '../contract';
 import type { GameEventLogEntry, OrderedGameEvent } from '../events/gameEvents';
-import { collectGameplaySnapshot } from './gameplaySnapshot';
+import { collectGameplaySnapshot, type GameplaySnapshotMetrics } from './gameplaySnapshot';
 import { IntentQueue, type IntentQueueSnapshot, type QueuedIntent } from '../net/inputQueue';
 import { filterLiveRemoteSnapshot } from './liveRemoteSnapshot';
 import {
@@ -49,6 +49,19 @@ export type StartupReadiness = {
   hasSimTick: boolean;
   hasOwnTransform: boolean;
   ready: boolean;
+};
+
+export type StdbClientMetrics = {
+  publishCount: number;
+  publishRateHz: number;
+  snapshotBuildMs: number;
+  snapshotBuildEwmaMs: number;
+  snapshotBuildMaxMs: number;
+  eventMergeMs: number;
+  eventOrderMs: number;
+  eventSummaryMs: number;
+  combatEventRows: number;
+  worldEventRows: number;
 };
 
 export type StdbSnapshot = {
@@ -90,6 +103,7 @@ export type StdbSnapshot = {
   tickStallMs: number;
   serverStalled: boolean;
   reconnectAttempts: number;
+  metrics: StdbClientMetrics;
   error?: string;
 };
 
@@ -131,6 +145,12 @@ export class StdbClient {
   private manualDisconnect = false;
   private lastObservedTick?: bigint;
   private lastObservedTickAtMs = performance.now();
+  private publishCount = 0;
+  private publishWindowCount = 0;
+  private publishWindowStartedAtMs = performance.now();
+  private publishRateHz = 0;
+  private snapshotBuildEwmaMs = 0;
+  private snapshotBuildMaxMs = 0;
   private readonly inputQueue = new IntentQueue();
   private readonly listeners = new Set<Listener>();
   private readonly uri: string;
@@ -521,7 +541,9 @@ export class StdbClient {
   }
 
   private refreshSnapshot(): void {
+    const buildStartedAtMs = nowMs();
     const snapshot = this.readSnapshot();
+    snapshot.metrics = this.recordSnapshotMetrics(nowMs() - buildStartedAtMs, snapshot.metrics);
     this.snapshotValue = snapshot;
     for (const listener of this.listeners) {
       listener(snapshot);
@@ -553,12 +575,17 @@ export class StdbClient {
       ownEntityId,
     );
     const region = Array.from(this.aoiRegionByEntity.values())[0];
+    const eventMergeStartedAtMs = nowMs();
+    const combatEvents = mergeEventRows(Array.from(connection.db.combat_event.iter()), this.combatEventBuffer);
+    const worldEvents = mergeEventRows(Array.from(connection.db.world_event.iter()), this.worldEventBuffer);
+    const eventMergeMs = nowMs() - eventMergeStartedAtMs;
+    const gameplayMetrics: GameplaySnapshotMetrics = { eventOrderMs: 0, eventSummaryMs: 0 };
     const gameplay = collectGameplaySnapshot(
       {
         healthRows: Array.from(this.nearbyHealthByEntity.values()),
         deathRows: Array.from(connection.db.death_state.iter()),
-        combatEvents: mergeEventRows(Array.from(connection.db.combat_event.iter()), this.combatEventBuffer),
-        worldEvents: mergeEventRows(Array.from(connection.db.world_event.iter()), this.worldEventBuffer),
+        combatEvents,
+        worldEvents,
         entityLayers: Array.from(connection.db.entity_layer.iter()),
         instanceMemberships: Array.from(connection.db.instance_membership.iter()),
         instances: Array.from(connection.db.instance.iter()),
@@ -567,6 +594,7 @@ export class StdbClient {
         playerInventory: Array.from(connection.db.player_inventory.iter()),
       },
       ownEntityId,
+      gameplayMetrics,
     );
     const readiness = {
       hasClientSequence: clientSequence !== undefined,
@@ -624,6 +652,14 @@ export class StdbClient {
       tickStallMs: tickStall.ms,
       serverStalled: tickStall.stalled,
       reconnectAttempts: this.reconnectAttempts,
+      metrics: {
+        ...emptyMetrics(),
+        eventMergeMs,
+        eventOrderMs: gameplayMetrics.eventOrderMs,
+        eventSummaryMs: gameplayMetrics.eventSummaryMs,
+        combatEventRows: combatEvents.length,
+        worldEventRows: worldEvents.length,
+      },
       error: this.error,
     };
   }
@@ -663,7 +699,31 @@ export class StdbClient {
       tickStallMs: 0,
       serverStalled: false,
       reconnectAttempts: this.reconnectAttempts,
+      metrics: emptyMetrics(),
       error: this.error,
+    };
+  }
+
+  private recordSnapshotMetrics(buildMs: number, metrics: StdbClientMetrics): StdbClientMetrics {
+    const now = nowMs();
+    this.publishCount += 1;
+    this.publishWindowCount += 1;
+    const windowMs = now - this.publishWindowStartedAtMs;
+    if (windowMs >= 1000) {
+      this.publishRateHz = (this.publishWindowCount * 1000) / windowMs;
+      this.publishWindowCount = 0;
+      this.publishWindowStartedAtMs = now;
+    }
+    this.snapshotBuildEwmaMs =
+      this.snapshotBuildEwmaMs === 0 ? buildMs : this.snapshotBuildEwmaMs * 0.9 + buildMs * 0.1;
+    this.snapshotBuildMaxMs = Math.max(this.snapshotBuildMaxMs, buildMs);
+    return {
+      ...metrics,
+      publishCount: this.publishCount,
+      publishRateHz: this.publishRateHz,
+      snapshotBuildMs: buildMs,
+      snapshotBuildEwmaMs: this.snapshotBuildEwmaMs,
+      snapshotBuildMaxMs: this.snapshotBuildMaxMs,
     };
   }
 
@@ -731,6 +791,25 @@ function mergeEventRows<T extends { eventId: bigint }>(cachedRows: T[], buffered
     byId.set(row.eventId, row);
   }
   return Array.from(byId.values());
+}
+
+function emptyMetrics(): StdbClientMetrics {
+  return {
+    publishCount: 0,
+    publishRateHz: 0,
+    snapshotBuildMs: 0,
+    snapshotBuildEwmaMs: 0,
+    snapshotBuildMaxMs: 0,
+    eventMergeMs: 0,
+    eventOrderMs: 0,
+    eventSummaryMs: 0,
+    combatEventRows: 0,
+    worldEventRows: 0,
+  };
+}
+
+function nowMs(): number {
+  return typeof performance === 'undefined' ? Date.now() : performance.now();
 }
 
 function watchReplicatedTable<Row extends { entityId: bigint }>(

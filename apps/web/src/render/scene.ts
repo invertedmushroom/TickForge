@@ -370,6 +370,7 @@ export async function mountScene(
   let lastInvalidGround = false;
   let lastAimRaycastMs = 0;
   let lastKccMoveMs = 0;
+  let lastRemoteIngestMs = 0;
   const aimRaycaster = new THREE.Raycaster();
   const remoteWorld = new RemoteEntityWorld(scene, characterLoader);
   cleanups.push(() => remoteWorld.destroy());
@@ -1554,7 +1555,9 @@ export async function mountScene(
     reconcileLocalCooldownsFromSnapshot(snapshot);
     const isAllowed = inputAllowed(snapshot, options);
 
-    remoteWorld.ingest(snapshot.remoteTransforms, snapshot.remoteEntities, performance.now(), snapshot.remoteHealth);
+    const remoteIngestStartedAtMs = performance.now();
+    remoteWorld.ingest(snapshot.remoteTransforms, snapshot.remoteEntities, remoteIngestStartedAtMs, snapshot.remoteHealth);
+    lastRemoteIngestMs = performance.now() - remoteIngestStartedAtMs;
     const liveIds = new Set<bigint>();
     for (const t of snapshot.remoteTransforms) {
       liveIds.add(t.entityId);
@@ -1756,6 +1759,7 @@ export async function mountScene(
         extrapolationSecsMax: remoteStats.extrapolationSecsMax,
         snapshotGapEwma: remoteStats.snapshotGapEwma,
         snapshotGapMax: remoteStats.snapshotGapMax,
+        remoteIngestMs: lastRemoteIngestMs,
         selectedTarget: targetSelection.getSelected(),
         hoverTarget: targetSelection.getHover(),
         tabCandidates: tabCandidateCount,

@@ -46,7 +46,16 @@ export type GameplaySnapshotState = {
   worldEventCount: number;
 };
 
-export function collectGameplaySnapshot(rows: GameplayRows, ownEntityId: bigint | undefined): GameplaySnapshotState {
+export type GameplaySnapshotMetrics = {
+  eventOrderMs: number;
+  eventSummaryMs: number;
+};
+
+export function collectGameplaySnapshot(
+  rows: GameplayRows,
+  ownEntityId: bigint | undefined,
+  metrics?: GameplaySnapshotMetrics,
+): GameplaySnapshotState {
   const remoteHealth = new Map<bigint, EntityHealth>();
   let ownHealth: EntityHealth | undefined;
   for (const row of rows.healthRows) {
@@ -75,7 +84,16 @@ export function collectGameplaySnapshot(rows: GameplayRows, ownEntityId: bigint 
           .sort((a, b) => a.slotIndex - b.slotIndex);
   const combatEvents = rows.combatEvents.slice();
   const worldEvents = rows.worldEvents.slice();
+  const orderStartedAtMs = nowMs();
   const gameEvents = orderGameEvents(combatEvents, worldEvents);
+  const eventOrderMs = nowMs() - orderStartedAtMs;
+  const summaryStartedAtMs = nowMs();
+  const gameEventLog = summarizeGameEvents(gameEvents, ownEntityId);
+  const eventSummaryMs = nowMs() - summaryStartedAtMs;
+  if (metrics) {
+    metrics.eventOrderMs = eventOrderMs;
+    metrics.eventSummaryMs = eventSummaryMs;
+  }
 
   return {
     ownHealth,
@@ -90,10 +108,14 @@ export function collectGameplaySnapshot(rows: GameplayRows, ownEntityId: bigint 
     combatEvents,
     worldEvents,
     gameEvents,
-    gameEventLog: summarizeGameEvents(gameEvents, ownEntityId),
+    gameEventLog,
     healthRows: rows.healthRows.length,
     deathRows: rows.deathRows.length,
     combatEventCount: rows.combatEvents.length,
     worldEventCount: rows.worldEvents.length,
   };
+}
+
+function nowMs(): number {
+  return typeof performance === 'undefined' ? Date.now() : performance.now();
 }

@@ -13,6 +13,7 @@ import {
   type LoadedMapBundle,
   type MapBundleEntry,
   type RuntimeMapState,
+  type TerrainCollisionGeometry,
 } from './content';
 
 export const MAP_ASSET_KIND = 'map-bundles';
@@ -173,6 +174,7 @@ async function loadRemotePhysics(
     { bundle_id: entry.bundle_id, manifest, colliders: colliderResult.value } as MapBundleEntry,
     expectedContentHash,
   );
+  bundle.terrainCollision = await loadTerrainCollision(entry.bundle_id, manifest, fetcher);
   const networkTouched = manifestResult.source === 'network' || colliderResult.source === 'network';
   return {
     bundle,
@@ -246,6 +248,137 @@ async function loadVisualChannel(
       bytes: totalBytes,
     },
   };
+}
+
+/**
+ * Load the terrain collision mesh referenced by `manifest.collision_mesh`, weld
+ * it into world-space trimesh geometry, and apply the import transform so KCC
+ * prediction collides against the same low-res mesh the worker imported into the
+ * DB. Returns `undefined` for RON-only bundles or when the glTF fails to load;
+ * the caller degrades to RON colliders (server stays authoritative).
+ */
+async function loadTerrainCollision(
+  bundleId: string,
+  manifest: MapBundleEntry['manifest'],
+  fetcher: AssetFetcher,
+): Promise<TerrainCollisionGeometry | undefined> {
+  const ref = manifest.collision_mesh;
+  if (!ref) {
+    return undefined;
+  }
+  try {
+    const entryUrl = fetcher.resolveUrl(`${bundleId}/${ref.entry_url}`);
+    const { GLTFLoader } = await import('three/examples/jsm/loaders/GLTFLoader.js');
+    const loader = new GLTFLoader();
+    const gltf = await loader.loadAsync(entryUrl);
+    const scenes = gltf.scenes.length > 0 ? gltf.scenes : [gltf.scene];
+    const geometry = extractTrimesh(scenes);
+    for (const scene of scenes) {
+      disposeGltfScene(scene);
+    }
+    if (!geometry) {
+      console.warn(`collision mesh ${bundleId} has no triangle geometry; using RON colliders only`);
+      return undefined;
+    }
+    applyCollisionTransform(geometry, ref.transform);
+    return geometry;
+  } catch (error) {
+    console.warn(`collision mesh ${bundleId} failed to load; using RON colliders only`, error);
+    return undefined;
+  }
+}
+
+/**
+ * Flatten every mesh in every loaded glTF scene into a single world-space trimesh,
+ * baking node/mesh transforms into the vertices. Mirrors the worker's
+ * `load_gltf_triangles` so client and server derive identical source geometry.
+ */
+function extractTrimesh(roots: readonly Group[]): TerrainCollisionGeometry | undefined {
+  const positions: number[] = [];
+  const indices: number[] = [];
+  let vertexOffset = 0;
+  for (const root of roots) {
+    root.updateMatrixWorld(true);
+    root.traverse((object) => {
+      const mesh = object as {
+        isMesh?: boolean;
+        geometry?: {
+          clone: () => {
+            applyMatrix4: (matrix: unknown) => void;
+            getAttribute: (
+              name: string,
+            ) =>
+              | { count: number; getX: (i: number) => number; getY: (i: number) => number; getZ: (i: number) => number }
+              | undefined;
+            getIndex: () => { count: number; getX: (i: number) => number } | null;
+            dispose: () => void;
+          };
+        };
+        matrixWorld?: unknown;
+      };
+      if (!mesh.isMesh || !mesh.geometry) {
+        return;
+      }
+      const geometry = mesh.geometry.clone();
+      if (mesh.matrixWorld) {
+        geometry.applyMatrix4(mesh.matrixWorld);
+      }
+      const position = geometry.getAttribute('position');
+      if (!position) {
+        geometry.dispose();
+        return;
+      }
+      const count = position.count;
+      for (let i = 0; i < count; i += 1) {
+        positions.push(position.getX(i), position.getY(i), position.getZ(i));
+      }
+      const index = geometry.getIndex();
+      if (index) {
+        for (let i = 0; i < index.count; i += 1) {
+          indices.push(vertexOffset + index.getX(i));
+        }
+      } else {
+        for (let i = 0; i < count; i += 1) {
+          indices.push(vertexOffset + i);
+        }
+      }
+      vertexOffset += count;
+      geometry.dispose();
+    });
+  }
+  if (positions.length < 9 || indices.length < 3) {
+    return undefined;
+  }
+  return { vertices: new Float32Array(positions), indices: new Uint32Array(indices) };
+}
+
+/**
+ * Apply the manifest import transform in place: `v = v * scale + offset`, then
+ * swap each triangle's 2nd/3rd index when `flip_winding`. Matches the worker's
+ * `apply_terrain_transform`.
+ */
+function applyCollisionTransform(
+  geometry: TerrainCollisionGeometry,
+  transform: NonNullable<MapBundleEntry['manifest']['collision_mesh']>['transform'],
+): void {
+  const scale = transform.scale;
+  const ox = transform.offset[0] ?? 0;
+  const oy = transform.offset[1] ?? 0;
+  const oz = transform.offset[2] ?? 0;
+  const v = geometry.vertices;
+  for (let i = 0; i + 2 < v.length; i += 3) {
+    v[i] = v[i] * scale + ox;
+    v[i + 1] = v[i + 1] * scale + oy;
+    v[i + 2] = v[i + 2] * scale + oz;
+  }
+  if (transform.flip_winding) {
+    const idx = geometry.indices;
+    for (let i = 0; i + 2 < idx.length; i += 3) {
+      const tmp = idx[i + 1];
+      idx[i + 1] = idx[i + 2];
+      idx[i + 2] = tmp;
+    }
+  }
 }
 
 function disposeGltfScene(group: Group): void {

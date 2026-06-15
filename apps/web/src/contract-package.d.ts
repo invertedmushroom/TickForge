@@ -138,6 +138,18 @@ declare module '@dive/client-contract/map-bundles' {
     shape: ShapeMetadata;
   };
 
+  export type CollisionMeshRef = {
+    terrain_set: string;
+    entry_url: string;
+    assets: Array<{ url: string; sha256: string; bytes: number }>;
+    transform: {
+      scale: number;
+      offset: number[];
+      flip_winding: boolean;
+    };
+    content_hash: string;
+  };
+
   export type MapBundleEntry = {
     bundle_id: string;
     manifest: {
@@ -152,9 +164,11 @@ declare module '@dive/client-contract/map-bundles' {
         layer_id: number | null;
         dungeon_template_id: string | null;
         terrain_set: string | null;
+        client_visual: string | null;
       };
       render_meshes: Array<{ url: string; sha256: string; bytes: number }>;
       collider_json: Array<{ url: string; sha256: string; bytes: number }>;
+      collision_mesh?: CollisionMeshRef;
       debug_markers: Array<{ kind: string; label: string; position: number[] }>;
     };
     colliders: {
@@ -189,6 +203,7 @@ declare module '@dive/client-contract/content-metadata.json' {
       name: string;
       max_players: number;
       terrain_set: string | null;
+      client_visual: string | null;
       spawn_points: number[][];
       exit_points: number[][];
       geometry: unknown[];

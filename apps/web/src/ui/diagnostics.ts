@@ -57,6 +57,13 @@ export function createDiagnosticsPanel(options: {
         ` · hp ${snapshot.healthRows}` +
         ` · death ${snapshot.deathRows}` +
         ` · events ${snapshot.combatEventCount}/${snapshot.worldEventCount}` +
+        ` · pub ${formatHertz(snapshot.metrics.publishRateHz)}` +
+        ` · snap ${formatOptionalMilliseconds(snapshot.metrics.snapshotBuildEwmaMs)}` +
+        `/${formatOptionalMilliseconds(snapshot.metrics.snapshotBuildMaxMs)}` +
+        ` · evt ${formatOptionalMilliseconds(snapshot.metrics.eventMergeMs)}` +
+        `/${formatOptionalMilliseconds(snapshot.metrics.eventOrderMs)}` +
+        `/${formatOptionalMilliseconds(snapshot.metrics.eventSummaryMs)}` +
+        ` · ingest ${formatOptionalMilliseconds(sceneStats?.remoteIngestMs)}` +
         ` · extrap ${sceneStats?.extrapolationEvents ?? 0}` +
         `/${formatSeconds(sceneStats?.extrapolationSecsCurrent)}` +
         `/${formatSeconds(sceneStats?.extrapolationSecsMax)}` +
@@ -102,6 +109,13 @@ function formatRatio(value: number | undefined): string {
     return '0%';
   }
   return `${Math.round(value * 100)}%`;
+}
+
+function formatHertz(value: number | undefined): string {
+  if (value === undefined) {
+    return '0hz';
+  }
+  return `${Math.round(value * 10) / 10}hz`;
 }
 
 function formatMetersPerSecond(value: number | undefined): string {
